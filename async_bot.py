@@ -209,6 +209,10 @@ async def radar_task():
                     logging.info(f"🎯 Радар: {clean_name} добавлен в HOT_LIST.")
 
             HOT_LIST = new_hot_list
+
+# --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+            logging.info(f"🔎 [РАДАР] Скан завершен. Монет на мушке (HOT_LIST): {len(HOT_LIST)}. Жду 5 минут...")
+            
             await asyncio.sleep(300) # Радар спит 5 минут
             
         except Exception as e:
