@@ -492,6 +492,7 @@ async def main():
 
 if __name__ == '__main__':
     Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
-    Thread(target=bot.infinity_polling, kwargs={'skip_pending': True}, daemon=True).start()
+    # Отключаем прослушивание команд, чтобы не конфликтовать со старым ботом
+    # Thread(target=bot.infinity_polling, kwargs={'skip_pending': True}, daemon=True).start() 
     try: asyncio.run(main())
     except KeyboardInterrupt: logging.info("\nОстановка.")
