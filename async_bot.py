@@ -251,12 +251,18 @@ async def execute_trade(signal):
         bal = await exchange.fetch_balance()
         free_usdt = float(bal['USDT']['free'])
         
-        risk_amount_usdt = free_usdt * RISK_PER_TRADE  
+        # --- ДИНАМИЧЕСКИЙ САЙЗИНГ ---
+        risk_multiplier = signal.get('dynamic_risk', 1.0)
+        actual_risk_percent = RISK_PER_TRADE * risk_multiplier
+        risk_amount_usdt = free_usdt * actual_risk_percent  
+        
         sl_distance = abs(signal['entry_price'] - signal['sl'])
         if sl_distance == 0: return
         
         ideal_qty = risk_amount_usdt / sl_distance
         required_margin = (ideal_qty * signal['entry_price']) / LEVERAGE
+        
+        # Защита: не входить более чем на 30% от свободной маржи даже при x2.5 риске
         if required_margin > (free_usdt * 0.3): 
             ideal_qty = (free_usdt * 0.3 * LEVERAGE) / signal['entry_price']
             
@@ -286,10 +292,13 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ СНАЙПЕРА (v6.1): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
-               f"Паттерн: {signal['pattern']} + Footprint Confirm\n\n"
+        score_info = signal.get('score_info', 'Базовый')
+        msg = (f"💥 **ВЫСТРЕЛ (Smart Risk): {clean_name}**\n"
+               f"Направление: **#{signal['direction'].upper()}**\n"
+               f"Рейтинг: {score_info} (Риск: {actual_risk_percent*100:.1f}%)\n"
+               f"Паттерн: {signal['pattern']}\n\n"
                f"Цена: {signal['entry_price']}\nОбъем: {qty}\n"
-               f"SL: {signal['sl']:.4f}\nTP1: {signal['tp1']:.4f}\nTP2: {signal['tp2']:.4f}")
+               f"SL: {signal['sl']:.4f}\nTP1: {signal['tp1']:.4f}")
         await send_tg_msg(msg)
             
     except Exception as e: 
@@ -298,54 +307,51 @@ async def execute_trade(signal):
 async def wss_sniper_worker(ws_sym, setup_data):
     buy_vol, sell_vol = 0.0, 0.0
     start_time = time.time()
-    
     try:
         async for ws in websockets.connect(WSS_URL):
             await ws.send(json.dumps({"id": f"sub_{ws_sym}", "reqType": "sub", "dataType": f"{ws_sym}@trade"}))
-            
             while ws_sym in HOT_LIST and len(active_positions) < MAX_POSITIONS:
                 message = await ws.recv()
                 data = json.loads(gzip.GzipFile(fileobj=io.BytesIO(message)).read().decode('utf-8'))
-
-                if data.get("ping"):
-                    await ws.send(json.dumps({"pong": data.get("ping")})); continue
-
-                if "data" in data and isinstance(data["data"], list):
-                    for trade in data["data"]:
-                        price_str = trade.get("p") or trade.get("price")
-                        qty_str = trade.get("q") or trade.get("v") or trade.get("amount") or trade.get("vol")
-                        if not price_str or not qty_str: continue
-                        
-                        price, qty = float(price_str), float(qty_str)
-                        trade_usdt = price * qty
-                        is_sell = trade.get("m", False)
-                        
-                        if is_sell: sell_vol += trade_usdt
-                        else: buy_vol += trade_usdt
-
+                if data.get("ping"): await ws.send(json.dumps({"pong": data.get("ping")})); continue
+                if "data" in data:
+                    for t in data["data"]:
+                        v_usdt = float(t['p']) * float(t['q'])
+                        if t.get('m'): sell_vol += v_usdt
+                        else: buy_vol += v_usdt
                 if time.time() - start_time >= 5:
-                    total_vol = buy_vol + sell_vol
-                    # СНИЖЕН ПОРОГ ДЛЯ ФЛЭТА ($2000 вместо $5000)
-                    if total_vol > 2000: 
-                        buy_pct = (buy_vol / total_vol) * 100
+                    total = buy_vol + sell_vol
+                    if total > 2000:
+                        buy_pct = (buy_vol / total) * 100
                         sell_pct = 100 - buy_pct
                         
-                        in_zone = setup_data['ob_low'] <= price <= setup_data['ob_high']
+                        in_zone = setup_data['ob_low'] <= float(data["data"][-1]['p']) <= setup_data['ob_high']
                         
                         if in_zone:
-                            if setup_data['direction'] == 'Long' and buy_pct >= 75:
-                                await execute_trade(setup_data)
-                                if ws_sym in HOT_LIST: del HOT_LIST[ws_sym]
-                                break
-                            elif setup_data['direction'] == 'Short' and sell_pct >= 75:
-                                await execute_trade(setup_data)
-                                if ws_sym in HOT_LIST: del HOT_LIST[ws_sym]
-                                break
+                            is_long_trigger = (setup_data['direction'] == 'Long' and buy_pct >= 75)
+                            is_short_trigger = (setup_data['direction'] == 'Short' and sell_pct >= 75)
                             
-                    buy_vol, sell_vol = 0.0, 0.0
-                    start_time = time.time()
+                            if is_long_trigger or is_short_trigger:
+                                dominant_pct = buy_pct if setup_data['direction'] == 'Long' else sell_pct
+                                
+                                # Оценка качества сетапа (Динамический риск)
+                                if dominant_pct >= 90:
+                                    setup_data['dynamic_risk'] = 2.5
+                                    setup_data['score_info'] = f"10/10 🔥 (Перевес {dominant_pct:.1f}%)"
+                                elif dominant_pct >= 85:
+                                    setup_data['dynamic_risk'] = 1.5
+                                    setup_data['score_info'] = f"8/10 ⚡ (Перевес {dominant_pct:.1f}%)"
+                                else:
+                                    setup_data['dynamic_risk'] = 1.0
+                                    setup_data['score_info'] = f"6/10 📊 (Перевес {dominant_pct:.1f}%)"
+
+                                await execute_trade(setup_data)
+                                del HOT_LIST[ws_sym]
+                                break
+                                
+                    buy_vol, sell_vol = 0.0, 0.0; start_time = time.time()
             break
-    except Exception as e: logging.error(f"Sniper error {ws_sym}: {e}")
+    except: pass
     finally: ACTIVE_WSS_CONNECTIONS.discard(ws_sym)
 
 async def sniper_manager():
