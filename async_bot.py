@@ -102,6 +102,20 @@ def calculate_ema(data, window):
     for price in data[1:]: ema = (price * alpha) + (ema * (1 - alpha))
     return ema
 
+# --- МОДУЛЬ: ДЕТЕКТОР FVG (Добавь это) ---
+def find_fvg(h, l, direction):
+    """
+    Ищет имбаланс в последних 5 свечах.
+    Bullish FVG: Low(i) > High(i-2)
+    Bearish FVG: High(i) < Low(i-2)
+    """
+    for i in range(len(h)-1, len(h)-6, -1):
+        if direction == 'Long':
+            if l[i] > h[i-2]: return True
+        else:
+            if h[i] < l[i-2]: return True
+    return False
+
 # --- АСИНХРОННЫЙ РАДАР (REST API) ---
 async def detect_smc_setup(sym, btc_trend, altseason):
     try:
@@ -118,57 +132,51 @@ async def detect_smc_setup(sym, btc_trend, altseason):
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level = leg_low + (leg_high - leg_low) * 0.5  
-        strong_premium_level = leg_low + (leg_high - leg_low) * 0.75 # Уровень для агрессивных шортов
+        strong_premium = leg_low + (leg_high - leg_low) * 0.75
 
         # --- ЛОГИКА LONG ---
-        allow_long = (btc_trend != 'Short') or altseason
-        if current_price > ema_200 and allow_long:
+        if current_price > ema_200 and (btc_trend != 'Short' or altseason):
             is_valid_choch = (c[-1] > np.max(h[-15:-1])) and (v[-1] > avg_volume * 1.2)
             if is_valid_choch and current_price <= eq_level:
-                try:
-                    ohlcv_4h = await exchange.fetch_ohlcv(sym, timeframe='4h', limit=205)
-                    c_4h = np.array([x[4] for x in ohlcv_4h], dtype=float)
-                    if len(c_4h) >= 200 and current_price < calculate_ema(c_4h, 200): return None
-                except: return None
-
+                
+                # КРИТИЧЕСКОЕ ОБНОВЛЕНИЕ: Проверка FVG (Imbalance)
+                if not find_fvg(h, l, 'Long'): return None
+                
                 for i in range(len(c)-2, len(c)-15, -1):
                     if c[i] < o[i]:  
                         ob_low, ob_high = l[i], h[i]
-                        # Проверка близости к Ордерблоку
                         if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
                             sl = ob_low - (atr * 0.3)  
-                            tp1 = current_price + (current_price - sl) * 1.5
-                            tp2 = current_price + (current_price - sl) * 3.0
-                            return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(tp1, 6), 'tp2': round(tp2, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + Discount'}
+                            return {
+                                'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 
+                                'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 
+                                'tp2': round(current_price + (current_price-sl)*3, 6), 
+                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG Imbalance'
+                            }
 
-        # --- ЛОГИКА SHORT (С АГРЕССИВНЫМ РЕЖИМОМ) ---
-        is_in_premium = current_price >= eq_level
-        is_in_strong_premium = current_price >= strong_premium_level
-        
+        # --- ЛОГИКА SHORT ---
+        is_in_strong_premium = current_price >= strong_premium
         allow_short = (current_price < ema_200 and btc_trend != 'Long') or is_in_strong_premium
 
         if allow_short:
             is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and (v[-1] > avg_volume * 1.2)
-            if is_valid_choch_short and is_in_premium:
+            if is_valid_choch_short and current_price >= eq_level:
                 
-                # Отключаем 4H фильтр для сильного перегрева
-                if not is_in_strong_premium:
-                    try:
-                        ohlcv_4h = await exchange.fetch_ohlcv(sym, timeframe='4h', limit=205)
-                        c_4h = np.array([x[4] for x in ohlcv_4h], dtype=float)
-                        if len(c_4h) >= 200 and current_price > calculate_ema(c_4h, 200): return None
-                    except: return None
-
+                # КРИТИЧЕСКОЕ ОБНОВЛЕНИЕ: Проверка FVG (Imbalance)
+                if not find_fvg(h, l, 'Short'): return None
+                
                 for i in range(len(c)-2, len(c)-15, -1):
                     if c[i] > o[i]:  
                         ob_high, ob_low = h[i], l[i]
-                        # Проверка близости к Ордерблоку
                         if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
                             sl = ob_high + (atr * 0.3)
-                            tp1 = current_price - (sl - current_price) * 1.5
-                            tp2 = current_price - (sl - current_price) * 3.0
-                            pattern_name = '🔥 Aggr. Short (Strong Premium)' if is_in_strong_premium else '1H OB + Premium'
-                            return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(tp1, 6), 'tp2': round(tp2, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': pattern_name}
+                            pattern_name = '🔥 Aggr. Short (Premium + FVG)' if is_in_strong_premium else '1H OB + FVG Imbalance'
+                            return {
+                                'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 
+                                'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 
+                                'tp2': round(current_price - (sl-current_price)*3, 6), 
+                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': pattern_name
+                            }
     except Exception as e: logging.error(f"SMC Detector Error {sym}: {e}")
     return None
 
