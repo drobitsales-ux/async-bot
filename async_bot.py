@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-# === НАСТРОЙКИ v6.0 Async (SMC + WSS Footprint) ===
+# === НАСТРОЙКИ v6.1 Async (SMC + WSS Footprint + Aggr. Shorts) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -118,8 +118,9 @@ async def detect_smc_setup(sym, btc_trend, altseason):
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level = leg_low + (leg_high - leg_low) * 0.5  
+        strong_premium_level = leg_low + (leg_high - leg_low) * 0.75 # Уровень для агрессивных шортов
 
-        # LONG
+        # --- ЛОГИКА LONG ---
         allow_long = (btc_trend != 'Short') or altseason
         if current_price > ema_200 and allow_long:
             is_valid_choch = (c[-1] > np.max(h[-15:-1])) and (v[-1] > avg_volume * 1.2)
@@ -133,28 +134,41 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                 for i in range(len(c)-2, len(c)-15, -1):
                     if c[i] < o[i]:  
                         ob_low, ob_high = l[i], h[i]
-                        sl = ob_low - (atr * 0.3)  
-                        tp1 = current_price + (current_price - sl) * 1.5
-                        tp2 = current_price + (current_price - sl) * 3.0
-                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(tp1, 6), 'tp2': round(tp2, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + Discount'}
+                        # Проверка близости к Ордерблоку
+                        if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
+                            sl = ob_low - (atr * 0.3)  
+                            tp1 = current_price + (current_price - sl) * 1.5
+                            tp2 = current_price + (current_price - sl) * 3.0
+                            return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(tp1, 6), 'tp2': round(tp2, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + Discount'}
 
-        # SHORT
-        if current_price < ema_200 and btc_trend != 'Long':
+        # --- ЛОГИКА SHORT (С АГРЕССИВНЫМ РЕЖИМОМ) ---
+        is_in_premium = current_price >= eq_level
+        is_in_strong_premium = current_price >= strong_premium_level
+        
+        allow_short = (current_price < ema_200 and btc_trend != 'Long') or is_in_strong_premium
+
+        if allow_short:
             is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and (v[-1] > avg_volume * 1.2)
-            if is_valid_choch_short and current_price >= eq_level:
-                try:
-                    ohlcv_4h = await exchange.fetch_ohlcv(sym, timeframe='4h', limit=205)
-                    c_4h = np.array([x[4] for x in ohlcv_4h], dtype=float)
-                    if len(c_4h) >= 200 and current_price > calculate_ema(c_4h, 200): return None
-                except: return None
+            if is_valid_choch_short and is_in_premium:
+                
+                # Отключаем 4H фильтр для сильного перегрева
+                if not is_in_strong_premium:
+                    try:
+                        ohlcv_4h = await exchange.fetch_ohlcv(sym, timeframe='4h', limit=205)
+                        c_4h = np.array([x[4] for x in ohlcv_4h], dtype=float)
+                        if len(c_4h) >= 200 and current_price > calculate_ema(c_4h, 200): return None
+                    except: return None
 
                 for i in range(len(c)-2, len(c)-15, -1):
                     if c[i] > o[i]:  
                         ob_high, ob_low = h[i], l[i]
-                        sl = ob_high + (atr * 0.3)
-                        tp1 = current_price - (sl - current_price) * 1.5
-                        tp2 = current_price - (sl - current_price) * 3.0
-                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(tp1, 6), 'tp2': round(tp2, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + Premium'}
+                        # Проверка близости к Ордерблоку
+                        if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
+                            sl = ob_high + (atr * 0.3)
+                            tp1 = current_price - (sl - current_price) * 1.5
+                            tp2 = current_price - (sl - current_price) * 3.0
+                            pattern_name = '🔥 Aggr. Short (Strong Premium)' if is_in_strong_premium else '1H OB + Premium'
+                            return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(tp1, 6), 'tp2': round(tp2, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': pattern_name}
     except Exception as e: logging.error(f"SMC Detector Error {sym}: {e}")
     return None
 
@@ -207,10 +221,12 @@ async def radar_task():
                     ws_sym = sym.replace('/', '-')
                     new_hot_list[ws_sym] = signal
                     logging.info(f"🎯 Радар: {clean_name} добавлен в HOT_LIST.")
+                    
+                    # Отправляем алерт в ТГ, только если монеты еще не было в списке
+                    if ws_sym not in HOT_LIST:
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nПаттерн: {signal['pattern']}\nЖду аномальный объем в стакане...")
 
             HOT_LIST = new_hot_list
-
-# --- ДОБАВИТЬ ЭТУ СТРОКУ ---
             logging.info(f"🔎 [РАДАР] Скан завершен. Монет на мушке (HOT_LIST): {len(HOT_LIST)}. Жду 5 минут...")
             
             await asyncio.sleep(300) # Радар спит 5 минут
@@ -262,7 +278,7 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"🎯 **ВХОД (Снайпер v6.0): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ СНАЙПЕРА (v6.1): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Паттерн: {signal['pattern']} + Footprint Confirm\n\n"
                f"Цена: {signal['entry_price']}\nОбъем: {qty}\n"
                f"SL: {signal['sl']:.4f}\nTP1: {signal['tp1']:.4f}\nTP2: {signal['tp2']:.4f}")
@@ -301,7 +317,8 @@ async def wss_sniper_worker(ws_sym, setup_data):
 
                 if time.time() - start_time >= 5:
                     total_vol = buy_vol + sell_vol
-                    if total_vol > 5000: # Минимальный объем в кластере 5k
+                    # СНИЖЕН ПОРОГ ДЛЯ ФЛЭТА ($2000 вместо $5000)
+                    if total_vol > 2000: 
                         buy_pct = (buy_vol / total_vol) * 100
                         sell_pct = 100 - buy_pct
                         
@@ -483,11 +500,11 @@ def send_stats(message):
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "Async Bot v6.0 Active"
+def index(): return "Async Bot v6.1 Active"
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск асинхронного ядра SMC + WSS Footprint...")
+    logging.info("🚀 Запуск асинхронного ядра SMC + WSS Footprint v6.1...")
     await asyncio.gather(
         radar_task(),
         sniper_manager(),
