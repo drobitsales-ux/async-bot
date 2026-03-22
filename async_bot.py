@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-# === НАСТРОЙКИ v6.1 Async (SMC + WSS Footprint + Aggr. Shorts) ===
+# === НАСТРОЙКИ v6.2.1 Async (SMC + FVG + Smart Risk + Soft Filters) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -27,12 +27,14 @@ RISK_PER_TRADE = 0.01
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MAX_SPREAD_PERCENT = 0.002  
-MIN_VOLUME_USDT = 5000000  
+
+# СНИЖЕННЫЙ ФИЛЬТР: 2 млн USDT вместо 5 млн для расширения пула монет
+MIN_VOLUME_USDT = 2000000  
 
 # Тайм-менеджмент
 TRADE_TIMEOUT_PROFIT_HOURS = 24  
 TRADE_TIMEOUT_ANY_HOURS = 48     
-SMC_TIMEFRAME = '1h'        
+SMC_TIMEFRAME = '1h'
 
 EXCLUDED_KEYWORDS = [
     'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', 'JPY',
@@ -102,21 +104,14 @@ def calculate_ema(data, window):
     for price in data[1:]: ema = (price * alpha) + (ema * (1 - alpha))
     return ema
 
-# --- МОДУЛЬ: ДЕТЕКТОР FVG (Добавь это) ---
+# --- МОДУЛЬ: ДЕТЕКТОР FVG ---
 def find_fvg(h, l, direction):
-    """
-    Ищет имбаланс в последних 5 свечах.
-    Bullish FVG: Low(i) > High(i-2)
-    Bearish FVG: High(i) < Low(i-2)
-    """
     for i in range(len(h)-1, len(h)-6, -1):
-        if direction == 'Long':
-            if l[i] > h[i-2]: return True
-        else:
-            if h[i] < l[i-2]: return True
+        if direction == 'Long' and l[i] > h[i-2]: return True
+        elif direction == 'Short' and h[i] < l[i-2]: return True
     return False
 
-# --- АСИНХРОННЫЙ РАДАР (REST API) ---
+# --- АСИНХРОННЫЙ РАДАР (SMC + FVG + Мягкие фильтры) ---
 async def detect_smc_setup(sym, btc_trend, altseason):
     try:
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
@@ -134,12 +129,13 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         eq_level = leg_low + (leg_high - leg_low) * 0.5  
         strong_premium = leg_low + (leg_high - leg_low) * 0.75
 
+        # СМЯГЧЕННЫЙ ФИЛЬТР ОБЪЕМА: 1.15 вместо 1.2
+        volume_threshold = avg_volume * 1.15
+
         # --- ЛОГИКА LONG ---
         if current_price > ema_200 and (btc_trend != 'Short' or altseason):
-            is_valid_choch = (c[-1] > np.max(h[-15:-1])) and (v[-1] > avg_volume * 1.2)
+            is_valid_choch = (c[-1] > np.max(h[-15:-1])) and (v[-1] > volume_threshold)
             if is_valid_choch and current_price <= eq_level:
-                
-                # КРИТИЧЕСКОЕ ОБНОВЛЕНИЕ: Проверка FVG (Imbalance)
                 if not find_fvg(h, l, 'Long'): return None
                 
                 for i in range(len(c)-2, len(c)-15, -1):
@@ -151,18 +147,16 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                                 'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 
                                 'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 
                                 'tp2': round(current_price + (current_price-sl)*3, 6), 
-                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG Imbalance'
+                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'
                             }
 
-        # --- ЛОГИКА SHORT ---
+        # --- ЛОГИКА SHORT (С Агрессивным режимом) ---
         is_in_strong_premium = current_price >= strong_premium
         allow_short = (current_price < ema_200 and btc_trend != 'Long') or is_in_strong_premium
 
         if allow_short:
-            is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and (v[-1] > avg_volume * 1.2)
+            is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and (v[-1] > volume_threshold)
             if is_valid_choch_short and current_price >= eq_level:
-                
-                # КРИТИЧЕСКОЕ ОБНОВЛЕНИЕ: Проверка FVG (Imbalance)
                 if not find_fvg(h, l, 'Short'): return None
                 
                 for i in range(len(c)-2, len(c)-15, -1):
@@ -170,7 +164,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                         ob_high, ob_low = h[i], l[i]
                         if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
                             sl = ob_high + (atr * 0.3)
-                            pattern_name = '🔥 Aggr. Short (Premium + FVG)' if is_in_strong_premium else '1H OB + FVG Imbalance'
+                            pattern_name = '🔥 Aggr. Short (Premium + FVG)' if is_in_strong_premium else '1H OB + FVG'
                             return {
                                 'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 
                                 'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 
