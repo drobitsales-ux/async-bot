@@ -123,20 +123,25 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         current_price = c[-1]
         ema_200 = calculate_ema(c, 200)
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
-        avg_volume = np.mean(v[-21:-1])
+        # Считаем средний объем только по ЗАКРЫТЫМ свечам (от -22 до -2)
+        avg_volume = np.mean(v[-22:-2])
+        volume_threshold = avg_volume * 1.15 # Мягкий фильтр (15%)
+
+        # УМНЫЙ ФИЛЬТР ОБЪЕМА: Проверяем закрытую свечу ИЛИ текущую (если в ней аномальный всплеск)
+        has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level = leg_low + (leg_high - leg_low) * 0.5  
         strong_premium = leg_low + (leg_high - leg_low) * 0.75
 
-        # СМЯГЧЕННЫЙ ФИЛЬТР ОБЪЕМА: 1.15 вместо 1.2
-        volume_threshold = avg_volume * 1.15
-
         # --- ЛОГИКА LONG ---
         if current_price > ema_200 and (btc_trend != 'Short' or altseason):
-            is_valid_choch = (c[-1] > np.max(h[-15:-1])) and (v[-1] > volume_threshold)
+            # Используем has_volume вместо v[-1]
+            is_valid_choch = (c[-1] > np.max(h[-15:-1])) and has_volume
+            
             if is_valid_choch and current_price <= eq_level:
-                if not find_fvg(h, l, 'Long'): return None
+                # ДЛЯ ASYNC БОТА (Если правишь rsi_bot.py - удали эту строку find_fvg)
+                if 'find_fvg' in globals() and not find_fvg(h, l, 'Long'): return None
                 
                 for i in range(len(c)-2, len(c)-15, -1):
                     if c[i] < o[i]:  
@@ -147,24 +152,27 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                                 'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 
                                 'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 
                                 'tp2': round(current_price + (current_price-sl)*3, 6), 
-                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'
+                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB'
                             }
 
-        # --- ЛОГИКА SHORT (С Агрессивным режимом) ---
+        # --- ЛОГИКА SHORT ---
         is_in_strong_premium = current_price >= strong_premium
         allow_short = (current_price < ema_200 and btc_trend != 'Long') or is_in_strong_premium
 
         if allow_short:
-            is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and (v[-1] > volume_threshold)
+            # Используем has_volume вместо v[-1]
+            is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and has_volume
+            
             if is_valid_choch_short and current_price >= eq_level:
-                if not find_fvg(h, l, 'Short'): return None
+                # ДЛЯ ASYNC БОТА (Если правишь rsi_bot.py - удали эту строку find_fvg)
+                if 'find_fvg' in globals() and not find_fvg(h, l, 'Short'): return None
                 
                 for i in range(len(c)-2, len(c)-15, -1):
                     if c[i] > o[i]:  
                         ob_high, ob_low = h[i], l[i]
                         if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
                             sl = ob_high + (atr * 0.3)
-                            pattern_name = '🔥 Aggr. Short (Premium + FVG)' if is_in_strong_premium else '1H OB + FVG'
+                            pattern_name = '🔥 Aggr. Short (Premium)' if is_in_strong_premium else '1H OB'
                             return {
                                 'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 
                                 'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 
