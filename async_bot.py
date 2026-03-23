@@ -174,7 +174,7 @@ async def radar_task():
                 if signal:
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST:
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю 4x Мульти-Сканер...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
 
             HOT_LIST = new_hot_list
             logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)}")
@@ -224,14 +224,12 @@ async def execute_trade(signal):
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- MULTI-EXCHANGE SNIPER CORE ---
+# --- MULTI-EXCHANGE SNIPER CORE (Только BingX + Bybit) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     
     sym_bingx = sym.replace('/', '-')
     sym_bybit = f"{base_coin}USDT"
-    sym_bitget = f"{base_coin}USDT"
-    sym_mexc = f"{base_coin}_USDT"
 
     state = {'buy_vol': 0.0, 'sell_vol': 0.0, 'current_price': setup_data['entry_price'], 'active': True}
 
@@ -271,65 +269,16 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception as e: 
                 logging.debug(f"Bybit WSS Reconnect: {e}"); await asyncio.sleep(1)
 
-    async def l_bitget():
-        url = "wss://ws.bitget.com/v2/ws/public"
-        while state['active']:
-            try:
-                async for ws in websockets.connect(url):
-                    await ws.send(json.dumps({"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "trade", "instId": sym_bitget}]}))
-                    async def ping_bg():
-                        while state['active']:
-                            await asyncio.sleep(25)
-                            try: await ws.send("ping")
-                            except: break
-                    ptask = asyncio.create_task(ping_bg())
-                    try:
-                        while state['active']:
-                            msg = await ws.recv()
-                            if msg == "pong": continue
-                            data = json.loads(msg)
-                            if "data" in data and isinstance(data["data"], list):
-                                for t in data["data"]:
-                                    v = float(t['price']) * float(t['size'])
-                                    if t['side'] == "sell": state['sell_vol'] += v
-                                    else: state['buy_vol'] += v
-                    finally: ptask.cancel()
-            except Exception as e: 
-                logging.debug(f"Bitget WSS Reconnect: {e}"); await asyncio.sleep(1)
-
-    async def l_mexc():
-        url = "wss://wbs.mexc.com/ws"
-        while state['active']:
-            try:
-                async for ws in websockets.connect(url):
-                    await ws.send(json.dumps({"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_mexc}"]}))
-                    async def ping_mexc():
-                        while state['active']:
-                            await asyncio.sleep(15)
-                            try: await ws.send(json.dumps({"method": "PING"}))
-                            except: break
-                    ptask = asyncio.create_task(ping_mexc())
-                    try:
-                        while state['active']:
-                            msg = await ws.recv()
-                            data = json.loads(msg)
-                            if "d" in data and "deals" in data["d"]:
-                                for t in data["d"]["deals"]:
-                                    v = float(t['p']) * float(t['v'])
-                                    if t['S'] == 2: state['sell_vol'] += v
-                                    else: state['buy_vol'] += v
-                    finally: ptask.cancel()
-            except Exception as e: 
-                logging.debug(f"MEXC WSS Reconnect: {e}"); await asyncio.sleep(1)
-
-    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit()), asyncio.create_task(l_bitget()), asyncio.create_task(l_mexc())]
+    # Оставляем только 2 задачи (BingX и Bybit)
+    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit())]
 
     try:
         while sym in HOT_LIST and len(active_positions) < MAX_POSITIONS:
             await asyncio.sleep(5)
             total = state['buy_vol'] + state['sell_vol']
             
-            if total > 10000:
+            # Порог снижен до 5000, так как собираем объемы только с 2х бирж вместо 4х
+            if total > 5000:
                 buy_pct = (state['buy_vol'] / total) * 100
                 sell_pct = 100 - buy_pct
                 
@@ -502,11 +451,11 @@ def send_stats(message):
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "Multi-WSS Async Bot v7.2 Active"
+def index(): return "2x Биржевой Снайпер (Bybit+BingX) + SMC Active"
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.2: 4x Мульти-Биржевой Снайпер + SMC...")
+    logging.info("🚀 Запуск ядра v7.2: 2x Биржевой Снайпер (Bybit+BingX) + SMC...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
