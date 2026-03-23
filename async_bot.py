@@ -14,39 +14,29 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-# === НАСТРОЙКИ v6.2.1 Async (SMC + FVG + Smart Risk + Soft Filters) ===
+# === НАСТРОЙКИ v7.0 Async (Multi-Exchange WSS + Test Mode) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
-WSS_URL = "wss://open-api-swap.bingx.com/swap-market"
 
-# Риск-менеджмент
 RISK_PER_TRADE = 0.01       
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MAX_SPREAD_PERCENT = 0.002  
-
-# СНИЖЕННЫЙ ФИЛЬТР: 2 млн USDT вместо 5 млн для расширения пула монет
 MIN_VOLUME_USDT = 2000000  
 
-# Тайм-менеджмент
 TRADE_TIMEOUT_PROFIT_HOURS = 24  
 TRADE_TIMEOUT_ANY_HOURS = 48     
 SMC_TIMEFRAME = '1h'
 
-EXCLUDED_KEYWORDS = [
-    'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', 'JPY',
-    'PEPE', 'SHIB', '1000', 'FLOKI', 'DOGE', 'BONK', 'MEME', 'LUNC', 'USTC', 'WIF', 'POPCAT',
-    'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/'
-]
+EXCLUDED_KEYWORDS = ['NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', 'JPY', 'PEPE', 'SHIB', '1000', 'FLOKI', 'DOGE', 'BONK', 'MEME', 'LUNC', 'USTC', 'WIF', 'POPCAT', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
 GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
 last_signals = {} 
 
-# В оперативной памяти
 HOT_LIST = {}  
 ACTIVE_WSS_CONNECTIONS = set()
 active_positions = []
@@ -56,13 +46,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 bot = telebot.TeleBot(TOKEN)
 
 exchange = ccxt_async.bingx({
-    'apiKey': BINGX_API_KEY,
-    'secret': BINGX_SECRET,
-    'options': {'defaultType': 'swap', 'marginMode': 'isolated'},
-    'enableRateLimit': True
+    'apiKey': BINGX_API_KEY, 'secret': BINGX_SECRET,
+    'options': {'defaultType': 'swap', 'marginMode': 'isolated'}, 'enableRateLimit': True
 })
 
-# --- БАЗА ДАННЫХ ---
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -77,8 +64,7 @@ def init_db():
 def save_positions():
     conn = get_db_conn(); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO active_positions (id, data) VALUES (1, ?)", (json.dumps(active_positions),))
-    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins) VALUES (1, ?, ?, ?)", 
-              (daily_stats['pnl'], daily_stats['trades'], daily_stats.get('wins', 0)))
+    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins) VALUES (1, ?, ?, ?)", (daily_stats['pnl'], daily_stats['trades'], daily_stats.get('wins', 0)))
     conn.commit(); conn.close()
 
 def load_positions():
@@ -93,7 +79,6 @@ def load_positions():
     except: pass
 
 async def send_tg_msg(text):
-    """Асинхронная отправка сообщений в Telegram"""
     try: await asyncio.to_thread(bot.send_message, GROUP_CHAT_ID, text)
     except Exception as e: logging.error(f"TG Error: {e}")
 
@@ -104,14 +89,13 @@ def calculate_ema(data, window):
     for price in data[1:]: ema = (price * alpha) + (ema * (1 - alpha))
     return ema
 
-# --- МОДУЛЬ: ДЕТЕКТОР FVG ---
 def find_fvg(h, l, direction):
     for i in range(len(h)-1, len(h)-6, -1):
         if direction == 'Long' and l[i] > h[i-2]: return True
         elif direction == 'Short' and h[i] < l[i-2]: return True
     return False
 
-# --- АСИНХРОННЫЙ РАДАР (SMC + FVG + Мягкие фильтры) ---
+# --- РАДАР (ТЕСТОВЫЙ РЕЖИМ) ---
 async def detect_smc_setup(sym, btc_trend, altseason):
     try:
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
@@ -123,85 +107,49 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         current_price = c[-1]
         ema_200 = calculate_ema(c, 200)
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
-        # Считаем средний объем только по ЗАКРЫТЫМ свечам (от -22 до -2)
+        
         avg_volume = np.mean(v[-22:-2])
-        volume_threshold = avg_volume * 1.15 # Мягкий фильтр (15%)
-
-        # ТЕСТОВЫЙ ФИЛЬТР ОБЪЕМА: 1.0 (просто средний объем, без всплеска)
-        volume_threshold = avg_volume * 1.0
+        volume_threshold = avg_volume * 1.0 # Тестовый фильтр (1.0)
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level = leg_low + (leg_high - leg_low) * 0.5  
-        strong_premium = leg_low + (leg_high - leg_low) * 0.75
 
-        # --- ЛОГИКА LONG (ТЕСТОВЫЙ РЕЖИМ) ---
-        allow_long = True # ВСЕГДА разрешаем лонги
-        if current_price > ema_200 and allow_long:
-            # Ищем микро-пробой за 6 часов (а не за 15)
+        # LONG (Всегда включен для теста)
+        if current_price > ema_200:
             is_valid_choch = (c[-1] > np.max(h[-6:-1])) and has_volume
-            
             if is_valid_choch and current_price <= eq_level:
-                if 'find_fvg' in globals() and not find_fvg(h, l, 'Long'): return None
-                
-                for i in range(len(c)-2, len(c)-6, -1): # Ищем микро-ОБ за 6 свечей
+                if not find_fvg(h, l, 'Long'): return None
+                for i in range(len(c)-2, len(c)-6, -1):
                     if c[i] < o[i]:  
                         ob_low, ob_high = l[i], h[i]
                         if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
                             sl = ob_low - (atr * 0.3)  
-                            return {
-                                'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 
-                                'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 
-                                'tp2': round(current_price + (current_price-sl)*3, 6), 
-                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H Micro-OB + FVG'
-                            }
+                            return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 'tp2': round(current_price + (current_price-sl)*3, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H Micro-OB + FVG'}
 
-        # --- ЛОГИКА SHORT (ТЕСТОВЫЙ РЕЖИМ) ---
-        is_in_strong_premium = current_price >= strong_premium
-        allow_short = True # ВСЕГДА разрешаем шорты
-
-        if allow_short:
-            # Ищем микро-пробой за 6 часов (а не за 15)
+        # SHORT (Всегда включен для теста)
+        if current_price < ema_200:
             is_valid_choch_short = (c[-1] < np.min(l[-6:-1])) and has_volume
-            
             if is_valid_choch_short and current_price >= eq_level:
-                if 'find_fvg' in globals() and not find_fvg(h, l, 'Short'): return None
-                
-                for i in range(len(c)-2, len(c)-6, -1): # Ищем микро-ОБ за 6 свечей
+                if not find_fvg(h, l, 'Short'): return None
+                for i in range(len(c)-2, len(c)-6, -1):
                     if c[i] > o[i]:  
                         ob_high, ob_low = h[i], l[i]
                         if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
                             sl = ob_high + (atr * 0.3)
-                            return {
-                                'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 
-                                'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 
-                                'tp2': round(current_price - (sl-current_price)*3, 6), 
-                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H Micro-OB + FVG'
-                            }
-    except Exception as e: logging.error(f"SMC Detector Error {sym}: {e}")
+                            return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 'tp2': round(current_price - (sl-current_price)*3, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H Micro-OB + FVG'}
+    except Exception as e: logging.error(f"SMC Error {sym}: {e}")
     return None
 
 async def radar_task():
-    global HOT_LIST, GLOBAL_STOP_UNTIL
+    global HOT_LIST
     await asyncio.sleep(5)
-    
     while True:
         try:
             if GLOBAL_STOP_UNTIL and datetime.now(timezone.utc) < GLOBAL_STOP_UNTIL:
                 await asyncio.sleep(60); continue
             if len(active_positions) >= MAX_POSITIONS:
                 await asyncio.sleep(60); continue
-
-            btc_trend, altseason = 'Short', False
-            try:
-                btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
-                btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
-                btc_trend = 'Long' if btc_c[-1] > calculate_ema(btc_c, 200) else 'Short'
-                
-                eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
-                eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
-                altseason = True if (eth_c / btc_c)[-1] > calculate_ema((eth_c / btc_c), 200) else False
-            except Exception as e: logging.error(f"Global Filter Error: {e}")
 
             markets = await exchange.load_markets()
             tickers = await exchange.fetch_tickers()
@@ -211,40 +159,29 @@ async def radar_task():
                 if m.get('type') != 'swap' or not m.get('active'): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 tick = tickers.get(sym)
-                if not tick or not tick.get('quoteVolume') or float(tick['quoteVolume']) < MIN_VOLUME_USDT: continue
-                
-                ask, bid = float(tick.get('ask', 0)), float(tick.get('bid', 0))
-                if ask > 0 and bid > 0 and ((ask - bid) / ask) <= MAX_SPREAD_PERCENT:
-                    base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
-                    if not any(pos['symbol'].split('/')[0].split('-')[0].split(':')[0] == base_coin for pos in active_positions):
-                        valid_symbols.append(sym)
+                if not tick or float(tick.get('quoteVolume', 0)) < MIN_VOLUME_USDT: continue
+                base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
+                if not any(pos['symbol'].split('/')[0].split('-')[0].split(':')[0] == base_coin for pos in active_positions):
+                    valid_symbols.append(sym)
 
             new_hot_list = {}
             for sym in valid_symbols:
                 clean_name = sym.split(':')[0]
-                if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)):
-                    continue
+                if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)): continue
                 
-                signal = await detect_smc_setup(sym, btc_trend, altseason)
+                signal = await detect_smc_setup(sym, 'Long', True) # Фейковые данные для теста
                 if signal:
-                    ws_sym = sym.replace('/', '-')
-                    new_hot_list[ws_sym] = signal
-                    logging.info(f"🎯 Радар: {clean_name} добавлен в HOT_LIST.")
-                    
-                    # Отправляем алерт в ТГ, только если монеты еще не было в списке
-                    if ws_sym not in HOT_LIST:
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nПаттерн: {signal['pattern']}\nЖду аномальный объем в стакане...")
+                    new_hot_list[sym] = signal
+                    if sym not in HOT_LIST:
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю 4x Мульти-Сканер...")
 
             HOT_LIST = new_hot_list
-            logging.info(f"🔎 [РАДАР] Скан завершен. Монет на мушке (HOT_LIST): {len(HOT_LIST)}. Жду 5 минут...")
-            
-            await asyncio.sleep(300) # Радар спит 5 минут
-            
+            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)}")
+            await asyncio.sleep(300) 
         except Exception as e:
-            logging.error(f"Radar error: {e}")
-            await asyncio.sleep(60)
+            logging.error(f"Radar error: {e}"); await asyncio.sleep(60)
 
-# --- АСИНХРОННЫЙ СНАЙПЕР И ЭКЗЕКЬЮТОР ---
+# --- ЭКЗЕКЬЮТОР ---
 async def execute_trade(signal):
     sym = signal['symbol']
     clean_name = sym.split(':')[0]
@@ -252,115 +189,168 @@ async def execute_trade(signal):
         bal = await exchange.fetch_balance()
         free_usdt = float(bal['USDT']['free'])
         
-        # --- ДИНАМИЧЕСКИЙ САЙЗИНГ ---
         risk_multiplier = signal.get('dynamic_risk', 1.0)
         actual_risk_percent = RISK_PER_TRADE * risk_multiplier
-        risk_amount_usdt = free_usdt * actual_risk_percent  
-        
-        sl_distance = abs(signal['entry_price'] - signal['sl'])
-        if sl_distance == 0: return
-        
-        ideal_qty = risk_amount_usdt / sl_distance
-        required_margin = (ideal_qty * signal['entry_price']) / LEVERAGE
-        
-        # Защита: не входить более чем на 30% от свободной маржи даже при x2.5 риске
-        if required_margin > (free_usdt * 0.3): 
-            ideal_qty = (free_usdt * 0.3 * LEVERAGE) / signal['entry_price']
-            
-        qty = float(exchange.amount_to_precision(sym, ideal_qty))
+        qty = float(exchange.amount_to_precision(sym, (free_usdt * actual_risk_percent) / abs(signal['entry_price'] - signal['sl'])))
         if qty <= 0: return 
 
         pos_side = 'LONG' if signal['direction'] == 'Long' else 'SHORT'
         side = 'buy' if signal['direction'] == 'Long' else 'sell'
+        sl_side = 'sell' if side == 'buy' else 'buy'
         
         await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
         await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
-        
-        sl_side = 'sell' if side == 'buy' else 'buy'
-        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={
-            'triggerPrice': signal['sl'], 'positionSide': pos_side, 'stopLossPrice': signal['sl']
-        })
+        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'triggerPrice': signal['sl'], 'positionSide': pos_side, 'stopLossPrice': signal['sl']})
         
         active_positions.append({
-            'symbol': sym, 'direction': signal['direction'], 'mode': 'SMC_WSS',
-            'entry_price': signal['entry_price'], 'initial_qty': qty, 
-            'sl_price': signal['sl'], 'tp1': signal['tp1'], 'tp2': signal['tp2'], 
-            'tp1_hit': False, 'tp2_hit': False, 'be_level': 0,
-            'sl_order_id': sl_ord['id'], 'position_side': pos_side,
-            'open_time': datetime.now(timezone.utc).isoformat()
+            'symbol': sym, 'direction': signal['direction'], 'entry_price': signal['entry_price'], 'initial_qty': qty, 
+            'sl_price': signal['sl'], 'tp1': signal['tp1'], 'tp2': signal['tp2'], 'tp1_hit': False, 'tp2_hit': False, 'be_level': 0,
+            'sl_order_id': sl_ord['id'], 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat()
         })
         
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        score_info = signal.get('score_info', 'Базовый')
-        msg = (f"💥 **ВЫСТРЕЛ (Smart Risk): {clean_name}**\n"
-               f"Направление: **#{signal['direction'].upper()}**\n"
-               f"Рейтинг: {score_info} (Риск: {actual_risk_percent*100:.1f}%)\n"
-               f"Паттерн: {signal['pattern']}\n\n"
-               f"Цена: {signal['entry_price']}\nОбъем: {qty}\n"
-               f"SL: {signal['sl']:.4f}\nTP1: {signal['tp1']:.4f}")
+        msg = (f"💥 **ВЫСТРЕЛ (Multi-WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+               f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
+               f"Цена: {signal['entry_price']}\nОбъем: {qty}\nSL: {signal['sl']:.4f}\nTP1: {signal['tp1']:.4f}")
         await send_tg_msg(msg)
-            
-    except Exception as e: 
-        logging.error(f"Trade error {clean_name}: {e}")
+    except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-async def wss_sniper_worker(ws_sym, setup_data):
-    buy_vol, sell_vol = 0.0, 0.0
-    start_time = time.time()
+# --- MULTI-EXCHANGE SNIPER CORE ---
+async def wss_sniper_worker(sym, setup_data):
+    base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
+    
+    sym_bingx = sym.replace('/', '-')
+    sym_bybit = f"{base_coin}USDT"
+    sym_bitget = f"{base_coin}USDT"
+    sym_mexc = f"{base_coin}_USDT"
+
+    state = {'buy_vol': 0.0, 'sell_vol': 0.0, 'current_price': setup_data['entry_price'], 'active': True}
+
+    async def l_bingx():
+        url = "wss://open-api-swap.bingx.com/swap-market"
+        while state['active']:
+            try:
+                async for ws in websockets.connect(url):
+                    await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
+                    while state['active']:
+                        msg = await ws.recv()
+                        data = json.loads(gzip.GzipFile(fileobj=io.BytesIO(msg)).read().decode('utf-8'))
+                        if data.get("ping"): await ws.send(json.dumps({"pong": data.get("ping")})); continue
+                        if "data" in data:
+                            for t in data["data"]:
+                                v = float(t['p']) * float(t['q'])
+                                if t.get('m'): state['sell_vol'] += v
+                                else: state['buy_vol'] += v
+                            state['current_price'] = float(data["data"][-1]['p'])
+            except: await asyncio.sleep(1)
+
+    async def l_bybit():
+        url = "wss://stream.bybit.com/v5/public/linear"
+        while state['active']:
+            try:
+                async for ws in websockets.connect(url):
+                    await ws.send(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
+                    while state['active']:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        if "data" in data and isinstance(data["data"], list):
+                            for t in data["data"]:
+                                v = float(t['p']) * float(t['v'])
+                                if t['S'] == "Sell": state['sell_vol'] += v
+                                else: state['buy_vol'] += v
+            except: await asyncio.sleep(1)
+
+    async def l_bitget():
+        url = "wss://ws.bitget.com/v2/ws/public"
+        while state['active']:
+            try:
+                async for ws in websockets.connect(url):
+                    await ws.send(json.dumps({"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "trade", "instId": sym_bitget}]}))
+                    async def ping_bg():
+                        while state['active']:
+                            await asyncio.sleep(25)
+                            try: await ws.send("ping")
+                            except: break
+                    ptask = asyncio.create_task(ping_bg())
+                    try:
+                        while state['active']:
+                            msg = await ws.recv()
+                            if msg == "pong": continue
+                            data = json.loads(msg)
+                            if "data" in data and isinstance(data["data"], list):
+                                for t in data["data"]:
+                                    v = float(t['price']) * float(t['size'])
+                                    if t['side'] == "sell": state['sell_vol'] += v
+                                    else: state['buy_vol'] += v
+                    finally: ptask.cancel()
+            except: await asyncio.sleep(1)
+
+    async def l_mexc():
+        url = "wss://wbs.mexc.com/ws"
+        while state['active']:
+            try:
+                async for ws in websockets.connect(url):
+                    await ws.send(json.dumps({"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_mexc}"]}))
+                    async def ping_mexc():
+                        while state['active']:
+                            await asyncio.sleep(15)
+                            try: await ws.send(json.dumps({"method": "PING"}))
+                            except: break
+                    ptask = asyncio.create_task(ping_mexc())
+                    try:
+                        while state['active']:
+                            msg = await ws.recv()
+                            data = json.loads(msg)
+                            if "d" in data and "deals" in data["d"]:
+                                for t in data["d"]["deals"]:
+                                    v = float(t['p']) * float(t['v'])
+                                    if t['S'] == 2: state['sell_vol'] += v
+                                    else: state['buy_vol'] += v
+                    finally: ptask.cancel()
+            except: await asyncio.sleep(1)
+
+    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit()), asyncio.create_task(l_bitget()), asyncio.create_task(l_mexc())]
+
     try:
-        async for ws in websockets.connect(WSS_URL):
-            await ws.send(json.dumps({"id": f"sub_{ws_sym}", "reqType": "sub", "dataType": f"{ws_sym}@trade"}))
-            while ws_sym in HOT_LIST and len(active_positions) < MAX_POSITIONS:
-                message = await ws.recv()
-                data = json.loads(gzip.GzipFile(fileobj=io.BytesIO(message)).read().decode('utf-8'))
-                if data.get("ping"): await ws.send(json.dumps({"pong": data.get("ping")})); continue
-                if "data" in data:
-                    for t in data["data"]:
-                        v_usdt = float(t['p']) * float(t['q'])
-                        if t.get('m'): sell_vol += v_usdt
-                        else: buy_vol += v_usdt
-                if time.time() - start_time >= 5:
-                    total = buy_vol + sell_vol
-                    if total > 2000:
-                        buy_pct = (buy_vol / total) * 100
-                        sell_pct = 100 - buy_pct
+        while sym in HOT_LIST and len(active_positions) < MAX_POSITIONS:
+            await asyncio.sleep(5)
+            total = state['buy_vol'] + state['sell_vol']
+            
+            # Порог увеличен до 10k$ за 5 сек, так как слушаем 4 биржи
+            if total > 10000:
+                buy_pct = (state['buy_vol'] / total) * 100
+                sell_pct = 100 - buy_pct
+                
+                in_zone = setup_data['ob_low'] <= state['current_price'] <= setup_data['ob_high']
+                
+                if in_zone:
+                    is_long = (setup_data['direction'] == 'Long' and buy_pct >= 75)
+                    is_short = (setup_data['direction'] == 'Short' and sell_pct >= 75)
+                    
+                    if is_long or is_short:
+                        dom_pct = buy_pct if setup_data['direction'] == 'Long' else sell_pct
                         
-                        in_zone = setup_data['ob_low'] <= float(data["data"][-1]['p']) <= setup_data['ob_high']
-                        
-                        if in_zone:
-                            is_long_trigger = (setup_data['direction'] == 'Long' and buy_pct >= 75)
-                            is_short_trigger = (setup_data['direction'] == 'Short' and sell_pct >= 75)
-                            
-                            if is_long_trigger or is_short_trigger:
-                                dominant_pct = buy_pct if setup_data['direction'] == 'Long' else sell_pct
-                                
-                                # Оценка качества сетапа (Динамический риск)
-                                if dominant_pct >= 90:
-                                    setup_data['dynamic_risk'] = 2.5
-                                    setup_data['score_info'] = f"10/10 🔥 (Перевес {dominant_pct:.1f}%)"
-                                elif dominant_pct >= 85:
-                                    setup_data['dynamic_risk'] = 1.5
-                                    setup_data['score_info'] = f"8/10 ⚡ (Перевес {dominant_pct:.1f}%)"
-                                else:
-                                    setup_data['dynamic_risk'] = 1.0
-                                    setup_data['score_info'] = f"6/10 📊 (Перевес {dominant_pct:.1f}%)"
+                        if dom_pct >= 90: setup_data['dynamic_risk'], setup_data['score_info'] = 2.5, f"10/10 🔥 ({dom_pct:.1f}%)"
+                        elif dom_pct >= 85: setup_data['dynamic_risk'], setup_data['score_info'] = 1.5, f"8/10 ⚡ ({dom_pct:.1f}%)"
+                        else: setup_data['dynamic_risk'], setup_data['score_info'] = 1.0, f"6/10 📊 ({dom_pct:.1f}%)"
 
-                                await execute_trade(setup_data)
-                                del HOT_LIST[ws_sym]
-                                break
-                                
-                    buy_vol, sell_vol = 0.0, 0.0; start_time = time.time()
-            break
-    except: pass
-    finally: ACTIVE_WSS_CONNECTIONS.discard(ws_sym)
+                        await execute_trade(setup_data)
+                        del HOT_LIST[sym]
+                        break
+            state['buy_vol'], state['sell_vol'] = 0.0, 0.0
+    finally:
+        state['active'] = False
+        for t in tasks: t.cancel()
+        ACTIVE_WSS_CONNECTIONS.discard(sym)
 
 async def sniper_manager():
     while True:
-        for ws_sym, setup_data in list(HOT_LIST.items()):
-            if ws_sym not in ACTIVE_WSS_CONNECTIONS:
-                ACTIVE_WSS_CONNECTIONS.add(ws_sym)
-                asyncio.create_task(wss_sniper_worker(ws_sym, setup_data))
+        for sym, setup_data in list(HOT_LIST.items()):
+            if sym not in ACTIVE_WSS_CONNECTIONS:
+                ACTIVE_WSS_CONNECTIONS.add(sym)
+                asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
 # --- АСИНХРОННЫЙ МОНИТОР ---
@@ -515,15 +505,12 @@ def send_stats(message):
 
 app = Flask(__name__)
 @app.route('/')
-def index(): return "Async Bot v6.1 Active"
+def index(): return "Multi-WSS Async Bot v7.0 Active"
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск асинхронного ядра SMC + WSS Footprint v6.1...")
-    await asyncio.gather(
-        radar_task(),
-        sniper_manager(),
-        monitor_positions_job()
+    logging.info("🚀 Запуск ядра v7.0: 4x Мульти-Биржевой Снайпер...")
+    await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job()
     )
 
 if __name__ == '__main__':
