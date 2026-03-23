@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-# === НАСТРОЙКИ v7.2 (SMC + Multi-Exchange WSS + Pure Python) ===
+# === НАСТРОЙКИ v7.2 (2x Биржевой Снайпер (Bybit+BingX) + SMC) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
