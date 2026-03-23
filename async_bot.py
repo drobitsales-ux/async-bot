@@ -127,23 +127,24 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         avg_volume = np.mean(v[-22:-2])
         volume_threshold = avg_volume * 1.15 # Мягкий фильтр (15%)
 
-        # УМНЫЙ ФИЛЬТР ОБЪЕМА: Проверяем закрытую свечу ИЛИ текущую (если в ней аномальный всплеск)
+        # ТЕСТОВЫЙ ФИЛЬТР ОБЪЕМА: 1.0 (просто средний объем, без всплеска)
+        volume_threshold = avg_volume * 1.0
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level = leg_low + (leg_high - leg_low) * 0.5  
         strong_premium = leg_low + (leg_high - leg_low) * 0.75
 
-        # --- ЛОГИКА LONG ---
-        if current_price > ema_200 and (btc_trend != 'Short' or altseason):
-            # Используем has_volume вместо v[-1]
-            is_valid_choch = (c[-1] > np.max(h[-15:-1])) and has_volume
+        # --- ЛОГИКА LONG (ТЕСТОВЫЙ РЕЖИМ) ---
+        allow_long = True # ВСЕГДА разрешаем лонги
+        if current_price > ema_200 and allow_long:
+            # Ищем микро-пробой за 6 часов (а не за 15)
+            is_valid_choch = (c[-1] > np.max(h[-6:-1])) and has_volume
             
             if is_valid_choch and current_price <= eq_level:
-                # ДЛЯ ASYNC БОТА (Если правишь rsi_bot.py - удали эту строку find_fvg)
                 if 'find_fvg' in globals() and not find_fvg(h, l, 'Long'): return None
                 
-                for i in range(len(c)-2, len(c)-15, -1):
+                for i in range(len(c)-2, len(c)-6, -1): # Ищем микро-ОБ за 6 свечей
                     if c[i] < o[i]:  
                         ob_low, ob_high = l[i], h[i]
                         if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
@@ -152,32 +153,30 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                                 'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 
                                 'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 
                                 'tp2': round(current_price + (current_price-sl)*3, 6), 
-                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB'
+                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H Micro-OB + FVG'
                             }
 
-        # --- ЛОГИКА SHORT ---
+        # --- ЛОГИКА SHORT (ТЕСТОВЫЙ РЕЖИМ) ---
         is_in_strong_premium = current_price >= strong_premium
-        allow_short = (current_price < ema_200 and btc_trend != 'Long') or is_in_strong_premium
+        allow_short = True # ВСЕГДА разрешаем шорты
 
         if allow_short:
-            # Используем has_volume вместо v[-1]
-            is_valid_choch_short = (c[-1] < np.min(l[-15:-1])) and has_volume
+            # Ищем микро-пробой за 6 часов (а не за 15)
+            is_valid_choch_short = (c[-1] < np.min(l[-6:-1])) and has_volume
             
             if is_valid_choch_short and current_price >= eq_level:
-                # ДЛЯ ASYNC БОТА (Если правишь rsi_bot.py - удали эту строку find_fvg)
                 if 'find_fvg' in globals() and not find_fvg(h, l, 'Short'): return None
                 
-                for i in range(len(c)-2, len(c)-15, -1):
+                for i in range(len(c)-2, len(c)-6, -1): # Ищем микро-ОБ за 6 свечей
                     if c[i] > o[i]:  
                         ob_high, ob_low = h[i], l[i]
                         if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
                             sl = ob_high + (atr * 0.3)
-                            pattern_name = '🔥 Aggr. Short (Premium)' if is_in_strong_premium else '1H OB'
                             return {
                                 'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 
                                 'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 
                                 'tp2': round(current_price - (sl-current_price)*3, 6), 
-                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': pattern_name
+                                'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H Micro-OB + FVG'
                             }
     except Exception as e: logging.error(f"SMC Detector Error {sym}: {e}")
     return None
