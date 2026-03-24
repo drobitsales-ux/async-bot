@@ -13,13 +13,14 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.3.1 (Ultra-Light Memory + Top-150 Limit) ===
+# === НАСТРОЙКИ v7.3.2 (Ultra-Light Memory + Top-150 + Fix SL Math) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
+# Увеличь это значение, если хочешь бóльшие объемы (например, 0.03 = 3% риска)
 RISK_PER_TRADE = 0.01       
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
@@ -183,7 +184,6 @@ async def radar_task():
 
             del tickers 
             
-            # ОПТИМИЗАЦИЯ: Берем ТОП-150 монет для увеличения числа сигналов
             temp_symbols.sort(key=lambda x: x[1], reverse=True)
             valid_symbols = [x[0] for x in temp_symbols[:150]]
 
@@ -199,7 +199,6 @@ async def radar_task():
                         NOTIFIED_SYMBOLS.add(sym)
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
                 
-                # Защитный сон 0.2 сек для 150 монет, чтобы память не "прыгала"
                 await asyncio.sleep(0.2) 
 
             HOT_LIST = new_hot_list
@@ -411,8 +410,9 @@ async def monitor_positions_job():
                 is_long = pos['direction'] == 'Long'
                 c_side = 'sell' if is_long else 'buy'
 
+                # ИСПРАВЛЕНИЕ: abs() для корректного расчета дистанций для шортов
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
-                    dist_to_tp1 = pos['tp1'] - pos['entry_price']
+                    dist_to_tp1 = abs(pos['tp1'] - pos['entry_price'])
                     tp1_80 = pos['entry_price'] + dist_to_tp1 * 0.8 if is_long else pos['entry_price'] - dist_to_tp1 * 0.8
                     if (is_long and high_p >= tp1_80) or (not is_long and low_p <= tp1_80):
                         try:
@@ -445,8 +445,9 @@ async def monitor_positions_job():
                             await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 достигнут!** Фиксация 40%.")
                         except Exception as e: logging.error(f"Ошибка выполнения TP1 для {sym}: {e}")
 
+                # ИСПРАВЛЕНИЕ: abs() для расчета дистанции к TP2
                 if pos.get('tp1_hit') and not pos.get('tp2_hit') and not pos.get('pre_tp2_hit'):
-                    dist_to_tp2 = pos['tp2'] - pos['tp1']
+                    dist_to_tp2 = abs(pos['tp2'] - pos['tp1'])
                     tp2_80 = pos['tp1'] + dist_to_tp2 * 0.8 if is_long else pos['tp1'] - dist_to_tp2 * 0.8
                     if (is_long and high_p >= tp2_80) or (not is_long and low_p <= tp2_80):
                         try:
@@ -509,7 +510,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.3.1 Active (Top-150 Limit, Memory Optimized)")
+        self.wfile.write(b"Bot v7.3.2 Active (Top-150 Limit, SL Math Fixed)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -518,7 +519,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.3.1: Ultra-Light Memory + Top-150 Limit...")
+    logging.info("🚀 Запуск ядра v7.3.2: Ultra-Light Memory + SL Math Fixed...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
