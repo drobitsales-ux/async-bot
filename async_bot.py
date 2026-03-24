@@ -2,11 +2,11 @@ import asyncio
 import websockets
 import json
 import gzip
-import io
 import time
 import os
 import logging
 import sqlite3
+import gc  # Добавлен сборщик мусора
 import ccxt.async_support as ccxt_async
 import numpy as np
 import telebot
@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-# === НАСТРОЙКИ v7.2 (SMC + 2x WSS + Pure Python) ===
+# === НАСТРОЙКИ v7.2 (SMC + 2x WSS + Гибридный Трейлинг) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -36,6 +36,7 @@ EXCLUDED_KEYWORDS = ['NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVE
 GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
 last_signals = {} 
+NOTIFIED_SYMBOLS = set() # Защита от спама в ТГ
 
 HOT_LIST = {}  
 ACTIVE_WSS_CONNECTIONS = set()
@@ -141,7 +142,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
     return None
 
 async def radar_task():
-    global HOT_LIST
+    global HOT_LIST, NOTIFIED_SYMBOLS
     await exchange.load_markets() 
     await asyncio.sleep(5)
     while True:
@@ -170,11 +171,18 @@ async def radar_task():
                 signal = await detect_smc_setup(sym, 'Long', True) 
                 if signal:
                     new_hot_list[sym] = signal
-                    if sym not in HOT_LIST:
+                    if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
+                        NOTIFIED_SYMBOLS.add(sym)
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
 
             HOT_LIST = new_hot_list
+            # Очистка старых уведомлений для монет, которые ушли с радара
+            NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
+            
             logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)}")
+            
+            # ЖЕСТКАЯ ОЧИСТКА ПАМЯТИ (Для Render)
+            gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
             logging.error(f"Radar error: {e}"); await asyncio.sleep(60)
@@ -184,7 +192,6 @@ async def execute_trade(signal):
     sym = signal['symbol']
     clean_name = sym.split(':')[0]
     
-    # 🛑 ЖЕСТКАЯ БЛОКИРОВКА ДУБЛЕЙ
     if any(p['symbol'] == sym for p in active_positions):
         logging.warning(f"⚠️ Позиция по {sym} уже активна. Блокировка дубля.")
         return
@@ -200,7 +207,6 @@ async def execute_trade(signal):
         qty = float(exchange.amount_to_precision(sym, ideal_qty))
         if qty <= 0: return 
 
-        # СТРОГОЕ округление цен для BingX
         sl_price = float(exchange.price_to_precision(sym, signal['sl']))
         tp1_price = float(exchange.price_to_precision(sym, signal['tp1']))
         tp2_price = float(exchange.price_to_precision(sym, signal['tp2']))
@@ -215,7 +221,8 @@ async def execute_trade(signal):
         
         active_positions.append({
             'symbol': sym, 'direction': signal['direction'], 'entry_price': signal['entry_price'], 'initial_qty': qty, 
-            'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 'tp1_hit': False, 'tp2_hit': False,
+            'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 
+            'tp1_hit': False, 'tp2_hit': False, 'pre_tp1_hit': False, 'pre_tp2_hit': False,
             'sl_order_id': sl_ord['id'], 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat()
         })
         
@@ -224,6 +231,7 @@ async def execute_trade(signal):
         
         msg = (f"💥 **ВЫСТРЕЛ (Bybit+BingX): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
+               f"📊 {signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {signal['entry_price']}\nОбъем: {qty}\nSL: {sl_price}\nTP1: {tp1_price}")
         await send_tg_msg(msg)
     except Exception as e: 
@@ -245,7 +253,8 @@ async def wss_sniper_worker(sym, setup_data):
                     await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
                     while state['active']:
                         msg = await ws.recv()
-                        data = json.loads(gzip.GzipFile(fileobj=io.BytesIO(msg)).read().decode('utf-8'))
+                        # Оптимизация памяти (Замена BytesIO на прямую распаковку zlib/gzip)
+                        data = json.loads(gzip.decompress(msg).decode('utf-8'))
                         if data.get("ping"): await ws.send(json.dumps({"pong": data.get("ping")})); continue
                         if "data" in data:
                             for t in data["data"]:
@@ -280,18 +289,21 @@ async def wss_sniper_worker(sym, setup_data):
             await asyncio.sleep(5)
             total = state['buy_vol'] + state['sell_vol']
             
-            if total > 5000:
+            # Порог снижен до 2500 для альтов
+            if total > 2500:
                 buy_pct = (state['buy_vol'] / total) * 100
                 sell_pct = 100 - buy_pct
                 
-                in_zone = setup_data['ob_low'] <= state['current_price'] <= setup_data['ob_high']
+                # Добавлен буфер для зоны ОБ (0.3%), чтобы не пропускать сделки
+                ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
+                in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
                 
                 if in_zone:
                     is_long = (setup_data['direction'] == 'Long' and buy_pct >= 75)
                     is_short = (setup_data['direction'] == 'Short' and sell_pct >= 75)
                     
                     if is_long or is_short:
-                        if sym in HOT_LIST: del HOT_LIST[sym] # Безопасное удаление
+                        if sym in HOT_LIST: del HOT_LIST[sym]
                             
                         dom_pct = buy_pct if setup_data['direction'] == 'Long' else sell_pct
                         
@@ -299,6 +311,7 @@ async def wss_sniper_worker(sym, setup_data):
                         elif dom_pct >= 85: setup_data['dynamic_risk'], setup_data['score_info'] = 1.5, f"8/10 ⚡ ({dom_pct:.1f}%)"
                         else: setup_data['dynamic_risk'], setup_data['score_info'] = 1.0, f"6/10 📊 ({dom_pct:.1f}%)"
 
+                        setup_data['vol_info'] = f"Объем за 5с: ${total:.0f} ({dom_pct:.0f}% {'покупок' if setup_data['direction']=='Long' else 'продаж'})"
                         await execute_trade(setup_data)
                         break
             state['buy_vol'], state['sell_vol'] = 0.0, 0.0
@@ -315,7 +328,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- АСИНХРОННЫЙ МОНИТОР (Гибридная модель: Классика + Микро-трейлинг) ---
+# --- АСИНХРОННЫЙ МОНИТОР (Гибридная модель + 80% Pre-TP) ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -378,7 +391,23 @@ async def monitor_positions_job():
                 is_long = pos['direction'] == 'Long'
                 c_side = 'sell' if is_long else 'buy'
 
-                # --- ШАГ 1: TP1 и ПЕРЕВОД В БУ ---
+                # --- ЗАЩИТА PRE-TP1 (80% пути к TP1) ---
+                if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
+                    dist_to_tp1 = pos['tp1'] - pos['entry_price']
+                    tp1_80 = pos['entry_price'] + dist_to_tp1 * 0.8 if is_long else pos['entry_price'] - dist_to_tp1 * 0.8
+                    if (is_long and high_p >= tp1_80) or (not is_long and low_p <= tp1_80):
+                        try:
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                            raw_be = pos['entry_price'] * (1.001 if is_long else 0.999)
+                            be_price = float(exchange.price_to_precision(sym, raw_be))
+                            new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_price, 'positionSide': pos['position_side'], 'stopLossPrice': be_price})
+                            pos['sl_order_id'] = new_sl['id']
+                            pos['current_sl'] = be_price
+                            pos['pre_tp1_hit'] = True
+                            await send_tg_msg(f"🛡 **{sym.split(':')[0]} Защита!** Цена прошла 80% к TP1.\nСтоп переведен в БУ: {be_price}")
+                        except Exception as e: logging.error(f"Error pre-TP1 {sym}: {e}")
+
+                # --- ШАГ 1: TP1 ---
                 if not pos.get('tp1_hit'):
                     if (is_long and high_p >= pos['tp1']) or (not is_long and low_p <= pos['tp1']):
                         try:
@@ -388,19 +417,31 @@ async def monitor_positions_job():
                                 pos['initial_qty'] = float(curr['contracts']) - close_qty 
                             
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                            
-                            # Перевод в БУ со строгим округлением!
                             raw_be = pos['entry_price'] * (1.001 if is_long else 0.999)
                             be_price = float(exchange.price_to_precision(sym, raw_be))
-                            
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_price, 'positionSide': pos['position_side'], 'stopLossPrice': be_price})
                             
                             pos['tp1_hit'] = True
                             pos['sl_order_id'] = new_sl['id']
                             pos['current_sl'] = be_price
-                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 достигнут!** Фиксация 40%.\nСтоп переведен в БУ: {be_price}")
-                        except Exception as e:
-                            logging.error(f"Ошибка выполнения TP1 для {sym}: {e}")
+                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 достигнут!** Фиксация 40%.")
+                        except Exception as e: logging.error(f"Ошибка выполнения TP1 для {sym}: {e}")
+
+                # --- ЗАЩИТА PRE-TP2 (80% пути от TP1 к TP2) ---
+                if pos.get('tp1_hit') and not pos.get('tp2_hit') and not pos.get('pre_tp2_hit'):
+                    dist_to_tp2 = pos['tp2'] - pos['tp1']
+                    tp2_80 = pos['tp1'] + dist_to_tp2 * 0.8 if is_long else pos['tp1'] - dist_to_tp2 * 0.8
+                    if (is_long and high_p >= tp2_80) or (not is_long and low_p <= tp2_80):
+                        try:
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                            safe_price = pos['tp1'] + (dist_to_tp2 * 0.2) if is_long else pos['tp1'] - (dist_to_tp2 * 0.2)
+                            safe_p = float(exchange.price_to_precision(sym, safe_price))
+                            new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': safe_p, 'positionSide': pos['position_side'], 'stopLossPrice': safe_p})
+                            pos['sl_order_id'] = new_sl['id']
+                            pos['current_sl'] = safe_p
+                            pos['pre_tp2_hit'] = True
+                            await send_tg_msg(f"🛡 **{sym.split(':')[0]} Защита!** Цена прошла 80% к TP2.\nСтоп подтянут в профит: {safe_p}")
+                        except Exception as e: logging.error(f"Error pre-TP2 {sym}: {e}")
 
                 # --- ШАГ 2: TP2 и ПЕРЕНОС SL НА TP1 ---
                 if pos.get('tp1_hit') and not pos.get('tp2_hit'):
@@ -412,14 +453,10 @@ async def monitor_positions_job():
                                 pos['initial_qty'] -= close_qty 
                             
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                            
-                            # Строгое округление TP1 для стопа
                             tp1_safe = float(exchange.price_to_precision(sym, pos['tp1']))
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': tp1_safe, 'positionSide': pos['position_side'], 'stopLossPrice': tp1_safe})
                             
-                            # Настройка микро-шага для трейлинга после TP2 (Шаг = половина дистанции от ТВХ до TP1)
                             micro_step = abs(pos['tp1'] - pos['entry_price']) * 0.5
-                            
                             pos['tp2_hit'] = True
                             pos['sl_order_id'] = new_sl['id']
                             pos['current_sl'] = tp1_safe
@@ -427,8 +464,7 @@ async def monitor_positions_job():
                             pos['trail_trigger'] = pos['tp2'] + micro_step if is_long else pos['tp2'] - micro_step
                             
                             await send_tg_msg(f"🔥 **{sym.split(':')[0]} TP2 достигнут!** Фиксация 50% остатка.\nСтоп перенесен на TP1: {tp1_safe}\nВключен Микро-Трейлинг!")
-                        except Exception as e:
-                            logging.error(f"Ошибка выполнения TP2 для {sym}: {e}")
+                        except Exception as e: logging.error(f"Ошибка выполнения TP2 для {sym}: {e}")
 
                 # --- ШАГ 3: МИКРО-ТРЕЙЛИНГ (После TP2) ---
                 if pos.get('tp2_hit'):
@@ -437,18 +473,15 @@ async def monitor_positions_job():
                     if (is_long and high_p >= tt) or (not is_long and low_p <= tt):
                         try:
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                            
                             raw_nsl = pos['current_sl'] + m_step if is_long else pos['current_sl'] - m_step
                             nsl = float(exchange.price_to_precision(sym, raw_nsl))
-                            
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
                             
                             pos['sl_order_id'] = new_sl['id']
                             pos['current_sl'] = nsl
                             pos['trail_trigger'] = tt + m_step if is_long else tt - m_step
                             await send_tg_msg(f"📈 **{sym.split(':')[0]} Микро-Трейлинг!** SL подтянут к {nsl}")
-                        except Exception as e:
-                            logging.error(f"Ошибка трейлинга SL для {sym}: {e}")
+                        except Exception as e: logging.error(f"Ошибка трейлинга SL для {sym}: {e}")
 
                 updated.append(pos)
             active_positions = updated
