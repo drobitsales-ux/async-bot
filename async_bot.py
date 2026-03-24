@@ -13,14 +13,13 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.3.2 (Ultra-Light Memory + Top-150 + Fix SL Math) ===
+# === НАСТРОЙКИ v7.3.4 (RAM Tracker + Top-150 Chunks) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-# Увеличь это значение, если хочешь бóльшие объемы (например, 0.03 = 3% риска)
 RISK_PER_TRADE = 0.01       
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
@@ -44,6 +43,17 @@ active_positions = []
 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
+
+# --- МОНИТОРИНГ ПАМЯТИ ---
+def get_mem_usage():
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if 'VmRSS' in line:
+                    return f"{int(line.split()[1]) / 1024:.1f} MB"
+    except:
+        return "N/A"
+    return "N/A"
 
 exchange = ccxt_async.bingx({
     'apiKey': BINGX_API_KEY, 'secret': BINGX_SECRET,
@@ -188,7 +198,7 @@ async def radar_task():
             valid_symbols = [x[0] for x in temp_symbols[:150]]
 
             new_hot_list = {}
-            for sym in valid_symbols:
+            for idx, sym in enumerate(valid_symbols):
                 clean_name = sym.split(':')[0]
                 if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)): continue
                 
@@ -200,11 +210,19 @@ async def radar_task():
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
                 
                 await asyncio.sleep(0.2) 
+                
+                # Принудительная очистка каждые 15 монет + Лог памяти
+                if (idx + 1) % 15 == 0:
+                    gc.collect()
+                    mem = get_mem_usage()
+                    logging.info(f"⚙️ Чанк {idx+1}/150 обработан. ОЗУ: {mem}")
+                    await asyncio.sleep(1.5) 
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
             
-            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-150 ликвидных). На мушке: {len(HOT_LIST)}")
+            final_mem = get_mem_usage()
+            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
@@ -306,8 +324,12 @@ async def wss_sniper_worker(sym, setup_data):
     tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit())]
 
     try:
-        while sym in HOT_LIST and len(active_positions) < MAX_POSITIONS:
+        while sym in HOT_LIST:
             await asyncio.sleep(5)
+            
+            if len(active_positions) >= MAX_POSITIONS:
+                continue
+                
             total = state['buy_vol'] + state['sell_vol']
             
             if total > 2500:
@@ -410,7 +432,6 @@ async def monitor_positions_job():
                 is_long = pos['direction'] == 'Long'
                 c_side = 'sell' if is_long else 'buy'
 
-                # ИСПРАВЛЕНИЕ: abs() для корректного расчета дистанций для шортов
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
                     dist_to_tp1 = abs(pos['tp1'] - pos['entry_price'])
                     tp1_80 = pos['entry_price'] + dist_to_tp1 * 0.8 if is_long else pos['entry_price'] - dist_to_tp1 * 0.8
@@ -445,7 +466,6 @@ async def monitor_positions_job():
                             await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 достигнут!** Фиксация 40%.")
                         except Exception as e: logging.error(f"Ошибка выполнения TP1 для {sym}: {e}")
 
-                # ИСПРАВЛЕНИЕ: abs() для расчета дистанции к TP2
                 if pos.get('tp1_hit') and not pos.get('tp2_hit') and not pos.get('pre_tp2_hit'):
                     dist_to_tp2 = abs(pos['tp2'] - pos['tp1'])
                     tp2_80 = pos['tp1'] + dist_to_tp2 * 0.8 if is_long else pos['tp1'] - dist_to_tp2 * 0.8
@@ -510,7 +530,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.3.2 Active (Top-150 Limit, SL Math Fixed)")
+        self.wfile.write(b"Bot v7.3.4 Active (RAM Tracker + Top-150 Chunks)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -519,7 +539,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.3.2: Ultra-Light Memory + SL Math Fixed...")
+    logging.info("🚀 Запуск ядра v7.3.4: RAM Tracker + Top-150 Chunks...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
