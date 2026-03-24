@@ -2,19 +2,18 @@ import asyncio
 import websockets
 import json
 import gzip
-import time
 import os
 import logging
 import sqlite3
 import gc
 import ccxt.async_support as ccxt_async
 import numpy as np
-import telebot
+import aiohttp
 from datetime import datetime, timezone, timedelta
 from threading import Thread
-from http.server import BaseHTTPRequestHandler, HTTPServer # Легкий сервер вместо Flask
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.2.1 (SMC + 2x WSS + Оптимизация Памяти) ===
+# === НАСТРОЙКИ v7.3 (Ultra-Light Memory + Top-50 Limit) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -44,7 +43,6 @@ active_positions = []
 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-bot = telebot.TeleBot(TOKEN)
 
 exchange = ccxt_async.bingx({
     'apiKey': BINGX_API_KEY, 'secret': BINGX_SECRET,
@@ -80,9 +78,17 @@ def load_positions():
     except Exception as e: 
         logging.error(f"Ошибка загрузки БД: {e}")
 
+# ОПТИМИЗАЦИЯ: Чистый aiohttp без тяжелых потоков telebot
 async def send_tg_msg(text):
-    try: await asyncio.to_thread(bot.send_message, GROUP_CHAT_ID, text)
-    except Exception as e: logging.error(f"TG Error: {e}")
+    if not TOKEN: return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                pass
+    except Exception as e: 
+        logging.error(f"TG Error: {e}")
 
 def calculate_ema(data, window):
     if len(data) < window: return data[-1]
@@ -116,7 +122,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         
-        # ОПТИМИЗАЦИЯ: Расширенные уровни (60% вместо 50%)
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
@@ -145,7 +150,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                                 result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
                                 break
         
-        # ОЧИСТКА ПАМЯТИ (Жесткое удаление массивов NumPy)
         del o, h, l, c, v, ohlcv, d
         return result
     except Exception as e: 
@@ -164,15 +168,26 @@ async def radar_task():
                 await asyncio.sleep(60); continue
 
             tickers = await exchange.fetch_tickers()
-            valid_symbols = []
+            temp_symbols = []
+            
             for sym, m in exchange.markets.items():
                 if m.get('type') != 'swap' or not m.get('active'): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
+                
                 tick = tickers.get(sym)
-                if not tick or float(tick.get('quoteVolume', 0)) < MIN_VOLUME_USDT: continue
+                vol = float(tick.get('quoteVolume', 0)) if tick else 0
+                if vol < MIN_VOLUME_USDT: continue
+                
                 base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
                 if not any(pos['symbol'].split('/')[0].split('-')[0].split(':')[0] == base_coin for pos in active_positions):
-                    valid_symbols.append(sym)
+                    temp_symbols.append((sym, vol))
+
+            # ОПТИМИЗАЦИЯ 1: Чистим гигантский словарь тикеров из памяти немедленно!
+            del tickers 
+            
+            # ОПТИМИЗАЦИЯ 2: Сортируем по объему и берем только ТОП-50 монет. Больше никаких 315 запросов!
+            temp_symbols.sort(key=lambda x: x[1], reverse=True)
+            valid_symbols = [x[0] for x in temp_symbols[:50]]
 
             new_hot_list = {}
             for sym in valid_symbols:
@@ -186,13 +201,12 @@ async def radar_task():
                         NOTIFIED_SYMBOLS.add(sym)
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
                 
-                # МИКРО-СОН (Критически важно для сглаживания потребления ОЗУ на Render)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1) # Уменьшил сон, так как монет теперь всего 50
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
             
-            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)}")
+            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-50 ликвидных). На мушке: {len(HOT_LIST)}")
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
@@ -204,7 +218,6 @@ async def execute_trade(signal):
     clean_name = sym.split(':')[0]
     
     if any(p['symbol'] == sym for p in active_positions):
-        logging.warning(f"⚠️ Позиция по {sym} уже активна. Блокировка дубля.")
         return
 
     try:
@@ -260,7 +273,8 @@ async def wss_sniper_worker(sym, setup_data):
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
             try:
-                async for ws in websockets.connect(url):
+                # ОПТИМИЗАЦИЯ: Лимиты на очередь сообщений, чтобы не ловить OOM при спаме
+                async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
                     await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
                     while state['active']:
                         msg = await ws.recv()
@@ -279,7 +293,7 @@ async def wss_sniper_worker(sym, setup_data):
         url = "wss://stream.bybit.com/v5/public/linear"
         while state['active']:
             try:
-                async for ws in websockets.connect(url):
+                async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
                     await ws.send(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
                     while state['active']:
                         msg = await ws.recv()
@@ -492,17 +506,12 @@ async def monitor_positions_job():
         except Exception as e: 
             logging.error(f"Критическая ошибка Монитора: {e}")
 
-# --- TELEGRAM ---
-@bot.message_handler(commands=['stats'])
-def send_stats(message):
-    bot.reply_to(message, "⏳ Сбор данных... (В асинхронной версии ответ придет чуть позже)")
-
-# --- УЛЬТРА-ЛЕГКИЙ ВЕБ-СЕРВЕР (Замена Flask) ---
+# --- УЛЬТРА-ЛЕГКИЙ ВЕБ-СЕРВЕР ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.2.1 Active (Flask Removed, Memory Optimized)")
+        self.wfile.write(b"Bot v7.3 Active (Top-50 Limit, Memory Optimized)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -511,7 +520,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.2.1: Ultra-Light Memory + Оптимизированный SMC...")
+    logging.info("🚀 Запуск ядра v7.3: Ultra-Light Memory + Top-50 Limit...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
