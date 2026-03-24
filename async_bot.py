@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.3 (Ultra-Light Memory + Top-50 Limit) ===
+# === НАСТРОЙКИ v7.3.1 (Ultra-Light Memory + Top-150 Limit) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -78,7 +78,6 @@ def load_positions():
     except Exception as e: 
         logging.error(f"Ошибка загрузки БД: {e}")
 
-# ОПТИМИЗАЦИЯ: Чистый aiohttp без тяжелых потоков telebot
 async def send_tg_msg(text):
     if not TOKEN: return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -182,12 +181,11 @@ async def radar_task():
                 if not any(pos['symbol'].split('/')[0].split('-')[0].split(':')[0] == base_coin for pos in active_positions):
                     temp_symbols.append((sym, vol))
 
-            # ОПТИМИЗАЦИЯ 1: Чистим гигантский словарь тикеров из памяти немедленно!
             del tickers 
             
-            # ОПТИМИЗАЦИЯ 2: Сортируем по объему и берем только ТОП-50 монет. Больше никаких 315 запросов!
+            # ОПТИМИЗАЦИЯ: Берем ТОП-150 монет для увеличения числа сигналов
             temp_symbols.sort(key=lambda x: x[1], reverse=True)
-            valid_symbols = [x[0] for x in temp_symbols[:50]]
+            valid_symbols = [x[0] for x in temp_symbols[:150]]
 
             new_hot_list = {}
             for sym in valid_symbols:
@@ -201,12 +199,13 @@ async def radar_task():
                         NOTIFIED_SYMBOLS.add(sym)
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
                 
-                await asyncio.sleep(0.1) # Уменьшил сон, так как монет теперь всего 50
+                # Защитный сон 0.2 сек для 150 монет, чтобы память не "прыгала"
+                await asyncio.sleep(0.2) 
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
             
-            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-50 ликвидных). На мушке: {len(HOT_LIST)}")
+            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-150 ликвидных). На мушке: {len(HOT_LIST)}")
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
@@ -273,7 +272,6 @@ async def wss_sniper_worker(sym, setup_data):
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
             try:
-                # ОПТИМИЗАЦИЯ: Лимиты на очередь сообщений, чтобы не ловить OOM при спаме
                 async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
                     await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
                     while state['active']:
@@ -511,7 +509,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.3 Active (Top-50 Limit, Memory Optimized)")
+        self.wfile.write(b"Bot v7.3.1 Active (Top-150 Limit, Memory Optimized)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -520,7 +518,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.3: Ultra-Light Memory + Top-50 Limit...")
+    logging.info("🚀 Запуск ядра v7.3.1: Ultra-Light Memory + Top-150 Limit...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
