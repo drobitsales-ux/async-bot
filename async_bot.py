@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.3.4 (RAM Tracker + Top-150 Chunks) ===
+# === НАСТРОЙКИ v7.4 (Trend Shield + 15% Volume Filter) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -44,15 +44,12 @@ daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
-# --- МОНИТОРИНГ ПАМЯТИ ---
 def get_mem_usage():
     try:
         with open('/proc/self/status') as f:
             for line in f:
-                if 'VmRSS' in line:
-                    return f"{int(line.split()[1]) / 1024:.1f} MB"
-    except:
-        return "N/A"
+                if 'VmRSS' in line: return f"{int(line.split()[1]) / 1024:.1f} MB"
+    except: pass
     return "N/A"
 
 exchange = ccxt_async.bingx({
@@ -95,10 +92,8 @@ async def send_tg_msg(text):
     payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                pass
-    except Exception as e: 
-        logging.error(f"TG Error: {e}")
+            async with session.post(url, json=payload) as resp: pass
+    except Exception as e: logging.error(f"TG Error: {e}")
 
 def calculate_ema(data, window):
     if len(data) < window: return data[-1]
@@ -127,16 +122,20 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        volume_threshold = avg_volume * 1.0 
+        # УЛУЧШЕНИЕ 1: Жесткий фильтр объемов (15% всплеск)
+        volume_threshold = avg_volume * 1.15 
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
-        
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
+        # УЛУЧШЕНИЕ 2: Блокировка Шортов в Альтсезон и жесткий BTC Тренд
+        allow_long = (btc_trend == 'Long') or altseason
+        allow_short = (btc_trend == 'Short') and not altseason
+
         result = None
-        if current_price > ema_200:
+        if allow_long and current_price > ema_200:
             is_valid_choch = (c[-1] > np.max(h[-6:-1])) and has_volume
             if is_valid_choch and current_price <= eq_level_long:
                 if find_fvg(h, l, 'Long'):
@@ -144,11 +143,12 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
                             if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
-                                sl = ob_low - (atr * 0.3)  
+                                # УЛУЧШЕНИЕ 3: Более широкий стоп (0.8 ATR)
+                                sl = ob_low - (atr * 0.8)  
                                 result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
                                 break
 
-        if not result and current_price < ema_200:
+        if allow_short and not result and current_price < ema_200:
             is_valid_choch_short = (c[-1] < np.min(l[-6:-1])) and has_volume
             if is_valid_choch_short and current_price >= eq_level_short:
                 if find_fvg(h, l, 'Short'):
@@ -156,7 +156,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
                             if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
-                                sl = ob_high + (atr * 0.3)
+                                sl = ob_high + (atr * 0.8)
                                 result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
                                 break
         
@@ -176,6 +176,21 @@ async def radar_task():
                 await asyncio.sleep(60); continue
             if len(active_positions) >= MAX_POSITIONS:
                 await asyncio.sleep(60); continue
+
+            # --- АНАЛИЗ ГЛОБАЛЬНОГО ТРЕНДА ---
+            btc_trend, altseason = 'Short', False
+            try:
+                btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
+                btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
+                btc_trend = 'Long' if btc_c[-1] > calculate_ema(btc_c, 200) else 'Short'
+                
+                eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
+                eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
+                altseason = True if (eth_c[-1] / btc_c[-1]) > calculate_ema((eth_c / btc_c), 200) else False
+                
+                del btc_ohlcv, btc_c, eth_ohlcv, eth_c
+            except Exception as e:
+                logging.error(f"Global Trend Filter Error: {e}")
 
             tickers = await exchange.fetch_tickers()
             temp_symbols = []
@@ -202,7 +217,7 @@ async def radar_task():
                 clean_name = sym.split(':')[0]
                 if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)): continue
                 
-                signal = await detect_smc_setup(sym, 'Long', True) 
+                signal = await detect_smc_setup(sym, btc_trend, altseason) 
                 if signal:
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
@@ -211,18 +226,15 @@ async def radar_task():
                 
                 await asyncio.sleep(0.2) 
                 
-                # Принудительная очистка каждые 15 монет + Лог памяти
                 if (idx + 1) % 15 == 0:
                     gc.collect()
-                    mem = get_mem_usage()
-                    logging.info(f"⚙️ Чанк {idx+1}/150 обработан. ОЗУ: {mem}")
                     await asyncio.sleep(1.5) 
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
             
             final_mem = get_mem_usage()
-            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
+            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-150). На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
@@ -327,8 +339,7 @@ async def wss_sniper_worker(sym, setup_data):
         while sym in HOT_LIST:
             await asyncio.sleep(5)
             
-            if len(active_positions) >= MAX_POSITIONS:
-                continue
+            if len(active_positions) >= MAX_POSITIONS: continue
                 
             total = state['buy_vol'] + state['sell_vol']
             
@@ -530,7 +541,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.3.4 Active (RAM Tracker + Top-150 Chunks)")
+        self.wfile.write(b"Bot v7.4 Active (Trend Shield + 15% Volume Filter)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -539,7 +550,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.3.4: RAM Tracker + Top-150 Chunks...")
+    logging.info("🚀 Запуск ядра v7.4: Trend Shield + 15% Volume Filter...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
