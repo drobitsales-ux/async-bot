@@ -6,15 +6,15 @@ import time
 import os
 import logging
 import sqlite3
-import gc  # Добавлен сборщик мусора
+import gc
 import ccxt.async_support as ccxt_async
 import numpy as np
 import telebot
 from datetime import datetime, timezone, timedelta
 from threading import Thread
-from flask import Flask
+from http.server import BaseHTTPRequestHandler, HTTPServer # Легкий сервер вместо Flask
 
-# === НАСТРОЙКИ v7.2 (SMC + 2x WSS + Гибридный Трейлинг) ===
+# === НАСТРОЙКИ v7.2.1 (SMC + 2x WSS + Оптимизация Памяти) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -36,7 +36,7 @@ EXCLUDED_KEYWORDS = ['NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVE
 GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
 last_signals = {} 
-NOTIFIED_SYMBOLS = set() # Защита от спама в ТГ
+NOTIFIED_SYMBOLS = set() 
 
 HOT_LIST = {}  
 ACTIVE_WSS_CONNECTIONS = set()
@@ -97,7 +97,7 @@ def find_fvg(h, l, direction):
         elif direction == 'Short' and h[i] < l[i-2]: return True
     return False
 
-# --- РАДАР ---
+# --- РАДАР И ОПТИМИЗИРОВАННЫЙ SMC ---
 async def detect_smc_setup(sym, btc_trend, altseason):
     try:
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
@@ -115,31 +115,42 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
-        eq_level = leg_low + (leg_high - leg_low) * 0.5  
+        
+        # ОПТИМИЗАЦИЯ: Расширенные уровни (60% вместо 50%)
+        eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
+        eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
+        result = None
         if current_price > ema_200:
             is_valid_choch = (c[-1] > np.max(h[-6:-1])) and has_volume
-            if is_valid_choch and current_price <= eq_level:
-                if not find_fvg(h, l, 'Long'): return None
-                for i in range(len(c)-2, len(c)-6, -1):
-                    if c[i] < o[i]:  
-                        ob_low, ob_high = l[i], h[i]
-                        if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
-                            sl = ob_low - (atr * 0.3)  
-                            return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
+            if is_valid_choch and current_price <= eq_level_long:
+                if find_fvg(h, l, 'Long'):
+                    for i in range(len(c)-2, len(c)-6, -1):
+                        if c[i] < o[i]:  
+                            ob_low, ob_high = l[i], h[i]
+                            if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
+                                sl = ob_low - (atr * 0.3)  
+                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
+                                break
 
-        if current_price < ema_200:
+        if not result and current_price < ema_200:
             is_valid_choch_short = (c[-1] < np.min(l[-6:-1])) and has_volume
-            if is_valid_choch_short and current_price >= eq_level:
-                if not find_fvg(h, l, 'Short'): return None
-                for i in range(len(c)-2, len(c)-6, -1):
-                    if c[i] > o[i]:  
-                        ob_high, ob_low = h[i], l[i]
-                        if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
-                            sl = ob_high + (atr * 0.3)
-                            return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
-    except Exception as e: logging.error(f"SMC Error {sym}: {e}")
-    return None
+            if is_valid_choch_short and current_price >= eq_level_short:
+                if find_fvg(h, l, 'Short'):
+                    for i in range(len(c)-2, len(c)-6, -1):
+                        if c[i] > o[i]:  
+                            ob_high, ob_low = h[i], l[i]
+                            if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
+                                sl = ob_high + (atr * 0.3)
+                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
+                                break
+        
+        # ОЧИСТКА ПАМЯТИ (Жесткое удаление массивов NumPy)
+        del o, h, l, c, v, ohlcv, d
+        return result
+    except Exception as e: 
+        logging.error(f"SMC Error {sym}: {e}")
+        return None
 
 async def radar_task():
     global HOT_LIST, NOTIFIED_SYMBOLS
@@ -174,14 +185,14 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
+                
+                # МИКРО-СОН (Критически важно для сглаживания потребления ОЗУ на Render)
+                await asyncio.sleep(0.3)
 
             HOT_LIST = new_hot_list
-            # Очистка старых уведомлений для монет, которые ушли с радара
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
             
             logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)}")
-            
-            # ЖЕСТКАЯ ОЧИСТКА ПАМЯТИ (Для Render)
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
@@ -237,7 +248,7 @@ async def execute_trade(signal):
     except Exception as e: 
         logging.error(f"Trade error {clean_name}: {e}")
 
-# --- MULTI-EXCHANGE SNIPER CORE (Только BingX + Bybit) ---
+# --- MULTI-EXCHANGE SNIPER CORE ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
@@ -253,7 +264,6 @@ async def wss_sniper_worker(sym, setup_data):
                     await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
                     while state['active']:
                         msg = await ws.recv()
-                        # Оптимизация памяти (Замена BytesIO на прямую распаковку zlib/gzip)
                         data = json.loads(gzip.decompress(msg).decode('utf-8'))
                         if data.get("ping"): await ws.send(json.dumps({"pong": data.get("ping")})); continue
                         if "data" in data:
@@ -289,12 +299,10 @@ async def wss_sniper_worker(sym, setup_data):
             await asyncio.sleep(5)
             total = state['buy_vol'] + state['sell_vol']
             
-            # Порог снижен до 2500 для альтов
             if total > 2500:
                 buy_pct = (state['buy_vol'] / total) * 100
                 sell_pct = 100 - buy_pct
                 
-                # Добавлен буфер для зоны ОБ (0.3%), чтобы не пропускать сделки
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
                 in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
                 
@@ -328,7 +336,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- АСИНХРОННЫЙ МОНИТОР (Гибридная модель + 80% Pre-TP) ---
+# --- АСИНХРОННЫЙ МОНИТОР ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -391,7 +399,6 @@ async def monitor_positions_job():
                 is_long = pos['direction'] == 'Long'
                 c_side = 'sell' if is_long else 'buy'
 
-                # --- ЗАЩИТА PRE-TP1 (80% пути к TP1) ---
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
                     dist_to_tp1 = pos['tp1'] - pos['entry_price']
                     tp1_80 = pos['entry_price'] + dist_to_tp1 * 0.8 if is_long else pos['entry_price'] - dist_to_tp1 * 0.8
@@ -407,7 +414,6 @@ async def monitor_positions_job():
                             await send_tg_msg(f"🛡 **{sym.split(':')[0]} Защита!** Цена прошла 80% к TP1.\nСтоп переведен в БУ: {be_price}")
                         except Exception as e: logging.error(f"Error pre-TP1 {sym}: {e}")
 
-                # --- ШАГ 1: TP1 ---
                 if not pos.get('tp1_hit'):
                     if (is_long and high_p >= pos['tp1']) or (not is_long and low_p <= pos['tp1']):
                         try:
@@ -427,7 +433,6 @@ async def monitor_positions_job():
                             await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 достигнут!** Фиксация 40%.")
                         except Exception as e: logging.error(f"Ошибка выполнения TP1 для {sym}: {e}")
 
-                # --- ЗАЩИТА PRE-TP2 (80% пути от TP1 к TP2) ---
                 if pos.get('tp1_hit') and not pos.get('tp2_hit') and not pos.get('pre_tp2_hit'):
                     dist_to_tp2 = pos['tp2'] - pos['tp1']
                     tp2_80 = pos['tp1'] + dist_to_tp2 * 0.8 if is_long else pos['tp1'] - dist_to_tp2 * 0.8
@@ -443,7 +448,6 @@ async def monitor_positions_job():
                             await send_tg_msg(f"🛡 **{sym.split(':')[0]} Защита!** Цена прошла 80% к TP2.\nСтоп подтянут в профит: {safe_p}")
                         except Exception as e: logging.error(f"Error pre-TP2 {sym}: {e}")
 
-                # --- ШАГ 2: TP2 и ПЕРЕНОС SL НА TP1 ---
                 if pos.get('tp1_hit') and not pos.get('tp2_hit'):
                     if (is_long and high_p >= pos['tp2']) or (not is_long and low_p <= pos['tp2']):
                         try:
@@ -466,7 +470,6 @@ async def monitor_positions_job():
                             await send_tg_msg(f"🔥 **{sym.split(':')[0]} TP2 достигнут!** Фиксация 50% остатка.\nСтоп перенесен на TP1: {tp1_safe}\nВключен Микро-Трейлинг!")
                         except Exception as e: logging.error(f"Ошибка выполнения TP2 для {sym}: {e}")
 
-                # --- ШАГ 3: МИКРО-ТРЕЙЛИНГ (После TP2) ---
                 if pos.get('tp2_hit'):
                     tt = pos.get('trail_trigger')
                     m_step = pos.get('micro_step')
@@ -494,16 +497,24 @@ async def monitor_positions_job():
 def send_stats(message):
     bot.reply_to(message, "⏳ Сбор данных... (В асинхронной версии ответ придет чуть позже)")
 
-app = Flask(__name__)
-@app.route('/')
-def index(): return "2x WSS Async Bot v7.2 Active"
+# --- УЛЬТРА-ЛЕГКИЙ ВЕБ-СЕРВЕР (Замена Flask) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot v7.2.1 Active (Flask Removed, Memory Optimized)")
+    def log_message(self, format, *args): return 
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler)
+    server.serve_forever()
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.2: 2x Биржевой Снайпер (Bybit+BingX) + Гибридный Трейлинг...")
+    logging.info("🚀 Запуск ядра v7.2.1: Ultra-Light Memory + Оптимизированный SMC...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
-    Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
+    Thread(target=run_server, daemon=True).start()
     try: asyncio.run(main())
     except KeyboardInterrupt: logging.info("\nОстановка.")
