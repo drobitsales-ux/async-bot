@@ -20,7 +20,7 @@ GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-RISK_PER_TRADE = 0.01       
+RISK_PER_TRADE = 0.02      
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MAX_SPREAD_PERCENT = 0.002  
