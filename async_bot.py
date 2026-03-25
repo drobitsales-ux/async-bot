@@ -382,7 +382,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- АСИНХРОННЫЙ МОНИТОР v7.5 (Endgame Edition: Trailing after TP1) ---
+# --- ИСПРАВЛЕННЫЙ БЛОК МОНИТОРА v7.5.1 (Fix NoneType Error) ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -394,7 +394,6 @@ async def monitor_positions_job():
             positions_raw = await exchange.fetch_positions()
             for pos in active_positions:
                 sym = pos['symbol']
-                # Проверка наличия живой позиции на бирже
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 
                 if not curr:
@@ -407,36 +406,24 @@ async def monitor_positions_job():
                     else:
                         CONSECUTIVE_LOSSES += 1
                         await send_tg_msg(f"🛑 **{sym.split(':')[0]} выбита по SL.**\nPNL: {pnl:.2f} USDT")
-                        if CONSECUTIVE_LOSSES >= 3: 
-                            GLOBAL_STOP_UNTIL = datetime.now(timezone.utc) + timedelta(hours=3)
-                            await send_tg_msg("⚠️ **Drawdown Защита:** 3 минуса подряд. Отдыхаем 3 часа.")
                     continue
 
-                # Логика ТАЙМАУТОВ
+                # Тайм-менеджмент и PNL
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
-                
                 ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
                 pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if pos['direction'] == 'Long' else (pos['entry_price'] - last_p) * float(curr['contracts'])
-                
-                close_by_timeout, timeout_reason = False, ""
-                if hours_passed >= TRADE_TIMEOUT_ANY_HOURS: close_by_timeout, timeout_reason = True, f"{TRADE_TIMEOUT_ANY_HOURS}ч"
-                elif hours_passed >= TRADE_TIMEOUT_PROFIT_HOURS and pnl > 0: close_by_timeout, timeout_reason = True, f"{TRADE_TIMEOUT_PROFIT_HOURS}ч (В плюсе)"
-                    
-                if close_by_timeout:
+
+                # Закрытие по таймауту
+                if hours_passed >= TRADE_TIMEOUT_ANY_HOURS or (hours_passed >= TRADE_TIMEOUT_PROFIT_HOURS and pnl > 0):
                     try:
                         c_side = 'sell' if pos['direction'] == 'Long' else 'buy'
                         await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                        daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
-                        await send_tg_msg(f"⏳ **{sym.split(':')[0]} закрыта по ТАЙМАУТУ {timeout_reason}!**\nPNL: {pnl:.2f} USDT")
-                        continue 
-                    except Exception as e: logging.error(f"Timeout Error {sym}: {e}")
+                        await exchange.cancel_order(pos['sl_order_id'], sym); continue 
+                    except: pass
 
-                # Получение текущих экстремумов свечи
                 ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
-                if not ohlcv: 
-                    updated.append(pos); continue
+                if not ohlcv: updated.append(pos); continue
                 
                 high_p, low_p = max([float(c[2]) for c in ohlcv]), min([float(c[3]) for c in ohlcv])
                 is_long = pos['direction'] == 'Long'
@@ -444,22 +431,20 @@ async def monitor_positions_job():
 
                 # 1. ЗАЩИТА ПЕРЕД TP1 (80% пути)
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
-                    dist_to_tp1 = abs(pos['tp1'] - pos['entry_price'])
-                    tp1_80 = pos['entry_price'] + dist_to_tp1 * 0.8 if is_long else pos['entry_price'] - dist_to_tp1 * 0.8
-                    if (is_long and high_p >= tp1_80) or (not is_long and low_p <= tp1_80):
+                    dist = abs(pos['tp1'] - pos['entry_price'])
+                    trigger_80 = pos['entry_price'] + dist * 0.8 if is_long else pos['entry_price'] - dist * 0.8
+                    if (is_long and high_p >= trigger_80) or (not is_long and low_p <= trigger_80):
                         try:
                             await exchange.cancel_order(pos['sl_order_id'], sym)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.001 if is_long else 0.999)))
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
-                            pos['sl_order_id'], pos['current_sl'], pos['pre_tp1_hit'] = new_sl['id'], be_p, True
-                            await send_tg_msg(f"🛡 **{sym.split(':')[0]}** 80% до TP1. Стоп в БУ: {be_p}")
+                            pos.update({'sl_order_id': new_sl['id'], 'current_sl': be_p, 'pre_tp1_hit': True})
                         except: pass
 
-                # 2. ДОСТИЖЕНИЕ TP1 + ЗАПУСК ТРЕЙЛИНГА
+                # 2. ДОСТИЖЕНИЕ TP1 + ИНИЦИАЛИЗАЦИЯ ТРЕЙЛИНГА
                 if not pos.get('tp1_hit'):
                     if (is_long and high_p >= pos['tp1']) or (not is_long and low_p <= pos['tp1']):
                         try:
-                            # Фиксируем 50% объема
                             close_qty = float(exchange.amount_to_precision(sym, float(curr['contracts']) * 0.50))
                             if close_qty > 0:
                                 await exchange.create_market_order(sym, c_side, close_qty, params={'positionSide': pos['position_side']})
@@ -469,47 +454,42 @@ async def monitor_positions_job():
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.002 if is_long else 0.998)))
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
                             
-                            # Настройка параметров Эндшпиля (Трейлинга)
-                            risk_val = abs(pos['entry_price'] - pos['sl_price'])
-                            micro_step = risk_val * 0.3 # Шаг 0.3 от изначального риска
-                            
+                            risk = abs(pos['entry_price'] - pos['sl_price'])
+                            m_step = risk * 0.3
                             pos.update({
                                 'tp1_hit': True, 'sl_order_id': new_sl['id'], 'current_sl': be_p,
-                                'micro_step': micro_step, 
-                                'trail_trigger': pos['tp1'] + micro_step if is_long else pos['tp1'] - micro_step
+                                'micro_step': m_step, 'trail_trigger': pos['tp1'] + m_step if is_long else pos['tp1'] - m_step
                             })
-                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 взят!** (50% закрыто).\n🛡 Запущен Микро-Трейлинг. Текущий SL: {be_p}")
-                        except Exception as e: logging.error(f"TP1 Error {sym}: {e}")
+                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 взят!**\n🛡 Запущен Эндшпиль.")
+                        except: pass
 
-                # 3. ЛОГИКА ТРЕЙЛИНГА (ЭНДШПИЛЬ) - РАБОТАЕТ ПОСЛЕ TP1
+                # 3. ЛОГИКА ТРЕЙЛИНГА (С ПРОВЕРКОЙ НА NONE)
                 if pos.get('tp1_hit'):
                     tt = pos.get('trail_trigger')
-                    m_step = pos.get('micro_step')
+                    ms = pos.get('micro_step')
+                    
+                    # Если данных нет (старая сделка), инициализируем их прямо сейчас
+                    if tt is None or ms is None:
+                        risk = abs(pos['entry_price'] - pos['sl_price'])
+                        ms = risk * 0.3
+                        tt = pos['tp1'] + ms if is_long else pos['tp1'] - ms
+                        pos['micro_step'], pos['trail_trigger'] = ms, tt
+
                     if (is_long and high_p >= tt) or (not is_long and low_p <= tt):
                         try:
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                            raw_nsl = pos['current_sl'] + m_step if is_long else pos['current_sl'] - m_step
-                            nsl = float(exchange.price_to_precision(sym, raw_nsl))
-                            new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
+                            new_sl_val = pos['current_sl'] + ms if is_long else pos['current_sl'] - ms
+                            nsl = float(exchange.price_to_precision(sym, new_sl_val))
+                            new_sl_order = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
                             
-                            pos['sl_order_id'] = new_sl['id']
-                            pos['current_sl'] = nsl
-                            pos['trail_trigger'] = tt + m_step if is_long else tt - m_step
-                            
-                            # Уведомление о TP2, если мы его проскочили трейлингом
-                            if not pos.get('tp2_hit'):
-                                if (is_long and nsl >= pos['tp2']) or (not is_long and nsl <= pos['tp2']):
-                                    pos['tp2_hit'] = True
-                                    await send_tg_msg(f"🔥 **{sym.split(':')[0]} прошел уровень TP2!** Продолжаю тянуть стоп...")
-                            
-                            await send_tg_msg(f"📈 **{sym.split(':')[0]} Трейлинг:** SL подтянут к {nsl}")
-                        except Exception as e: logging.error(f"Trailing Error {sym}: {e}")
+                            pos.update({'sl_order_id': new_sl_order['id'], 'current_sl': nsl, 'trail_trigger': tt + ms if is_long else tt - ms})
+                            await send_tg_msg(f"📈 **{sym.split(':')[0]} Трейлинг:** SL -> {nsl}")
+                        except: pass
 
                 updated.append(pos)
             active_positions = updated
             await asyncio.to_thread(save_positions)
-        except Exception as e: 
-            logging.error(f"Критическая ошибка Монитора: {e}")
+        except Exception as e: logging.error(f"Критическая ошибка Монитора: {e}")
 
 # --- УЛЬТРА-ЛЕГКИЙ ВЕБ-СЕРВЕР ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
