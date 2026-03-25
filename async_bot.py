@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.4 (Trend Shield + 15% Volume Filter) ===
+# === НАСТРОЙКИ v7.4.1 (Trend Shield + 15% Vol + TP2 UI + DB Check) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -79,7 +79,12 @@ def load_positions():
     try:
         conn = get_db_conn(); c = conn.cursor()
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
-        if row: active_positions = json.loads(row[0])
+        if row: 
+            active_positions = json.loads(row[0])
+            logging.info(f"✅ База данных загружена. Активных сделок в памяти: {len(active_positions)}")
+        else:
+            logging.info("ℹ️ База данных пуста. Активных сделок нет.")
+            
         c.execute("SELECT pnl, trades, wins FROM daily_stats WHERE id = 1"); stat_row = c.fetchone()
         if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'] = stat_row
         conn.close()
@@ -122,7 +127,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        # УЛУЧШЕНИЕ 1: Жесткий фильтр объемов (15% всплеск)
         volume_threshold = avg_volume * 1.15 
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
@@ -130,7 +134,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
-        # УЛУЧШЕНИЕ 2: Блокировка Шортов в Альтсезон и жесткий BTC Тренд
         allow_long = (btc_trend == 'Long') or altseason
         allow_short = (btc_trend == 'Short') and not altseason
 
@@ -143,7 +146,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
                             if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
-                                # УЛУЧШЕНИЕ 3: Более широкий стоп (0.8 ATR)
                                 sl = ob_low - (atr * 0.8)  
                                 result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
                                 break
@@ -177,7 +179,6 @@ async def radar_task():
             if len(active_positions) >= MAX_POSITIONS:
                 await asyncio.sleep(60); continue
 
-            # --- АНАЛИЗ ГЛОБАЛЬНОГО ТРЕНДА ---
             btc_trend, altseason = 'Short', False
             try:
                 btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
@@ -281,10 +282,11 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
+        # ДОБАВЛЕН ВЫВОД TP2
         msg = (f"💥 **ВЫСТРЕЛ (Bybit+BingX): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
                f"📊 {signal.get('vol_info', 'Нет данных')}\n\n"
-               f"Цена: {signal['entry_price']}\nОбъем: {qty}\nSL: {sl_price}\nTP1: {tp1_price}")
+               f"Цена: {signal['entry_price']}\nОбъем: {qty}\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
     except Exception as e: 
         logging.error(f"Trade error {clean_name}: {e}")
@@ -541,7 +543,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.4 Active (Trend Shield + 15% Volume Filter)")
+        self.wfile.write(b"Bot v7.4.1 Active (Trend Shield + 15% Vol + TP2 UI)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -550,7 +552,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.4: Trend Shield + 15% Volume Filter...")
+    logging.info("🚀 Запуск ядра v7.4.1: Trend Shield + 15% Vol + TP2 UI...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
