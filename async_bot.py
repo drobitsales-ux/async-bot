@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.4.1 (Trend Shield + 15% Vol + TP2 UI + DB Check) ===
+# === НАСТРОЙКИ v7.5 (Endgame Trailing + Strict Filters) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -127,7 +127,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        volume_threshold = avg_volume * 1.15 
+        volume_threshold = avg_volume * 1.10  
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
@@ -282,7 +282,6 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        # ДОБАВЛЕН ВЫВОД TP2
         msg = (f"💥 **ВЫСТРЕЛ (Bybit+BingX): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
                f"📊 {signal.get('vol_info', 'Нет данных')}\n\n"
@@ -382,7 +381,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- ИСПРАВЛЕННЫЙ БЛОК МОНИТОРА v7.5.1 (Fix NoneType Error) ---
+# --- АСИНХРОННЫЙ МОНИТОР v7.5 ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -406,15 +405,16 @@ async def monitor_positions_job():
                     else:
                         CONSECUTIVE_LOSSES += 1
                         await send_tg_msg(f"🛑 **{sym.split(':')[0]} выбита по SL.**\nPNL: {pnl:.2f} USDT")
+                        if CONSECUTIVE_LOSSES >= 3: 
+                            GLOBAL_STOP_UNTIL = datetime.now(timezone.utc) + timedelta(hours=3)
+                            await send_tg_msg("⚠️ **Drawdown Защита:** 3 минуса подряд. Отдыхаем 3 часа.")
                     continue
 
-                # Тайм-менеджмент и PNL
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
                 pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if pos['direction'] == 'Long' else (pos['entry_price'] - last_p) * float(curr['contracts'])
 
-                # Закрытие по таймауту
                 if hours_passed >= TRADE_TIMEOUT_ANY_HOURS or (hours_passed >= TRADE_TIMEOUT_PROFIT_HOURS and pnl > 0):
                     try:
                         c_side = 'sell' if pos['direction'] == 'Long' else 'buy'
@@ -441,34 +441,36 @@ async def monitor_positions_job():
                             pos.update({'sl_order_id': new_sl['id'], 'current_sl': be_p, 'pre_tp1_hit': True})
                         except: pass
 
-                # 2. ДОСТИЖЕНИЕ TP1 + ИНИЦИАЛИЗАЦИЯ ТРЕЙЛИНГА
+                # 2. ДОСТИЖЕНИЕ TP1 + ИНИЦИАЛИЗАЦИЯ ТРЕЙЛИНГА (ЭНДШПИЛЬ)
                 if not pos.get('tp1_hit'):
                     if (is_long and high_p >= pos['tp1']) or (not is_long and low_p <= pos['tp1']):
                         try:
+                            # Изменение 1: Фиксируем 50%
                             close_qty = float(exchange.amount_to_precision(sym, float(curr['contracts']) * 0.50))
                             if close_qty > 0:
                                 await exchange.create_market_order(sym, c_side, close_qty, params={'positionSide': pos['position_side']})
                                 pos['initial_qty'] = float(curr['contracts']) - close_qty 
                             
                             await exchange.cancel_order(pos['sl_order_id'], sym)
+                            # Изменение 2: Безубыток+ (Entry + 0.2%)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.002 if is_long else 0.998)))
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
                             
+                            # Изменение 3: Шаг микро-трейлинга 0.3R
                             risk = abs(pos['entry_price'] - pos['sl_price'])
                             m_step = risk * 0.3
                             pos.update({
                                 'tp1_hit': True, 'sl_order_id': new_sl['id'], 'current_sl': be_p,
                                 'micro_step': m_step, 'trail_trigger': pos['tp1'] + m_step if is_long else pos['tp1'] - m_step
                             })
-                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 взят!**\n🛡 Запущен Эндшпиль.")
+                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 взят!** (50% закрыто).\n🛡 Запущен Эндшпиль (Трейлинг)!")
                         except: pass
 
-                # 3. ЛОГИКА ТРЕЙЛИНГА (С ПРОВЕРКОЙ НА NONE)
+                # 3. ЛОГИКА ТРЕЙЛИНГА (РАБОТАЕТ СРАЗУ ПОСЛЕ TP1)
                 if pos.get('tp1_hit'):
                     tt = pos.get('trail_trigger')
                     ms = pos.get('micro_step')
                     
-                    # Если данных нет (старая сделка), инициализируем их прямо сейчас
                     if tt is None or ms is None:
                         risk = abs(pos['entry_price'] - pos['sl_price'])
                         ms = risk * 0.3
@@ -496,7 +498,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.4.1 Active (Trend Shield + 15% Vol + TP2 UI)")
+        self.wfile.write(b"Bot v7.5 Active (Endgame Trailing + Strict Filters)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -505,7 +507,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.4.1: Trend Shield + 15% Vol + TP2 UI...")
+    logging.info("🚀 Запуск ядра v7.5: Endgame Trailing + Strict Filters...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
