@@ -142,27 +142,33 @@ async def detect_smc_setup(sym, btc_trend, altseason):
 
         result = None
         if allow_long and current_price > ema_200:
-            is_valid_choch = (c[-1] > np.max(h[-6:-1])) and has_volume
+            # ОПТИМИЗАЦИЯ: Ищем слом максимума за последние 10 часов (было 5)
+            is_valid_choch = (c[-1] > np.max(h[-11:-1])) and has_volume
             if is_valid_choch and current_price <= eq_level_long:
                 if find_fvg(h, l, 'Long'):
-                    for i in range(len(c)-2, len(c)-6, -1):
+                    # ОПТИМИЗАЦИЯ: Ищем Ордерблок в глубине до 10 свечей
+                    for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
-                            if current_price > ob_high and (current_price - ob_high) < (atr * 0.5):
+                            # ОПТИМИЗАЦИЯ: Позволяем цене уйти на 1.0 ATR от блока (было 0.5)
+                            if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                 sl = ob_low - (atr * 0.8)  
-                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
+                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 'tp2': round(current_price + (current_price-sl)*3, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
                                 break
 
         if allow_short and not result and current_price < ema_200:
-            is_valid_choch_short = (c[-1] < np.min(l[-6:-1])) and has_volume
+            # ОПТИМИЗАЦИЯ: Ищем слом минимума за последние 10 часов
+            is_valid_choch_short = (c[-1] < np.min(l[-11:-1])) and has_volume
             if is_valid_choch_short and current_price >= eq_level_short:
                 if find_fvg(h, l, 'Short'):
-                    for i in range(len(c)-2, len(c)-6, -1):
+                    # ОПТИМИЗАЦИЯ: Ищем Ордерблок в глубине до 10 свечей
+                    for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
-                            if current_price < ob_low and (ob_low - current_price) < (atr * 0.5):
+                            # ОПТИМИЗАЦИЯ: Позволяем цене уйти на 1.0 ATR от блока
+                            if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                 sl = ob_high + (atr * 0.8)
-                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
+                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 'tp2': round(current_price - (sl-current_price)*3, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
                                 break
         
         del o, h, l, c, v, ohlcv, d
