@@ -108,7 +108,8 @@ def calculate_ema(data, window):
     return ema
 
 def find_fvg(h, l, direction):
-    for i in range(len(h)-1, len(h)-6, -1):
+    # ОПТИМИЗАЦИЯ: Ищем имбаланс на глубину до 12 свечей (синхронно с Ордерблоком)
+    for i in range(len(h)-1, len(h)-12, -1):
         if direction == 'Long' and l[i] > h[i-2]: return True
         elif direction == 'Short' and h[i] < l[i-2]: return True
     return False
@@ -129,46 +130,43 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         avg_volume = np.mean(v[-22:-2])
         volume_threshold = avg_volume * 1.10  
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
-        
-        # Расчет превышения объема для логов
         vol_increase_pct = ((v[-1] / avg_volume) - 1) * 100 if avg_volume > 0 else 0
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
+        # НОВАЯ ЛОГИКА ТРЕНДА (Позволяем шортить при падающем битке всегда)
         allow_long = (btc_trend == 'Long') or altseason
-        allow_short = (btc_trend == 'Short') and not altseason
+        allow_short = (btc_trend == 'Short')
 
         result = None
         if allow_long and current_price > ema_200:
-            # ОПТИМИЗАЦИЯ: Ищем слом максимума за последние 10 часов (было 5)
+            # ОПТИМИЗАЦИЯ: Слом за 10 часов
             is_valid_choch = (c[-1] > np.max(h[-11:-1])) and has_volume
             if is_valid_choch and current_price <= eq_level_long:
                 if find_fvg(h, l, 'Long'):
-                    # ОПТИМИЗАЦИЯ: Ищем Ордерблок в глубине до 10 свечей
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
-                            # ОПТИМИЗАЦИЯ: Позволяем цене уйти на 1.0 ATR от блока (было 0.5)
+                            # ОПТИМИЗАЦИЯ: Оттяжка 1.0 ATR
                             if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                 sl = ob_low - (atr * 0.8)  
-                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(current_price + (current_price-sl)*1.5, 6), 'tp2': round(current_price + (current_price-sl)*3, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
+                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
 
         if allow_short and not result and current_price < ema_200:
-            # ОПТИМИЗАЦИЯ: Ищем слом минимума за последние 10 часов
+            # ОПТИМИЗАЦИЯ: Слом за 10 часов
             is_valid_choch_short = (c[-1] < np.min(l[-11:-1])) and has_volume
             if is_valid_choch_short and current_price >= eq_level_short:
                 if find_fvg(h, l, 'Short'):
-                    # ОПТИМИЗАЦИЯ: Ищем Ордерблок в глубине до 10 свечей
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
-                            # ОПТИМИЗАЦИЯ: Позволяем цене уйти на 1.0 ATR от блока
+                            # ОПТИМИЗАЦИЯ: Оттяжка 1.0 ATR
                             if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                 sl = ob_high + (atr * 0.8)
-                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': round(sl, 6), 'tp1': round(current_price - (sl-current_price)*1.5, 6), 'tp2': round(current_price - (sl-current_price)*3, 6), 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG'}
+                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
         
         del o, h, l, c, v, ohlcv, d
