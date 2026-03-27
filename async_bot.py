@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.6 (Aggressive Trail + Smart WSS Limits) ===
+# === НАСТРОЙКИ v7.7 (Async Semaphore 200 Coins + WSS Memory Fix) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -29,6 +29,9 @@ MIN_VOLUME_USDT = 2000000
 TRADE_TIMEOUT_PROFIT_HOURS = 24  
 TRADE_TIMEOUT_ANY_HOURS = 48     
 SMC_TIMEFRAME = '1h'
+
+MAX_CONCURRENT_TASKS = 15  
+SCAN_LIMIT = 200           
 
 EXCLUDED_KEYWORDS = ['NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', 'JPY', 'PEPE', 'SHIB', '1000', 'FLOKI', 'DOGE', 'BONK', 'MEME', 'LUNC', 'USTC', 'WIF', 'POPCAT', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
@@ -108,7 +111,6 @@ def calculate_ema(data, window):
     return ema
 
 def find_fvg(h, l, direction):
-    # ОПТИМИЗАЦИЯ: Ищем имбаланс на глубину до 12 свечей (синхронно с Ордерблоком)
     for i in range(len(h)-1, len(h)-12, -1):
         if direction == 'Long' and l[i] > h[i-2]: return True
         elif direction == 'Short' and h[i] < l[i-2]: return True
@@ -136,34 +138,29 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
-        # НОВАЯ ЛОГИКА ТРЕНДА (Позволяем шортить при падающем битке всегда)
         allow_long = (btc_trend == 'Long') or altseason
         allow_short = (btc_trend == 'Short')
 
         result = None
         if allow_long and current_price > ema_200:
-            # ОПТИМИЗАЦИЯ: Слом за 10 часов
             is_valid_choch = (c[-1] > np.max(h[-11:-1])) and has_volume
             if is_valid_choch and current_price <= eq_level_long:
                 if find_fvg(h, l, 'Long'):
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
-                            # ОПТИМИЗАЦИЯ: Оттяжка 1.0 ATR
                             if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                 sl = ob_low - (atr * 0.8)  
                                 result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
 
         if allow_short and not result and current_price < ema_200:
-            # ОПТИМИЗАЦИЯ: Слом за 10 часов
             is_valid_choch_short = (c[-1] < np.min(l[-11:-1])) and has_volume
             if is_valid_choch_short and current_price >= eq_level_short:
                 if find_fvg(h, l, 'Short'):
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
-                            # ОПТИМИЗАЦИЯ: Оттяжка 1.0 ATR
                             if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                 sl = ob_high + (atr * 0.8)
                                 result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
@@ -174,6 +171,17 @@ async def detect_smc_setup(sym, btc_trend, altseason):
     except Exception as e: 
         logging.error(f"SMC Error {sym}: {e}")
         return None
+
+# --- АСИНХРОННЫЙ СЕМАФОР И СКАНЕР ---
+async def process_single_coin(sym, btc_trend, altseason, sem):
+    async with sem: 
+        try:
+            signal = await detect_smc_setup(sym, btc_trend, altseason)
+            await asyncio.sleep(0.05) 
+            return sym, signal
+        except Exception as e:
+            logging.error(f"Ошибка process_single_coin {sym}: {e}")
+            return sym, None
 
 async def radar_task():
     global HOT_LIST, NOTIFIED_SYMBOLS
@@ -207,41 +215,53 @@ async def radar_task():
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 
                 tick = tickers.get(sym)
-                vol = float(tick.get('quoteVolume', 0)) if tick else 0
+                if not tick: continue
+                
+                vol = float(tick.get('quoteVolume') or 0)
                 if vol < MIN_VOLUME_USDT: continue
+                
+                ask = float(tick.get('ask') or 0)
+                bid = float(tick.get('bid') or 0)
+                if ask > 0 and bid > 0 and (ask - bid) / ask > MAX_SPREAD_PERCENT: continue
                 
                 base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
                 if not any(pos['symbol'].split('/')[0].split('-')[0].split(':')[0] == base_coin for pos in active_positions):
                     temp_symbols.append((sym, vol))
 
-            del tickers 
-            
             temp_symbols.sort(key=lambda x: x[1], reverse=True)
-            valid_symbols = [x[0] for x in temp_symbols[:150]]
+            valid_symbols = [x[0] for x in temp_symbols[:SCAN_LIMIT]]
+
+            sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+            tasks = []
+            
+            for sym in valid_symbols:
+                clean_name = sym.split(':')[0]
+                if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)): 
+                    continue
+                tasks.append(process_single_coin(sym, btc_trend, altseason, sem))
+
+            if tasks:
+                results = await asyncio.gather(*tasks)
+            else:
+                results = []
+
+            del tickers
+            gc.collect()
 
             new_hot_list = {}
-            for idx, sym in enumerate(valid_symbols):
-                clean_name = sym.split(':')[0]
-                if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)): continue
-                
-                signal = await detect_smc_setup(sym, btc_trend, altseason) 
+            for sym, signal in results:
                 if signal:
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
+                        clean_name = sym.split(':')[0]
                         await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
-                
-                await asyncio.sleep(0.2) 
-                
-                if (idx + 1) % 15 == 0:
-                    gc.collect()
-                    await asyncio.sleep(1.5) 
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
             
             final_mem = get_mem_usage()
-            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-150). На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
+            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-{SCAN_LIMIT}). На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception as e:
@@ -295,7 +315,7 @@ async def execute_trade(signal):
     except Exception as e: 
         logging.error(f"Trade error {clean_name}: {e}")
 
-# --- MULTI-EXCHANGE SNIPER CORE ---
+# --- MULTI-EXCHANGE SNIPER CORE (WSS MEMORY FIX) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
@@ -312,14 +332,18 @@ async def wss_sniper_worker(sym, setup_data):
                     while state['active']:
                         msg = await ws.recv()
                         data = json.loads(gzip.decompress(msg).decode('utf-8'))
-                        if data.get("ping"): await ws.send(json.dumps({"pong": data.get("ping")})); continue
+                        if data.get("ping"): 
+                            await ws.send(json.dumps({"pong": data.get("ping")}))
+                            del data, msg; continue
                         if "data" in data:
                             for t in data["data"]:
                                 v = float(t['p']) * float(t['q'])
                                 if t.get('m'): state['sell_vol'] += v
                                 else: state['buy_vol'] += v
                             state['current_price'] = float(data["data"][-1]['p'])
-            except: await asyncio.sleep(1)
+                        del data, msg # Принудительная очистка мусора JSON
+            except: 
+                if state['active']: await asyncio.sleep(1)
 
     async def l_bybit():
         url = "wss://stream.bybit.com/v5/public/linear"
@@ -335,7 +359,9 @@ async def wss_sniper_worker(sym, setup_data):
                                 v = float(t['p']) * float(t['v'])
                                 if t['S'] == "Sell": state['sell_vol'] += v
                                 else: state['buy_vol'] += v
-            except: await asyncio.sleep(1)
+                        del data, msg # Принудительная очистка мусора JSON
+            except: 
+                if state['active']: await asyncio.sleep(1)
 
     tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit())]
 
@@ -346,7 +372,6 @@ async def wss_sniper_worker(sym, setup_data):
                 
             total = state['buy_vol'] + state['sell_vol']
             
-            # СНИЖЕН ФИЛЬТР WSS: 1000$ за 5 сек и 70% доминации (Вместо 2500$ и 75%)
             if total > 1000:
                 buy_pct = (state['buy_vol'] / total) * 100
                 sell_pct = 100 - buy_pct
@@ -365,7 +390,6 @@ async def wss_sniper_worker(sym, setup_data):
                         setup_data['dynamic_risk'] = 1.0
                         setup_data['score_info'] = f"WSS Approved ({dom_pct:.1f}%)"
                         
-                        # НОВЫЙ ФОРМАТ ОБЪЕМА
                         vol_display = setup_data.get('vol_pct', 10)
                         side_display = 'покупок' if setup_data['direction']=='Long' else 'продаж'
                         setup_data['vol_info'] = f"Объем +{vol_display:.0f}% ({dom_pct:.0f}% {side_display})"
@@ -386,7 +410,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- АСИНХРОННЫЙ МОНИТОР v7.6 (АГРЕССИВНЫЙ ТРЕЙЛИНГ) ---
+# --- АСИНХРОННЫЙ МОНИТОР v7.7 (АГРЕССИВНЫЙ ТРЕЙЛИНГ) ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -457,7 +481,6 @@ async def monitor_positions_job():
                             new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
                             
                             risk = abs(pos['entry_price'] - pos['sl_price'])
-                            # Шаг трейлинга 0.3R, Дистанция отставания 0.5R
                             m_step = risk * 0.3
                             t_dist = risk * 0.5 
                             
@@ -484,7 +507,6 @@ async def monitor_positions_job():
                     if (is_long and high_p >= tt) or (not is_long and low_p <= tt):
                         try:
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                            # Стоп прыгает вплотную к триггеру (отстает всего на 0.5R от максимума)
                             new_sl_val = tt - td if is_long else tt + td
                             nsl = float(exchange.price_to_precision(sym, new_sl_val))
                             new_sl_order = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
@@ -503,7 +525,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.6 Active (Aggressive Trail + Smart WSS)")
+        self.wfile.write(b"Bot v7.7 Active (Async Semaphore 200 Coins + WSS Fix)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -512,7 +534,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.6: Aggressive Trail + Smart WSS...")
+    logging.info("🚀 Запуск ядра v7.7: Async Semaphore 200 Coins + WSS Fix...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
