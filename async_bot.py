@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.7 (Async Semaphore 200 Coins + WSS Memory Fix) ===
+# === НАСТРОЙКИ v7.8 (Tri-Core WSS: BingX + Bybit + Binance) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -255,7 +255,7 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Bybit+BingX Снайпер...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Tri-Core Снайпер...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -307,7 +307,7 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ (Bybit+BingX): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ (Tri-Core WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
                f"📊 {signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {signal['entry_price']}\nОбъем: {qty}\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
@@ -315,11 +315,12 @@ async def execute_trade(signal):
     except Exception as e: 
         logging.error(f"Trade error {clean_name}: {e}")
 
-# --- MULTI-EXCHANGE SNIPER CORE (WSS MEMORY FIX) ---
+# --- TRI-CORE WSS SNIPER (BINGX + BYBIT + BINANCE) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
     sym_bybit = f"{base_coin}USDT"
+    sym_binance = f"{base_coin}usdt".lower()
 
     state = {'buy_vol': 0.0, 'sell_vol': 0.0, 'current_price': setup_data['entry_price'], 'active': True}
 
@@ -341,7 +342,7 @@ async def wss_sniper_worker(sym, setup_data):
                                 if t.get('m'): state['sell_vol'] += v
                                 else: state['buy_vol'] += v
                             state['current_price'] = float(data["data"][-1]['p'])
-                        del data, msg # Принудительная очистка мусора JSON
+                        del data, msg
             except: 
                 if state['active']: await asyncio.sleep(1)
 
@@ -359,11 +360,27 @@ async def wss_sniper_worker(sym, setup_data):
                                 v = float(t['p']) * float(t['v'])
                                 if t['S'] == "Sell": state['sell_vol'] += v
                                 else: state['buy_vol'] += v
-                        del data, msg # Принудительная очистка мусора JSON
+                        del data, msg
             except: 
                 if state['active']: await asyncio.sleep(1)
 
-    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit())]
+    async def l_binance():
+        url = f"wss://fstream.binance.com/ws/{sym_binance}@trade"
+        while state['active']:
+            try:
+                async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
+                    while state['active']:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        if 'p' in data and 'q' in data:
+                            v = float(data['p']) * float(data['q'])
+                            if data.get('m'): state['sell_vol'] += v
+                            else: state['buy_vol'] += v
+                        del data, msg
+            except: 
+                if state['active']: await asyncio.sleep(1)
+
+    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit()), asyncio.create_task(l_binance())]
 
     try:
         while sym in HOT_LIST:
@@ -372,7 +389,8 @@ async def wss_sniper_worker(sym, setup_data):
                 
             total = state['buy_vol'] + state['sell_vol']
             
-            if total > 1000:
+            # УВЕЛИЧЕН ФИЛЬТР: 2500$ за 5 сек (т.к. добавили гигантские объемы Binance)
+            if total > 2500:
                 buy_pct = (state['buy_vol'] / total) * 100
                 sell_pct = 100 - buy_pct
                 
@@ -388,7 +406,7 @@ async def wss_sniper_worker(sym, setup_data):
                         dom_pct = buy_pct if setup_data['direction'] == 'Long' else sell_pct
                         
                         setup_data['dynamic_risk'] = 1.0
-                        setup_data['score_info'] = f"WSS Approved ({dom_pct:.1f}%)"
+                        setup_data['score_info'] = f"WSS Tri-Core ({dom_pct:.1f}%)"
                         
                         vol_display = setup_data.get('vol_pct', 10)
                         side_display = 'покупок' if setup_data['direction']=='Long' else 'продаж'
@@ -410,7 +428,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- АСИНХРОННЫЙ МОНИТОР v7.7 (АГРЕССИВНЫЙ ТРЕЙЛИНГ) ---
+# --- АСИНХРОННЫЙ МОНИТОР v7.8 (АГРЕССИВНЫЙ ТРЕЙЛИНГ) ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -525,7 +543,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.7 Active (Async Semaphore 200 Coins + WSS Fix)")
+        self.wfile.write(b"Bot v7.8 Active (Tri-Core WSS: BingX + Bybit + Binance)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -534,7 +552,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.7: Async Semaphore 200 Coins + WSS Fix...")
+    logging.info("🚀 Запуск ядра v7.8: Tri-Core WSS: BingX + Bybit + Binance...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
