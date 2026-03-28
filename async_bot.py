@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.8 (Tri-Core WSS: BingX + Bybit + Binance) ===
+# === НАСТРОЙКИ v7.9 (Memory Safe WSS + Smart Tri-Core) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -132,7 +132,10 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         avg_volume = np.mean(v[-22:-2])
         volume_threshold = avg_volume * 1.10  
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
-        vol_increase_pct = ((v[-1] / avg_volume) - 1) * 100 if avg_volume > 0 else 0
+        
+        # Исправление процента: Берем максимум из двух последних свечей
+        max_vol = max(v[-1], v[-2])
+        vol_increase_pct = ((max_vol / avg_volume) - 1) * 100 if avg_volume > 0 else 0
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
@@ -307,15 +310,16 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
+        # Исправление терминов в сообщении
         msg = (f"💥 **ВЫСТРЕЛ (Tri-Core WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
                f"📊 {signal.get('vol_info', 'Нет данных')}\n\n"
-               f"Цена: {signal['entry_price']}\nОбъем: {qty}\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
+               f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
     except Exception as e: 
         logging.error(f"Trade error {clean_name}: {e}")
 
-# --- TRI-CORE WSS SNIPER (BINGX + BYBIT + BINANCE) ---
+# --- TRI-CORE WSS SNIPER (MEMORY SAFE FIX) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
@@ -328,29 +332,31 @@ async def wss_sniper_worker(sym, setup_data):
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
             try:
-                async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
+                # Безопасное подключение через async with
+                async with websockets.connect(url, max_size=1048576, max_queue=16) as ws:
                     await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
                     while state['active']:
                         msg = await ws.recv()
                         data = json.loads(gzip.decompress(msg).decode('utf-8'))
-                        if data.get("ping"): 
-                            await ws.send(json.dumps({"pong": data.get("ping")}))
-                            del data, msg; continue
+                        if "ping" in data: 
+                            await ws.send(json.dumps({"pong": data["ping"]}))
+                            continue
                         if "data" in data:
                             for t in data["data"]:
                                 v = float(t['p']) * float(t['q'])
                                 if t.get('m'): state['sell_vol'] += v
                                 else: state['buy_vol'] += v
                             state['current_price'] = float(data["data"][-1]['p'])
-                        del data, msg
-            except: 
+            except asyncio.CancelledError:
+                break
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_bybit():
         url = "wss://stream.bybit.com/v5/public/linear"
         while state['active']:
             try:
-                async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
+                async with websockets.connect(url, max_size=1048576, max_queue=16) as ws:
                     await ws.send(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
                     while state['active']:
                         msg = await ws.recv()
@@ -360,15 +366,17 @@ async def wss_sniper_worker(sym, setup_data):
                                 v = float(t['p']) * float(t['v'])
                                 if t['S'] == "Sell": state['sell_vol'] += v
                                 else: state['buy_vol'] += v
-                        del data, msg
-            except: 
+            except asyncio.CancelledError:
+                break
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_binance():
-        url = f"wss://fstream.binance.com/ws/{sym_binance}@trade"
+        # ОПТИМИЗАЦИЯ: Использование aggTrade вместо trade (на 90% меньше данных)
+        url = f"wss://fstream.binance.com/ws/{sym_binance}@aggTrade"
         while state['active']:
             try:
-                async for ws in websockets.connect(url, max_size=1048576, max_queue=16):
+                async with websockets.connect(url, max_size=1048576, max_queue=16) as ws:
                     while state['active']:
                         msg = await ws.recv()
                         data = json.loads(msg)
@@ -376,20 +384,20 @@ async def wss_sniper_worker(sym, setup_data):
                             v = float(data['p']) * float(data['q'])
                             if data.get('m'): state['sell_vol'] += v
                             else: state['buy_vol'] += v
-                        del data, msg
-            except: 
+            except asyncio.CancelledError:
+                break
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit()), asyncio.create_task(l_binance())]
 
     try:
-        while sym in HOT_LIST:
+        while sym in HOT_LIST and state['active']:
             await asyncio.sleep(5)
             if len(active_positions) >= MAX_POSITIONS: continue
                 
             total = state['buy_vol'] + state['sell_vol']
             
-            # УВЕЛИЧЕН ФИЛЬТР: 2500$ за 5 сек (т.к. добавили гигантские объемы Binance)
             if total > 2500:
                 buy_pct = (state['buy_vol'] / total) * 100
                 sell_pct = 100 - buy_pct
@@ -416,9 +424,13 @@ async def wss_sniper_worker(sym, setup_data):
                         break
             state['buy_vol'], state['sell_vol'] = 0.0, 0.0
     finally:
+        # Устранение зомби-процессов и принудительная очистка
         state['active'] = False
-        for t in tasks: t.cancel()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
+        gc.collect()
 
 async def sniper_manager():
     while True:
@@ -428,7 +440,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# --- АСИНХРОННЫЙ МОНИТОР v7.8 (АГРЕССИВНЫЙ ТРЕЙЛИНГ) ---
+# --- АСИНХРОННЫЙ МОНИТОР v7.9 (АГРЕССИВНЫЙ ТРЕЙЛИНГ) ---
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
@@ -543,7 +555,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.8 Active (Tri-Core WSS: BingX + Bybit + Binance)")
+        self.wfile.write(b"Bot v7.9 Active (Memory Safe WSS + Smart Tri-Core)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -552,7 +564,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.8: Tri-Core WSS: BingX + Bybit + Binance...")
+    logging.info("🚀 Запуск ядра v7.9: Memory Safe WSS + Smart Tri-Core...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
