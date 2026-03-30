@@ -1,5 +1,4 @@
 import asyncio
-import websockets
 import json
 import gzip
 import os
@@ -13,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.10 (Memory Chunking + Tri-Core) ===
+# === НАСТРОЙКИ v7.11 (Aiohttp WSS Engine + Memory Safe) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -30,7 +29,7 @@ TRADE_TIMEOUT_PROFIT_HOURS = 24
 TRADE_TIMEOUT_ANY_HOURS = 48     
 SMC_TIMEFRAME = '1h'
 
-MAX_CONCURRENT_TASKS = 10  # Уменьшено для стабильности чанков
+MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 200           
 
 EXCLUDED_KEYWORDS = ['NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', 'JPY', 'PEPE', 'SHIB', '1000', 'FLOKI', 'DOGE', 'BONK', 'MEME', 'LUNC', 'USTC', 'WIF', 'POPCAT', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
@@ -84,14 +83,15 @@ def load_positions():
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
         if row: 
             active_positions = json.loads(row[0])
-            logging.info(f"✅ БД загружена. Сделок в памяти: {len(active_positions)}")
+            logging.info(f"✅ База данных загружена. Активных сделок в памяти: {len(active_positions)}")
         else:
-            logging.info("ℹ️ БД пуста. Сделок нет.")
+            logging.info("ℹ️ База данных пуста. Активных сделок нет.")
+            
         c.execute("SELECT pnl, trades, wins FROM daily_stats WHERE id = 1"); stat_row = c.fetchone()
         if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'] = stat_row
         conn.close()
     except Exception as e: 
-        logging.error(f"Ошибка БД: {e}")
+        logging.error(f"Ошибка загрузки БД: {e}")
 
 async def send_tg_msg(text):
     if not TOKEN: return
@@ -120,7 +120,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
         if not ohlcv or len(ohlcv) < 200: return None
         
-        # ОПТИМИЗАЦИЯ ПАМЯТИ: Создаем массивы напрямую, без лишних списков
         o = np.array([x[1] for x in ohlcv], dtype=float)
         h = np.array([x[2] for x in ohlcv], dtype=float)
         l = np.array([x[3] for x in ohlcv], dtype=float)
@@ -237,7 +236,7 @@ async def radar_task():
 
             sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
             results = []
-            chunk_size = 10  # ОПТИМИЗАЦИЯ ПАМЯТИ: Чанкинг (делим 200 монет по 10 штук)
+            chunk_size = 10  
 
             for i in range(0, len(valid_symbols), chunk_size):
                 chunk = valid_symbols[i:i+chunk_size]
@@ -252,7 +251,6 @@ async def radar_task():
                     chunk_results = await asyncio.gather(*tasks)
                     results.extend(chunk_results)
                 
-                # Принудительная очистка памяти после каждого чанка
                 gc.collect()
                 await asyncio.sleep(0.1)
 
@@ -322,6 +320,7 @@ async def execute_trade(signal):
     except Exception as e: 
         logging.error(f"Trade error {clean_name}: {e}")
 
+# --- НОВЫЙ AIOHTTP WSS СНАЙПЕР (Идеален для памяти) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
@@ -334,20 +333,28 @@ async def wss_sniper_worker(sym, setup_data):
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
             try:
-                async with websockets.connect(url, max_size=1048576, max_queue=16) as ws:
-                    await ws.send(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
-                    while state['active']:
-                        msg = await ws.recv()
-                        data = json.loads(gzip.decompress(msg).decode('utf-8'))
-                        if "ping" in data: 
-                            await ws.send(json.dumps({"pong": data["ping"]}))
-                            continue
-                        if "data" in data:
-                            for t in data["data"]:
-                                v = float(t['p']) * float(t['q'])
-                                if t.get('m'): state['sell_vol'] += v
-                                else: state['buy_vol'] += v
-                            state['current_price'] = float(data["data"][-1]['p'])
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url) as ws:
+                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
+                        async for msg in ws:
+                            if not state['active']: break
+                            try:
+                                if msg.type == aiohttp.WSMsgType.BINARY:
+                                    data = json.loads(gzip.decompress(msg.data).decode('utf-8'))
+                                elif msg.type == aiohttp.WSMsgType.TEXT:
+                                    data = json.loads(msg.data)
+                                else: continue
+
+                                if "ping" in data: 
+                                    await ws.send_str(json.dumps({"pong": data["ping"]}))
+                                    continue
+                                if "data" in data:
+                                    for t in data["data"]:
+                                        v = float(t['p']) * float(t['q'])
+                                        if t.get('m'): state['sell_vol'] += v
+                                        else: state['buy_vol'] += v
+                                    state['current_price'] = float(data["data"][-1]['p'])
+                            except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
@@ -356,16 +363,20 @@ async def wss_sniper_worker(sym, setup_data):
         url = "wss://stream.bybit.com/v5/public/linear"
         while state['active']:
             try:
-                async with websockets.connect(url, max_size=1048576, max_queue=16) as ws:
-                    await ws.send(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
-                    while state['active']:
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-                        if "data" in data and isinstance(data["data"], list):
-                            for t in data["data"]:
-                                v = float(t['p']) * float(t['v'])
-                                if t['S'] == "Sell": state['sell_vol'] += v
-                                else: state['buy_vol'] += v
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url) as ws:
+                        await ws.send_str(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
+                        async for msg in ws:
+                            if not state['active']: break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    if "data" in data and isinstance(data["data"], list):
+                                        for t in data["data"]:
+                                            v = float(t['p']) * float(t['v'])
+                                            if t['S'] == "Sell": state['sell_vol'] += v
+                                            else: state['buy_vol'] += v
+                                except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
@@ -374,14 +385,18 @@ async def wss_sniper_worker(sym, setup_data):
         url = f"wss://fstream.binance.com/ws/{sym_binance}@aggTrade"
         while state['active']:
             try:
-                async with websockets.connect(url, max_size=1048576, max_queue=16) as ws:
-                    while state['active']:
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-                        if 'p' in data and 'q' in data:
-                            v = float(data['p']) * float(data['q'])
-                            if data.get('m'): state['sell_vol'] += v
-                            else: state['buy_vol'] += v
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url) as ws:
+                        async for msg in ws:
+                            if not state['active']: break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    if 'p' in data and 'q' in data:
+                                        v = float(data['p']) * float(data['q'])
+                                        if data.get('m'): state['sell_vol'] += v
+                                        else: state['buy_vol'] += v
+                                except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
@@ -545,7 +560,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.10 Active (Memory Chunking + Tri-Core)")
+        self.wfile.write(b"Bot v7.11 Active (Aiohttp WSS Engine)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -554,7 +569,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.10: Memory Chunking + Tri-Core...")
+    logging.info("🚀 Запуск ядра v7.11: Aiohttp WSS Engine...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
