@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.11 (Aiohttp WSS Engine + Memory Safe) ===
+# === НАСТРОЙКИ v7.12 (Shadow Log + Core/Confirmation Logic) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -83,7 +83,7 @@ def load_positions():
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
         if row: 
             active_positions = json.loads(row[0])
-            logging.info(f"✅ База данных загружена. Активных сделок в памяти: {len(active_positions)}")
+            logging.info(f"✅ База данных загружена. Активных сделок: {len(active_positions)}")
         else:
             logging.info("ℹ️ База данных пуста. Активных сделок нет.")
             
@@ -91,7 +91,7 @@ def load_positions():
         if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'] = stat_row
         conn.close()
     except Exception as e: 
-        logging.error(f"Ошибка загрузки БД: {e}")
+        logging.error(f"Ошибка БД: {e}")
 
 async def send_tg_msg(text):
     if not TOKEN: return
@@ -171,9 +171,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         
         del o, h, l, c, v, ohlcv
         return result
-    except Exception as e: 
-        logging.error(f"SMC Error {sym}: {e}")
-        return None
+    except Exception as e: return None
 
 async def process_single_coin(sym, btc_trend, altseason, sem):
     async with sem: 
@@ -181,8 +179,7 @@ async def process_single_coin(sym, btc_trend, altseason, sem):
             signal = await detect_smc_setup(sym, btc_trend, altseason)
             await asyncio.sleep(0.05) 
             return sym, signal
-        except Exception:
-            return sym, None
+        except Exception: return sym, None
 
 async def radar_task():
     global HOT_LIST, NOTIFIED_SYMBOLS
@@ -204,7 +201,6 @@ async def radar_task():
                 eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
                 altseason = True if (eth_c[-1] / btc_c[-1]) > calculate_ema((eth_c / btc_c), 200) else False
-                
                 del btc_ohlcv, btc_c, eth_ohlcv, eth_c
             except: pass
 
@@ -261,7 +257,7 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Tri-Core Снайпер...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Анализ Ядра (BingX) + Бонус (Binance/Bybit)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -270,8 +266,7 @@ async def radar_task():
             logging.info(f"🔎 [РАДАР] Скан завершен (Топ-{SCAN_LIMIT}). На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
             gc.collect() 
             await asyncio.sleep(300) 
-        except Exception as e:
-            logging.error(f"Radar error: {e}"); await asyncio.sleep(60)
+        except Exception as e: await asyncio.sleep(60)
 
 async def execute_trade(signal):
     sym = signal['symbol']
@@ -312,22 +307,27 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ (Tri-Core WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ (Async WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"Рейтинг: {signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n"
-               f"📊 {signal.get('vol_info', 'Нет данных')}\n\n"
+               f"{signal.get('vol_info', '')}\n\n"
                f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
-    except Exception as e: 
-        logging.error(f"Trade error {clean_name}: {e}")
+    except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- НОВЫЙ AIOHTTP WSS СНАЙПЕР (Идеален для памяти) ---
+# --- НОВЫЙ AIOHTTP WSS СНАЙПЕР (BingX Core + Tri-Core Bonus + Shadow Log) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
     sym_bybit = f"{base_coin}USDT"
     sym_binance = f"{base_coin}usdt".lower()
 
-    state = {'buy_vol': 0.0, 'sell_vol': 0.0, 'current_price': setup_data['entry_price'], 'active': True}
+    state = {
+        'bingx_buy': 0.0, 'bingx_sell': 0.0,
+        'other_buy': 0.0, 'other_sell': 0.0,
+        'max_bingx_seen': 0.0, 'max_other_seen': 0.0,
+        'current_price': setup_data['entry_price'], 
+        'active': True
+    }
 
     async def l_bingx():
         url = "wss://open-api-swap.bingx.com/swap-market"
@@ -341,8 +341,6 @@ async def wss_sniper_worker(sym, setup_data):
                             try:
                                 if msg.type == aiohttp.WSMsgType.BINARY:
                                     data = json.loads(gzip.decompress(msg.data).decode('utf-8'))
-                                elif msg.type == aiohttp.WSMsgType.TEXT:
-                                    data = json.loads(msg.data)
                                 else: continue
 
                                 if "ping" in data: 
@@ -351,8 +349,8 @@ async def wss_sniper_worker(sym, setup_data):
                                 if "data" in data:
                                     for t in data["data"]:
                                         v = float(t['p']) * float(t['q'])
-                                        if t.get('m'): state['sell_vol'] += v
-                                        else: state['buy_vol'] += v
+                                        if t.get('m'): state['bingx_sell'] += v
+                                        else: state['bingx_buy'] += v
                                     state['current_price'] = float(data["data"][-1]['p'])
                             except Exception: pass
             except asyncio.CancelledError: break
@@ -374,8 +372,8 @@ async def wss_sniper_worker(sym, setup_data):
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
                                             v = float(t['p']) * float(t['v'])
-                                            if t['S'] == "Sell": state['sell_vol'] += v
-                                            else: state['buy_vol'] += v
+                                            if t['S'] == "Sell": state['other_sell'] += v
+                                            else: state['other_buy'] += v
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -394,8 +392,8 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if 'p' in data and 'q' in data:
                                         v = float(data['p']) * float(data['q'])
-                                        if data.get('m'): state['sell_vol'] += v
-                                        else: state['buy_vol'] += v
+                                        if data.get('m'): state['other_sell'] += v
+                                        else: state['other_buy'] += v
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -408,38 +406,67 @@ async def wss_sniper_worker(sym, setup_data):
             await asyncio.sleep(5)
             if len(active_positions) >= MAX_POSITIONS: continue
                 
-            total = state['buy_vol'] + state['sell_vol']
+            bx_total = state['bingx_buy'] + state['bingx_sell']
+            oth_total = state['other_buy'] + state['other_sell']
             
-            if total > 2500:
-                buy_pct = (state['buy_vol'] / total) * 100
-                sell_pct = 100 - buy_pct
+            # Обновление Теневого Лога
+            if bx_total > state['max_bingx_seen']: state['max_bingx_seen'] = bx_total
+            if oth_total > state['max_other_seen']: state['max_other_seen'] = oth_total
+            
+            # ЯДРО: Проверяем только BingX (Порог 1500$)
+            if bx_total > 1500:
+                bx_buy_pct = (state['bingx_buy'] / bx_total) * 100
+                bx_sell_pct = 100 - bx_buy_pct
                 
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
                 in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
                 
                 if in_zone:
-                    is_long = (setup_data['direction'] == 'Long' and buy_pct >= 70)
-                    is_short = (setup_data['direction'] == 'Short' and sell_pct >= 70)
+                    is_long = (setup_data['direction'] == 'Long' and bx_buy_pct >= 70)
+                    is_short = (setup_data['direction'] == 'Short' and bx_sell_pct >= 70)
                     
                     if is_long or is_short:
                         if sym in HOT_LIST: del HOT_LIST[sym]
-                        dom_pct = buy_pct if setup_data['direction'] == 'Long' else sell_pct
                         
-                        setup_data['dynamic_risk'] = 1.0
-                        setup_data['score_info'] = f"WSS Tri-Core ({dom_pct:.1f}%)"
+                        dom_pct = bx_buy_pct if is_long else bx_sell_pct
+                        side_display = 'покупок' if is_long else 'продаж'
                         
-                        vol_display = setup_data.get('vol_pct', 10)
-                        side_display = 'покупок' if setup_data['direction']=='Long' else 'продаж'
-                        setup_data['vol_info'] = f"Объем +{vol_display:.0f}% ({dom_pct:.0f}% {side_display})"
+                        # БОНУС: Проверяем подтверждение от Binance/Bybit
+                        is_confirmed = False
+                        oth_dom_pct = 0
+                        if oth_total > 1500:
+                            oth_buy_pct = (state['other_buy'] / oth_total) * 100 if oth_total > 0 else 0
+                            oth_sell_pct = 100 - oth_buy_pct
+                            if is_long and oth_buy_pct >= 70:
+                                is_confirmed = True
+                                oth_dom_pct = oth_buy_pct
+                            elif is_short and oth_sell_pct >= 70:
+                                is_confirmed = True
+                                oth_dom_pct = oth_sell_pct
+
+                        if is_confirmed:
+                            setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Подтверждено)"
+                            setup_data['dynamic_risk'] = 1.5
+                            setup_data['vol_info'] = f"BingX: {bx_total:.0f}$ ({dom_pct:.0f}% {side_display})\n📊 Binance/Bybit: {oth_total:.0f}$ ({oth_dom_pct:.0f}% {side_display})"
+                        else:
+                            setup_data['score_info'] = f"⚡ Базовый Сигнал"
+                            setup_data['dynamic_risk'] = 1.0
+                            setup_data['vol_info'] = f"BingX: {bx_total:.0f}$ ({dom_pct:.0f}% {side_display})\n📊 Binance/Bybit: Тишина / Нет пары"
                         
                         await execute_trade(setup_data)
                         break
-            state['buy_vol'], state['sell_vol'] = 0.0, 0.0
+                        
+            # Сброс счетчиков на следующие 5 секунд
+            state['bingx_buy'], state['bingx_sell'] = 0.0, 0.0
+            state['other_buy'], state['other_sell'] = 0.0, 0.0
+            
     finally:
         state['active'] = False
         for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
+        # Вывод Теневого Лога при отключении Снайпера
+        logging.info(f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят с мушки. Макс. 5-сек всплеск -> BingX: ${state['max_bingx_seen']:.0f} | Binance/Bybit: ${state['max_other_seen']:.0f}")
         gc.collect()
 
 async def sniper_manager():
@@ -560,7 +587,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.11 Active (Aiohttp WSS Engine)")
+        self.wfile.write(b"Bot v7.12 Active (Shadow Log & Core Logic)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -569,7 +596,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.11: Aiohttp WSS Engine...")
+    logging.info("🚀 Запуск ядра v7.12: Shadow Log & Core Logic...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
