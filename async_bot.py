@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.13 (Independent Tri-Core & 2.0x TOP Signal) ===
+# === НАСТРОЙКИ v7.14 (Quad-Core, 300 Coins & Tiered Thresholds) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -30,7 +30,7 @@ TRADE_TIMEOUT_ANY_HOURS = 48
 SMC_TIMEFRAME = '1h'
 
 MAX_CONCURRENT_TASKS = 10  
-SCAN_LIMIT = 200           
+SCAN_LIMIT = 300  # РАСШИРЕНО ДО ТОП-300         
 
 EXCLUDED_KEYWORDS = ['NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', 'JPY', 'PEPE', 'SHIB', '1000', 'FLOKI', 'DOGE', 'BONK', 'MEME', 'LUNC', 'USTC', 'WIF', 'POPCAT', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
@@ -257,7 +257,7 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю Независимый Tri-Core Снайпер...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю QUAD-CORE Снайпер (BingX, Bybit, Binance, MEXC)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -307,24 +307,26 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ (Async WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ (QUAD-CORE WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"{signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
-               f"📊 **Подтверждение объемов:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
+               f"📊 **Анализ ликвидности:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- ИНДИВИДУАЛЬНЫЙ TRI-CORE СНАЙПЕР (v7.13) ---
+# --- QUAD-CORE WSS SNIPER (BingX + Bybit + Binance + MEXC) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     sym_bingx = sym.replace('/', '-')
     sym_bybit = f"{base_coin}USDT"
     sym_binance = f"{base_coin}usdt".lower()
+    sym_mexc = f"{base_coin}USDT"
 
     state = {
         'bx_b': 0.0, 'bx_s': 0.0, 'max_bx': 0.0,
         'by_b': 0.0, 'by_s': 0.0, 'max_by': 0.0,
         'bn_b': 0.0, 'bn_s': 0.0, 'max_bn': 0.0,
+        'mc_b': 0.0, 'mc_s': 0.0, 'max_mc': 0.0,
         'current_price': setup_data['entry_price'], 
         'active': True
     }
@@ -399,7 +401,30 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit()), asyncio.create_task(l_binance())]
+    async def l_mexc():
+        # MEXC Spot (Идеально для мемкоинов до их выхода на фьючи)
+        url = "wss://wbs.mexc.com/ws"
+        while state['active']:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url) as ws:
+                        await ws.send_str(json.dumps({"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_mexc}"]}))
+                        async for msg in ws:
+                            if not state['active']: break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    if "d" in data and "deals" in data["d"]:
+                                        for t in data["d"]["deals"]:
+                                            v = float(t['p']) * float(t['v'])
+                                            if t['S'] == 2: state['mc_s'] += v  # 2 = Sell
+                                            else: state['mc_b'] += v            # 1 = Buy
+                                except Exception: pass
+            except asyncio.CancelledError: break
+            except Exception: 
+                if state['active']: await asyncio.sleep(1)
+
+    tasks = [asyncio.create_task(l_bingx()), asyncio.create_task(l_bybit()), asyncio.create_task(l_binance()), asyncio.create_task(l_mexc())]
 
     try:
         while sym in HOT_LIST and state['active']:
@@ -409,28 +434,36 @@ async def wss_sniper_worker(sym, setup_data):
             bx_tot = state['bx_b'] + state['bx_s']
             by_tot = state['by_b'] + state['by_s']
             bn_tot = state['bn_b'] + state['bn_s']
+            mc_tot = state['mc_b'] + state['mc_s']
             
             # Теневой лог (обновляем рекорды)
             if bx_tot > state['max_bx']: state['max_bx'] = bx_tot
             if by_tot > state['max_by']: state['max_by'] = by_tot
             if bn_tot > state['max_bn']: state['max_bn'] = bn_tot
+            if mc_tot > state['max_mc']: state['max_mc'] = mc_tot
             
-            # Собираем список бирж, которые прошли фильтр (1500$ + 70% доминация)
             valid_exchanges = []
             
+            # Tier 1: BingX & MEXC (Низкая ликвидность -> порог 1500$)
             if bx_tot > 1500:
                 pct = (state['bx_b'] / bx_tot) * 100 if setup_data['direction'] == 'Long' else (state['bx_s'] / bx_tot) * 100
                 if pct >= 70: valid_exchanges.append(('BingX', bx_tot, pct))
                 
-            if by_tot > 1500:
+            if mc_tot > 1500:
+                pct = (state['mc_b'] / mc_tot) * 100 if setup_data['direction'] == 'Long' else (state['mc_s'] / mc_tot) * 100
+                if pct >= 70: valid_exchanges.append(('MEXC', mc_tot, pct))
+                
+            # Tier 2: Bybit (Средняя/Высокая ликвидность -> порог 3000$)
+            if by_tot > 3000:
                 pct = (state['by_b'] / by_tot) * 100 if setup_data['direction'] == 'Long' else (state['by_s'] / by_tot) * 100
                 if pct >= 70: valid_exchanges.append(('Bybit', by_tot, pct))
                 
-            if bn_tot > 1500:
+            # Tier 3: Binance (Абсолютная ликвидность -> порог 5000$)
+            if bn_tot > 5000:
                 pct = (state['bn_b'] / bn_tot) * 100 if setup_data['direction'] == 'Long' else (state['bn_s'] / bn_tot) * 100
                 if pct >= 70: valid_exchanges.append(('Binance', bn_tot, pct))
 
-            # Если ХОТЯ БЫ ОДНА биржа дала добро
+            # Если ХОТЯ БЫ ОДНА биржа дала добро (любая из 4)
             if len(valid_exchanges) > 0:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
                 in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
@@ -457,14 +490,15 @@ async def wss_sniper_worker(sym, setup_data):
             state['bx_b'], state['bx_s'] = 0.0, 0.0
             state['by_b'], state['by_s'] = 0.0, 0.0
             state['bn_b'], state['bn_s'] = 0.0, 0.0
+            state['mc_b'], state['mc_s'] = 0.0, 0.0
             
     finally:
         state['active'] = False
         for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
-        # Независимый теневой лог
-        logging.info(f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят с мушки. Макс. 5-сек всплеск -> BingX: ${state['max_bx']:.0f} | Bybit: ${state['max_by']:.0f} | Binance: ${state['max_bn']:.0f}")
+        # Quad-Core Теневой Лог
+        logging.info(f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят с мушки. Макс. 5-сек всплеск -> BingX: ${state['max_bx']:.0f} | MEXC: ${state['max_mc']:.0f} | Bybit: ${state['max_by']:.0f} | Binance: ${state['max_bn']:.0f}")
         gc.collect()
 
 async def sniper_manager():
@@ -585,7 +619,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.13 Active (Independent Tri-Core & 2.0x Risk)")
+        self.wfile.write(b"Bot v7.14 Active (Quad-Core, 300 Coins & Tiered WSS)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -594,7 +628,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.13: Independent Tri-Core & 2.0x Risk...")
+    logging.info("🚀 Запуск ядра v7.14: Quad-Core, 300 Coins & Tiered WSS...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
