@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.18 (ULTIMATE 10-CORE, Fixed WSS URLs & Logs) ===
+# === НАСТРОЙКИ v7.19 (10-CORE, WSS Fixes, Error Debugging) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -32,7 +32,8 @@ SMC_TIMEFRAME = '15m'
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
 
-EXCLUDED_KEYWORDS = ['NCS', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
+# ОБНОВЛЕНО: Добавлен NCFX (Forex)
+EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
 GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
@@ -314,11 +315,14 @@ async def execute_trade(signal):
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- 10-CORE WSS SNIPER (All Spot & Futures Channels) ---
+# --- 10-CORE WSS SNIPER (All Spot & Futures Channels with Error Tracing) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     
-    sym_bingx = sym.replace('/', '-')
+    # ИСПРАВЛЕНИЕ: Прямое формирование тикеров BingX (убираем мусор от CCXT)
+    sym_bingx_s = f"{base_coin}-USDT"
+    sym_bingx_f = f"{base_coin}-USDT"
+    
     sym_mexc = f"{base_coin}USDT"
     sym_bybit = f"{base_coin}USDT"
     sym_bybit_1000 = f"1000{base_coin}USDT"
@@ -338,14 +342,14 @@ async def wss_sniper_worker(sym, setup_data):
         'active': True
     }
 
-    # BINGX SPOT (Updated URL and JSON parsing)
+    # BINGX SPOT
     async def l_bingx_s():
         url = "wss://open-api-ws.bingx.com/market"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
+                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_s}@trade"}))
                         async for msg in ws:
                             if not state['active']: break
                             try:
@@ -358,13 +362,17 @@ async def wss_sniper_worker(sym, setup_data):
                                         d = data["data"]
                                         trades = d if isinstance(d, list) else [d]
                                         for t in trades:
-                                            if 'p' in t and 'q' in t:
-                                                v = float(t['p']) * float(t['q'])
+                                            # Защита от разных форматов (q или v)
+                                            q_val = t.get('q', t.get('v', 0))
+                                            if 'p' in t and q_val:
+                                                v = float(t['p']) * float(q_val)
                                                 if t.get('m'): state['bx_s_s'] += v
                                                 else: state['bx_s_b'] += v
-                            except Exception: pass
+                            except Exception as e:
+                                if not state.get('err_bx_s'): logging.error(f"⚠️ [PARSE ERR] BingX(S) {base_coin}: {e}"); state['err_bx_s'] = True
             except asyncio.CancelledError: break
-            except Exception: 
+            except Exception as e: 
+                if not state.get('err_bx_s') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(S) {base_coin}: {e}"); state['err_bx_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
     # BINGX FUTURES
@@ -374,7 +382,7 @@ async def wss_sniper_worker(sym, setup_data):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx}@trade"}))
+                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_f}@trade"}))
                         async for msg in ws:
                             if not state['active']: break
                             try:
@@ -387,19 +395,22 @@ async def wss_sniper_worker(sym, setup_data):
                                         d = data["data"]
                                         trades = d if isinstance(d, list) else [d]
                                         for t in trades:
-                                            if 'p' in t and 'q' in t:
-                                                v = float(t['p']) * float(t['q'])
+                                            q_val = t.get('q', t.get('v', 0))
+                                            if 'p' in t and q_val:
+                                                v = float(t['p']) * float(q_val)
                                                 if t.get('m'): state['bx_f_s'] += v
                                                 else: state['bx_f_b'] += v
-                                        state['current_price'] = float(data["data"][-1].get('p', state['current_price'])) if isinstance(data["data"], list) else float(data["data"].get('p', state['current_price']))
-                            except Exception: pass
+                                        state['current_price'] = float(trades[-1].get('p', state['current_price']))
+                            except Exception as e:
+                                if not state.get('err_bx_f'): logging.error(f"⚠️ [PARSE ERR] BingX(F) {base_coin}: {e}"); state['err_bx_f'] = True
             except asyncio.CancelledError: break
-            except Exception: 
+            except Exception as e: 
+                if not state.get('err_bx_f') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(F) {base_coin}: {e}"); state['err_bx_f'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC SPOT (Updated URL)
+    # MEXC SPOT
     async def l_mexc_s():
-        url = "wss://wbs-api.mexc.com/ws"
+        url = "wss://wbs.mexc.com/ws"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -414,14 +425,17 @@ async def wss_sniper_worker(sym, setup_data):
                                         for t in data["d"]["deals"]:
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
-                                                if t.get('S') == 2: state['mc_s_s'] += v 
+                                                # Исправлено: приведение к строке для защиты от типа данных
+                                                if str(t.get('S')) == '2': state['mc_s_s'] += v 
                                                 else: state['mc_s_b'] += v            
-                                except Exception: pass
+                                except Exception as e:
+                                    if not state.get('err_mc_s'): logging.error(f"⚠️ [PARSE ERR] MEXC(S) {base_coin}: {e}"); state['err_mc_s'] = True
             except asyncio.CancelledError: break
-            except Exception: 
+            except Exception as e: 
+                if not state.get('err_mc_s') and state['active']: logging.error(f"⚠️ [CONN ERR] MEXC(S) {base_coin}: {e}"); state['err_mc_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC FUTURES (Updated URL and Endpoint Logic)
+    # MEXC FUTURES
     async def l_mexc_f():
         url = "wss://contract.mexc.com/edge"
         while state['active']:
@@ -438,12 +452,14 @@ async def wss_sniper_worker(sym, setup_data):
                                         d = data["data"]
                                         if 'p' in d and 'v' in d:
                                             p = float(d["p"])
-                                            v = float(d["v"]) * p  # Аппроксимация в USDT
-                                            if d.get("T") == 2: state['mc_f_s'] += v 
+                                            v = float(d["v"]) * p
+                                            if str(d.get("T")) == '2': state['mc_f_s'] += v 
                                             else: state['mc_f_b'] += v            
-                                except Exception: pass
+                                except Exception as e:
+                                    if not state.get('err_mc_f'): logging.error(f"⚠️ [PARSE ERR] MEXC(F) {base_coin}: {e}"); state['err_mc_f'] = True
             except asyncio.CancelledError: break
-            except Exception: 
+            except Exception as e: 
+                if not state.get('err_mc_f') and state['active']: logging.error(f"⚠️ [CONN ERR] MEXC(F) {base_coin}: {e}"); state['err_mc_f'] = True
                 if state['active']: await asyncio.sleep(1)
 
     # BYBIT SPOT
@@ -534,9 +550,11 @@ async def wss_sniper_worker(sym, setup_data):
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_s_s'] += v
                                         else: state['bn_s_b'] += v
-                                except Exception: pass
+                                except Exception as e:
+                                    if not state.get('err_bn_s'): logging.error(f"⚠️ [PARSE ERR] Binance(S) {base_coin}: {e}"); state['err_bn_s'] = True
             except asyncio.CancelledError: break
-            except Exception: 
+            except Exception as e: 
+                if not state.get('err_bn_s') and state['active']: logging.error(f"⚠️ [CONN ERR] Binance(S) {base_coin}: {e}"); state['err_bn_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
     # BINANCE FUTURES
@@ -689,7 +707,7 @@ async def wss_sniper_worker(sym, setup_data):
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         
-        # Исправленный 10-потоковый теневой лог (теперь выводится ВСЁ)
+        # Исправленный 10-потоковый теневой лог
         log_str = (f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят. Макс. 5-сек -> "
                    f"BingX(S): ${state['max_bx_s']:.0f} | BingX(F): ${state['max_bx_f']:.0f} | "
                    f"MEXC(S): ${state['max_mc_s']:.0f} | MEXC(F): ${state['max_mc_f']:.0f} | "
@@ -816,7 +834,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.18 Active (10-CORE ULTIMATE WSS)")
+        self.wfile.write(b"Bot v7.19 Active (WSS Fixes & Error Debugger)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -825,7 +843,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.18: 10-CORE ULTIMATE WSS (Fixed APIs & Logs)...")
+    logging.info("🚀 Запуск ядра v7.19: WSS Fixes & Error Debugger...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
