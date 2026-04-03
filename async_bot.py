@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.19 (10-CORE, WSS Fixes, Error Debugging) ===
+# === НАСТРОЙКИ v7.20 (10-CORE, Anti-451, Safe Parsing) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -32,7 +32,6 @@ SMC_TIMEFRAME = '15m'
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
 
-# ОБНОВЛЕНО: Добавлен NCFX (Forex)
 EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
 GLOBAL_STOP_UNTIL = None
@@ -315,11 +314,10 @@ async def execute_trade(signal):
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- 10-CORE WSS SNIPER (All Spot & Futures Channels with Error Tracing) ---
+# --- 10-CORE WSS SNIPER (Anti-451 and Safe Parsing) ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     
-    # ИСПРАВЛЕНИЕ: Прямое формирование тикеров BingX (убираем мусор от CCXT)
     sym_bingx_s = f"{base_coin}-USDT"
     sym_bingx_f = f"{base_coin}-USDT"
     
@@ -342,7 +340,7 @@ async def wss_sniper_worker(sym, setup_data):
         'active': True
     }
 
-    # BINGX SPOT
+    # BINGX SPOT (Safe Parse)
     async def l_bingx_s():
         url = "wss://open-api-ws.bingx.com/market"
         while state['active']:
@@ -360,9 +358,10 @@ async def wss_sniper_worker(sym, setup_data):
                                         continue
                                     if "data" in data:
                                         d = data["data"]
+                                        if not d: continue  # Защита от null (None)
                                         trades = d if isinstance(d, list) else [d]
                                         for t in trades:
-                                            # Защита от разных форматов (q или v)
+                                            if not isinstance(t, dict): continue
                                             q_val = t.get('q', t.get('v', 0))
                                             if 'p' in t and q_val:
                                                 v = float(t['p']) * float(q_val)
@@ -375,7 +374,7 @@ async def wss_sniper_worker(sym, setup_data):
                 if not state.get('err_bx_s') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(S) {base_coin}: {e}"); state['err_bx_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # BINGX FUTURES
+    # BINGX FUTURES (Safe Parse)
     async def l_bingx_f():
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
@@ -393,14 +392,17 @@ async def wss_sniper_worker(sym, setup_data):
                                         continue
                                     if "data" in data:
                                         d = data["data"]
+                                        if not d: continue  # Защита от null (None)
                                         trades = d if isinstance(d, list) else [d]
                                         for t in trades:
+                                            if not isinstance(t, dict): continue
                                             q_val = t.get('q', t.get('v', 0))
                                             if 'p' in t and q_val:
                                                 v = float(t['p']) * float(q_val)
                                                 if t.get('m'): state['bx_f_s'] += v
                                                 else: state['bx_f_b'] += v
-                                        state['current_price'] = float(trades[-1].get('p', state['current_price']))
+                                        if trades and isinstance(trades[-1], dict) and 'p' in trades[-1]:
+                                            state['current_price'] = float(trades[-1]['p'])
                             except Exception as e:
                                 if not state.get('err_bx_f'): logging.error(f"⚠️ [PARSE ERR] BingX(F) {base_coin}: {e}"); state['err_bx_f'] = True
             except asyncio.CancelledError: break
@@ -410,7 +412,7 @@ async def wss_sniper_worker(sym, setup_data):
 
     # MEXC SPOT
     async def l_mexc_s():
-        url = "wss://wbs.mexc.com/ws"
+        url = "wss://wbs-api.mexc.com/ws"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -421,11 +423,11 @@ async def wss_sniper_worker(sym, setup_data):
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    if "d" in data and "deals" in data["d"]:
+                                    if "d" in data and data["d"] and "deals" in data["d"]:
                                         for t in data["d"]["deals"]:
+                                            if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
-                                                # Исправлено: приведение к строке для защиты от типа данных
                                                 if str(t.get('S')) == '2': state['mc_s_s'] += v 
                                                 else: state['mc_s_b'] += v            
                                 except Exception as e:
@@ -450,7 +452,7 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if data.get("channel") == "push.deal" and "data" in data:
                                         d = data["data"]
-                                        if 'p' in d and 'v' in d:
+                                        if isinstance(d, dict) and 'p' in d and 'v' in d:
                                             p = float(d["p"])
                                             v = float(d["v"]) * p
                                             if str(d.get("T")) == '2': state['mc_f_s'] += v 
@@ -477,6 +479,7 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
+                                            if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
                                                 if t.get('S') == "Sell": state['bb_s_s'] += v
@@ -501,6 +504,7 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
+                                            if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
                                                 if t.get('S') == "Sell": state['bb_f_s'] += v
@@ -525,6 +529,7 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
+                                            if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
                                                 if t.get('S') == "Sell": state['bb_f_s'] += v
@@ -534,9 +539,9 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # BINANCE SPOT
+    # BINANCE SPOT (Anti-451 URL Fix: data-stream.binance.vision)
     async def l_binance_s():
-        url = f"wss://stream.binance.com:9443/ws/{sym_binance}@aggTrade"
+        url = f"wss://data-stream.binance.vision/ws/{sym_binance}@aggTrade"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -546,7 +551,7 @@ async def wss_sniper_worker(sym, setup_data):
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    if 'p' in data and 'q' in data:
+                                    if isinstance(data, dict) and 'p' in data and 'q' in data:
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_s_s'] += v
                                         else: state['bn_s_b'] += v
@@ -569,7 +574,7 @@ async def wss_sniper_worker(sym, setup_data):
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    if 'p' in data and 'q' in data:
+                                    if isinstance(data, dict) and 'p' in data and 'q' in data:
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_f_s'] += v
                                         else: state['bn_f_b'] += v
@@ -590,7 +595,7 @@ async def wss_sniper_worker(sym, setup_data):
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    if 'p' in data and 'q' in data:
+                                    if isinstance(data, dict) and 'p' in data and 'q' in data:
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_f_s'] += v
                                         else: state['bn_f_b'] += v
@@ -639,7 +644,7 @@ async def wss_sniper_worker(sym, setup_data):
             
             valid_exchanges = []
             
-            # Tier 1 (1500$) Смягчено до 65%
+            # Tier 1 (1500$)
             if bx_s_tot > 1500:
                 pct = (state['bx_s_b'] / bx_s_tot) * 100 if is_long else (state['bx_s_s'] / bx_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
@@ -707,7 +712,6 @@ async def wss_sniper_worker(sym, setup_data):
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         
-        # Исправленный 10-потоковый теневой лог
         log_str = (f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят. Макс. 5-сек -> "
                    f"BingX(S): ${state['max_bx_s']:.0f} | BingX(F): ${state['max_bx_f']:.0f} | "
                    f"MEXC(S): ${state['max_mc_s']:.0f} | MEXC(F): ${state['max_mc_f']:.0f} | "
@@ -834,7 +838,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.19 Active (WSS Fixes & Error Debugger)")
+        self.wfile.write(b"Bot v7.20 Active (Anti-451 & Safe Parser)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -843,7 +847,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.19: WSS Fixes & Error Debugger...")
+    logging.info("🚀 Запуск ядра v7.20: Anti-451 & Safe Parser...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
