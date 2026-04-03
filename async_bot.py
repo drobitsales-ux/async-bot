@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.20 (10-CORE, Anti-451, Safe Parsing) ===
+# === НАСТРОЙКИ v7.21 (10-CORE, Institutional Scalping Edition) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -25,8 +25,9 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 
-TRADE_TIMEOUT_PROFIT_HOURS = 12  
-TRADE_TIMEOUT_ANY_HOURS = 24     
+# --- СКАЛЬПИНГ ТАЙМАУТЫ (Для 1H вернуть 12 и 24) ---
+TRADE_TIMEOUT_PROFIT_HOURS = 2  
+TRADE_TIMEOUT_ANY_HOURS = 4     
 SMC_TIMEFRAME = '15m'
 
 MAX_CONCURRENT_TASKS = 10  
@@ -144,6 +145,10 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         allow_long = (btc_trend == 'Long') or altseason
         allow_short = (btc_trend == 'Short')
 
+        # --- СКАЛЬПИНГ МНОЖИТЕЛИ TP (Для 1H вернуть 1.5 и 3.0) ---
+        tp1_mult = 1.0  
+        tp2_mult = 2.0  
+
         result = None
         if allow_long and current_price > ema_200:
             is_valid_choch = (c[-1] > np.max(h[-11:-1])) and has_volume
@@ -154,7 +159,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                             ob_low, ob_high = l[i], h[i]
                             if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                 sl = ob_low - (atr * 0.8)  
-                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB + FVG', 'vol_pct': vol_increase_pct}
+                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*tp1_mult, 'tp2': current_price + (current_price-sl)*tp2_mult, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
 
         if allow_short and not result and current_price < ema_200:
@@ -166,7 +171,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                             ob_high, ob_low = h[i], l[i]
                             if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                 sl = ob_high + (atr * 0.8)
-                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB + FVG', 'vol_pct': vol_increase_pct}
+                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*tp1_mult, 'tp2': current_price - (sl-current_price)*tp2_mult, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
         
         del o, h, l, c, v, ohlcv
@@ -314,7 +319,7 @@ async def execute_trade(signal):
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- 10-CORE WSS SNIPER (Anti-451 and Safe Parsing) ---
+# --- 10-CORE WSS SNIPER ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     
@@ -340,7 +345,7 @@ async def wss_sniper_worker(sym, setup_data):
         'active': True
     }
 
-    # BINGX SPOT (Safe Parse)
+    # BINGX SPOT
     async def l_bingx_s():
         url = "wss://open-api-ws.bingx.com/market"
         while state['active']:
@@ -358,7 +363,7 @@ async def wss_sniper_worker(sym, setup_data):
                                         continue
                                     if "data" in data:
                                         d = data["data"]
-                                        if not d: continue  # Защита от null (None)
+                                        if not d: continue 
                                         trades = d if isinstance(d, list) else [d]
                                         for t in trades:
                                             if not isinstance(t, dict): continue
@@ -374,7 +379,7 @@ async def wss_sniper_worker(sym, setup_data):
                 if not state.get('err_bx_s') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(S) {base_coin}: {e}"); state['err_bx_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # BINGX FUTURES (Safe Parse)
+    # BINGX FUTURES
     async def l_bingx_f():
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
@@ -392,7 +397,7 @@ async def wss_sniper_worker(sym, setup_data):
                                         continue
                                     if "data" in data:
                                         d = data["data"]
-                                        if not d: continue  # Защита от null (None)
+                                        if not d: continue 
                                         trades = d if isinstance(d, list) else [d]
                                         for t in trades:
                                             if not isinstance(t, dict): continue
@@ -410,7 +415,7 @@ async def wss_sniper_worker(sym, setup_data):
                 if not state.get('err_bx_f') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(F) {base_coin}: {e}"); state['err_bx_f'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC SPOT
+    # MEXC SPOT (Fortified Parser)
     async def l_mexc_s():
         url = "wss://wbs-api.mexc.com/ws"
         while state['active']:
@@ -424,7 +429,9 @@ async def wss_sniper_worker(sym, setup_data):
                                 try:
                                     data = json.loads(msg.data)
                                     if "d" in data and data["d"] and "deals" in data["d"]:
-                                        for t in data["d"]["deals"]:
+                                        deals = data["d"]["deals"]
+                                        deals_list = deals if isinstance(deals, list) else [deals]
+                                        for t in deals_list:
                                             if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
@@ -437,7 +444,7 @@ async def wss_sniper_worker(sym, setup_data):
                 if not state.get('err_mc_s') and state['active']: logging.error(f"⚠️ [CONN ERR] MEXC(S) {base_coin}: {e}"); state['err_mc_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC FUTURES
+    # MEXC FUTURES (Fortified Parser)
     async def l_mexc_f():
         url = "wss://contract.mexc.com/edge"
         while state['active']:
@@ -452,11 +459,13 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if data.get("channel") == "push.deal" and "data" in data:
                                         d = data["data"]
-                                        if isinstance(d, dict) and 'p' in d and 'v' in d:
-                                            p = float(d["p"])
-                                            v = float(d["v"]) * p
-                                            if str(d.get("T")) == '2': state['mc_f_s'] += v 
-                                            else: state['mc_f_b'] += v            
+                                        deals = d if isinstance(d, list) else [d]
+                                        for t in deals:
+                                            if isinstance(t, dict) and 'p' in t and 'v' in t:
+                                                p = float(t["p"])
+                                                v = float(t["v"]) * p
+                                                if str(t.get("T")) == '2': state['mc_f_s'] += v 
+                                                else: state['mc_f_b'] += v            
                                 except Exception as e:
                                     if not state.get('err_mc_f'): logging.error(f"⚠️ [PARSE ERR] MEXC(F) {base_coin}: {e}"); state['err_mc_f'] = True
             except asyncio.CancelledError: break
@@ -539,7 +548,7 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # BINANCE SPOT (Anti-451 URL Fix: data-stream.binance.vision)
+    # BINANCE SPOT
     async def l_binance_s():
         url = f"wss://data-stream.binance.vision/ws/{sym_binance}@aggTrade"
         while state['active']:
@@ -838,7 +847,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.20 Active (Anti-451 & Safe Parser)")
+        self.wfile.write(b"Bot v7.21 Active (Institutional Scalping)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -847,7 +856,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.20: Anti-451 & Safe Parser...")
+    logging.info("🚀 Запуск ядра v7.21: Institutional Scalping Edition...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
