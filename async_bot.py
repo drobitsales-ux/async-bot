@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.17 (10-CORE ULTIMATE: All Spot & Futures) ===
+# === НАСТРОЙКИ v7.18 (ULTIMATE 10-CORE, Fixed WSS URLs & Logs) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -23,12 +23,11 @@ RISK_PER_TRADE = 0.02
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MAX_SPREAD_PERCENT = 0.002  
-MIN_VOLUME_USDT = 1000000  # Было 2000000  
+MIN_VOLUME_USDT = 1000000  
 
-# Оптимизированные таймауты
 TRADE_TIMEOUT_PROFIT_HOURS = 12  
 TRADE_TIMEOUT_ANY_HOURS = 24     
-SMC_TIMEFRAME = '15m'      # Было '1h'
+SMC_TIMEFRAME = '15m'
 
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
@@ -155,7 +154,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                             ob_low, ob_high = l[i], h[i]
                             if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                 sl = ob_low - (atr * 0.8)  
-                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
+                                result = {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl)*1.5, 'tp2': current_price + (current_price-sl)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
 
         if allow_short and not result and current_price < ema_200:
@@ -167,7 +166,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
                             ob_high, ob_low = h[i], l[i]
                             if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                 sl = ob_high + (atr * 0.8)
-                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '1H OB + FVG', 'vol_pct': vol_increase_pct}
+                                result = {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price)*1.5, 'tp2': current_price - (sl-current_price)*3, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB + FVG', 'vol_pct': vol_increase_pct}
                                 break
         
         del o, h, l, c, v, ohlcv
@@ -258,7 +257,7 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю 10-CORE Снайпер (Spot + Futures)...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (10 Потоков)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -339,9 +338,9 @@ async def wss_sniper_worker(sym, setup_data):
         'active': True
     }
 
-    # BINGX SPOT
+    # BINGX SPOT (Updated URL and JSON parsing)
     async def l_bingx_s():
-        url = "wss://open-api.bingx.com/market"
+        url = "wss://open-api-ws.bingx.com/market"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -356,10 +355,13 @@ async def wss_sniper_worker(sym, setup_data):
                                         await ws.send_str(json.dumps({"pong": data["ping"]}))
                                         continue
                                     if "data" in data:
-                                        for t in data["data"]:
-                                            v = float(t['p']) * float(t['q'])
-                                            if t.get('m'): state['bx_s_s'] += v
-                                            else: state['bx_s_b'] += v
+                                        d = data["data"]
+                                        trades = d if isinstance(d, list) else [d]
+                                        for t in trades:
+                                            if 'p' in t and 'q' in t:
+                                                v = float(t['p']) * float(t['q'])
+                                                if t.get('m'): state['bx_s_s'] += v
+                                                else: state['bx_s_b'] += v
                             except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -382,19 +384,22 @@ async def wss_sniper_worker(sym, setup_data):
                                         await ws.send_str(json.dumps({"pong": data["ping"]}))
                                         continue
                                     if "data" in data:
-                                        for t in data["data"]:
-                                            v = float(t['p']) * float(t['q'])
-                                            if t.get('m'): state['bx_f_s'] += v
-                                            else: state['bx_f_b'] += v
-                                        state['current_price'] = float(data["data"][-1]['p'])
+                                        d = data["data"]
+                                        trades = d if isinstance(d, list) else [d]
+                                        for t in trades:
+                                            if 'p' in t and 'q' in t:
+                                                v = float(t['p']) * float(t['q'])
+                                                if t.get('m'): state['bx_f_s'] += v
+                                                else: state['bx_f_b'] += v
+                                        state['current_price'] = float(data["data"][-1].get('p', state['current_price'])) if isinstance(data["data"], list) else float(data["data"].get('p', state['current_price']))
                             except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC SPOT
+    # MEXC SPOT (Updated URL)
     async def l_mexc_s():
-        url = "wss://wbs.mexc.com/ws"
+        url = "wss://wbs-api.mexc.com/ws"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -407,17 +412,18 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "d" in data and "deals" in data["d"]:
                                         for t in data["d"]["deals"]:
-                                            v = float(t['p']) * float(t['v'])
-                                            if t['S'] == 2: state['mc_s_s'] += v 
-                                            else: state['mc_s_b'] += v            
+                                            if 'p' in t and 'v' in t:
+                                                v = float(t['p']) * float(t['v'])
+                                                if t.get('S') == 2: state['mc_s_s'] += v 
+                                                else: state['mc_s_b'] += v            
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC FUTURES
+    # MEXC FUTURES (Updated URL and Endpoint Logic)
     async def l_mexc_f():
-        url = "wss://contract.mexc.com/ws"
+        url = "wss://contract.mexc.com/edge"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -428,11 +434,13 @@ async def wss_sniper_worker(sym, setup_data):
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    if "data" in data and data.get("channel") == "push.deal":
-                                        p = float(data["data"]["p"])
-                                        v = float(data["data"]["v"]) * p  # Конвертация в USDT
-                                        if data["data"]["T"] == 2: state['mc_f_s'] += v 
-                                        else: state['mc_f_b'] += v            
+                                    if data.get("channel") == "push.deal" and "data" in data:
+                                        d = data["data"]
+                                        if 'p' in d and 'v' in d:
+                                            p = float(d["p"])
+                                            v = float(d["v"]) * p  # Аппроксимация в USDT
+                                            if d.get("T") == 2: state['mc_f_s'] += v 
+                                            else: state['mc_f_b'] += v            
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -453,9 +461,10 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
-                                            v = float(t['p']) * float(t['v'])
-                                            if t['S'] == "Sell": state['bb_s_s'] += v
-                                            else: state['bb_s_b'] += v
+                                            if 'p' in t and 'v' in t:
+                                                v = float(t['p']) * float(t['v'])
+                                                if t.get('S') == "Sell": state['bb_s_s'] += v
+                                                else: state['bb_s_b'] += v
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -476,9 +485,10 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
-                                            v = float(t['p']) * float(t['v'])
-                                            if t['S'] == "Sell": state['bb_f_s'] += v
-                                            else: state['bb_f_b'] += v
+                                            if 'p' in t and 'v' in t:
+                                                v = float(t['p']) * float(t['v'])
+                                                if t.get('S') == "Sell": state['bb_f_s'] += v
+                                                else: state['bb_f_b'] += v
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -499,9 +509,10 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
-                                            v = float(t['p']) * float(t['v'])
-                                            if t['S'] == "Sell": state['bb_f_s'] += v
-                                            else: state['bb_f_b'] += v
+                                            if 'p' in t and 'v' in t:
+                                                v = float(t['p']) * float(t['v'])
+                                                if t.get('S') == "Sell": state['bb_f_s'] += v
+                                                else: state['bb_f_b'] += v
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -678,7 +689,7 @@ async def wss_sniper_worker(sym, setup_data):
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         
-        # Обновленный 10-потоковый теневой лог
+        # Исправленный 10-потоковый теневой лог (теперь выводится ВСЁ)
         log_str = (f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят. Макс. 5-сек -> "
                    f"BingX(S): ${state['max_bx_s']:.0f} | BingX(F): ${state['max_bx_f']:.0f} | "
                    f"MEXC(S): ${state['max_mc_s']:.0f} | MEXC(F): ${state['max_mc_f']:.0f} | "
@@ -805,7 +816,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.17 Active (10-CORE ULTIMATE WSS: All Spot & Futures)")
+        self.wfile.write(b"Bot v7.18 Active (10-CORE ULTIMATE WSS)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -814,7 +825,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.17: 10-CORE ULTIMATE WSS (All Spot & Futures)...")
+    logging.info("🚀 Запуск ядра v7.18: 10-CORE ULTIMATE WSS (Fixed APIs & Logs)...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
