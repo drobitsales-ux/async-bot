@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.23 (10-CORE, Institutional Scalping, Anti-Absorption) ===
+# === НАСТРОЙКИ v7.24 (10-CORE, Inst. Scalping, Global Delta CVD) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -144,6 +144,7 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         allow_long = (btc_trend == 'Long') or altseason
         allow_short = (btc_trend == 'Short')
 
+        # --- СКАЛЬПИНГ МНОЖИТЕЛИ TP (Для 1H вернуть 1.5 и 3.0) ---
         tp1_mult = 1.0  
         tp2_mult = 2.0  
 
@@ -638,7 +639,7 @@ async def wss_sniper_worker(sym, setup_data):
             
             valid_exchanges = []
             
-            # Tier 1 (1500$)
+            # --- 1. Локальная проверка доминации (Оставляем 65%) ---
             if bx_s_tot > 1500:
                 pct = (state['bx_s_b'] / bx_s_tot) * 100 if is_long else (state['bx_s_s'] / bx_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
@@ -655,17 +656,14 @@ async def wss_sniper_worker(sym, setup_data):
                 pct = (state['bb_s_b'] / bb_s_tot) * 100 if is_long else (state['bb_s_s'] / bb_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
                 
-            # Tier 2 (2500$)
             if bn_s_tot > 2500:
                 pct = (state['bn_s_b'] / bn_s_tot) * 100 if is_long else (state['bn_s_s'] / bn_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
                 
-            # Tier 3 (3000$)
             if bb_f_tot > 3000:
                 pct = (state['bb_f_b'] / bb_f_tot) * 100 if is_long else (state['bb_f_s'] / bb_f_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
                 
-            # Tier 4 (5000$)
             if bn_f_tot > 5000:
                 pct = (state['bn_f_b'] / bn_f_tot) * 100 if is_long else (state['bn_f_s'] / bn_f_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
@@ -675,9 +673,17 @@ async def wss_sniper_worker(sym, setup_data):
                 in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
                 
                 if in_zone:
-                    # --- Защиты Институционального Скальпинга ---
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                     
+                    # --- 2. Глобальная Кумулятивная Дельта (CVD) ---
+                    global_buy = state['bx_s_b'] + state['bx_f_b'] + state['mc_s_b'] + state['mc_f_b'] + state['bb_s_b'] + state['bb_f_b'] + state['bn_s_b'] + state['bn_f_b']
+                    global_sell = state['bx_s_s'] + state['bx_f_s'] + state['mc_s_s'] + state['mc_f_s'] + state['bb_s_s'] + state['bb_f_s'] + state['bn_s_s'] + state['bn_f_s']
+                    global_delta = global_buy - global_sell
+                    
+                    is_divergent = False
+                    if is_long and global_delta < 0: is_divergent = True
+                    if not is_long and global_delta > 0: is_divergent = True
+
                     is_absorbed = False
                     if is_long and price_shift_pct < -0.05: is_absorbed = True
                     if not is_long and price_shift_pct > 0.05: is_absorbed = True
@@ -686,6 +692,11 @@ async def wss_sniper_worker(sym, setup_data):
                     if is_long and price_shift_pct > 1.2: is_exhausted = True
                     if not is_long and price_shift_pct < -1.2: is_exhausted = True
                     
+                    if is_divergent:
+                        logging.info(f"🛡 [ДЕЛЬТА-ДИВЕРГЕНЦИЯ] {clean_name} отменен. Сигнал {setup_data['direction']}, но глобальная дельта рынка: {global_delta:.0f}$")
+                        if sym in HOT_LIST: del HOT_LIST[sym]
+                        break
+                        
                     if is_absorbed:
                         logging.info(f"🛡 [АБСОРБЦИЯ] {clean_name} отменен. Объемы: {valid_exchanges[0][0]}, но сдвиг цены: {price_shift_pct:.2f}%")
                         if sym in HOT_LIST: del HOT_LIST[sym]
@@ -703,7 +714,7 @@ async def wss_sniper_worker(sym, setup_data):
                     
                     if len(valid_exchanges) >= 2:
                         setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Подтверждено: {len(valid_exchanges)} пула)"
-                        setup_data['dynamic_risk'] = 1.5  # Снижено для защиты баланса
+                        setup_data['dynamic_risk'] = 1.5  
                     else:
                         setup_data['score_info'] = f"⚡ Базовый Сигнал ({valid_exchanges[0][0]})"
                         setup_data['dynamic_risk'] = 1.0
@@ -863,7 +874,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.23 Active (Institutional Scalping, Anti-Absorb, %PNL)")
+        self.wfile.write(b"Bot v7.24 Active (Inst. Scalping, Global Delta CVD)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -872,7 +883,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.23: Institutional Scalping, Anti-Absorb, %PNL...")
+    logging.info("🚀 Запуск ядра v7.24: Global Delta CVD & Anti-Absorb...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
