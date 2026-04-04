@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.21 (10-CORE, Institutional Scalping Edition) ===
+# === НАСТРОЙКИ v7.23 (10-CORE, Institutional Scalping, Anti-Absorption) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -25,7 +25,6 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 
-# --- СКАЛЬПИНГ ТАЙМАУТЫ (Для 1H вернуть 12 и 24) ---
 TRADE_TIMEOUT_PROFIT_HOURS = 2  
 TRADE_TIMEOUT_ANY_HOURS = 4     
 SMC_TIMEFRAME = '15m'
@@ -145,7 +144,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         allow_long = (btc_trend == 'Long') or altseason
         allow_short = (btc_trend == 'Short')
 
-        # --- СКАЛЬПИНГ МНОЖИТЕЛИ TP (Для 1H вернуть 1.5 и 3.0) ---
         tp1_mult = 1.0  
         tp2_mult = 2.0  
 
@@ -345,7 +343,6 @@ async def wss_sniper_worker(sym, setup_data):
         'active': True
     }
 
-    # BINGX SPOT
     async def l_bingx_s():
         url = "wss://open-api-ws.bingx.com/market"
         while state['active']:
@@ -357,7 +354,9 @@ async def wss_sniper_worker(sym, setup_data):
                             if not state['active']: break
                             try:
                                 if msg.type == aiohttp.WSMsgType.BINARY:
-                                    data = json.loads(gzip.decompress(msg.data).decode('utf-8'))
+                                    decomp_data = gzip.decompress(msg.data).decode('utf-8')
+                                    if not decomp_data.strip(): continue
+                                    data = json.loads(decomp_data)
                                     if "ping" in data: 
                                         await ws.send_str(json.dumps({"pong": data["ping"]}))
                                         continue
@@ -372,14 +371,11 @@ async def wss_sniper_worker(sym, setup_data):
                                                 v = float(t['p']) * float(q_val)
                                                 if t.get('m'): state['bx_s_s'] += v
                                                 else: state['bx_s_b'] += v
-                            except Exception as e:
-                                if not state.get('err_bx_s'): logging.error(f"⚠️ [PARSE ERR] BingX(S) {base_coin}: {e}"); state['err_bx_s'] = True
+                            except Exception as e: pass
             except asyncio.CancelledError: break
             except Exception as e: 
-                if not state.get('err_bx_s') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(S) {base_coin}: {e}"); state['err_bx_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # BINGX FUTURES
     async def l_bingx_f():
         url = "wss://open-api-swap.bingx.com/swap-market"
         while state['active']:
@@ -391,7 +387,9 @@ async def wss_sniper_worker(sym, setup_data):
                             if not state['active']: break
                             try:
                                 if msg.type == aiohttp.WSMsgType.BINARY:
-                                    data = json.loads(gzip.decompress(msg.data).decode('utf-8'))
+                                    decomp_data = gzip.decompress(msg.data).decode('utf-8')
+                                    if not decomp_data.strip(): continue
+                                    data = json.loads(decomp_data)
                                     if "ping" in data: 
                                         await ws.send_str(json.dumps({"pong": data["ping"]}))
                                         continue
@@ -408,14 +406,11 @@ async def wss_sniper_worker(sym, setup_data):
                                                 else: state['bx_f_b'] += v
                                         if trades and isinstance(trades[-1], dict) and 'p' in trades[-1]:
                                             state['current_price'] = float(trades[-1]['p'])
-                            except Exception as e:
-                                if not state.get('err_bx_f'): logging.error(f"⚠️ [PARSE ERR] BingX(F) {base_coin}: {e}"); state['err_bx_f'] = True
+                            except Exception as e: pass
             except asyncio.CancelledError: break
             except Exception as e: 
-                if not state.get('err_bx_f') and state['active']: logging.error(f"⚠️ [CONN ERR] BingX(F) {base_coin}: {e}"); state['err_bx_f'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC SPOT (Fortified Parser)
     async def l_mexc_s():
         url = "wss://wbs-api.mexc.com/ws"
         while state['active']:
@@ -437,14 +432,11 @@ async def wss_sniper_worker(sym, setup_data):
                                                 v = float(t['p']) * float(t['v'])
                                                 if str(t.get('S')) == '2': state['mc_s_s'] += v 
                                                 else: state['mc_s_b'] += v            
-                                except Exception as e:
-                                    if not state.get('err_mc_s'): logging.error(f"⚠️ [PARSE ERR] MEXC(S) {base_coin}: {e}"); state['err_mc_s'] = True
+                                except Exception as e: pass
             except asyncio.CancelledError: break
             except Exception as e: 
-                if not state.get('err_mc_s') and state['active']: logging.error(f"⚠️ [CONN ERR] MEXC(S) {base_coin}: {e}"); state['err_mc_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # MEXC FUTURES (Fortified Parser)
     async def l_mexc_f():
         url = "wss://contract.mexc.com/edge"
         while state['active']:
@@ -466,14 +458,11 @@ async def wss_sniper_worker(sym, setup_data):
                                                 v = float(t["v"]) * p
                                                 if str(t.get("T")) == '2': state['mc_f_s'] += v 
                                                 else: state['mc_f_b'] += v            
-                                except Exception as e:
-                                    if not state.get('err_mc_f'): logging.error(f"⚠️ [PARSE ERR] MEXC(F) {base_coin}: {e}"); state['err_mc_f'] = True
+                                except Exception as e: pass
             except asyncio.CancelledError: break
             except Exception as e: 
-                if not state.get('err_mc_f') and state['active']: logging.error(f"⚠️ [CONN ERR] MEXC(F) {base_coin}: {e}"); state['err_mc_f'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # BYBIT SPOT
     async def l_bybit_s():
         url = "wss://stream.bybit.com/v5/public/spot"
         while state['active']:
@@ -498,7 +487,6 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # BYBIT FUTURES
     async def l_bybit_f():
         url = "wss://stream.bybit.com/v5/public/linear"
         while state['active']:
@@ -523,7 +511,6 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # BYBIT FUTURES 1000x
     async def l_bybit_f1000():
         url = "wss://stream.bybit.com/v5/public/linear"
         while state['active']:
@@ -548,7 +535,6 @@ async def wss_sniper_worker(sym, setup_data):
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    # BINANCE SPOT
     async def l_binance_s():
         url = f"wss://data-stream.binance.vision/ws/{sym_binance}@aggTrade"
         while state['active']:
@@ -564,14 +550,12 @@ async def wss_sniper_worker(sym, setup_data):
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_s_s'] += v
                                         else: state['bn_s_b'] += v
-                                except Exception as e:
-                                    if not state.get('err_bn_s'): logging.error(f"⚠️ [PARSE ERR] Binance(S) {base_coin}: {e}"); state['err_bn_s'] = True
+                                        state['current_price'] = float(data['p'])
+                                except Exception as e: pass
             except asyncio.CancelledError: break
             except Exception as e: 
-                if not state.get('err_bn_s') and state['active']: logging.error(f"⚠️ [CONN ERR] Binance(S) {base_coin}: {e}"); state['err_bn_s'] = True
                 if state['active']: await asyncio.sleep(1)
 
-    # BINANCE FUTURES
     async def l_binance_f():
         url = f"wss://fstream.binance.com/ws/{sym_binance}@aggTrade"
         while state['active']:
@@ -587,12 +571,12 @@ async def wss_sniper_worker(sym, setup_data):
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_f_s'] += v
                                         else: state['bn_f_b'] += v
+                                        state['current_price'] = float(data['p'])
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
                 
-    # BINANCE FUTURES 1000x
     async def l_binance_f1000():
         url = f"wss://fstream.binance.com/ws/{sym_binance_1000}@aggTrade"
         while state['active']:
@@ -608,6 +592,7 @@ async def wss_sniper_worker(sym, setup_data):
                                         v = float(data['p']) * float(data['q'])
                                         if data.get('m'): state['bn_f_s'] += v
                                         else: state['bn_f_b'] += v
+                                        state['current_price'] = float(data['p'])
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -690,6 +675,27 @@ async def wss_sniper_worker(sym, setup_data):
                 in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
                 
                 if in_zone:
+                    # --- Защиты Институционального Скальпинга ---
+                    price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
+                    
+                    is_absorbed = False
+                    if is_long and price_shift_pct < -0.05: is_absorbed = True
+                    if not is_long and price_shift_pct > 0.05: is_absorbed = True
+                    
+                    is_exhausted = False
+                    if is_long and price_shift_pct > 1.2: is_exhausted = True
+                    if not is_long and price_shift_pct < -1.2: is_exhausted = True
+                    
+                    if is_absorbed:
+                        logging.info(f"🛡 [АБСОРБЦИЯ] {clean_name} отменен. Объемы: {valid_exchanges[0][0]}, но сдвиг цены: {price_shift_pct:.2f}%")
+                        if sym in HOT_LIST: del HOT_LIST[sym]
+                        break
+                        
+                    if is_exhausted:
+                        logging.info(f"🛡 [ОТСТРЕЛ] {clean_name} отменен. Цена улетела от базы: {price_shift_pct:.2f}%")
+                        if sym in HOT_LIST: del HOT_LIST[sym]
+                        break
+                    
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     
                     side_str = 'покупок' if is_long else 'продаж'
@@ -697,7 +703,7 @@ async def wss_sniper_worker(sym, setup_data):
                     
                     if len(valid_exchanges) >= 2:
                         setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Подтверждено: {len(valid_exchanges)} пула)"
-                        setup_data['dynamic_risk'] = 2.0
+                        setup_data['dynamic_risk'] = 1.5  # Снижено для защиты баланса
                     else:
                         setup_data['score_info'] = f"⚡ Базовый Сигнал ({valid_exchanges[0][0]})"
                         setup_data['dynamic_risk'] = 1.0
@@ -753,13 +759,16 @@ async def monitor_positions_job():
                 if not curr:
                     ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
                     pnl = (last_p - pos['entry_price']) * pos['initial_qty'] if pos['direction'] == 'Long' else (pos['entry_price'] - last_p) * pos['initial_qty']
+                    margin = (pos['entry_price'] * pos['initial_qty']) / LEVERAGE
+                    pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
+                    
                     daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
                     if pnl > 0:
                         daily_stats['wins'] += 1; CONSECUTIVE_LOSSES = 0
-                        await send_tg_msg(f"✅ **{sym.split(':')[0]} закрыта в плюс!**\nPNL: {pnl:.2f} USDT")
+                        await send_tg_msg(f"✅ **{sym.split(':')[0]} закрыта в плюс!**\nPNL: +{pnl:.2f} USDT (+{pnl_pct:.2f}%)")
                     else:
                         CONSECUTIVE_LOSSES += 1
-                        await send_tg_msg(f"🛑 **{sym.split(':')[0]} выбита по SL.**\nPNL: {pnl:.2f} USDT")
+                        await send_tg_msg(f"🛑 **{sym.split(':')[0]} выбита по SL.**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
                     continue
 
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
@@ -771,7 +780,14 @@ async def monitor_positions_job():
                     try:
                         c_side = 'sell' if pos['direction'] == 'Long' else 'buy'
                         await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
-                        await exchange.cancel_order(pos['sl_order_id'], sym); continue 
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                        
+                        margin = (pos['entry_price'] * float(curr['contracts'])) / LEVERAGE
+                        pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
+                        icon = "✅" if pnl > 0 else "🛑"
+                        sign = "+" if pnl > 0 else ""
+                        await send_tg_msg(f"{icon} **{sym.split(':')[0]} закрыта по ТАЙМАУТУ!**\nPNL: {sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)")
+                        continue 
                     except: pass
 
                 ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
@@ -847,7 +863,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.21 Active (Institutional Scalping)")
+        self.wfile.write(b"Bot v7.23 Active (Institutional Scalping, Anti-Absorb, %PNL)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -856,7 +872,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.21: Institutional Scalping Edition...")
+    logging.info("🚀 Запуск ядра v7.23: Institutional Scalping, Anti-Absorb, %PNL...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
