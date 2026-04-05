@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.24 (10-CORE, Inst. Scalping, Global Delta CVD) ===
+# === НАСТРОЙКИ v7.25 (10-CORE, Bug Fixes, High-Volume Scalping) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -144,7 +144,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         allow_long = (btc_trend == 'Long') or altseason
         allow_short = (btc_trend == 'Short')
 
-        # --- СКАЛЬПИНГ МНОЖИТЕЛИ TP (Для 1H вернуть 1.5 и 3.0) ---
         tp1_mult = 1.0  
         tp2_mult = 2.0  
 
@@ -321,6 +320,7 @@ async def execute_trade(signal):
 # --- 10-CORE WSS SNIPER ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
+    clean_name = base_coin  # ИСПРАВЛЕНИЕ: Объявляем переменную для защиты от крашей
     
     sym_bingx_s = f"{base_coin}-USDT"
     sym_bingx_f = f"{base_coin}-USDT"
@@ -372,9 +372,9 @@ async def wss_sniper_worker(sym, setup_data):
                                                 v = float(t['p']) * float(q_val)
                                                 if t.get('m'): state['bx_s_s'] += v
                                                 else: state['bx_s_b'] += v
-                            except Exception as e: pass
+                            except Exception: pass
             except asyncio.CancelledError: break
-            except Exception as e: 
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_bingx_f():
@@ -407,9 +407,9 @@ async def wss_sniper_worker(sym, setup_data):
                                                 else: state['bx_f_b'] += v
                                         if trades and isinstance(trades[-1], dict) and 'p' in trades[-1]:
                                             state['current_price'] = float(trades[-1]['p'])
-                            except Exception as e: pass
+                            except Exception: pass
             except asyncio.CancelledError: break
-            except Exception as e: 
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_mexc_s():
@@ -433,9 +433,9 @@ async def wss_sniper_worker(sym, setup_data):
                                                 v = float(t['p']) * float(t['v'])
                                                 if str(t.get('S')) == '2': state['mc_s_s'] += v 
                                                 else: state['mc_s_b'] += v            
-                                except Exception as e: pass
+                                except Exception: pass
             except asyncio.CancelledError: break
-            except Exception as e: 
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_mexc_f():
@@ -459,9 +459,9 @@ async def wss_sniper_worker(sym, setup_data):
                                                 v = float(t["v"]) * p
                                                 if str(t.get("T")) == '2': state['mc_f_s'] += v 
                                                 else: state['mc_f_b'] += v            
-                                except Exception as e: pass
+                                except Exception: pass
             except asyncio.CancelledError: break
-            except Exception as e: 
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_bybit_s():
@@ -552,9 +552,9 @@ async def wss_sniper_worker(sym, setup_data):
                                         if data.get('m'): state['bn_s_s'] += v
                                         else: state['bn_s_b'] += v
                                         state['current_price'] = float(data['p'])
-                                except Exception as e: pass
+                                except Exception: pass
             except asyncio.CancelledError: break
-            except Exception as e: 
+            except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
     async def l_binance_f():
@@ -639,32 +639,32 @@ async def wss_sniper_worker(sym, setup_data):
             
             valid_exchanges = []
             
-            # --- 1. Локальная проверка доминации (Оставляем 65%) ---
-            if bx_s_tot > 1500:
+            # --- ПОВЫШЕННЫЕ ПОРОГИ ДЛЯ СКАЛЬПИНГА (Уменьшение рыночного шума) ---
+            if bx_s_tot > 3000:
                 pct = (state['bx_s_b'] / bx_s_tot) * 100 if is_long else (state['bx_s_s'] / bx_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
-            if bx_f_tot > 1500:
+            if bx_f_tot > 3000:
                 pct = (state['bx_f_b'] / bx_f_tot) * 100 if is_long else (state['bx_f_s'] / bx_f_tot) * 100
                 if pct >= 65: valid_exchanges.append(('BingX (F)', bx_f_tot, pct))
-            if mc_s_tot > 1500:
+            if mc_s_tot > 3000:
                 pct = (state['mc_s_b'] / mc_s_tot) * 100 if is_long else (state['mc_s_s'] / mc_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('MEXC (S)', mc_s_tot, pct))
-            if mc_f_tot > 1500:
+            if mc_f_tot > 3000:
                 pct = (state['mc_f_b'] / mc_f_tot) * 100 if is_long else (state['mc_f_s'] / mc_f_tot) * 100
                 if pct >= 65: valid_exchanges.append(('MEXC (F)', mc_f_tot, pct))
-            if bb_s_tot > 1500:
+            if bb_s_tot > 3000:
                 pct = (state['bb_s_b'] / bb_s_tot) * 100 if is_long else (state['bb_s_s'] / bb_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
                 
-            if bn_s_tot > 2500:
+            if bn_s_tot > 4000:
                 pct = (state['bn_s_b'] / bn_s_tot) * 100 if is_long else (state['bn_s_s'] / bn_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
                 
-            if bb_f_tot > 3000:
+            if bb_f_tot > 5000:
                 pct = (state['bb_f_b'] / bb_f_tot) * 100 if is_long else (state['bb_f_s'] / bb_f_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
                 
-            if bn_f_tot > 5000:
+            if bn_f_tot > 8000:
                 pct = (state['bn_f_b'] / bn_f_tot) * 100 if is_long else (state['bn_f_s'] / bn_f_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
 
@@ -675,7 +675,6 @@ async def wss_sniper_worker(sym, setup_data):
                 if in_zone:
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                     
-                    # --- 2. Глобальная Кумулятивная Дельта (CVD) ---
                     global_buy = state['bx_s_b'] + state['bx_f_b'] + state['mc_s_b'] + state['mc_f_b'] + state['bb_s_b'] + state['bb_f_b'] + state['bn_s_b'] + state['bn_f_b']
                     global_sell = state['bx_s_s'] + state['bx_f_s'] + state['mc_s_s'] + state['mc_f_s'] + state['bb_s_s'] + state['bb_f_s'] + state['bn_s_s'] + state['bn_f_s']
                     global_delta = global_buy - global_sell
@@ -738,7 +737,7 @@ async def wss_sniper_worker(sym, setup_data):
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         
-        log_str = (f"🕵️‍♂️ [SHADOW LOG] {sym.split(':')[0]} снят. Макс. 5-сек -> "
+        log_str = (f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. 5-сек -> "
                    f"BingX(S): ${state['max_bx_s']:.0f} | BingX(F): ${state['max_bx_f']:.0f} | "
                    f"MEXC(S): ${state['max_mc_s']:.0f} | MEXC(F): ${state['max_mc_f']:.0f} | "
                    f"Bybit(S): ${state['max_bb_s']:.0f} | Bybit(F): ${state['max_bb_f']:.0f} | "
@@ -874,7 +873,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.24 Active (Inst. Scalping, Global Delta CVD)")
+        self.wfile.write(b"Bot v7.25 Active (Bug Fixes & Scalping Filters)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -883,7 +882,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.24: Global Delta CVD & Anti-Absorb...")
+    logging.info("🚀 Запуск ядра v7.25: Bug Fixes & High-Volume Filter...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
