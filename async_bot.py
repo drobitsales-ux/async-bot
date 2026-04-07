@@ -642,31 +642,31 @@ async def wss_sniper_worker(sym, setup_data):
             # --- ПОВЫШЕННЫЕ ПОРОГИ ДЛЯ СКАЛЬПИНГА (Уменьшение рыночного шума) ---
             if bx_s_tot > 3000:
                 pct = (state['bx_s_b'] / bx_s_tot) * 100 if is_long else (state['bx_s_s'] / bx_s_tot) * 100
-                if pct >= 65: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
+                if pct >= 60: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
             if bx_f_tot > 3000:
                 pct = (state['bx_f_b'] / bx_f_tot) * 100 if is_long else (state['bx_f_s'] / bx_f_tot) * 100
-                if pct >= 65: valid_exchanges.append(('BingX (F)', bx_f_tot, pct))
+                if pct >= 60: valid_exchanges.append(('BingX (F)', bx_f_tot, pct))
             if mc_s_tot > 3000:
                 pct = (state['mc_s_b'] / mc_s_tot) * 100 if is_long else (state['mc_s_s'] / mc_s_tot) * 100
-                if pct >= 65: valid_exchanges.append(('MEXC (S)', mc_s_tot, pct))
+                if pct >= 60: valid_exchanges.append(('MEXC (S)', mc_s_tot, pct))
             if mc_f_tot > 3000:
                 pct = (state['mc_f_b'] / mc_f_tot) * 100 if is_long else (state['mc_f_s'] / mc_f_tot) * 100
-                if pct >= 65: valid_exchanges.append(('MEXC (F)', mc_f_tot, pct))
+                if pct >= 60: valid_exchanges.append(('MEXC (F)', mc_f_tot, pct))
             if bb_s_tot > 3000:
                 pct = (state['bb_s_b'] / bb_s_tot) * 100 if is_long else (state['bb_s_s'] / bb_s_tot) * 100
                 if pct >= 65: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
                 
             if bn_s_tot > 4000:
                 pct = (state['bn_s_b'] / bn_s_tot) * 100 if is_long else (state['bn_s_s'] / bn_s_tot) * 100
-                if pct >= 65: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
+                if pct >= 60: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
                 
             if bb_f_tot > 5000:
                 pct = (state['bb_f_b'] / bb_f_tot) * 100 if is_long else (state['bb_f_s'] / bb_f_tot) * 100
-                if pct >= 65: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
+                if pct >= 60: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
                 
             if bn_f_tot > 8000:
                 pct = (state['bn_f_b'] / bn_f_tot) * 100 if is_long else (state['bn_f_s'] / bn_f_tot) * 100
-                if pct >= 65: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
+                if pct >= 60: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
 
             if len(valid_exchanges) > 0:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
