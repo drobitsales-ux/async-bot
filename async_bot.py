@@ -5,6 +5,7 @@ import os
 import logging
 import sqlite3
 import gc
+import time
 import ccxt.async_support as ccxt_async
 import numpy as np
 import aiohttp
@@ -12,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v7.25 (10-CORE, Bug Fixes, High-Volume Scalping) ===
+# === НАСТРОЙКИ v8.0 (30s Rolling CVD, High-Volume) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -260,7 +261,7 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (10 Потоков)...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (30s Rolling Window)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -310,21 +311,20 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ (10-CORE WSS): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ (v8.0 CVD): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"{signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
-               f"📊 **Анализ ликвидности:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
+               f"📊 **Анализ 30s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- 10-CORE WSS SNIPER ---
+# --- v8.0: 30s ROLLING WINDOW SNIPER ---
 async def wss_sniper_worker(sym, setup_data):
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
-    clean_name = base_coin  # ИСПРАВЛЕНИЕ: Объявляем переменную для защиты от крашей
+    clean_name = base_coin  
     
     sym_bingx_s = f"{base_coin}-USDT"
     sym_bingx_f = f"{base_coin}-USDT"
-    
     sym_mexc = f"{base_coin}USDT"
     sym_bybit = f"{base_coin}USDT"
     sym_bybit_1000 = f"1000{base_coin}USDT"
@@ -332,14 +332,12 @@ async def wss_sniper_worker(sym, setup_data):
     sym_binance_1000 = f"1000{base_coin}usdt".lower()
 
     state = {
-        'bx_s_b': 0.0, 'bx_s_s': 0.0, 'max_bx_s': 0.0,
-        'bx_f_b': 0.0, 'bx_f_s': 0.0, 'max_bx_f': 0.0,
-        'mc_s_b': 0.0, 'mc_s_s': 0.0, 'max_mc_s': 0.0,
-        'mc_f_b': 0.0, 'mc_f_s': 0.0, 'max_mc_f': 0.0,
-        'bb_s_b': 0.0, 'bb_s_s': 0.0, 'max_bb_s': 0.0,
-        'bb_f_b': 0.0, 'bb_f_s': 0.0, 'max_bb_f': 0.0,
-        'bn_s_b': 0.0, 'bn_s_s': 0.0, 'max_bn_s': 0.0,
-        'bn_f_b': 0.0, 'bn_f_s': 0.0, 'max_bn_f': 0.0,
+        'trades': [],
+        'start_time': time.time(),
+        'max_bx_s': 0.0, 'max_bx_f': 0.0,
+        'max_mc_s': 0.0, 'max_mc_f': 0.0,
+        'max_bb_s': 0.0, 'max_bb_f': 0.0,
+        'max_bn_s': 0.0, 'max_bn_f': 0.0,
         'current_price': setup_data['entry_price'], 
         'active': True
     }
@@ -370,8 +368,8 @@ async def wss_sniper_worker(sym, setup_data):
                                             q_val = t.get('q', t.get('v', 0))
                                             if 'p' in t and q_val:
                                                 v = float(t['p']) * float(q_val)
-                                                if t.get('m'): state['bx_s_s'] += v
-                                                else: state['bx_s_b'] += v
+                                                side = 's' if t.get('m') else 'b'
+                                                state['trades'].append({'ts': time.time(), 'ex': 'bx_s', 'side': side, 'v': v})
                             except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -403,8 +401,8 @@ async def wss_sniper_worker(sym, setup_data):
                                             q_val = t.get('q', t.get('v', 0))
                                             if 'p' in t and q_val:
                                                 v = float(t['p']) * float(q_val)
-                                                if t.get('m'): state['bx_f_s'] += v
-                                                else: state['bx_f_b'] += v
+                                                side = 's' if t.get('m') else 'b'
+                                                state['trades'].append({'ts': time.time(), 'ex': 'bx_f', 'side': side, 'v': v})
                                         if trades and isinstance(trades[-1], dict) and 'p' in trades[-1]:
                                             state['current_price'] = float(trades[-1]['p'])
                             except Exception: pass
@@ -431,8 +429,8 @@ async def wss_sniper_worker(sym, setup_data):
                                             if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
-                                                if str(t.get('S')) == '2': state['mc_s_s'] += v 
-                                                else: state['mc_s_b'] += v            
+                                                side = 's' if str(t.get('S')) == '2' else 'b'
+                                                state['trades'].append({'ts': time.time(), 'ex': 'mc_s', 'side': side, 'v': v})
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -457,8 +455,8 @@ async def wss_sniper_worker(sym, setup_data):
                                             if isinstance(t, dict) and 'p' in t and 'v' in t:
                                                 p = float(t["p"])
                                                 v = float(t["v"]) * p
-                                                if str(t.get("T")) == '2': state['mc_f_s'] += v 
-                                                else: state['mc_f_b'] += v            
+                                                side = 's' if str(t.get("T")) == '2' else 'b'
+                                                state['trades'].append({'ts': time.time(), 'ex': 'mc_f', 'side': side, 'v': v})
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -481,20 +479,20 @@ async def wss_sniper_worker(sym, setup_data):
                                             if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
-                                                if t.get('S') == "Sell": state['bb_s_s'] += v
-                                                else: state['bb_s_b'] += v
+                                                side = 's' if t.get('S') == "Sell" else 'b'
+                                                state['trades'].append({'ts': time.time(), 'ex': 'bb_s', 'side': side, 'v': v})
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    async def l_bybit_f():
+    async def l_bybit_f(url_target, ex_code):
         url = "wss://stream.bybit.com/v5/public/linear"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
+                        await ws.send_str(json.dumps({"op": "subscribe", "args": [f"publicTrade.{url_target}"]}))
                         async for msg in ws:
                             if not state['active']: break
                             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -505,32 +503,8 @@ async def wss_sniper_worker(sym, setup_data):
                                             if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
                                                 v = float(t['p']) * float(t['v'])
-                                                if t.get('S') == "Sell": state['bb_f_s'] += v
-                                                else: state['bb_f_b'] += v
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_bybit_f1000():
-        url = "wss://stream.bybit.com/v5/public/linear"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit_1000}"]}))
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if "data" in data and isinstance(data["data"], list):
-                                        for t in data["data"]:
-                                            if not isinstance(t, dict): continue
-                                            if 'p' in t and 'v' in t:
-                                                v = float(t['p']) * float(t['v'])
-                                                if t.get('S') == "Sell": state['bb_f_s'] += v
-                                                else: state['bb_f_b'] += v
+                                                side = 's' if t.get('S') == "Sell" else 'b'
+                                                state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': side, 'v': v})
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
@@ -549,16 +523,16 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if isinstance(data, dict) and 'p' in data and 'q' in data:
                                         v = float(data['p']) * float(data['q'])
-                                        if data.get('m'): state['bn_s_s'] += v
-                                        else: state['bn_s_b'] += v
+                                        side = 's' if data.get('m') else 'b'
+                                        state['trades'].append({'ts': time.time(), 'ex': 'bn_s', 'side': side, 'v': v})
                                         state['current_price'] = float(data['p'])
                                 except Exception: pass
             except asyncio.CancelledError: break
             except Exception: 
                 if state['active']: await asyncio.sleep(1)
 
-    async def l_binance_f():
-        url = f"wss://fstream.binance.com/ws/{sym_binance}@aggTrade"
+    async def l_binance_f(url_target, ex_code):
+        url = f"wss://fstream.binance.com/ws/{url_target}@aggTrade"
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -570,29 +544,8 @@ async def wss_sniper_worker(sym, setup_data):
                                     data = json.loads(msg.data)
                                     if isinstance(data, dict) and 'p' in data and 'q' in data:
                                         v = float(data['p']) * float(data['q'])
-                                        if data.get('m'): state['bn_f_s'] += v
-                                        else: state['bn_f_b'] += v
-                                        state['current_price'] = float(data['p'])
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-                
-    async def l_binance_f1000():
-        url = f"wss://fstream.binance.com/ws/{sym_binance_1000}@aggTrade"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if isinstance(data, dict) and 'p' in data and 'q' in data:
-                                        v = float(data['p']) * float(data['q'])
-                                        if data.get('m'): state['bn_f_s'] += v
-                                        else: state['bn_f_b'] += v
+                                        side = 's' if data.get('m') else 'b'
+                                        state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': side, 'v': v})
                                         state['current_price'] = float(data['p'])
                                 except Exception: pass
             except asyncio.CancelledError: break
@@ -605,28 +558,56 @@ async def wss_sniper_worker(sym, setup_data):
         asyncio.create_task(l_mexc_s()), 
         asyncio.create_task(l_mexc_f()), 
         asyncio.create_task(l_bybit_s()), 
-        asyncio.create_task(l_bybit_f()), 
-        asyncio.create_task(l_bybit_f1000()), 
+        asyncio.create_task(l_bybit_f(sym_bybit, 'bb_f')), 
+        asyncio.create_task(l_bybit_f(sym_bybit_1000, 'bb_f')), 
         asyncio.create_task(l_binance_s()), 
-        asyncio.create_task(l_binance_f()), 
-        asyncio.create_task(l_binance_f1000())
+        asyncio.create_task(l_binance_f(sym_binance, 'bn_f')), 
+        asyncio.create_task(l_binance_f(sym_binance_1000, 'bn_f'))
     ]
 
     try:
         is_long = (setup_data['direction'] == 'Long')
         
         while sym in HOT_LIST and state['active']:
-            await asyncio.sleep(5)
+            await asyncio.sleep(3) # Проверка каждые 3 сек
             if len(active_positions) >= MAX_POSITIONS: continue
+            
+            now = time.time()
+            # Скользящее окно 30 секунд
+            state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 30]
+            
+            # Ждем заполнения буфера (15 сек) перед выводами
+            if now - state['start_time'] < 15:
+                continue
                 
-            bx_s_tot = state['bx_s_b'] + state['bx_s_s']
-            bx_f_tot = state['bx_f_b'] + state['bx_f_s']
-            mc_s_tot = state['mc_s_b'] + state['mc_s_s']
-            mc_f_tot = state['mc_f_b'] + state['mc_f_s']
-            bb_s_tot = state['bb_s_b'] + state['bb_s_s']
-            bb_f_tot = state['bb_f_b'] + state['bb_f_s']
-            bn_s_tot = state['bn_s_b'] + state['bn_s_s']
-            bn_f_tot = state['bn_f_b'] + state['bn_f_s']
+            bx_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_s' and t['side'] == 'b')
+            bx_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_s' and t['side'] == 's')
+            bx_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_f' and t['side'] == 'b')
+            bx_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_f' and t['side'] == 's')
+            
+            mc_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_s' and t['side'] == 'b')
+            mc_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_s' and t['side'] == 's')
+            mc_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_f' and t['side'] == 'b')
+            mc_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_f' and t['side'] == 's')
+            
+            bb_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_s' and t['side'] == 'b')
+            bb_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_s' and t['side'] == 's')
+            bb_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_f' and t['side'] == 'b')
+            bb_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_f' and t['side'] == 's')
+            
+            bn_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_s' and t['side'] == 'b')
+            bn_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_s' and t['side'] == 's')
+            bn_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_f' and t['side'] == 'b')
+            bn_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_f' and t['side'] == 's')
+            
+            bx_s_tot = bx_s_b + bx_s_s
+            bx_f_tot = bx_f_b + bx_f_s
+            mc_s_tot = mc_s_b + mc_s_s
+            mc_f_tot = mc_f_b + mc_f_s
+            bb_s_tot = bb_s_b + bb_s_s
+            bb_f_tot = bb_f_b + bb_f_s
+            bn_s_tot = bn_s_b + bn_s_s
+            bn_f_tot = bn_f_b + bn_f_s
             
             if bx_s_tot > state['max_bx_s']: state['max_bx_s'] = bx_s_tot
             if bx_f_tot > state['max_bx_f']: state['max_bx_f'] = bx_f_tot
@@ -639,33 +620,33 @@ async def wss_sniper_worker(sym, setup_data):
             
             valid_exchanges = []
             
-            # --- ПОВЫШЕННЫЕ ПОРОГИ ДЛЯ СКАЛЬПИНГА (Уменьшение рыночного шума) ---
-            if bx_s_tot > 3000:
-                pct = (state['bx_s_b'] / bx_s_tot) * 100 if is_long else (state['bx_s_s'] / bx_s_tot) * 100
+            # --- 30s WINDOW THRESHOLDS ---
+            if bx_s_tot > 15000:
+                pct = (bx_s_b / bx_s_tot) * 100 if is_long else (bx_s_s / bx_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
-            if bx_f_tot > 3000:
-                pct = (state['bx_f_b'] / bx_f_tot) * 100 if is_long else (state['bx_f_s'] / bx_f_tot) * 100
+            if bx_f_tot > 15000:
+                pct = (bx_f_b / bx_f_tot) * 100 if is_long else (bx_f_s / bx_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('BingX (F)', bx_f_tot, pct))
-            if mc_s_tot > 3000:
-                pct = (state['mc_s_b'] / mc_s_tot) * 100 if is_long else (state['mc_s_s'] / mc_s_tot) * 100
+            if mc_s_tot > 15000:
+                pct = (mc_s_b / mc_s_tot) * 100 if is_long else (mc_s_s / mc_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('MEXC (S)', mc_s_tot, pct))
-            if mc_f_tot > 3000:
-                pct = (state['mc_f_b'] / mc_f_tot) * 100 if is_long else (state['mc_f_s'] / mc_f_tot) * 100
+            if mc_f_tot > 15000:
+                pct = (mc_f_b / mc_f_tot) * 100 if is_long else (mc_f_s / mc_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('MEXC (F)', mc_f_tot, pct))
-            if bb_s_tot > 3000:
-                pct = (state['bb_s_b'] / bb_s_tot) * 100 if is_long else (state['bb_s_s'] / bb_s_tot) * 100
-                if pct >= 65: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
+            if bb_s_tot > 15000:
+                pct = (bb_s_b / bb_s_tot) * 100 if is_long else (bb_s_s / bb_s_tot) * 100
+                if pct >= 60: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
                 
-            if bn_s_tot > 4000:
-                pct = (state['bn_s_b'] / bn_s_tot) * 100 if is_long else (state['bn_s_s'] / bn_s_tot) * 100
+            if bn_s_tot > 20000:
+                pct = (bn_s_b / bn_s_tot) * 100 if is_long else (bn_s_s / bn_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
                 
-            if bb_f_tot > 5000:
-                pct = (state['bb_f_b'] / bb_f_tot) * 100 if is_long else (state['bb_f_s'] / bb_f_tot) * 100
+            if bb_f_tot > 25000:
+                pct = (bb_f_b / bb_f_tot) * 100 if is_long else (bb_f_s / bb_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
                 
-            if bn_f_tot > 8000:
-                pct = (state['bn_f_b'] / bn_f_tot) * 100 if is_long else (state['bn_f_s'] / bn_f_tot) * 100
+            if bn_f_tot > 40000:
+                pct = (bn_f_b / bn_f_tot) * 100 if is_long else (bn_f_s / bn_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
 
             if len(valid_exchanges) > 0:
@@ -675,8 +656,8 @@ async def wss_sniper_worker(sym, setup_data):
                 if in_zone:
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                     
-                    global_buy = state['bx_s_b'] + state['bx_f_b'] + state['mc_s_b'] + state['mc_f_b'] + state['bb_s_b'] + state['bb_f_b'] + state['bn_s_b'] + state['bn_f_b']
-                    global_sell = state['bx_s_s'] + state['bx_f_s'] + state['mc_s_s'] + state['mc_f_s'] + state['bb_s_s'] + state['bb_f_s'] + state['bn_s_s'] + state['bn_f_s']
+                    global_buy = bx_s_b + bx_f_b + mc_s_b + mc_f_b + bb_s_b + bb_f_b + bn_s_b + bn_f_b
+                    global_sell = bx_s_s + bx_f_s + mc_s_s + mc_f_s + bb_s_s + bb_f_s + bn_s_s + bn_f_s
                     global_delta = global_buy - global_sell
                     
                     is_divergent = False
@@ -722,22 +703,13 @@ async def wss_sniper_worker(sym, setup_data):
                     await execute_trade(setup_data)
                     break
                     
-            state['bx_s_b'], state['bx_s_s'] = 0.0, 0.0
-            state['bx_f_b'], state['bx_f_s'] = 0.0, 0.0
-            state['mc_s_b'], state['mc_s_s'] = 0.0, 0.0
-            state['mc_f_b'], state['mc_f_s'] = 0.0, 0.0
-            state['bb_s_b'], state['bb_s_s'] = 0.0, 0.0
-            state['bb_f_b'], state['bb_f_s'] = 0.0, 0.0
-            state['bn_s_b'], state['bn_s_s'] = 0.0, 0.0
-            state['bn_f_b'], state['bn_f_s'] = 0.0, 0.0
-            
     finally:
         state['active'] = False
         for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         
-        log_str = (f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. 5-сек -> "
+        log_str = (f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. 30-сек CVD -> "
                    f"BingX(S): ${state['max_bx_s']:.0f} | BingX(F): ${state['max_bx_f']:.0f} | "
                    f"MEXC(S): ${state['max_mc_s']:.0f} | MEXC(F): ${state['max_mc_f']:.0f} | "
                    f"Bybit(S): ${state['max_bb_s']:.0f} | Bybit(F): ${state['max_bb_f']:.0f} | "
@@ -873,7 +845,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v7.25 Active (Bug Fixes & Scalping Filters)")
+        self.wfile.write(b"Bot v8.0 Active (30s Rolling CVD)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -882,7 +854,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v7.25: Bug Fixes & High-Volume Filter...")
+    logging.info("🚀 Запуск ядра v8.0: 30s Rolling CVD...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
