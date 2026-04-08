@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.1 (60s Entry, 30s CVD SL, Relaxed FOMO) ===
+# === НАСТРОЙКИ v8.2 (Adaptive Thresholds, Expanded OB Zone) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -30,9 +30,8 @@ TRADE_TIMEOUT_PROFIT_HOURS = 2
 TRADE_TIMEOUT_ANY_HOURS = 4     
 SMC_TIMEFRAME = '15m'
 
-# --- ДИНАМИЧЕСКИЙ СТОП-ЛОСС (CVD) ---
-CRITICAL_CVD_USDT = 150000  # Экстренный выход, если перевес против нас > $150k за 30 сек
-GLOBAL_CVD = {}             # Хранилище дельты реального времени
+CRITICAL_CVD_USDT = 150000  
+GLOBAL_CVD = {}             
 
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
@@ -95,8 +94,7 @@ def load_positions():
         c.execute("SELECT pnl, trades, wins FROM daily_stats WHERE id = 1"); stat_row = c.fetchone()
         if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'] = stat_row
         conn.close()
-    except Exception as e: 
-        logging.error(f"Ошибка БД: {e}")
+    except Exception as e: pass
 
 async def send_tg_msg(text):
     if not TOKEN: return
@@ -105,7 +103,7 @@ async def send_tg_msg(text):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp: pass
-    except Exception as e: logging.error(f"TG Error: {e}")
+    except Exception as e: pass
 
 def calculate_ema(data, window):
     if len(data) < window: return data[-1]
@@ -136,7 +134,6 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        # СМЯГЧЕНИЕ: Достаточно просто объема выше среднего (шум на волатильном рынке)
         volume_threshold = avg_volume * 1.05  
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
         
@@ -210,7 +207,6 @@ async def radar_task():
                 eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
                 altseason = True if (eth_c[-1] / btc_c[-1]) > calculate_ema((eth_c / btc_c), 200) else False
-                del btc_ohlcv, btc_c, eth_ohlcv, eth_c
             except: pass
 
             tickers = await exchange.fetch_tickers()
@@ -222,12 +218,10 @@ async def radar_task():
                 
                 tick = tickers.get(sym)
                 if not tick: continue
-                
                 vol = float(tick.get('quoteVolume') or 0)
                 if vol < MIN_VOLUME_USDT: continue
                 
-                ask = float(tick.get('ask') or 0)
-                bid = float(tick.get('bid') or 0)
+                ask, bid = float(tick.get('ask') or 0), float(tick.get('bid') or 0)
                 if ask > 0 and bid > 0 and (ask - bid) / ask > MAX_SPREAD_PERCENT: continue
                 
                 base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
@@ -236,27 +230,13 @@ async def radar_task():
 
             temp_symbols.sort(key=lambda x: x[1], reverse=True)
             valid_symbols = [x[0] for x in temp_symbols[:SCAN_LIMIT]]
-            del tickers
-            gc.collect()
-
+            
             sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
             results = []
-            chunk_size = 10  
-
-            for i in range(0, len(valid_symbols), chunk_size):
-                chunk = valid_symbols[i:i+chunk_size]
-                tasks = []
-                for sym in chunk:
-                    clean_name = sym.split(':')[0]
-                    if clean_name in last_signals and (datetime.now(timezone.utc) - last_signals[clean_name] < timedelta(hours=4)): 
-                        continue
-                    tasks.append(process_single_coin(sym, btc_trend, altseason, sem))
-                
-                if tasks:
-                    chunk_results = await asyncio.gather(*tasks)
-                    results.extend(chunk_results)
-                
-                gc.collect()
+            for i in range(0, len(valid_symbols), 10):
+                chunk = valid_symbols[i:i+10]
+                tasks = [process_single_coin(s, btc_trend, altseason, sem) for s in chunk if s.split(':')[0] not in last_signals or (datetime.now(timezone.utc) - last_signals[s.split(':')[0]] > timedelta(hours=4))]
+                if tasks: results.extend(await asyncio.gather(*tasks))
                 await asyncio.sleep(0.1)
 
             new_hot_list = {}
@@ -265,28 +245,23 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (Dual Window + CVD SL)...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.2)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
-            
-            final_mem = get_mem_usage()
-            logging.info(f"🔎 [РАДАР] Скан завершен (Топ-{SCAN_LIMIT}). На мушке: {len(HOT_LIST)} | ОЗУ: {final_mem}")
+            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {get_mem_usage()}")
             gc.collect() 
             await asyncio.sleep(300) 
-        except Exception as e: await asyncio.sleep(60)
+        except Exception: await asyncio.sleep(60)
 
 async def execute_trade(signal):
     sym = signal['symbol']
     clean_name = sym.split(':')[0]
-    
     if any(p['symbol'] == sym for p in active_positions): return
 
     try:
         bal = await exchange.fetch_balance()
         free_usdt = float(bal['USDT']['free'])
-        
         risk_multiplier = signal.get('dynamic_risk', 1.0)
         actual_risk_percent = RISK_PER_TRADE * risk_multiplier
         
@@ -309,21 +284,19 @@ async def execute_trade(signal):
         active_positions.append({
             'symbol': sym, 'direction': signal['direction'], 'entry_price': signal['entry_price'], 'initial_qty': qty, 
             'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 
-            'tp1_hit': False, 'tp2_hit': False, 'pre_tp1_hit': False, 'pre_tp2_hit': False,
-            'sl_order_id': sl_ord['id'], 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat()
+            'tp1_hit': False, 'pre_tp1_hit': False, 'sl_order_id': sl_ord['id'], 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat()
         })
         
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ (v8.1 CVD): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ (v8.2 CVD): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"{signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
                f"📊 **Анализ 60s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
-    except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
+    except Exception as e: logging.error(f"Trade error: {e}")
 
-# --- v8.1: DUAL WINDOW & DYNAMIC SL WORKER ---
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
@@ -337,375 +310,113 @@ async def wss_sniper_worker(sym, setup_data):
     sym_binance = f"{base_coin}usdt".lower()
     sym_binance_1000 = f"1000{base_coin}usdt".lower()
 
-    state = {
-        'trades': [],
-        'start_time': time.time(),
-        'max_bn_f_60s': 0.0,
-        'current_price': setup_data['entry_price'], 
-        'active': True
-    }
+    state = {'trades': [], 'start_time': time.time(), 'max_bn_f_60s': 0.0, 'current_price': setup_data['entry_price'], 'active': True}
 
-    async def l_bingx_s():
-        url = "wss://open-api-ws.bingx.com/market"
+    async def l_ws(url, payload, ex_code, is_binance=False):
         while state['active']:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_s}@trade"}))
+                        if payload: await ws.send_str(json.dumps(payload))
                         async for msg in ws:
                             if not state['active']: break
                             try:
-                                if msg.type == aiohttp.WSMsgType.BINARY:
-                                    decomp_data = gzip.decompress(msg.data).decode('utf-8')
-                                    if not decomp_data.strip(): continue
-                                    data = json.loads(decomp_data)
-                                    if "ping" in data: 
-                                        await ws.send_str(json.dumps({"pong": data["ping"]}))
-                                        continue
-                                    if "data" in data:
-                                        d = data["data"]
-                                        if not d: continue 
-                                        trades = d if isinstance(d, list) else [d]
-                                        for t in trades:
-                                            if not isinstance(t, dict): continue
-                                            q_val = t.get('q', t.get('v', 0))
-                                            if 'p' in t and q_val:
-                                                v = float(t['p']) * float(q_val)
-                                                side = 's' if t.get('m') else 'b'
-                                                state['trades'].append({'ts': time.time(), 'ex': 'bx_s', 'side': side, 'v': v})
-                            except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_bingx_f():
-        url = "wss://open-api-swap.bingx.com/swap-market"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_f}@trade"}))
-                        async for msg in ws:
-                            if not state['active']: break
-                            try:
-                                if msg.type == aiohttp.WSMsgType.BINARY:
-                                    decomp_data = gzip.decompress(msg.data).decode('utf-8')
-                                    if not decomp_data.strip(): continue
-                                    data = json.loads(decomp_data)
-                                    if "ping" in data: 
-                                        await ws.send_str(json.dumps({"pong": data["ping"]}))
-                                        continue
-                                    if "data" in data:
-                                        d = data["data"]
-                                        if not d: continue 
-                                        trades = d if isinstance(d, list) else [d]
-                                        for t in trades:
-                                            if not isinstance(t, dict): continue
-                                            q_val = t.get('q', t.get('v', 0))
-                                            if 'p' in t and q_val:
-                                                v = float(t['p']) * float(q_val)
-                                                side = 's' if t.get('m') else 'b'
-                                                state['trades'].append({'ts': time.time(), 'ex': 'bx_f', 'side': side, 'v': v})
-                                        if trades and isinstance(trades[-1], dict) and 'p' in trades[-1]:
-                                            state['current_price'] = float(trades[-1]['p'])
-                            except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_mexc_s():
-        url = "wss://wbs-api.mexc.com/ws"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_mexc}"]}))
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
+                                if is_binance and msg.type == aiohttp.WSMsgType.TEXT:
                                     data = json.loads(msg.data)
-                                    if "d" in data and data["d"] and "deals" in data["d"]:
-                                        deals = data["d"]["deals"]
-                                        deals_list = deals if isinstance(deals, list) else [deals]
-                                        for t in deals_list:
-                                            if not isinstance(t, dict): continue
-                                            if 'p' in t and 'v' in t:
-                                                v = float(t['p']) * float(t['v'])
-                                                side = 's' if str(t.get('S')) == '2' else 'b'
-                                                state['trades'].append({'ts': time.time(), 'ex': 'mc_s', 'side': side, 'v': v})
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_mexc_f():
-        url = "wss://contract.mexc.com/edge"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"method": "sub.deal", "param": {"symbol": f"{base_coin}_USDT"}}))
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if data.get("channel") == "push.deal" and "data" in data:
-                                        d = data["data"]
-                                        deals = d if isinstance(d, list) else [d]
-                                        for t in deals:
-                                            if isinstance(t, dict) and 'p' in t and 'v' in t:
-                                                p = float(t["p"])
-                                                v = float(t["v"]) * p
-                                                side = 's' if str(t.get("T")) == '2' else 'b'
-                                                state['trades'].append({'ts': time.time(), 'ex': 'mc_f', 'side': side, 'v': v})
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_bybit_s():
-        url = "wss://stream.bybit.com/v5/public/spot"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}))
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
+                                    if 'p' in data and 'q' in data:
+                                        state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': 's' if data.get('m') else 'b', 'v': float(data['p']) * float(data['q'])})
+                                        state['current_price'] = float(data['p'])
+                                elif msg.type == aiohttp.WSMsgType.BINARY:
+                                    d = gzip.decompress(msg.data).decode('utf-8')
+                                    if not d.strip(): continue
+                                    data = json.loads(d)
+                                    if "ping" in data: await ws.send_str(json.dumps({"pong": data["ping"]}))
+                                    elif "data" in data and data["data"]:
+                                        for t in (data["data"] if isinstance(data["data"], list) else [data["data"]]):
+                                            if 'p' in t and (t.get('q') or t.get('v')):
+                                                state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': 's' if t.get('m') else 'b', 'v': float(t['p']) * float(t.get('q', t.get('v', 0)))})
+                                                if ex_code == 'bx_f': state['current_price'] = float(t['p'])
+                                elif msg.type == aiohttp.WSMsgType.TEXT:
                                     data = json.loads(msg.data)
                                     if "data" in data and isinstance(data["data"], list):
                                         for t in data["data"]:
-                                            if not isinstance(t, dict): continue
                                             if 'p' in t and 'v' in t:
-                                                v = float(t['p']) * float(t['v'])
-                                                side = 's' if t.get('S') == "Sell" else 'b'
-                                                state['trades'].append({'ts': time.time(), 'ex': 'bb_s', 'side': side, 'v': v})
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_bybit_f(url_target, ex_code):
-        url = "wss://stream.bybit.com/v5/public/linear"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        await ws.send_str(json.dumps({"op": "subscribe", "args": [f"publicTrade.{url_target}"]}))
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if "data" in data and isinstance(data["data"], list):
-                                        for t in data["data"]:
-                                            if not isinstance(t, dict): continue
+                                                state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': 's' if t.get('S') == "Sell" else 'b', 'v': float(t['p']) * float(t['v'])})
+                                    elif "d" in data and "deals" in data["d"]:
+                                        for t in (data["d"]["deals"] if isinstance(data["d"]["deals"], list) else [data["d"]["deals"]]):
                                             if 'p' in t and 'v' in t:
-                                                v = float(t['p']) * float(t['v'])
-                                                side = 's' if t.get('S') == "Sell" else 'b'
-                                                state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': side, 'v': v})
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_binance_s():
-        url = f"wss://data-stream.binance.vision/ws/{sym_binance}@aggTrade"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if isinstance(data, dict) and 'p' in data and 'q' in data:
-                                        v = float(data['p']) * float(data['q'])
-                                        side = 's' if data.get('m') else 'b'
-                                        state['trades'].append({'ts': time.time(), 'ex': 'bn_s', 'side': side, 'v': v})
-                                        state['current_price'] = float(data['p'])
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
-
-    async def l_binance_f(url_target, ex_code):
-        url = f"wss://fstream.binance.com/ws/{url_target}@aggTrade"
-        while state['active']:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20) as ws:
-                        async for msg in ws:
-                            if not state['active']: break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if isinstance(data, dict) and 'p' in data and 'q' in data:
-                                        v = float(data['p']) * float(data['q'])
-                                        side = 's' if data.get('m') else 'b'
-                                        state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': side, 'v': v})
-                                        state['current_price'] = float(data['p'])
-                                except Exception: pass
-            except asyncio.CancelledError: break
-            except Exception: 
-                if state['active']: await asyncio.sleep(1)
+                                                state['trades'].append({'ts': time.time(), 'ex': ex_code, 'side': 's' if str(t.get('S')) == '2' or str(t.get('T')) == '2' else 'b', 'v': float(t['p']) * float(t['v'])})
+                            except Exception: pass
+            except Exception: await asyncio.sleep(1)
 
     tasks = [
-        asyncio.create_task(l_bingx_s()),
-        asyncio.create_task(l_bingx_f()), 
-        asyncio.create_task(l_mexc_s()), 
-        asyncio.create_task(l_mexc_f()), 
-        asyncio.create_task(l_bybit_s()), 
-        asyncio.create_task(l_bybit_f(sym_bybit, 'bb_f')), 
-        asyncio.create_task(l_bybit_f(sym_bybit_1000, 'bb_f')), 
-        asyncio.create_task(l_binance_s()), 
-        asyncio.create_task(l_binance_f(sym_binance, 'bn_f')), 
-        asyncio.create_task(l_binance_f(sym_binance_1000, 'bn_f'))
+        asyncio.create_task(l_ws("wss://open-api-ws.bingx.com/market", {"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_s}@trade"}, 'bx_s')),
+        asyncio.create_task(l_ws("wss://open-api-swap.bingx.com/swap-market", {"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_f}@trade"}, 'bx_f')),
+        asyncio.create_task(l_ws("wss://wbs-api.mexc.com/ws", {"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_mexc}"]}, 'mc_s')),
+        asyncio.create_task(l_ws("wss://contract.mexc.com/edge", {"method": "sub.deal", "param": {"symbol": f"{base_coin}_USDT"}}, 'mc_f')),
+        asyncio.create_task(l_ws("wss://stream.bybit.com/v5/public/spot", {"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}, 'bb_s')),
+        asyncio.create_task(l_ws("wss://stream.bybit.com/v5/public/linear", {"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}, 'bb_f')),
+        asyncio.create_task(l_ws("wss://stream.bybit.com/v5/public/linear", {"op": "subscribe", "args": [f"publicTrade.{sym_bybit_1000}"]}, 'bb_f')),
+        asyncio.create_task(l_ws(f"wss://data-stream.binance.vision/ws/{sym_binance}@aggTrade", None, 'bn_s', True)),
+        asyncio.create_task(l_ws(f"wss://fstream.binance.com/ws/{sym_binance}@aggTrade", None, 'bn_f', True)),
+        asyncio.create_task(l_ws(f"wss://fstream.binance.com/ws/{sym_binance_1000}@aggTrade", None, 'bn_f', True))
     ]
 
     try:
         is_long = (setup_data['direction'] == 'Long')
         
-        # РАБОТАЕМ, ПОКА МОНЕТА НА МУШКЕ ИЛИ ОТКРЫТА СДЕЛКА
         while (sym in HOT_LIST or any(p['symbol'] == sym for p in active_positions)) and state['active']:
             await asyncio.sleep(3) 
             now = time.time()
-            
-            # Сохраняем максимум 60 секунд данных для расчета
             state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
             
-            # --- РАСЧЕТ 30s CVD ДЛЯ СТОП-ЛОССА ---
             trades_30s = [t for t in state['trades'] if now - t['ts'] <= 30]
-            buy_30s = sum(t['v'] for t in trades_30s if t['side'] == 'b')
-            sell_30s = sum(t['v'] for t in trades_30s if t['side'] == 's')
-            GLOBAL_CVD[sym] = buy_30s - sell_30s
+            GLOBAL_CVD[sym] = sum(t['v'] for t in trades_30s if t['side'] == 'b') - sum(t['v'] for t in trades_30s if t['side'] == 's')
             
-            # Если монета не на мушке (уже в сделке), пропускаем блок входа
-            if sym not in HOT_LIST: continue
-            if len(active_positions) >= MAX_POSITIONS: continue
-            
-            # Ждем заполнения буфера хотя бы 15 сек перед первым входом
-            if now - state['start_time'] < 15: continue
+            if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or now - state['start_time'] < 15: continue
                 
-            bx_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_s' and t['side'] == 'b')
-            bx_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_s' and t['side'] == 's')
-            bx_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_f' and t['side'] == 'b')
-            bx_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_f' and t['side'] == 's')
+            vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_s', 'bn_f']}
+            tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
             
-            mc_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_s' and t['side'] == 'b')
-            mc_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_s' and t['side'] == 's')
-            mc_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_f' and t['side'] == 'b')
-            mc_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'mc_f' and t['side'] == 's')
-            
-            bb_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_s' and t['side'] == 'b')
-            bb_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_s' and t['side'] == 's')
-            bb_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_f' and t['side'] == 'b')
-            bb_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bb_f' and t['side'] == 's')
-            
-            bn_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_s' and t['side'] == 'b')
-            bn_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_s' and t['side'] == 's')
-            bn_f_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_f' and t['side'] == 'b')
-            bn_f_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bn_f' and t['side'] == 's')
-            
-            bx_s_tot = bx_s_b + bx_s_s
-            bx_f_tot = bx_f_b + bx_f_s
-            mc_s_tot = mc_s_b + mc_s_s
-            mc_f_tot = mc_f_b + mc_f_s
-            bb_s_tot = bb_s_b + bb_s_s
-            bb_f_tot = bb_f_b + bb_f_s
-            bn_s_tot = bn_s_b + bn_s_s
-            bn_f_tot = bn_f_b + bn_f_s
-            
-            if bn_f_tot > state['max_bn_f_60s']: state['max_bn_f_60s'] = bn_f_tot
+            if tots['bn_f'] > state['max_bn_f_60s']: state['max_bn_f_60s'] = tots['bn_f']
             
             valid_exchanges = []
             
-            # --- 60s WINDOW ENTRY THRESHOLDS ---
-            if bx_s_tot > 20000:
-                pct = (bx_s_b / bx_s_tot) * 100 if is_long else (bx_s_s / bx_s_tot) * 100
-                if pct >= 60: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
-            if bx_f_tot > 20000:
-                pct = (bx_f_b / bx_f_tot) * 100 if is_long else (bx_f_s / bx_f_tot) * 100
-                if pct >= 60: valid_exchanges.append(('BingX (F)', bx_f_tot, pct))
-            if mc_s_tot > 20000:
-                pct = (mc_s_b / mc_s_tot) * 100 if is_long else (mc_s_s / mc_s_tot) * 100
-                if pct >= 60: valid_exchanges.append(('MEXC (S)', mc_s_tot, pct))
-            if mc_f_tot > 20000:
-                pct = (mc_f_b / mc_f_tot) * 100 if is_long else (mc_f_s / mc_f_tot) * 100
-                if pct >= 60: valid_exchanges.append(('MEXC (F)', mc_f_tot, pct))
-            if bb_s_tot > 20000:
-                pct = (bb_s_b / bb_s_tot) * 100 if is_long else (bb_s_s / bb_s_tot) * 100
-                if pct >= 60: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
-                
-            if bn_s_tot > 30000:
-                pct = (bn_s_b / bn_s_tot) * 100 if is_long else (bn_s_s / bn_s_tot) * 100
-                if pct >= 60: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
-                
-            if bb_f_tot > 40000:
-                pct = (bb_f_b / bb_f_tot) * 100 if is_long else (bb_f_s / bb_f_tot) * 100
-                if pct >= 60: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
-                
-            if bn_f_tot > 50000:
-                pct = (bn_f_b / bn_f_tot) * 100 if is_long else (bn_f_s / bn_f_tot) * 100
-                if pct >= 60: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
+            # --- V8.2: СНИЖЕННЫЕ ПОРОГИ ДЛЯ ВХОДА ---
+            thresh = {'bx_s': 10000, 'bx_f': 10000, 'mc_s': 10000, 'mc_f': 10000, 'bb_s': 10000, 'bn_s': 20000, 'bb_f': 25000, 'bn_f': 30000}
+            labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bn_s': 'Binance (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
+            
+            for ex, limit in thresh.items():
+                if tots[ex] > limit:
+                    pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
+                    if pct >= 60: valid_exchanges.append((labels[ex], tots[ex], pct))
 
             if len(valid_exchanges) > 0:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
-                in_zone = (setup_data['ob_low'] - ob_range*0.3) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.3)
+                # СМЯГЧЕНИЕ: Расширенный буфер зоны OB (0.5 вместо 0.3)
+                in_zone = (setup_data['ob_low'] - ob_range*0.5) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.5)
                 
                 if in_zone:
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
+                    global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                     
-                    global_buy = bx_s_b + bx_f_b + mc_s_b + mc_f_b + bb_s_b + bb_f_b + bn_s_b + bn_f_b
-                    global_sell = bx_s_s + bx_f_s + mc_s_s + mc_f_s + bb_s_s + bb_f_s + bn_s_s + bn_f_s
-                    global_delta = global_buy - global_sell
-                    
-                    is_divergent = False
-                    if is_long and global_delta < 0: is_divergent = True
-                    if not is_long and global_delta > 0: is_divergent = True
-
-                    is_absorbed = False
-                    if is_long and price_shift_pct < -0.05: is_absorbed = True
-                    if not is_long and price_shift_pct > 0.05: is_absorbed = True
-                    
-                    # СМЯГЧЕНИЕ: Расширен лимит отстрела до 2.5% для резких импульсов
-                    is_exhausted = False
-                    if is_long and price_shift_pct > 2.5: is_exhausted = True
-                    if not is_long and price_shift_pct < -2.5: is_exhausted = True
-                    
-                    if is_divergent:
-                        logging.info(f"🛡 [ДЕЛЬТА-ДИВЕРГЕНЦИЯ] {clean_name} отменен. Сигнал {setup_data['direction']}, но глобальная дельта рынка: {global_delta:.0f}$")
+                    if (is_long and global_delta < 0) or (not is_long and global_delta > 0):
+                        logging.info(f"🛡 [ДЕЛТА-ДИВЕРГЕНЦИЯ] {clean_name} отменен.")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
-                        
-                    if is_absorbed:
-                        logging.info(f"🛡 [АБСОРБЦИЯ] {clean_name} отменен. Объемы: {valid_exchanges[0][0]}, но сдвиг цены: {price_shift_pct:.2f}%")
+                    if (is_long and price_shift_pct < -0.05) or (not is_long and price_shift_pct > 0.05):
+                        logging.info(f"🛡 [АБСОРБЦИЯ] {clean_name} отменен.")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
-                        
-                    if is_exhausted:
-                        logging.info(f"🛡 [ОТСТРЕЛ] {clean_name} отменен. Цена улетела от базы: {price_shift_pct:.2f}%")
+                    if (is_long and price_shift_pct > 2.5) or (not is_long and price_shift_pct < -2.5):
+                        logging.info(f"🛡 [ОТСТРЕЛ] {clean_name} отменен.")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
                     if sym in HOT_LIST: del HOT_LIST[sym]
-                    
-                    side_str = 'покупок' if is_long else 'продаж'
-                    vol_strings = [f"✅ {ex}: {tot:.0f}$ ({pct:.0f}% {side_str})" for ex, tot, pct in valid_exchanges]
-                    
-                    if len(valid_exchanges) >= 2:
-                        setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Подтверждено: {len(valid_exchanges)} пула)"
-                        setup_data['dynamic_risk'] = 1.5  
-                    else:
-                        setup_data['score_info'] = f"⚡ Базовый Сигнал ({valid_exchanges[0][0]})"
-                        setup_data['dynamic_risk'] = 1.0
-                        
-                    setup_data['vol_info'] = "\n".join(vol_strings)
+                    setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Пулов: {len(valid_exchanges)})" if len(valid_exchanges) >= 2 else f"⚡ Базовый Сигнал ({valid_exchanges[0][0]})"
+                    setup_data['dynamic_risk'] = 1.5 if len(valid_exchanges) >= 2 else 1.0
+                    setup_data['vol_info'] = "\n".join([f"✅ {ex}: {tot:.0f}$ ({pct:.0f}%)" for ex, tot, pct in valid_exchanges])
                     await execute_trade(setup_data)
                     
     finally:
@@ -714,10 +425,7 @@ async def wss_sniper_worker(sym, setup_data):
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         if sym in GLOBAL_CVD: del GLOBAL_CVD[sym]
-        
-        log_str = (f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. Binance(F) 60s: ${state['max_bn_f_60s']:.0f}")
-        logging.info(log_str)
-        gc.collect()
+        logging.info(f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. Binance(F) 60s: ${state['max_bn_f_60s']:.0f}")
 
 async def sniper_manager():
     while True:
@@ -728,9 +436,9 @@ async def sniper_manager():
         await asyncio.sleep(5)
 
 async def monitor_positions_job():
-    global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
+    global active_positions, daily_stats, CONSECUTIVE_LOSSES
     while True:
-        await asyncio.sleep(5) # Ускорен цикл для мгновенной реакции CVD SL
+        await asyncio.sleep(5) 
         if not active_positions: continue
         
         updated = []
@@ -743,88 +451,51 @@ async def monitor_positions_job():
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 
                 if not curr:
-                    ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
-                    pnl = (last_p - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - last_p) * pos['initial_qty']
-                    margin = (pos['entry_price'] * pos['initial_qty']) / LEVERAGE
-                    pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
-                    
+                    ticker = await exchange.fetch_ticker(sym); pnl = (ticker['last'] - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - ticker['last']) * pos['initial_qty']
+                    pnl_pct = (pnl / ((pos['entry_price'] * pos['initial_qty']) / LEVERAGE)) * 100 if (pos['entry_price'] * pos['initial_qty']) > 0 else 0
                     daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
-                    if pnl > 0:
-                        daily_stats['wins'] += 1; CONSECUTIVE_LOSSES = 0
-                        await send_tg_msg(f"✅ **{clean_name} закрыта в плюс!**\nPNL: +{pnl:.2f} USDT (+{pnl_pct:.2f}%)")
-                    else:
-                        CONSECUTIVE_LOSSES += 1
-                        await send_tg_msg(f"🛑 **{clean_name} выбита по SL.**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
+                    if pnl > 0: daily_stats['wins'] += 1; CONSECUTIVE_LOSSES = 0; await send_tg_msg(f"✅ **{clean_name} закрыта в плюс!**\nPNL: +{pnl:.2f} USDT (+{pnl_pct:.2f}%)")
+                    else: CONSECUTIVE_LOSSES += 1; await send_tg_msg(f"🛑 **{clean_name} выбита по SL.**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
                     continue
 
-                # --- ЛОГИКА ДИНАМИЧЕСКОГО СТОП-ЛОССА НА ДЕЛЬТЕ ---
                 ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
                 current_cvd = GLOBAL_CVD.get(sym, 0)
                 
-                if is_long and last_p < pos['entry_price'] and current_cvd < -CRITICAL_CVD_USDT:
+                if (is_long and last_p < pos['entry_price'] and current_cvd < -CRITICAL_CVD_USDT) or (not is_long and last_p > pos['entry_price'] and current_cvd > CRITICAL_CVD_USDT):
                     try:
-                        c_side = 'sell'
-                        await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
+                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']), params={'positionSide': pos['position_side']})
                         await exchange.cancel_order(pos['sl_order_id'], sym)
-                        
-                        pnl = (last_p - pos['entry_price']) * float(curr['contracts'])
-                        margin = (pos['entry_price'] * float(curr['contracts'])) / LEVERAGE
-                        pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
-                        
-                        daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
-                        CONSECUTIVE_LOSSES += 1
-                        await send_tg_msg(f"🚨 **[CVD STOP] Экстренный выход из {clean_name}!**\nАгрессивные продажи: {current_cvd:,.0f} $\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
-                        continue
-                    except: pass
-                elif not is_long and last_p > pos['entry_price'] and current_cvd > CRITICAL_CVD_USDT:
-                    try:
-                        c_side = 'buy'
-                        await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                        
-                        pnl = (pos['entry_price'] - last_p) * float(curr['contracts'])
-                        margin = (pos['entry_price'] * float(curr['contracts'])) / LEVERAGE
-                        pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
-                        
-                        daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
-                        CONSECUTIVE_LOSSES += 1
-                        await send_tg_msg(f"🚨 **[CVD STOP] Экстренный выход из {clean_name}!**\nАгрессивные покупки: +{current_cvd:,.0f} $\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
+                        pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - last_p) * float(curr['contracts'])
+                        pnl_pct = (pnl / ((pos['entry_price'] * float(curr['contracts'])) / LEVERAGE)) * 100
+                        daily_stats['trades'] += 1; daily_stats['pnl'] += pnl; CONSECUTIVE_LOSSES += 1
+                        await send_tg_msg(f"🚨 **[CVD STOP] Экстренный выход из {clean_name}!**\nДельта: {current_cvd:,.0f} $\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
                         continue
                     except: pass
 
-                # Тайм-ауты
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - last_p) * float(curr['contracts'])
 
                 if hours_passed >= TRADE_TIMEOUT_ANY_HOURS or (hours_passed >= TRADE_TIMEOUT_PROFIT_HOURS and pnl > 0):
                     try:
-                        c_side = 'sell' if is_long else 'buy'
-                        await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
+                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']), params={'positionSide': pos['position_side']})
                         await exchange.cancel_order(pos['sl_order_id'], sym)
-                        
-                        margin = (pos['entry_price'] * float(curr['contracts'])) / LEVERAGE
-                        pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
-                        icon = "✅" if pnl > 0 else "🛑"
-                        sign = "+" if pnl > 0 else ""
-                        await send_tg_msg(f"{icon} **{clean_name} закрыта по ТАЙМАУТУ!**\nPNL: {sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)")
+                        pnl_pct = (pnl / ((pos['entry_price'] * float(curr['contracts'])) / LEVERAGE)) * 100
+                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} **{clean_name} закрыта по ТАЙМАУТУ!**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
                         continue 
                     except: pass
 
                 ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
                 if not ohlcv: updated.append(pos); continue
-                
                 high_p, low_p = max([float(c[2]) for c in ohlcv]), min([float(c[3]) for c in ohlcv])
-                c_side = 'sell' if is_long else 'buy'
 
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
-                    dist = abs(pos['tp1'] - pos['entry_price'])
-                    trigger_80 = pos['entry_price'] + dist * 0.8 if is_long else pos['entry_price'] - dist * 0.8
-                    if (is_long and high_p >= trigger_80) or (not is_long and low_p <= trigger_80):
+                    trigger = pos['entry_price'] + abs(pos['tp1'] - pos['entry_price']) * 0.8 * (1 if is_long else -1)
+                    if (is_long and high_p >= trigger) or (not is_long and low_p <= trigger):
                         try:
                             await exchange.cancel_order(pos['sl_order_id'], sym)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.001 if is_long else 0.999)))
-                            new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
+                            new_sl = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
                             pos.update({'sl_order_id': new_sl['id'], 'current_sl': be_p, 'pre_tp1_hit': True})
                         except: pass
 
@@ -832,70 +503,36 @@ async def monitor_positions_job():
                     if (is_long and high_p >= pos['tp1']) or (not is_long and low_p <= pos['tp1']):
                         try:
                             close_qty = float(exchange.amount_to_precision(sym, float(curr['contracts']) * 0.50))
-                            if close_qty > 0:
-                                await exchange.create_market_order(sym, c_side, close_qty, params={'positionSide': pos['position_side']})
-                                pos['initial_qty'] = float(curr['contracts']) - close_qty 
-                            
+                            if close_qty > 0: await exchange.create_market_order(sym, 'sell' if is_long else 'buy', close_qty, params={'positionSide': pos['position_side']}); pos['initial_qty'] = float(curr['contracts']) - close_qty 
                             await exchange.cancel_order(pos['sl_order_id'], sym)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.002 if is_long else 0.998)))
-                            new_sl = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
-                            
+                            new_sl = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
                             risk = abs(pos['entry_price'] - pos['sl_price'])
-                            m_step = risk * 0.3
-                            t_dist = risk * 0.5 
-                            
-                            pos.update({
-                                'tp1_hit': True, 'sl_order_id': new_sl['id'], 'current_sl': be_p,
-                                'micro_step': m_step, 'trail_distance': t_dist, 
-                                'trail_trigger': pos['tp1'] + m_step if is_long else pos['tp1'] - m_step
-                            })
+                            pos.update({'tp1_hit': True, 'sl_order_id': new_sl['id'], 'micro_step': risk*0.3, 'trail_distance': risk*0.5, 'trail_trigger': pos['tp1'] + risk*0.3 * (1 if is_long else -1)})
                             await send_tg_msg(f"💰 **{clean_name} TP1 взят!** (50% закрыто).\n🛡 Запущен Агрессивный Трейлинг.")
                         except: pass
 
                 if pos.get('tp1_hit'):
-                    tt = pos.get('trail_trigger')
-                    ms = pos.get('micro_step')
-                    td = pos.get('trail_distance')
-                    
-                    if tt is None or ms is None or td is None:
-                        risk = abs(pos['entry_price'] - pos['sl_price'])
-                        ms, td = risk * 0.3, risk * 0.5
-                        tt = pos['tp1'] + ms if is_long else pos['tp1'] - ms
-                        pos.update({'micro_step': ms, 'trail_trigger': tt, 'trail_distance': td})
-
+                    tt, ms, td = pos.get('trail_trigger'), pos.get('micro_step'), pos.get('trail_distance')
                     if (is_long and high_p >= tt) or (not is_long and low_p <= tt):
                         try:
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                            new_sl_val = tt - td if is_long else tt + td
-                            nsl = float(exchange.price_to_precision(sym, new_sl_val))
-                            new_sl_order = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
-                            
-                            pos.update({'sl_order_id': new_sl_order['id'], 'current_sl': nsl, 'trail_trigger': tt + ms if is_long else tt - ms})
+                            nsl = float(exchange.price_to_precision(sym, tt - td if is_long else tt + td))
+                            new_sl_order = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
+                            pos.update({'sl_order_id': new_sl_order['id'], 'trail_trigger': tt + ms if is_long else tt - ms})
                             await send_tg_msg(f"📈 **{clean_name} Трейлинг:** SL -> {nsl}")
                         except: pass
-
                 updated.append(pos)
             active_positions = updated
             await asyncio.to_thread(save_positions)
-        except Exception as e: logging.error(f"Критическая ошибка Монитора: {e}")
+        except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot v8.1 Active (Dual Window, CVD SL, Relaxed FOMO)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.2 Active")
     def log_message(self, format, *args): return 
 
-def run_server():
-    server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler)
-    server.serve_forever()
-
-async def main():
-    init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.1: Dual Window & CVD SL...")
-    await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
-
 if __name__ == '__main__':
-    Thread(target=run_server, daemon=True).start()
-    try: asyncio.run(main())
+    init_db(); load_positions()
+    Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler).serve_forever(), daemon=True).start()
+    try: asyncio.run(asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job()))
     except KeyboardInterrupt: logging.info("\nОстановка.")
