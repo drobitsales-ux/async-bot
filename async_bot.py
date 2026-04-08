@@ -169,8 +169,13 @@ async def detect_setups(sym, btc_trend, altseason):
         upper_bb = sma_20 + (2 * std_dev)
         lower_bb = sma_20 - (2 * std_dev)
         bb_width = (upper_bb - lower_bb) / sma_20 * 100
+        
+        # УЖЕСТОЧЕНИЕ: Ищем всплеск объема минимум на 50% для защиты уровня
+        grid_volume_threshold = avg_volume * 1.50
+        grid_has_volume = (v[-1] > grid_volume_threshold) or (v[-2] > grid_volume_threshold)
 
-        if bb_width < 3.0 and has_volume:
+        # УЖЕСТОЧЕНИЕ: Канал должен быть очень узким (меньше 2.5%)
+        if bb_width < 2.5 and grid_has_volume:
             if current_price <= lower_bb * 1.002: 
                 sl = lower_bb - (atr * 0.5)
                 return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': sma_20, 'tp2': upper_bb, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
@@ -251,26 +256,31 @@ async def radar_task():
 async def execute_trade(signal):
     sym = signal['symbol']
     clean_name = sym.split(':')[0]
+    
+    # СТРОГИЙ КПП: Блокировка состояния гонки перед самым входом
+    if len(active_positions) >= MAX_POSITIONS: 
+        logging.info(f"🚫 Пропуск {clean_name}: Лимит позиций ({MAX_POSITIONS}) уже достигнут.")
+        return
+        
     if any(p['symbol'] == sym for p in active_positions): return
 
     try:
         bal = await exchange.fetch_balance()
         free_usdt = float(bal['USDT']['free'])
         
-        # 1. Расчет объема по РИСКУ (как раньше)
+        # 1. Расчет объема по РИСКУ
         risk_multiplier = signal.get('dynamic_risk', 1.0)
         actual_risk_percent = RISK_PER_TRADE * risk_multiplier
         risk_amount = free_usdt * actual_risk_percent
         sl_dist = abs(signal['entry_price'] - signal['sl'])
         ideal_qty = risk_amount / sl_dist if sl_dist > 0 else 0
         
-        # 2. Расчет максимального объема по МАРЖЕ (чтобы не словить 101204)
-        # Выделяем на одну сделку максимум 1/MAX_POSITIONS часть от свободных денег
-        max_margin_per_trade = (free_usdt * 0.95) / MAX_POSITIONS  # 5% буфер на комиссии
+        # 2. Расчет максимального объема по МАРЖЕ
+        max_margin_per_trade = (free_usdt * 0.95) / MAX_POSITIONS
         max_notional_allowed = max_margin_per_trade * LEVERAGE
         max_qty_allowed = max_notional_allowed / signal['entry_price']
         
-        # 3. Берем МЕНЬШЕЕ из двух значений (защита депозита)
+        # 3. Финализация объема
         final_qty = min(ideal_qty, max_qty_allowed)
         qty = float(exchange.amount_to_precision(sym, final_qty))
         
