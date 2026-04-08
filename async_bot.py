@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.3 (Bug Fixes, Dual Window, GRID Module) ===
+# === НАСТРОЙКИ v8.4 (Margin Cap Protection, GRID+SMC) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -137,7 +137,7 @@ async def detect_setups(sym, btc_trend, altseason):
         has_volume = (v[-1] > avg_volume * 1.05) or (v[-2] > avg_volume * 1.05)
         vol_increase_pct = ((max(v[-1], v[-2]) / avg_volume) - 1) * 100 if avg_volume > 0 else 0
 
-        # --- 1. SMC МОДУЛЬ (Трендовый) ---
+        # --- 1. SMC МОДУЛЬ ---
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
@@ -162,7 +162,7 @@ async def detect_setups(sym, btc_trend, altseason):
                                 sl = ob_high + (atr * 0.8)
                                 return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price), 'tp2': current_price - (sl-current_price)*2, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
-        # --- 2. GRID МОДУЛЬ (Боковой пинг-понг) ---
+        # --- 2. GRID МОДУЛЬ ---
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -170,17 +170,16 @@ async def detect_setups(sym, btc_trend, altseason):
         lower_bb = sma_20 - (2 * std_dev)
         bb_width = (upper_bb - lower_bb) / sma_20 * 100
 
-        # Если ширина канала < 3% (флэт) и есть всплеск объема (кто-то защищает границы)
         if bb_width < 3.0 and has_volume:
-            if current_price <= lower_bb * 1.002: # Отскок от дна канала
+            if current_price <= lower_bb * 1.002: 
                 sl = lower_bb - (atr * 0.5)
                 return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': sma_20, 'tp2': upper_bb, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
-            elif current_price >= upper_bb * 0.998: # Отскок от потолка канала
+            elif current_price >= upper_bb * 0.998: 
                 sl = upper_bb + (atr * 0.5)
                 return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': sma_20, 'tp2': lower_bb, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
 
         return None
-    except Exception as e: return None
+    except Exception: return None
 
 async def process_single_coin(sym, btc_trend, altseason, sem):
     async with sem: 
@@ -240,7 +239,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.3)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.4)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -257,32 +256,59 @@ async def execute_trade(signal):
     try:
         bal = await exchange.fetch_balance()
         free_usdt = float(bal['USDT']['free'])
-        actual_risk_percent = RISK_PER_TRADE * signal.get('dynamic_risk', 1.0)
-        qty = float(exchange.amount_to_precision(sym, (free_usdt * actual_risk_percent) / abs(signal['entry_price'] - signal['sl'])))
-        if qty <= 0: return 
+        
+        # 1. Расчет объема по РИСКУ (как раньше)
+        risk_multiplier = signal.get('dynamic_risk', 1.0)
+        actual_risk_percent = RISK_PER_TRADE * risk_multiplier
+        risk_amount = free_usdt * actual_risk_percent
+        sl_dist = abs(signal['entry_price'] - signal['sl'])
+        ideal_qty = risk_amount / sl_dist if sl_dist > 0 else 0
+        
+        # 2. Расчет максимального объема по МАРЖЕ (чтобы не словить 101204)
+        # Выделяем на одну сделку максимум 1/MAX_POSITIONS часть от свободных денег
+        max_margin_per_trade = (free_usdt * 0.95) / MAX_POSITIONS  # 5% буфер на комиссии
+        max_notional_allowed = max_margin_per_trade * LEVERAGE
+        max_qty_allowed = max_notional_allowed / signal['entry_price']
+        
+        # 3. Берем МЕНЬШЕЕ из двух значений (защита депозита)
+        final_qty = min(ideal_qty, max_qty_allowed)
+        qty = float(exchange.amount_to_precision(sym, final_qty))
+        
+        if qty <= 0: 
+            logging.warning(f"Trade ignored: QTY too small for {clean_name}")
+            return 
 
         pos_side = 'LONG' if signal['direction'] == 'Long' else 'SHORT'
         side = 'buy' if signal['direction'] == 'Long' else 'sell'
+        sl_side = 'sell' if side == 'buy' else 'buy'
         
         await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
         await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
-        sl_ord = await exchange.create_order(sym, 'stop_market', 'sell' if side == 'buy' else 'buy', qty, params={'triggerPrice': float(exchange.price_to_precision(sym, signal['sl'])), 'positionSide': pos_side, 'stopLossPrice': float(exchange.price_to_precision(sym, signal['sl']))})
         
+        sl_price = float(exchange.price_to_precision(sym, signal['sl']))
+        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price})
+        
+        tp1_price = float(exchange.price_to_precision(sym, signal['tp1']))
+        tp2_price = float(exchange.price_to_precision(sym, signal['tp2']))
+
         active_positions.append({
             'symbol': sym, 'direction': signal['direction'], 'entry_price': signal['entry_price'], 'initial_qty': qty, 
-            'sl_price': float(exchange.price_to_precision(sym, signal['sl'])), 'tp1': float(exchange.price_to_precision(sym, signal['tp1'])), 'tp2': float(exchange.price_to_precision(sym, signal['tp2'])), 
+            'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 
             'tp1_hit': False, 'pre_tp1_hit': False, 'sl_order_id': sl_ord['id'], 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat(), 'mode': signal['mode']
         })
         
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
+        # Информационный блок: показываем, не уперлись ли мы в потолок маржи
+        cap_note = " (Margin Capped ⚠️)" if ideal_qty > max_qty_allowed else ""
+        
         msg = (f"💥 **ВЫСТРЕЛ [{signal['mode']}]: {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"{signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
                f"📊 **Анализ 60s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
-               f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {float(exchange.price_to_precision(sym, signal['sl']))}\nTP1: {float(exchange.price_to_precision(sym, signal['tp1']))}\nTP2: {float(exchange.price_to_precision(sym, signal['tp2']))}")
+               f"Цена: {signal['entry_price']}\nКоличество: {qty} монет{cap_note}\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
-    except Exception as e: logging.error(f"Trade error: {e}")
+    except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
@@ -508,7 +534,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.3 Active (SMC + GRID)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.4 Active (Margin Cap, GRID+SMC)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -518,7 +544,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.3: SMC + GRID Modules...")
+    logging.info("🚀 Запуск ядра v8.4: Margin Cap + SMC + GRID...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
