@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.0 (30s Rolling CVD, High-Volume) ===
+# === НАСТРОЙКИ v8.1 (60s Entry, 30s CVD SL, Relaxed FOMO) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -29,6 +29,10 @@ MIN_VOLUME_USDT = 1000000
 TRADE_TIMEOUT_PROFIT_HOURS = 2  
 TRADE_TIMEOUT_ANY_HOURS = 4     
 SMC_TIMEFRAME = '15m'
+
+# --- ДИНАМИЧЕСКИЙ СТОП-ЛОСС (CVD) ---
+CRITICAL_CVD_USDT = 150000  # Экстренный выход, если перевес против нас > $150k за 30 сек
+GLOBAL_CVD = {}             # Хранилище дельты реального времени
 
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
@@ -132,7 +136,8 @@ async def detect_smc_setup(sym, btc_trend, altseason):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        volume_threshold = avg_volume * 1.10  
+        # СМЯГЧЕНИЕ: Достаточно просто объема выше среднего (шум на волатильном рынке)
+        volume_threshold = avg_volume * 1.05  
         has_volume = (v[-1] > volume_threshold) or (v[-2] > volume_threshold)
         
         max_vol = max(v[-1], v[-2])
@@ -261,7 +266,7 @@ async def radar_task():
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
                         clean_name = sym.split(':')[0]
-                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (30s Rolling Window)...")
+                        await send_tg_msg(f"🎯 **РАДАР:** {clean_name} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (Dual Window + CVD SL)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -311,15 +316,16 @@ async def execute_trade(signal):
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        msg = (f"💥 **ВЫСТРЕЛ (v8.0 CVD): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
+        msg = (f"💥 **ВЫСТРЕЛ (v8.1 CVD): {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"{signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
-               f"📊 **Анализ 30s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
+               f"📊 **Анализ 60s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {signal['entry_price']}\nКоличество: {qty} монет\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
     except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
 
-# --- v8.0: 30s ROLLING WINDOW SNIPER ---
+# --- v8.1: DUAL WINDOW & DYNAMIC SL WORKER ---
 async def wss_sniper_worker(sym, setup_data):
+    global GLOBAL_CVD
     base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
     clean_name = base_coin  
     
@@ -334,10 +340,7 @@ async def wss_sniper_worker(sym, setup_data):
     state = {
         'trades': [],
         'start_time': time.time(),
-        'max_bx_s': 0.0, 'max_bx_f': 0.0,
-        'max_mc_s': 0.0, 'max_mc_f': 0.0,
-        'max_bb_s': 0.0, 'max_bb_f': 0.0,
-        'max_bn_s': 0.0, 'max_bn_f': 0.0,
+        'max_bn_f_60s': 0.0,
         'current_price': setup_data['entry_price'], 
         'active': True
     }
@@ -568,17 +571,26 @@ async def wss_sniper_worker(sym, setup_data):
     try:
         is_long = (setup_data['direction'] == 'Long')
         
-        while sym in HOT_LIST and state['active']:
-            await asyncio.sleep(3) # Проверка каждые 3 сек
+        # РАБОТАЕМ, ПОКА МОНЕТА НА МУШКЕ ИЛИ ОТКРЫТА СДЕЛКА
+        while (sym in HOT_LIST or any(p['symbol'] == sym for p in active_positions)) and state['active']:
+            await asyncio.sleep(3) 
+            now = time.time()
+            
+            # Сохраняем максимум 60 секунд данных для расчета
+            state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
+            
+            # --- РАСЧЕТ 30s CVD ДЛЯ СТОП-ЛОССА ---
+            trades_30s = [t for t in state['trades'] if now - t['ts'] <= 30]
+            buy_30s = sum(t['v'] for t in trades_30s if t['side'] == 'b')
+            sell_30s = sum(t['v'] for t in trades_30s if t['side'] == 's')
+            GLOBAL_CVD[sym] = buy_30s - sell_30s
+            
+            # Если монета не на мушке (уже в сделке), пропускаем блок входа
+            if sym not in HOT_LIST: continue
             if len(active_positions) >= MAX_POSITIONS: continue
             
-            now = time.time()
-            # Скользящее окно 30 секунд
-            state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 30]
-            
-            # Ждем заполнения буфера (15 сек) перед выводами
-            if now - state['start_time'] < 15:
-                continue
+            # Ждем заполнения буфера хотя бы 15 сек перед первым входом
+            if now - state['start_time'] < 15: continue
                 
             bx_s_b = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_s' and t['side'] == 'b')
             bx_s_s = sum(t['v'] for t in state['trades'] if t['ex'] == 'bx_s' and t['side'] == 's')
@@ -609,43 +621,36 @@ async def wss_sniper_worker(sym, setup_data):
             bn_s_tot = bn_s_b + bn_s_s
             bn_f_tot = bn_f_b + bn_f_s
             
-            if bx_s_tot > state['max_bx_s']: state['max_bx_s'] = bx_s_tot
-            if bx_f_tot > state['max_bx_f']: state['max_bx_f'] = bx_f_tot
-            if mc_s_tot > state['max_mc_s']: state['max_mc_s'] = mc_s_tot
-            if mc_f_tot > state['max_mc_f']: state['max_mc_f'] = mc_f_tot
-            if bb_s_tot > state['max_bb_s']: state['max_bb_s'] = bb_s_tot
-            if bb_f_tot > state['max_bb_f']: state['max_bb_f'] = bb_f_tot
-            if bn_s_tot > state['max_bn_s']: state['max_bn_s'] = bn_s_tot
-            if bn_f_tot > state['max_bn_f']: state['max_bn_f'] = bn_f_tot
+            if bn_f_tot > state['max_bn_f_60s']: state['max_bn_f_60s'] = bn_f_tot
             
             valid_exchanges = []
             
-            # --- 30s WINDOW THRESHOLDS ---
-            if bx_s_tot > 15000:
+            # --- 60s WINDOW ENTRY THRESHOLDS ---
+            if bx_s_tot > 20000:
                 pct = (bx_s_b / bx_s_tot) * 100 if is_long else (bx_s_s / bx_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('BingX (S)', bx_s_tot, pct))
-            if bx_f_tot > 15000:
+            if bx_f_tot > 20000:
                 pct = (bx_f_b / bx_f_tot) * 100 if is_long else (bx_f_s / bx_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('BingX (F)', bx_f_tot, pct))
-            if mc_s_tot > 15000:
+            if mc_s_tot > 20000:
                 pct = (mc_s_b / mc_s_tot) * 100 if is_long else (mc_s_s / mc_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('MEXC (S)', mc_s_tot, pct))
-            if mc_f_tot > 15000:
+            if mc_f_tot > 20000:
                 pct = (mc_f_b / mc_f_tot) * 100 if is_long else (mc_f_s / mc_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('MEXC (F)', mc_f_tot, pct))
-            if bb_s_tot > 15000:
+            if bb_s_tot > 20000:
                 pct = (bb_s_b / bb_s_tot) * 100 if is_long else (bb_s_s / bb_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Bybit (S)', bb_s_tot, pct))
                 
-            if bn_s_tot > 20000:
+            if bn_s_tot > 30000:
                 pct = (bn_s_b / bn_s_tot) * 100 if is_long else (bn_s_s / bn_s_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Binance (S)', bn_s_tot, pct))
                 
-            if bb_f_tot > 25000:
+            if bb_f_tot > 40000:
                 pct = (bb_f_b / bb_f_tot) * 100 if is_long else (bb_f_s / bb_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Bybit (F)', bb_f_tot, pct))
                 
-            if bn_f_tot > 40000:
+            if bn_f_tot > 50000:
                 pct = (bn_f_b / bn_f_tot) * 100 if is_long else (bn_f_s / bn_f_tot) * 100
                 if pct >= 60: valid_exchanges.append(('Binance (F)', bn_f_tot, pct))
 
@@ -668,24 +673,25 @@ async def wss_sniper_worker(sym, setup_data):
                     if is_long and price_shift_pct < -0.05: is_absorbed = True
                     if not is_long and price_shift_pct > 0.05: is_absorbed = True
                     
+                    # СМЯГЧЕНИЕ: Расширен лимит отстрела до 2.5% для резких импульсов
                     is_exhausted = False
-                    if is_long and price_shift_pct > 1.2: is_exhausted = True
-                    if not is_long and price_shift_pct < -1.2: is_exhausted = True
+                    if is_long and price_shift_pct > 2.5: is_exhausted = True
+                    if not is_long and price_shift_pct < -2.5: is_exhausted = True
                     
                     if is_divergent:
                         logging.info(f"🛡 [ДЕЛЬТА-ДИВЕРГЕНЦИЯ] {clean_name} отменен. Сигнал {setup_data['direction']}, но глобальная дельта рынка: {global_delta:.0f}$")
                         if sym in HOT_LIST: del HOT_LIST[sym]
-                        break
+                        continue
                         
                     if is_absorbed:
                         logging.info(f"🛡 [АБСОРБЦИЯ] {clean_name} отменен. Объемы: {valid_exchanges[0][0]}, но сдвиг цены: {price_shift_pct:.2f}%")
                         if sym in HOT_LIST: del HOT_LIST[sym]
-                        break
+                        continue
                         
                     if is_exhausted:
                         logging.info(f"🛡 [ОТСТРЕЛ] {clean_name} отменен. Цена улетела от базы: {price_shift_pct:.2f}%")
                         if sym in HOT_LIST: del HOT_LIST[sym]
-                        break
+                        continue
                     
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     
@@ -701,19 +707,15 @@ async def wss_sniper_worker(sym, setup_data):
                         
                     setup_data['vol_info'] = "\n".join(vol_strings)
                     await execute_trade(setup_data)
-                    break
                     
     finally:
         state['active'] = False
         for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
+        if sym in GLOBAL_CVD: del GLOBAL_CVD[sym]
         
-        log_str = (f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. 30-сек CVD -> "
-                   f"BingX(S): ${state['max_bx_s']:.0f} | BingX(F): ${state['max_bx_f']:.0f} | "
-                   f"MEXC(S): ${state['max_mc_s']:.0f} | MEXC(F): ${state['max_mc_f']:.0f} | "
-                   f"Bybit(S): ${state['max_bb_s']:.0f} | Bybit(F): ${state['max_bb_f']:.0f} | "
-                   f"Binance(S): ${state['max_bn_s']:.0f} | Binance(F): ${state['max_bn_f']:.0f}")
+        log_str = (f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. Binance(F) 60s: ${state['max_bn_f_60s']:.0f}")
         logging.info(log_str)
         gc.collect()
 
@@ -728,7 +730,7 @@ async def sniper_manager():
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES, GLOBAL_STOP_UNTIL
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(5) # Ускорен цикл для мгновенной реакции CVD SL
         if not active_positions: continue
         
         updated = []
@@ -736,31 +738,68 @@ async def monitor_positions_job():
             positions_raw = await exchange.fetch_positions()
             for pos in active_positions:
                 sym = pos['symbol']
+                clean_name = sym.split(':')[0]
+                is_long = pos['direction'] == 'Long'
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 
                 if not curr:
                     ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
-                    pnl = (last_p - pos['entry_price']) * pos['initial_qty'] if pos['direction'] == 'Long' else (pos['entry_price'] - last_p) * pos['initial_qty']
+                    pnl = (last_p - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - last_p) * pos['initial_qty']
                     margin = (pos['entry_price'] * pos['initial_qty']) / LEVERAGE
                     pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
                     
                     daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
                     if pnl > 0:
                         daily_stats['wins'] += 1; CONSECUTIVE_LOSSES = 0
-                        await send_tg_msg(f"✅ **{sym.split(':')[0]} закрыта в плюс!**\nPNL: +{pnl:.2f} USDT (+{pnl_pct:.2f}%)")
+                        await send_tg_msg(f"✅ **{clean_name} закрыта в плюс!**\nPNL: +{pnl:.2f} USDT (+{pnl_pct:.2f}%)")
                     else:
                         CONSECUTIVE_LOSSES += 1
-                        await send_tg_msg(f"🛑 **{sym.split(':')[0]} выбита по SL.**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
+                        await send_tg_msg(f"🛑 **{clean_name} выбита по SL.**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
                     continue
 
+                # --- ЛОГИКА ДИНАМИЧЕСКОГО СТОП-ЛОССА НА ДЕЛЬТЕ ---
+                ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
+                current_cvd = GLOBAL_CVD.get(sym, 0)
+                
+                if is_long and last_p < pos['entry_price'] and current_cvd < -CRITICAL_CVD_USDT:
+                    try:
+                        c_side = 'sell'
+                        await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                        
+                        pnl = (last_p - pos['entry_price']) * float(curr['contracts'])
+                        margin = (pos['entry_price'] * float(curr['contracts'])) / LEVERAGE
+                        pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
+                        
+                        daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
+                        CONSECUTIVE_LOSSES += 1
+                        await send_tg_msg(f"🚨 **[CVD STOP] Экстренный выход из {clean_name}!**\nАгрессивные продажи: {current_cvd:,.0f} $\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
+                        continue
+                    except: pass
+                elif not is_long and last_p > pos['entry_price'] and current_cvd > CRITICAL_CVD_USDT:
+                    try:
+                        c_side = 'buy'
+                        await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                        
+                        pnl = (pos['entry_price'] - last_p) * float(curr['contracts'])
+                        margin = (pos['entry_price'] * float(curr['contracts'])) / LEVERAGE
+                        pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
+                        
+                        daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
+                        CONSECUTIVE_LOSSES += 1
+                        await send_tg_msg(f"🚨 **[CVD STOP] Экстренный выход из {clean_name}!**\nАгрессивные покупки: +{current_cvd:,.0f} $\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
+                        continue
+                    except: pass
+
+                # Тайм-ауты
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
-                ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
-                pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if pos['direction'] == 'Long' else (pos['entry_price'] - last_p) * float(curr['contracts'])
+                pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - last_p) * float(curr['contracts'])
 
                 if hours_passed >= TRADE_TIMEOUT_ANY_HOURS or (hours_passed >= TRADE_TIMEOUT_PROFIT_HOURS and pnl > 0):
                     try:
-                        c_side = 'sell' if pos['direction'] == 'Long' else 'buy'
+                        c_side = 'sell' if is_long else 'buy'
                         await exchange.create_market_order(sym, c_side, float(curr['contracts']), params={'positionSide': pos['position_side']})
                         await exchange.cancel_order(pos['sl_order_id'], sym)
                         
@@ -768,7 +807,7 @@ async def monitor_positions_job():
                         pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
                         icon = "✅" if pnl > 0 else "🛑"
                         sign = "+" if pnl > 0 else ""
-                        await send_tg_msg(f"{icon} **{sym.split(':')[0]} закрыта по ТАЙМАУТУ!**\nPNL: {sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)")
+                        await send_tg_msg(f"{icon} **{clean_name} закрыта по ТАЙМАУТУ!**\nPNL: {sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)")
                         continue 
                     except: pass
 
@@ -776,7 +815,6 @@ async def monitor_positions_job():
                 if not ohlcv: updated.append(pos); continue
                 
                 high_p, low_p = max([float(c[2]) for c in ohlcv]), min([float(c[3]) for c in ohlcv])
-                is_long = pos['direction'] == 'Long'
                 c_side = 'sell' if is_long else 'buy'
 
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
@@ -811,7 +849,7 @@ async def monitor_positions_job():
                                 'micro_step': m_step, 'trail_distance': t_dist, 
                                 'trail_trigger': pos['tp1'] + m_step if is_long else pos['tp1'] - m_step
                             })
-                            await send_tg_msg(f"💰 **{sym.split(':')[0]} TP1 взят!** (50% закрыто).\n🛡 Запущен Агрессивный Трейлинг.")
+                            await send_tg_msg(f"💰 **{clean_name} TP1 взят!** (50% закрыто).\n🛡 Запущен Агрессивный Трейлинг.")
                         except: pass
 
                 if pos.get('tp1_hit'):
@@ -833,7 +871,7 @@ async def monitor_positions_job():
                             new_sl_order = await exchange.create_order(sym, 'stop_market', c_side, pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl})
                             
                             pos.update({'sl_order_id': new_sl_order['id'], 'current_sl': nsl, 'trail_trigger': tt + ms if is_long else tt - ms})
-                            await send_tg_msg(f"📈 **{sym.split(':')[0]} Трейлинг:** SL -> {nsl}")
+                            await send_tg_msg(f"📈 **{clean_name} Трейлинг:** SL -> {nsl}")
                         except: pass
 
                 updated.append(pos)
@@ -845,7 +883,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot v8.0 Active (30s Rolling CVD)")
+        self.wfile.write(b"Bot v8.1 Active (Dual Window, CVD SL, Relaxed FOMO)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -854,7 +892,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.0: 30s Rolling CVD...")
+    logging.info("🚀 Запуск ядра v8.1: Dual Window & CVD SL...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
