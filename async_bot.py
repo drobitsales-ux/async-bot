@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.10 (Pinbar Exhaustion, Trend-Aligned GRID, Whale Exception) ===
+# === НАСТРОЙКИ v8.11 (Adaptive SMC: FVG Momentum + Breaker, Trend GRID) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -124,11 +124,12 @@ def calculate_rsi(data, window=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def find_fvg(h, l, direction):
+def find_fvg_details(h, l, direction):
+    # Возвращает не просто факт FVG, но и его границы
     for i in range(len(h)-1, len(h)-12, -1):
-        if direction == 'Long' and l[i] > h[i-2]: return True
-        elif direction == 'Short' and h[i] < l[i-2]: return True
-    return False
+        if direction == 'Long' and l[i] > h[i-2]: return {'found': True, 'top': l[i], 'bottom': h[i-2]}
+        elif direction == 'Short' and h[i] < l[i-2]: return {'found': True, 'top': l[i-2], 'bottom': h[i]}
+    return {'found': False}
 
 async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
     try:
@@ -151,37 +152,64 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
         vol_increase_pct = ((max(v[-1], v[-2]) / avg_volume) - 1) * 100 if avg_volume > 0 else 0
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
-        eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
-        eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
+        
+        # АДАПТИВНЫЙ SMC: При сильной волатильности разрешаем более высокие входы (неглубокий откат)
+        is_high_momentum = btc_volatility_pct > 2.0
+        discount_ratio = 0.85 if is_high_momentum else 0.6  
+        premium_ratio = 0.15 if is_high_momentum else 0.4
+        
+        eq_level_long = leg_low + (leg_high - leg_low) * discount_ratio  
+        eq_level_short = leg_low + (leg_high - leg_low) * premium_ratio 
 
-        # --- 1. SMC МОДУЛЬ (Liquidity Sweep) ---
+        # --- 1. АДАПТИВНЫЙ SMC МОДУЛЬ ---
         if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
-                if find_fvg(h, l, 'Long'):
+                fvg = find_fvg_details(h, l, 'Long')
+                if fvg['found']:
+                    # Режим 1: Momentum FVG Ретест (при высокой волатильности)
+                    if is_high_momentum and current_price <= fvg['top'] and current_price >= fvg['bottom']:
+                        sl = fvg['bottom'] - (atr * 0.8)
+                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                    
+                    # Режим 2: Классический OB + Sweep (при спокойном рынке)
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
                             if i >= 15:
                                 local_min_past = np.min(l[i-15:i])
-                                if ob_low <= local_min_past:
+                                # При высоком моментуме разрешаем вход от Breaker Block без жесткого Sweep
+                                is_valid_ob = (ob_low <= local_min_past) if not is_high_momentum else True 
+                                
+                                if is_valid_ob:
                                     if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                         sl = ob_low - (atr * 0.8)  
-                                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG (Sweep)', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                                        patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
+                                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
-                if find_fvg(h, l, 'Short'):
+                fvg = find_fvg_details(h, l, 'Short')
+                if fvg['found']:
+                    # Режим 1: Momentum FVG Ретест
+                    if is_high_momentum and current_price >= fvg['bottom'] and current_price <= fvg['top']:
+                        sl = fvg['top'] + (atr * 0.8)
+                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                        
+                    # Режим 2: Классический OB + Sweep
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
                             if i >= 15:
                                 local_max_past = np.max(h[i-15:i])
-                                if ob_high >= local_max_past:
+                                is_valid_ob = (ob_high >= local_max_past) if not is_high_momentum else True
+                                
+                                if is_valid_ob:
                                     if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                         sl = ob_high + (atr * 0.8)
-                                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG (Sweep)', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                                        patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
+                                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
-        # --- 2. GRID МОДУЛЬ (Adaptive + Trend Aligned + Pinbar Exhaustion) ---
+        # --- 2. GRID МОДУЛЬ (Adaptive + Trend Aligned + Pinbar) ---
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -201,22 +229,18 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
 
         grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
         
-        # Анализ свечного паттерна (Pinbar / Wick)
         candle_range = h[-1] - l[-1] if h[-1] - l[-1] > 0 else 0.0001
         lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
         upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
 
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
-            # TREND ALIGNMENT: Если волатильность BTC высокая, торгуем только по тренду EMA200
             allow_long = btc_volatility_pct < 2.0 or current_price > ema_200
             allow_short = btc_volatility_pct < 2.0 or current_price < ema_200
             
-            # LONG GRID: Цена у нижней границы + длинный хвост снизу (минимум 30% свечи)
             if allow_long and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.3: 
                 sl = lower_bb - (atr * 0.5)
                 return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
             
-            # SHORT GRID: Цена у верхней границы + длинный хвост сверху (минимум 30% свечи)
             elif allow_short and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.3: 
                 sl = upper_bb + (atr * 0.5)
                 return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
@@ -290,7 +314,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.10)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.11)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -370,8 +394,8 @@ async def execute_trade(signal):
         await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side, 'clientOrderId': bot_client_id})
         sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price, 'clientOrderId': f"{bot_client_id}_SL"})
         
-        timeout_profit = 0.75 if signal['mode'] == 'GRID' else 2.0
-        timeout_any = 1.5 if signal['mode'] == 'GRID' else 4.0
+        timeout_profit = 0.75 if signal['mode'] == 'GRID' else 3.0
+        timeout_any = 1.5 if signal['mode'] == 'GRID' else 6.0
 
         active_positions.append({
             'symbol': sym, 'direction': signal['direction'], 'entry_price': current_market_price, 'initial_qty': qty, 
@@ -654,7 +678,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.10 Active (Pinbar Exhaustion, Trend GRID)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.11 Active (Adaptive SMC, Pinbar Exhaustion)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -664,7 +688,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.10: Pinbar Exhaustion + Trend-Aligned GRID...")
+    logging.info("🚀 Запуск ядра v8.11: Adaptive SMC (Momentum/Breaker) + Pinbar GRID...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
