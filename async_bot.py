@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.7 (Contract Size Fix, Anti-Fee Guard, Auto-Recovery) ===
+# === НАСТРОЙКИ v8.8 (SMC Sweep, Adaptive GRID, Session Filter) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -25,8 +25,6 @@ MAX_POSITIONS = 3
 LEVERAGE = 10               
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
-
-# Защита от съедания прибыли комиссиями (минимальный объем позиции в $)
 MIN_NOTIONAL_USDT = 10.0    
 
 SMC_TIMEFRAME = '15m'
@@ -131,7 +129,7 @@ def find_fvg(h, l, direction):
         elif direction == 'Short' and h[i] < l[i-2]: return True
     return False
 
-async def detect_setups(sym, btc_trend, altseason):
+async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
     try:
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
         if not ohlcv or len(ohlcv) < 200: return None
@@ -155,15 +153,20 @@ async def detect_setups(sym, btc_trend, altseason):
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
+        # --- 1. SMC МОДУЛЬ (Liquidity Sweep) ---
         if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                 if find_fvg(h, l, 'Long'):
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
-                            if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
-                                sl = ob_low - (atr * 0.8)  
-                                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                            # Проверка Снятия Ликвидности
+                            if i >= 15:
+                                local_min_past = np.min(l[i-15:i])
+                                if ob_low <= local_min_past: # OB снял ликвидность
+                                    if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
+                                        sl = ob_low - (atr * 0.8)  
+                                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG (Sweep)', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
@@ -171,10 +174,15 @@ async def detect_setups(sym, btc_trend, altseason):
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
-                            if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
-                                sl = ob_high + (atr * 0.8)
-                                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                            # Проверка Снятия Ликвидности
+                            if i >= 15:
+                                local_max_past = np.max(h[i-15:i])
+                                if ob_high >= local_max_past: # OB снял ликвидность
+                                    if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
+                                        sl = ob_high + (atr * 0.8)
+                                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG (Sweep)', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
+        # --- 2. GRID МОДУЛЬ (Adaptive + Session Filter) ---
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -185,21 +193,32 @@ async def detect_setups(sym, btc_trend, altseason):
         grid_volume_threshold = avg_volume * 1.50
         grid_has_volume = (v[-1] > grid_volume_threshold) or (v[-2] > grid_volume_threshold)
 
-        if bb_width < 2.5 and grid_has_volume:
+        # Фильтр сессий и фандинга (Время в UTC)
+        now_utc = datetime.now(timezone.utc)
+        hour, minute = now_utc.hour, now_utc.minute
+        
+        is_us_open = (hour == 13 and minute >= 30) or (hour == 14 and minute <= 30)
+        is_funding = (hour in [23, 7, 15] and minute >= 45) or (hour in [0, 8, 16] and minute <= 15)
+        skip_grid = is_us_open or is_funding
+
+        # Адаптивный канал (зависит от волатильности BTC)
+        grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
+
+        if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
             if current_price <= lower_bb * 1.002 and rsi_15m < 45: 
                 sl = lower_bb - (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
             elif current_price >= upper_bb * 0.998 and rsi_15m > 55: 
                 sl = upper_bb + (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
 
         return None
     except Exception: return None
 
-async def process_single_coin(sym, btc_trend, altseason, sem):
+async def process_single_coin(sym, btc_trend, altseason, btc_volatility_pct, sem):
     async with sem: 
         try:
-            signal = await detect_setups(sym, btc_trend, altseason)
+            signal = await detect_setups(sym, btc_trend, altseason, btc_volatility_pct)
             await asyncio.sleep(0.05) 
             return sym, signal
         except Exception: return sym, None
@@ -216,12 +235,19 @@ async def radar_task():
                 await asyncio.sleep(60); continue
 
             btc_trend, altseason = 'Short', False
+            btc_volatility_pct = 2.0
             try:
                 btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
                 btc_trend = 'Long' if btc_c[-1] > calculate_ema(btc_c, 200) else 'Short'
                 eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 altseason = True if (np.array([x[4] for x in eth_ohlcv], dtype=float)[-1] / btc_c[-1]) > calculate_ema((np.array([x[4] for x in eth_ohlcv], dtype=float) / btc_c), 200) else False
+                
+                # Расчет адаптивной волатильности BTC
+                btc_bb_window = 20
+                btc_sma = np.mean(btc_c[-btc_bb_window:])
+                btc_std = np.std(btc_c[-btc_bb_window:])
+                btc_volatility_pct = (4 * btc_std) / btc_sma * 100
             except: pass
 
             tickers = await exchange.fetch_tickers()
@@ -246,7 +272,7 @@ async def radar_task():
             results = []
             for i in range(0, len(valid_symbols), 10):
                 chunk = valid_symbols[i:i+10]
-                tasks = [process_single_coin(s, btc_trend, altseason, sem) for s in chunk if s.split(':')[0] not in last_signals or (datetime.now(timezone.utc) - last_signals[s.split(':')[0]] > timedelta(hours=4))]
+                tasks = [process_single_coin(s, btc_trend, altseason, btc_volatility_pct, sem) for s in chunk if s.split(':')[0] not in last_signals or (datetime.now(timezone.utc) - last_signals[s.split(':')[0]] > timedelta(hours=4))]
                 if tasks: results.extend(await asyncio.gather(*tasks))
                 await asyncio.sleep(0.1)
 
@@ -256,11 +282,11 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.7)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.8)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
-            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {get_mem_usage()}")
+            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {get_mem_usage()} | BTC Vol: {btc_volatility_pct:.2f}%")
             gc.collect() 
             await asyncio.sleep(300) 
         except Exception: await asyncio.sleep(60)
@@ -316,13 +342,11 @@ async def execute_trade(signal):
         
         final_qty_coins = min(ideal_qty_coins, max_qty_allowed_coins)
         
-        # Перевод рассчитанных монет в КОНТРАКТЫ с учетом спецификации биржи
         final_contracts = final_qty_coins / contract_size if contract_size > 0 else final_qty_coins
         qty = float(exchange.amount_to_precision(sym, final_contracts))
         
         if qty <= 0: return 
         
-        # Проверка минимальной суммы сделки (чтобы не отдавать прибыль на комиссии)
         notional_value = qty * contract_size * current_market_price
         if notional_value < MIN_NOTIONAL_USDT:
             logging.warning(f"🚫 {clean_name} проигнорирован: Объем {notional_value:.2f}$ меньше минимального {MIN_NOTIONAL_USDT}$.")
@@ -352,7 +376,8 @@ async def execute_trade(signal):
         
         cap_note = " (Margin Capped ⚠️)" if ideal_qty_coins > max_qty_allowed_coins else ""
         msg = (f"💥 **ВЫСТРЕЛ [{signal['mode']}]: {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
-               f"{signal.get('score_info', 'ТОП Сигнал')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
+               f"{signal.get('score_info', 'ТОП Сигнал')} (Риск: {actual_risk_percent*100:.1f}%)\n"
+               f"Паттерн: {signal.get('pattern', 'N/A')}\n\n"
                f"📊 **Анализ 60s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
                f"Цена: {current_market_price}\nОбъем: {qty} контр. (~{notional_value:.1f}$){cap_note}\nSL (ATR-Cap): {sl_price}\nTP1 (Dynamic): {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
@@ -609,7 +634,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.7 Active (Contract Fix, Strict Multi-Exchange, Auto-Recovery)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.8 Active (SMC Sweep, Adaptive GRID, Session Filter)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -619,7 +644,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.7: Contract Fix + Anti-Fee Guard + Multi-Exchange...")
+    logging.info("🚀 Запуск ядра v8.8: SMC Sweep + Adaptive GRID + Session Filter...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
