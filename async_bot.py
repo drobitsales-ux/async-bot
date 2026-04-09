@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.9 (Whale Exception, Order Tagging, Adaptive GRID) ===
+# === НАСТРОЙКИ v8.10 (Pinbar Exhaustion, Trend-Aligned GRID, Whale Exception) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,7 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_THRESHOLD = 200000 # Порог для включения "Исключения для Китов"
+WHALE_VOLUME_THRESHOLD = 200000 
 
 SMC_TIMEFRAME = '15m'
 
@@ -181,7 +181,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                         sl = ob_high + (atr * 0.8)
                                         return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG (Sweep)', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
-        # --- 2. GRID МОДУЛЬ (Adaptive + Session Filter) ---
+        # --- 2. GRID МОДУЛЬ (Adaptive + Trend Aligned + Pinbar Exhaustion) ---
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -200,14 +200,26 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
         skip_grid = is_us_open or is_funding
 
         grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
+        
+        # Анализ свечного паттерна (Pinbar / Wick)
+        candle_range = h[-1] - l[-1] if h[-1] - l[-1] > 0 else 0.0001
+        lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
+        upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
 
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
-            if current_price <= lower_bb * 1.002 and rsi_15m < 45: 
+            # TREND ALIGNMENT: Если волатильность BTC высокая, торгуем только по тренду EMA200
+            allow_long = btc_volatility_pct < 2.0 or current_price > ema_200
+            allow_short = btc_volatility_pct < 2.0 or current_price < ema_200
+            
+            # LONG GRID: Цена у нижней границы + длинный хвост снизу (минимум 30% свечи)
+            if allow_long and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.3: 
                 sl = lower_bb - (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
-            elif current_price >= upper_bb * 0.998 and rsi_15m > 55: 
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+            
+            # SHORT GRID: Цена у верхней границы + длинный хвост сверху (минимум 30% свечи)
+            elif allow_short and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.3: 
                 sl = upper_bb + (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
 
         return None
     except Exception: return None
@@ -278,7 +290,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.9)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.10)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -352,8 +364,7 @@ async def execute_trade(signal):
         side = 'buy' if is_long else 'sell'
         sl_side = 'sell' if side == 'buy' else 'buy'
         
-        # --- ИЗОЛЯЦИЯ ОРДЕРОВ (Order Tagging) ---
-        bot_client_id = f"OMNI89_{clean_name}_{int(time.time()*100)}"
+        bot_client_id = f"OMNI_{clean_name}_{int(time.time()*100)}"
         
         await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
         await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side, 'clientOrderId': bot_client_id})
@@ -479,7 +490,6 @@ async def wss_sniper_worker(sym, setup_data):
             if len(valid_exchanges) > 0:
                 is_whale_override = False
                 
-                # --- ИСКЛЮЧЕНИЕ ДЛЯ КИТОВ (Whale Exception) ---
                 if len(valid_exchanges) < 2:
                     max_single_vol = max([tots[ex] for ex in tots]) if tots else 0
                     global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
@@ -491,7 +501,6 @@ async def wss_sniper_worker(sym, setup_data):
                             valid_exchanges.append(("WHALE_OVERRIDE", max_single_vol, 100))
                 
                 if len(valid_exchanges) < 2 and not is_whale_override:
-                    logging.info(f"🛡 [СЛАБЫЙ СИГНАЛ] {clean_name} отменен (Подтвердили: {len(valid_exchanges)} бирж).")
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     continue
                     
@@ -524,7 +533,6 @@ async def wss_sniper_worker(sym, setup_data):
         await asyncio.gather(*tasks, return_exceptions=True)
         ACTIVE_WSS_CONNECTIONS.discard(sym)
         if sym in GLOBAL_CVD: del GLOBAL_CVD[sym]
-        logging.info(f"🕵️‍♂️ [SHADOW LOG] {clean_name} снят. Макс. Binance(F) 60s: ${state['max_bn_f_60s']:.0f}")
 
 async def sniper_manager():
     while True:
@@ -545,7 +553,6 @@ async def monitor_positions_job():
             for pr in positions_raw:
                 sym = pr['symbol']
                 qty = float(pr.get('contracts', 0))
-                # Автоматическое восстановление позиций
                 if qty > 0 and sym not in active_syms:
                     pos_side = pr.get('positionSide', 'LONG')
                     is_long = (pos_side == 'LONG')
@@ -647,7 +654,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.9 Active (Whale Exception, Order Tagging)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.10 Active (Pinbar Exhaustion, Trend GRID)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -657,7 +664,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.9: Whale Exception + Order Tagging...")
+    logging.info("🚀 Запуск ядра v8.10: Pinbar Exhaustion + Trend-Aligned GRID...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
