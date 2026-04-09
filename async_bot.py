@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.4 (Margin Cap Protection, GRID+SMC) ===
+# === НАСТРОЙКИ v8.5 (ATR-Cap, Cooldown Filter, Dynamic TP) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -32,6 +32,7 @@ SMC_TIMEFRAME = '15m'
 
 CRITICAL_CVD_USDT = 150000  
 GLOBAL_CVD = {}             
+COOLDOWN_CACHE = {}         # Кэш для блокировки тикеров при нехватке маржи
 
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
@@ -131,17 +132,18 @@ async def detect_setups(sym, btc_trend, altseason):
         
         current_price = c[-1]
         ema_200 = calculate_ema(c, 200)
+        # Расчет ATR (Average True Range)
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
         has_volume = (v[-1] > avg_volume * 1.05) or (v[-2] > avg_volume * 1.05)
         vol_increase_pct = ((max(v[-1], v[-2]) / avg_volume) - 1) * 100 if avg_volume > 0 else 0
 
-        # --- 1. SMC МОДУЛЬ ---
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         eq_level_long = leg_low + (leg_high - leg_low) * 0.6  
         eq_level_short = leg_low + (leg_high - leg_low) * 0.4 
 
+        # --- 1. SMC МОДУЛЬ ---
         if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                 if find_fvg(h, l, 'Long'):
@@ -150,7 +152,7 @@ async def detect_setups(sym, btc_trend, altseason):
                             ob_low, ob_high = l[i], h[i]
                             if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                 sl = ob_low - (atr * 0.8)  
-                                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': current_price + (current_price-sl), 'tp2': current_price + (current_price-sl)*2, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
@@ -160,7 +162,7 @@ async def detect_setups(sym, btc_trend, altseason):
                             ob_high, ob_low = h[i], l[i]
                             if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                 sl = ob_high + (atr * 0.8)
-                                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': current_price - (sl-current_price), 'tp2': current_price - (sl-current_price)*2, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB+FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
         # --- 2. GRID МОДУЛЬ ---
         bb_window = 20
@@ -170,18 +172,16 @@ async def detect_setups(sym, btc_trend, altseason):
         lower_bb = sma_20 - (2 * std_dev)
         bb_width = (upper_bb - lower_bb) / sma_20 * 100
         
-        # УЖЕСТОЧЕНИЕ: Ищем всплеск объема минимум на 50% для защиты уровня
         grid_volume_threshold = avg_volume * 1.50
         grid_has_volume = (v[-1] > grid_volume_threshold) or (v[-2] > grid_volume_threshold)
 
-        # УЖЕСТОЧЕНИЕ: Канал должен быть очень узким (меньше 2.5%)
         if bb_width < 2.5 and grid_has_volume:
             if current_price <= lower_bb * 1.002: 
                 sl = lower_bb - (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'tp1': sma_20, 'tp2': upper_bb, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
             elif current_price >= upper_bb * 0.998: 
                 sl = upper_bb + (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'tp1': sma_20, 'tp2': lower_bb, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Range Scalp', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
 
         return None
     except Exception: return None
@@ -220,6 +220,10 @@ async def radar_task():
             for sym, m in exchange.markets.items():
                 if m.get('type') != 'swap' or not m.get('active'): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
+                
+                # Игнорируем тикеры в кулдауне
+                if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: continue
+                
                 tick = tickers.get(sym)
                 if not tick or float(tick.get('quoteVolume') or 0) < MIN_VOLUME_USDT: continue
                 ask, bid = float(tick.get('ask') or 0), float(tick.get('bid') or 0)
@@ -244,7 +248,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.4)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.5)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -254,33 +258,62 @@ async def radar_task():
         except Exception: await asyncio.sleep(60)
 
 async def execute_trade(signal):
+    global COOLDOWN_CACHE
     sym = signal['symbol']
     clean_name = sym.split(':')[0]
     
-    # СТРОГИЙ КПП: Блокировка состояния гонки перед самым входом
     if len(active_positions) >= MAX_POSITIONS: 
         logging.info(f"🚫 Пропуск {clean_name}: Лимит позиций ({MAX_POSITIONS}) уже достигнут.")
         return
         
     if any(p['symbol'] == sym for p in active_positions): return
+    if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: return
 
     try:
         bal = await exchange.fetch_balance()
         free_usdt = float(bal['USDT']['free'])
+        ticker = await exchange.fetch_ticker(sym)
+        current_market_price = ticker['last']
         
-        # 1. Расчет объема по РИСКУ
+        atr = signal.get('atr', current_market_price * 0.015)
+        logical_sl_dist = abs(signal['entry_price'] - signal['sl'])
+        
+        # --- ЗАЩИТА ОТ ГИГАНТСКИХ СТОПОВ (ATR-Cap) ---
+        # Ограничиваем дистанцию стопа максимум 2.5 средними свечами
+        actual_sl_dist = min(logical_sl_dist, atr * 2.5)
+        
+        is_long = signal['direction'] == 'Long'
+        
+        if is_long:
+            sl_raw = current_market_price - actual_sl_dist
+            tp1_raw = current_market_price + (actual_sl_dist * 1.5) # Dynamic TP: RR 1:1.5
+            tp2_raw = current_market_price + (actual_sl_dist * 3.0)
+        else:
+            sl_raw = current_market_price + actual_sl_dist
+            tp1_raw = current_market_price - (actual_sl_dist * 1.5)
+            tp2_raw = current_market_price - (actual_sl_dist * 3.0)
+            
+        sl_price = float(exchange.price_to_precision(sym, sl_raw))
+        tp1_price = float(exchange.price_to_precision(sym, tp1_raw))
+        tp2_price = float(exchange.price_to_precision(sym, tp2_raw))
+
+        # --- СТРОГАЯ ПРОВЕРКА ПРЕЦИЗИИ (Защита от ошибки 110411) ---
+        if is_long and sl_price >= current_market_price:
+            logging.error(f"Аномалия SL: {sl_price} >= текущей {current_market_price}. Отмена входа для {clean_name}.")
+            return
+        if not is_long and sl_price <= current_market_price:
+            logging.error(f"Аномалия SL: {sl_price} <= текущей {current_market_price}. Отмена входа для {clean_name}.")
+            return
+
         risk_multiplier = signal.get('dynamic_risk', 1.0)
         actual_risk_percent = RISK_PER_TRADE * risk_multiplier
         risk_amount = free_usdt * actual_risk_percent
-        sl_dist = abs(signal['entry_price'] - signal['sl'])
-        ideal_qty = risk_amount / sl_dist if sl_dist > 0 else 0
+        ideal_qty = risk_amount / actual_sl_dist if actual_sl_dist > 0 else 0
         
-        # 2. Расчет максимального объема по МАРЖЕ
         max_margin_per_trade = (free_usdt * 0.95) / MAX_POSITIONS
         max_notional_allowed = max_margin_per_trade * LEVERAGE
-        max_qty_allowed = max_notional_allowed / signal['entry_price']
+        max_qty_allowed = max_notional_allowed / current_market_price
         
-        # 3. Финализация объема
         final_qty = min(ideal_qty, max_qty_allowed)
         qty = float(exchange.amount_to_precision(sym, final_qty))
         
@@ -288,37 +321,37 @@ async def execute_trade(signal):
             logging.warning(f"Trade ignored: QTY too small for {clean_name}")
             return 
 
-        pos_side = 'LONG' if signal['direction'] == 'Long' else 'SHORT'
-        side = 'buy' if signal['direction'] == 'Long' else 'sell'
+        pos_side = 'LONG' if is_long else 'SHORT'
+        side = 'buy' if is_long else 'sell'
         sl_side = 'sell' if side == 'buy' else 'buy'
         
         await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
         await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
-        
-        sl_price = float(exchange.price_to_precision(sym, signal['sl']))
         sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price})
         
-        tp1_price = float(exchange.price_to_precision(sym, signal['tp1']))
-        tp2_price = float(exchange.price_to_precision(sym, signal['tp2']))
-
         active_positions.append({
-            'symbol': sym, 'direction': signal['direction'], 'entry_price': signal['entry_price'], 'initial_qty': qty, 
-            'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 
+            'symbol': sym, 'direction': signal['direction'], 'entry_price': current_market_price, 'initial_qty': qty, 
+            'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 'atr': atr,
             'tp1_hit': False, 'pre_tp1_hit': False, 'sl_order_id': sl_ord['id'], 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat(), 'mode': signal['mode']
         })
         
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
         
-        # Информационный блок: показываем, не уперлись ли мы в потолок маржи
         cap_note = " (Margin Capped ⚠️)" if ideal_qty > max_qty_allowed else ""
-        
         msg = (f"💥 **ВЫСТРЕЛ [{signal['mode']}]: {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n"
                f"{signal.get('score_info', 'Базовый')} (Риск: {actual_risk_percent*100:.1f}%)\n\n"
                f"📊 **Анализ 60s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
-               f"Цена: {signal['entry_price']}\nКоличество: {qty} монет{cap_note}\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
+               f"Цена: {current_market_price}\nКоличество: {qty} монет{cap_note}\nSL (ATR-Cap): {sl_price}\nTP1 (Dynamic): {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
-    except Exception as e: logging.error(f"Trade error {clean_name}: {e}")
+        
+    except Exception as e: 
+        error_msg = str(e)
+        if "101204" in error_msg or "Insufficient margin" in error_msg:
+            COOLDOWN_CACHE[sym] = time.time() + 1800 # 30 minutes
+            logging.error(f"🚫 Нехватка маржи для {clean_name}. Кулдаун тикера на 30 мин.")
+        else:
+            logging.error(f"Trade error {clean_name}: {error_msg}")
 
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
@@ -523,8 +556,10 @@ async def monitor_positions_job():
                             await exchange.cancel_order(pos['sl_order_id'], sym)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.002 if is_long else 0.998)))
                             new_sl = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p})
-                            risk = abs(pos['entry_price'] - pos['sl_price'])
-                            pos.update({'tp1_hit': True, 'sl_order_id': new_sl['id'], 'micro_step': risk*0.3, 'trail_distance': risk*0.5, 'trail_trigger': pos['tp1'] + risk*0.3 * (1 if is_long else -1)})
+                            
+                            # Использование ATR для шага трейлинга
+                            atr_step = pos.get('atr', abs(pos['entry_price'] - pos['sl_price']) * 0.5)
+                            pos.update({'tp1_hit': True, 'sl_order_id': new_sl['id'], 'micro_step': atr_step*0.3, 'trail_distance': atr_step*0.8, 'trail_trigger': pos['tp1'] + atr_step*0.3 * (1 if is_long else -1)})
                             await send_tg_msg(f"💰 **[{pos.get('mode', 'SMC')}] {clean_name} TP1 взят!** (50% закрыто).\n🛡 Запущен Агрессивный Трейлинг.")
                         except: pass
 
@@ -544,7 +579,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.4 Active (Margin Cap, GRID+SMC)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.5 Active (ATR-Cap, Dynamic TP, Cooldown)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -554,7 +589,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.4: Margin Cap + SMC + GRID...")
+    logging.info("🚀 Запуск ядра v8.5: ATR-Cap + Cooldown + Dynamic TP...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
