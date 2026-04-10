@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.11 (Adaptive SMC: FVG Momentum + Breaker, Trend GRID) ===
+# === НАСТРОЙКИ v8.12 (True Sandbox, Fee Guard, Smart Filters) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -125,7 +125,6 @@ def calculate_rsi(data, window=14):
     return 100 - (100 / (1 + rs))
 
 def find_fvg_details(h, l, direction):
-    # Возвращает не просто факт FVG, но и его границы
     for i in range(len(h)-1, len(h)-12, -1):
         if direction == 'Long' and l[i] > h[i-2]: return {'found': True, 'top': l[i], 'bottom': h[i-2]}
         elif direction == 'Short' and h[i] < l[i-2]: return {'found': True, 'top': l[i-2], 'bottom': h[i]}
@@ -153,7 +152,6 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         
-        # АДАПТИВНЫЙ SMC: При сильной волатильности разрешаем более высокие входы (неглубокий откат)
         is_high_momentum = btc_volatility_pct > 2.0
         discount_ratio = 0.85 if is_high_momentum else 0.6  
         premium_ratio = 0.15 if is_high_momentum else 0.4
@@ -166,18 +164,15 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                 fvg = find_fvg_details(h, l, 'Long')
                 if fvg['found']:
-                    # Режим 1: Momentum FVG Ретест (при высокой волатильности)
                     if is_high_momentum and current_price <= fvg['top'] and current_price >= fvg['bottom']:
                         sl = fvg['bottom'] - (atr * 0.8)
                         return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
                     
-                    # Режим 2: Классический OB + Sweep (при спокойном рынке)
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
                             if i >= 15:
                                 local_min_past = np.min(l[i-15:i])
-                                # При высоком моментуме разрешаем вход от Breaker Block без жесткого Sweep
                                 is_valid_ob = (ob_low <= local_min_past) if not is_high_momentum else True 
                                 
                                 if is_valid_ob:
@@ -190,12 +185,10 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
                 fvg = find_fvg_details(h, l, 'Short')
                 if fvg['found']:
-                    # Режим 1: Momentum FVG Ретест
                     if is_high_momentum and current_price >= fvg['bottom'] and current_price <= fvg['top']:
                         sl = fvg['top'] + (atr * 0.8)
                         return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
                         
-                    # Режим 2: Классический OB + Sweep
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
@@ -209,7 +202,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                         patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
                                         return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
 
-        # --- 2. GRID МОДУЛЬ (Adaptive + Trend Aligned + Pinbar) ---
+        # --- 2. GRID МОДУЛЬ ---
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -314,7 +307,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.11)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.12)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -343,7 +336,11 @@ async def execute_trade(signal):
         
         atr = signal.get('atr', current_market_price * 0.015)
         logical_sl_dist = abs(signal['entry_price'] - signal['sl'])
-        actual_sl_dist = min(logical_sl_dist, atr * 2.5)
+        
+        # --- FEE GUARD: Защита от микроскопических стоп-лоссов ---
+        # Устанавливаем минимальную дистанцию в 0.4%, чтобы спред не съел сделку
+        min_allowed_sl_dist = current_market_price * 0.004
+        actual_sl_dist = max(logical_sl_dist, min_allowed_sl_dist)
         
         is_long = signal['direction'] == 'Long'
         
@@ -413,7 +410,7 @@ async def execute_trade(signal):
                f"{signal.get('score_info', 'ТОП Сигнал')} (Риск: {actual_risk_percent*100:.1f}%)\n"
                f"Паттерн: {signal.get('pattern', 'N/A')}\n\n"
                f"📊 **Анализ 60s CVD:**\n{signal.get('vol_info', 'Нет данных')}\n\n"
-               f"Цена: {current_market_price}\nОбъем: {qty} контр. (~{notional_value:.1f}$){cap_note}\nSL (ATR-Cap): {sl_price}\nTP1 (Dynamic): {tp1_price}\nTP2: {tp2_price}")
+               f"Цена: {current_market_price}\nОбъем: {qty} контр. (~{notional_value:.1f}$){cap_note}\nSL (Smart-Cap): {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
         await send_tg_msg(msg)
         
     except Exception as e: 
@@ -503,13 +500,14 @@ async def wss_sniper_worker(sym, setup_data):
             if tots['bn_f'] > state['max_bn_f_60s']: state['max_bn_f_60s'] = tots['bn_f']
             
             valid_exchanges = []
-            thresh = {'bx_s': 10000, 'bx_f': 10000, 'mc_s': 10000, 'mc_f': 10000, 'bb_s': 10000, 'bn_s': 20000, 'bb_f': 25000, 'bn_f': 30000}
+            # Снижены требования для Multi-Exchange фильтра (даем больше гибкости)
+            thresh = {'bx_s': 8000, 'bx_f': 8000, 'mc_s': 8000, 'mc_f': 8000, 'bb_s': 8000, 'bn_s': 15000, 'bb_f': 20000, 'bn_f': 25000}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bn_s': 'Binance (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
             for ex, limit in thresh.items():
                 if tots[ex] > limit:
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
-                    if pct >= 60: valid_exchanges.append((labels[ex], tots[ex], pct))
+                    if pct >= 65: valid_exchanges.append((labels[ex], tots[ex], pct))
 
             if len(valid_exchanges) > 0:
                 is_whale_override = False
@@ -573,22 +571,8 @@ async def monitor_positions_job():
         try:
             positions_raw = await exchange.fetch_positions()
             
-            active_syms = [p['symbol'] for p in active_positions]
-            for pr in positions_raw:
-                sym = pr['symbol']
-                qty = float(pr.get('contracts', 0))
-                if qty > 0 and sym not in active_syms:
-                    pos_side = pr.get('positionSide', 'LONG')
-                    is_long = (pos_side == 'LONG')
-                    entry_p = float(pr.get('entryPrice', 0))
-                    if entry_p > 0:
-                        active_positions.append({
-                            'symbol': sym, 'direction': 'Long' if is_long else 'Short', 'entry_price': entry_p, 'initial_qty': qty,
-                            'sl_price': entry_p * (0.95 if is_long else 1.05), 'tp1': entry_p * (1.02 if is_long else 0.98), 'tp2': entry_p * (1.04 if is_long else 0.96),
-                            'atr': entry_p * 0.015, 'tp1_hit': False, 'pre_tp1_hit': False, 'sl_order_id': 'restored', 'position_side': pos_side, 'open_time': datetime.now(timezone.utc).isoformat(), 'mode': 'RESTORED',
-                            'timeout_profit': 1.0, 'timeout_any': 3.0, 'client_tag': 'OMNI_RESTORED'
-                        })
-                        await send_tg_msg(f"🔄 **ВОССТАНОВЛЕНА ПОЗИЦИЯ**\nБот нашел сделку: {sym.split(':')[0]} ({pos_side}). Взял под управление.")
+            # --- ИСТИННАЯ ПЕСОЧНИЦА (Удалено слепое перехватывание сделок) ---
+            # Бот больше не будет воровать сделки RSI-бота или открытые вручную.
 
             if not active_positions: continue
             updated = []
@@ -613,7 +597,7 @@ async def monitor_positions_job():
                 if (is_long and last_p < pos['entry_price'] and current_cvd < -CRITICAL_CVD_USDT) or (not is_long and last_p > pos['entry_price'] and current_cvd > CRITICAL_CVD_USDT):
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']), params={'positionSide': pos['position_side'], 'clientOrderId': f"EXIT_{pos.get('client_tag', 'OMNI')}"})
-                        if pos['sl_order_id'] != 'restored': await exchange.cancel_order(pos['sl_order_id'], sym)
+                        if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - last_p) * float(curr['contracts'])
                         pnl_pct = (pnl / ((pos['entry_price'] * float(curr['contracts'])) / LEVERAGE)) * 100
                         daily_stats['trades'] += 1; daily_stats['pnl'] += pnl; CONSECUTIVE_LOSSES += 1
@@ -628,7 +612,7 @@ async def monitor_positions_job():
                 if hours_passed >= pos.get('timeout_any', 4.0) or (hours_passed >= pos.get('timeout_profit', 2.0) and pnl > 0):
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']), params={'positionSide': pos['position_side'], 'clientOrderId': f"TIME_{pos.get('client_tag', 'OMNI')}"})
-                        if pos['sl_order_id'] != 'restored': await exchange.cancel_order(pos['sl_order_id'], sym)
+                        if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         pnl_pct = (pnl / ((pos['entry_price'] * float(curr['contracts'])) / LEVERAGE)) * 100
                         await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} **[{pos.get('mode', 'SMC')}] {clean_name} закрыта по ТАЙМАУТУ!**\nPNL: {pnl:.2f} USDT ({pnl_pct:.2f}%)")
                         continue 
@@ -642,7 +626,7 @@ async def monitor_positions_job():
                     trigger = pos['entry_price'] + abs(pos['tp1'] - pos['entry_price']) * 0.8 * (1 if is_long else -1)
                     if (is_long and high_p >= trigger) or (not is_long and low_p <= trigger):
                         try:
-                            if pos['sl_order_id'] != 'restored': await exchange.cancel_order(pos['sl_order_id'], sym)
+                            if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.001 if is_long else 0.999)))
                             new_sl = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p, 'clientOrderId': f"SL_{pos.get('client_tag', 'OMNI')}"})
                             pos.update({'sl_order_id': new_sl['id'], 'current_sl': be_p, 'pre_tp1_hit': True})
@@ -653,7 +637,7 @@ async def monitor_positions_job():
                         try:
                             close_qty = float(exchange.amount_to_precision(sym, float(curr['contracts']) * 0.50))
                             if close_qty > 0: await exchange.create_market_order(sym, 'sell' if is_long else 'buy', close_qty, params={'positionSide': pos['position_side'], 'clientOrderId': f"TP1_{pos.get('client_tag', 'OMNI')}"}); pos['initial_qty'] = float(curr['contracts']) - close_qty 
-                            if pos['sl_order_id'] != 'restored': await exchange.cancel_order(pos['sl_order_id'], sym)
+                            if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                             be_p = float(exchange.price_to_precision(sym, pos['entry_price'] * (1.002 if is_long else 0.998)))
                             new_sl = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': be_p, 'positionSide': pos['position_side'], 'stopLossPrice': be_p, 'clientOrderId': f"SL_{pos.get('client_tag', 'OMNI')}"})
                             
@@ -666,7 +650,7 @@ async def monitor_positions_job():
                     tt, ms, td = pos.get('trail_trigger'), pos.get('micro_step'), pos.get('trail_distance')
                     if (is_long and high_p >= tt) or (not is_long and low_p <= tt):
                         try:
-                            if pos['sl_order_id'] != 'restored': await exchange.cancel_order(pos['sl_order_id'], sym)
+                            if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                             nsl = float(exchange.price_to_precision(sym, tt - td if is_long else tt + td))
                             new_sl_order = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', pos['initial_qty'], params={'triggerPrice': nsl, 'positionSide': pos['position_side'], 'stopLossPrice': nsl, 'clientOrderId': f"TRAIL_{pos.get('client_tag', 'OMNI')}"})
                             pos.update({'sl_order_id': new_sl_order['id'], 'trail_trigger': tt + ms if is_long else tt - ms})
@@ -678,7 +662,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.11 Active (Adaptive SMC, Pinbar Exhaustion)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.12 Active (True Sandbox, Fee Guard, Smart Filters)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -688,7 +672,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.11: Adaptive SMC (Momentum/Breaker) + Pinbar GRID...")
+    logging.info("🚀 Запуск ядра v8.12: True Sandbox + Fee Guard + Smart Filters...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
