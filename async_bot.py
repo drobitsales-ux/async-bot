@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.15 (Verbose Logging, Dynamic Volume, Daily Stats Report) ===
+# === НАСТРОЙКИ v8.16 (Altseason Mode, Slippage Tolerant, CVD Buffer) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -161,7 +161,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                 if fvg['found']:
                     if is_high_momentum and current_price <= fvg['top'] and current_price >= fvg['bottom']:
                         sl = fvg['bottom'] - (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
+                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
@@ -171,7 +171,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                 if is_valid_ob and current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                     sl = ob_low - (atr * 0.8)  
                                     patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
-                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
+                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
@@ -179,7 +179,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                 if fvg['found']:
                     if is_high_momentum and current_price >= fvg['bottom'] and current_price <= fvg['top']:
                         sl = fvg['top'] + (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
+                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
@@ -189,7 +189,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                 if is_valid_ob and current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                     sl = ob_high + (atr * 0.8)
                                     patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
-                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
+                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
         # GRID
         bb_window = 20
@@ -210,9 +210,9 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
 
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
             if (btc_volatility_pct < 2.0 or current_price > ema_200) and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.3: 
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
             elif (btc_volatility_pct < 2.0 or current_price < ema_200) and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.3: 
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
         return None
     except Exception: return None
@@ -399,6 +399,8 @@ async def wss_sniper_worker(sym, setup_data):
 
     try:
         is_long = (setup_data['direction'] == 'Long')
+        is_altseason = setup_data.get('altseason', False)
+        
         while (sym in HOT_LIST or any(p['symbol'] == sym for p in active_positions)) and state['active']:
             await asyncio.sleep(3) 
             now = time.time()
@@ -420,13 +422,16 @@ async def wss_sniper_worker(sym, setup_data):
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
                     if pct >= 65: valid_exchanges.append((labels[ex], tots[ex], pct))
 
-            if len(valid_exchanges) < 2:
+            # Альтсезон: нужно 1 биржа. Иначе: 2 биржи.
+            req_exchanges = 1 if is_altseason else 2
+            
+            if len(valid_exchanges) < req_exchanges:
                 global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                 max_vol = max([tots[ex] for ex in tots]) if tots else 0
                 if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
                     valid_exchanges.append(("WHALE_OVERRIDE", max_vol, 100))
                 else:
-                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Нехватка объемов (Подтвердило бирж: {len(valid_exchanges)} из 2)")
+                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Нехватка объемов (Подтвердило бирж: {len(valid_exchanges)} из {req_exchanges})")
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     continue
                     
@@ -435,11 +440,16 @@ async def wss_sniper_worker(sym, setup_data):
                 price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                 global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                 
-                if (is_long and global_delta < 0) or (not is_long and global_delta > 0):
+                # CVD Buffer: Игнорируем мелкий минус (шум розницы)
+                cvd_buffer = 5000 
+                if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта против тренда ({global_delta:,.0f}$)")
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     continue
-                if (is_long and price_shift_pct < -0.05) or (not is_long and price_shift_pct > 0.05):
+                
+                # Slippage Tolerance: Расширено до 0.20%
+                slippage_limit = 0.20
+                if (is_long and price_shift_pct < -slippage_limit) or (not is_long and price_shift_pct > slippage_limit):
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена ушла против нас (Проскальзывание {price_shift_pct:.2f}%)")
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     continue
@@ -567,7 +577,7 @@ async def daily_report_task():
             last_day = current_day
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.15 Active (Daily Stats Report)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.16 Active (Altseason Mode, Slippage Tolerant, CVD Buffer)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -576,7 +586,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.15: Verbose Logging + Daily Stats Report...")
+    logging.info("🚀 Запуск ядра v8.16: Altseason Mode + Slippage Tolerant + CVD Buffer...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task())
 
 if __name__ == '__main__':
