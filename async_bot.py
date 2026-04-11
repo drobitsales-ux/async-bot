@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.12 (True Sandbox, Fee Guard, Smart Filters) ===
+# === НАСТРОЙКИ v8.13 (Dynamic Volume WSS, True Sandbox, Fee Guard) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -166,7 +166,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                 if fvg['found']:
                     if is_high_momentum and current_price <= fvg['top'] and current_price >= fvg['bottom']:
                         sl = fvg['bottom'] - (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
                     
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
@@ -179,7 +179,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                     if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                         sl = ob_low - (atr * 0.8)  
                                         patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
-                                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
@@ -187,7 +187,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                 if fvg['found']:
                     if is_high_momentum and current_price >= fvg['bottom'] and current_price <= fvg['top']:
                         sl = fvg['top'] + (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
                         
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
@@ -200,7 +200,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                     if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                         sl = ob_high + (atr * 0.8)
                                         patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
-                                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC'}
+                                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct}
 
         # --- 2. GRID МОДУЛЬ ---
         bb_window = 20
@@ -232,11 +232,11 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
             
             if allow_long and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.3: 
                 sl = lower_bb - (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct}
             
             elif allow_short and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.3: 
                 sl = upper_bb + (atr * 0.5)
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID'}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar, Limit {grid_width_limit:.1f}%)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct}
 
         return None
     except Exception: return None
@@ -307,7 +307,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.12)...")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!\nЗапускаю OMNI-CORE Снайпер (v8.13)...")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -337,8 +337,6 @@ async def execute_trade(signal):
         atr = signal.get('atr', current_market_price * 0.015)
         logical_sl_dist = abs(signal['entry_price'] - signal['sl'])
         
-        # --- FEE GUARD: Защита от микроскопических стоп-лоссов ---
-        # Устанавливаем минимальную дистанцию в 0.4%, чтобы спред не съел сделку
         min_allowed_sl_dist = current_market_price * 0.004
         actual_sl_dist = max(logical_sl_dist, min_allowed_sl_dist)
         
@@ -377,9 +375,7 @@ async def execute_trade(signal):
         if qty <= 0: return 
         
         notional_value = qty * contract_size * current_market_price
-        if notional_value < MIN_NOTIONAL_USDT:
-            logging.warning(f"🚫 {clean_name} проигнорирован: Объем {notional_value:.2f}$ меньше минимального {MIN_NOTIONAL_USDT}$.")
-            return
+        if notional_value < MIN_NOTIONAL_USDT: return
 
         pos_side = 'LONG' if is_long else 'SHORT'
         side = 'buy' if is_long else 'sell'
@@ -500,8 +496,16 @@ async def wss_sniper_worker(sym, setup_data):
             if tots['bn_f'] > state['max_bn_f_60s']: state['max_bn_f_60s'] = tots['bn_f']
             
             valid_exchanges = []
-            # Снижены требования для Multi-Exchange фильтра (даем больше гибкости)
-            thresh = {'bx_s': 8000, 'bx_f': 8000, 'mc_s': 8000, 'mc_f': 8000, 'bb_s': 8000, 'bn_s': 15000, 'bb_f': 20000, 'bn_f': 25000}
+            
+            # --- DYNAMIC THRESHOLDS: Адаптация под флэт ---
+            vol_modifier = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
+            
+            thresh = {
+                'bx_s': 8000 * vol_modifier, 'bx_f': 8000 * vol_modifier, 
+                'mc_s': 8000 * vol_modifier, 'mc_f': 8000 * vol_modifier, 
+                'bb_s': 8000 * vol_modifier, 'bn_s': 15000 * vol_modifier, 
+                'bb_f': 20000 * vol_modifier, 'bn_f': 25000 * vol_modifier
+            }
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bn_s': 'Binance (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
             for ex, limit in thresh.items():
@@ -570,9 +574,6 @@ async def monitor_positions_job():
         await asyncio.sleep(5) 
         try:
             positions_raw = await exchange.fetch_positions()
-            
-            # --- ИСТИННАЯ ПЕСОЧНИЦА (Удалено слепое перехватывание сделок) ---
-            # Бот больше не будет воровать сделки RSI-бота или открытые вручную.
 
             if not active_positions: continue
             updated = []
@@ -594,7 +595,11 @@ async def monitor_positions_job():
                 ticker = await exchange.fetch_ticker(sym); last_p = ticker['last']
                 current_cvd = GLOBAL_CVD.get(sym, 0)
                 
-                if (is_long and last_p < pos['entry_price'] and current_cvd < -CRITICAL_CVD_USDT) or (not is_long and last_p > pos['entry_price'] and current_cvd > CRITICAL_CVD_USDT):
+                # Масштабируем экстренный CVD-выход
+                cvd_limit = CRITICAL_CVD_USDT
+                if clean_name in ['DOGE', 'SOL', 'XRP']: cvd_limit = CRITICAL_CVD_USDT * 2
+                
+                if (is_long and last_p < pos['entry_price'] and current_cvd < -cvd_limit) or (not is_long and last_p > pos['entry_price'] and current_cvd > cvd_limit):
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']), params={'positionSide': pos['position_side'], 'clientOrderId': f"EXIT_{pos.get('client_tag', 'OMNI')}"})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
@@ -662,7 +667,7 @@ async def monitor_positions_job():
         except Exception: pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.12 Active (True Sandbox, Fee Guard, Smart Filters)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.13 Active (Dynamic Volume WSS)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -672,7 +677,7 @@ def run_server():
 async def main():
     init_db()
     load_positions()
-    logging.info("🚀 Запуск ядра v8.12: True Sandbox + Fee Guard + Smart Filters...")
+    logging.info("🚀 Запуск ядра v8.13: Dynamic Volume WSS + Smart Filters...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job())
 
 if __name__ == '__main__':
