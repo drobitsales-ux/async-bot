@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.16 (Altseason Mode, Slippage Tolerant, CVD Buffer) ===
+# === НАСТРОЙКИ v8.17 (Institutional Regime Filter, Daily Sync 22:00 GMT+2) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -46,8 +46,8 @@ NOTIFIED_SYMBOLS = set()
 
 HOT_LIST = {}  
 ACTIVE_WSS_CONNECTIONS = set()
+daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': 0.0}
 active_positions = []
-daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
@@ -73,12 +73,15 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (id INTEGER PRIMARY KEY, pnl REAL, trades INTEGER, wins INTEGER)''')
     try: c.execute("ALTER TABLE daily_stats ADD COLUMN wins INTEGER DEFAULT 0")
     except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE daily_stats ADD COLUMN prev_winrate REAL DEFAULT 0.0")
+    except sqlite3.OperationalError: pass
     conn.commit(); conn.close()
 
 def save_positions():
     conn = get_db_conn(); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO active_positions (id, data) VALUES (1, ?)", (json.dumps(active_positions),))
-    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins) VALUES (1, ?, ?, ?)", (daily_stats['pnl'], daily_stats['trades'], daily_stats.get('wins', 0)))
+    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins, prev_winrate) VALUES (1, ?, ?, ?, ?)", 
+              (daily_stats['pnl'], daily_stats['trades'], daily_stats.get('wins', 0), daily_stats.get('prev_winrate', 0.0)))
     conn.commit(); conn.close()
 
 def load_positions():
@@ -89,8 +92,10 @@ def load_positions():
         if row: 
             active_positions = json.loads(row[0])
             logging.info(f"✅ БД загружена. Активных сделок: {len(active_positions)}")
-        c.execute("SELECT pnl, trades, wins FROM daily_stats WHERE id = 1"); stat_row = c.fetchone()
-        if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'] = stat_row
+        c.execute("SELECT pnl, trades, wins, prev_winrate FROM daily_stats WHERE id = 1")
+        stat_row = c.fetchone()
+        if stat_row: 
+            daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'] = stat_row
         conn.close()
     except Exception: pass
 
@@ -191,7 +196,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                     patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
                                     return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
-        # GRID
+        # GRID - Институциональный фильтр волатильности
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -202,8 +207,11 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
 
         now_utc = datetime.now(timezone.utc)
         skip_grid = (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30) or (now_utc.hour in [23, 7, 15] and now_utc.minute >= 45) or (now_utc.hour in [0, 8, 16] and now_utc.minute <= 15)
-        grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
         
+        # Если волатильность BTC > 2.5%, мы полностью запрещаем GRID, чтобы не ловить ножи в тренде.
+        if btc_volatility_pct > 2.5: skip_grid = True 
+        
+        grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
         candle_range = h[-1] - l[-1] if h[-1] - l[-1] > 0 else 0.0001
         lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
         upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
@@ -422,7 +430,6 @@ async def wss_sniper_worker(sym, setup_data):
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
                     if pct >= 65: valid_exchanges.append((labels[ex], tots[ex], pct))
 
-            # Альтсезон: нужно 1 биржа. Иначе: 2 биржи.
             req_exchanges = 1 if is_altseason else 2
             
             if len(valid_exchanges) < req_exchanges:
@@ -440,14 +447,12 @@ async def wss_sniper_worker(sym, setup_data):
                 price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                 global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                 
-                # CVD Buffer: Игнорируем мелкий минус (шум розницы)
                 cvd_buffer = 5000 
                 if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта против тренда ({global_delta:,.0f}$)")
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     continue
                 
-                # Slippage Tolerance: Расширено до 0.20%
                 slippage_limit = 0.20
                 if (is_long and price_shift_pct < -slippage_limit) or (not is_long and price_shift_pct > slippage_limit):
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена ушла против нас (Проскальзывание {price_shift_pct:.2f}%)")
@@ -552,32 +557,41 @@ async def monitor_positions_job():
 
 async def daily_report_task():
     global daily_stats
-    last_day = datetime.now(timezone.utc).date()
+    reported_today = False
     while True:
-        await asyncio.sleep(60) 
-        current_day = datetime.now(timezone.utc).date()
-        if current_day > last_day:
+        await asyncio.sleep(30)
+        now = datetime.now(timezone.utc)
+        # Отчет в 22:00 GMT+2 (это ровно 20:00 UTC)
+        if now.hour == 20 and now.minute == 0 and not reported_today:
             trades = daily_stats['trades']
             wins = daily_stats['wins']
             pnl = daily_stats['pnl']
             winrate = (wins / trades * 100) if trades > 0 else 0
+            prev_winrate = daily_stats.get('prev_winrate', 0.0)
             
-            report = (f"🗓 **ИТОГИ ДНЯ (Async Bot):** {last_day.strftime('%d.%m.%Y')}\n\n"
-                      f"📈 Сделок: {trades}\n"
-                      f"🎯 Винрейт: {winrate:.1f}%\n"
-                      f"💵 Прибыль: {pnl:.2f} USDT")
+            diff = winrate - prev_winrate
+            diff_str = f"+{diff:.1f}%" if diff > 0 else f"{diff:.1f}%"
+            
+            report = (f"🗓 **ИТОГИ ДНЯ (Async Bot):** {now.strftime('%d.%m.%Y')}\n\n"
+                      f"📈 Открыто сделок за день: {trades}\n"
+                      f"🎯 Винрейт: {winrate:.1f}% ({diff_str} к вчерашнему)\n"
+                      f"💵 Прибыль за день: {pnl:.2f} USDT")
             
             await send_tg_msg(report)
             
+            # Сохраняем винрейт и ОБНУЛЯЕМ счетчики для следующего дня
+            daily_stats['prev_winrate'] = winrate
             daily_stats['pnl'] = 0.0
             daily_stats['trades'] = 0
             daily_stats['wins'] = 0
             await asyncio.to_thread(save_positions)
+            reported_today = True
             
-            last_day = current_day
+        elif now.hour != 20:
+            reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.16 Active (Altseason Mode, Slippage Tolerant, CVD Buffer)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.17 Active (Inst. Volatility Filter & 22:00 Daily Sync)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -586,7 +600,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.16: Altseason Mode + Slippage Tolerant + CVD Buffer...")
+    logging.info("🚀 Запуск ядра v8.17: Volatility Guard + Daily Stats Sync (20:00 UTC)...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task())
 
 if __name__ == '__main__':
