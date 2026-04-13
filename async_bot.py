@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.18 (Smart Maker Filters, Inst. Regime, 22:00 Sync) ===
+# === НАСТРОЙКИ v8.19 (Time-Adjusted Volume Thresholds) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,7 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_THRESHOLD = 200000 
+WHALE_VOLUME_THRESHOLD = 60000 # Снижено пропорционально 5-секундному окну
 
 SMC_TIMEFRAME = '15m'
 
@@ -91,7 +91,6 @@ def load_positions():
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
         if row: 
             active_positions = json.loads(row[0])
-            logging.info(f"✅ БД загружена. Активных сделок: {len(active_positions)}")
         c.execute("SELECT pnl, trades, wins, prev_winrate FROM daily_stats WHERE id = 1")
         stat_row = c.fetchone()
         if stat_row: 
@@ -196,7 +195,6 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                     patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
                                     return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
-        # GRID - Институциональный фильтр волатильности
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
@@ -208,13 +206,11 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
         now_utc = datetime.now(timezone.utc)
         skip_grid = (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30) or (now_utc.hour in [23, 7, 15] and now_utc.minute >= 45) or (now_utc.hour in [0, 8, 16] and now_utc.minute <= 15)
         
-        # Если волатильность BTC > 2.5%, мы полностью запрещаем GRID, чтобы не ловить ножи в тренде.
         if btc_volatility_pct > 2.5: skip_grid = True 
         
         grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
         candle_range = h[-1] - l[-1] if h[-1] - l[-1] > 0 else 0.0001
         
-        # v8.18 - Смягчение фильтра тени свечи (Wick Ratio) до 0.2 (20%)
         lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
         upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
 
@@ -417,21 +413,20 @@ async def wss_sniper_worker(sym, setup_data):
             state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
             GLOBAL_CVD[sym] = sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 'b') - sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 's')
             
-            # v8.18 - Время на раздумья снижено до 5 секунд (было 15)
             if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or now - state['start_time'] < 5: continue
                 
             vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
             tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
             
             vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
-            thresh = {'bx_s': 8000*vol_mod, 'bx_f': 8000*vol_mod, 'mc_s': 8000*vol_mod, 'mc_f': 8000*vol_mod, 'bb_s': 8000*vol_mod, 'bb_f': 20000*vol_mod, 'bn_f': 25000*vol_mod}
+            # v8.19: Пороги объема уменьшены в 3 раза, так как мы собираем данные всего 5 секунд!
+            thresh = {'bx_s': 2500*vol_mod, 'bx_f': 2500*vol_mod, 'mc_s': 2500*vol_mod, 'mc_f': 2500*vol_mod, 'bb_s': 2500*vol_mod, 'bb_f': 7000*vol_mod, 'bn_f': 10000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
             valid_exchanges = []
             for ex, limit in thresh.items():
                 if tots[ex] > limit:
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
-                    # v8.18 - Снижение порога доминации до 55% (было 65%)
                     if pct >= 55: valid_exchanges.append((labels[ex], tots[ex], pct))
 
             req_exchanges = 1 if is_altseason else 2
@@ -451,14 +446,12 @@ async def wss_sniper_worker(sym, setup_data):
                 price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                 global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                 
-                # v8.18 - Увеличен буфер CVD до 15,000$ (прощаем мелкие встречные сделки)
                 cvd_buffer = 15000 
                 if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта против тренда ({global_delta:,.0f}$)")
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     continue
                 
-                # v8.18 - Расширение коридора проскальзывания до 0.35%
                 slippage_limit = 0.35
                 if (is_long and price_shift_pct < -slippage_limit) or (not is_long and price_shift_pct > slippage_limit):
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена ушла против нас (Проскальзывание {price_shift_pct:.2f}%)")
@@ -595,7 +588,7 @@ async def daily_report_task():
             reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.18 Active (Smart Maker Filters)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.19 Active (Time-Adjusted Volume Thresholds)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -604,7 +597,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.18: Smart Maker Filters (Faster Reaction, Looser Flow)...")
+    logging.info("🚀 Запуск ядра v8.19: Time-Adjusted Volume Thresholds...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task())
 
 if __name__ == '__main__':
