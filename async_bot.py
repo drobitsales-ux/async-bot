@@ -13,8 +13,8 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.23 (Oracle Lead-Lag Model: Binance/Bybit Trigger) ===
-DB_PATH = '/data/bot.db' 
+# === НАСТРОЙКИ v8.24 (Oracle Model + ZERO-LATENCY Execution) ===
+DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
@@ -33,6 +33,7 @@ SMC_TIMEFRAME = '15m'
 CRITICAL_CVD_USDT = 150000  
 GLOBAL_CVD = {}             
 COOLDOWN_CACHE = {}         
+LEVERAGE_CACHE = set() # Кэш для ускорения: не ставим плечо, если уже стоит
 
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
@@ -43,6 +44,7 @@ GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
 last_signals = {} 
 NOTIFIED_SYMBOLS = set() 
+GLOBAL_BALANCE = 0.0 # HFT Кэш баланса
 
 HOT_LIST = {}  
 ACTIVE_WSS_CONNECTIONS = set()
@@ -67,7 +69,6 @@ exchange = ccxt_async.bingx({
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = get_db_conn(); c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, data TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (id INTEGER PRIMARY KEY, pnl REAL, trades INTEGER, wins INTEGER)''')
@@ -106,6 +107,15 @@ async def send_tg_msg(text):
             async with session.post(url, json=payload) as resp: pass
     except Exception: pass
 
+async def update_balance_task():
+    global GLOBAL_BALANCE
+    while True:
+        try:
+            bal = await exchange.fetch_balance()
+            GLOBAL_BALANCE = float(bal['USDT']['free'])
+        except Exception: pass
+        await asyncio.sleep(10) # Обновляем каждые 10 секунд
+
 def calculate_ema(data, window):
     if len(data) < window: return data[-1]
     alpha = 2 / (window + 1)
@@ -135,12 +145,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
         if not ohlcv or len(ohlcv) < 200: return None
         
-        o = np.array([x[1] for x in ohlcv], dtype=float)
-        h = np.array([x[2] for x in ohlcv], dtype=float)
-        l = np.array([x[3] for x in ohlcv], dtype=float)
-        c = np.array([x[4] for x in ohlcv], dtype=float)
-        v = np.array([x[5] for x in ohlcv], dtype=float)
-        
+        o, h, l, c, v = (np.array([x[i] for x in ohlcv], dtype=float) for i in range(1, 6))
         current_price = c[-1]
         ema_200 = calculate_ema(c, 200)
         rsi_15m = calculate_rsi(c, 14)
@@ -152,8 +157,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         is_high_momentum = btc_volatility_pct > 2.0
-        discount_ratio = 0.85 if is_high_momentum else 0.6  
-        premium_ratio = 0.15 if is_high_momentum else 0.4
+        discount_ratio, premium_ratio = (0.85, 0.15) if is_high_momentum else (0.6, 0.4)
         
         eq_level_long = leg_low + (leg_high - leg_low) * discount_ratio  
         eq_level_short = leg_low + (leg_high - leg_low) * premium_ratio 
@@ -162,62 +166,54 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                 fvg = find_fvg_details(h, l, 'Long')
                 if fvg['found']:
-                    if is_high_momentum and current_price <= fvg['top'] and current_price >= fvg['bottom']:
+                    if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
                         sl = fvg['bottom'] - (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
-                            if i >= 15:
-                                local_min_past = np.min(l[i-15:i])
-                                is_valid_ob = (ob_low <= local_min_past) if not is_high_momentum else True 
-                                if is_valid_ob and current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
+                            if i >= 15 and (is_high_momentum or ob_low <= np.min(l[i-15:i])):
+                                if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                     sl = ob_low - (atr * 0.8)  
-                                    patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
-                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                                    patt = '15m OB Breaker' if is_high_momentum else '15m OB+FVG'
+                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
                 fvg = find_fvg_details(h, l, 'Short')
                 if fvg['found']:
-                    if is_high_momentum and current_price >= fvg['bottom'] and current_price <= fvg['top']:
+                    if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
                         sl = fvg['top'] + (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
-                            if i >= 15:
-                                local_max_past = np.max(h[i-15:i])
-                                is_valid_ob = (ob_high >= local_max_past) if not is_high_momentum else True
-                                if is_valid_ob and current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
+                            if i >= 15 and (is_high_momentum or ob_high >= np.max(h[i-15:i])):
+                                if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                     sl = ob_high + (atr * 0.8)
-                                    patt = '15m OB+FVG (Sweep)' if not is_high_momentum else '15m OB Breaker'
-                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'vol_pct': vol_increase_pct, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                                    patt = '15m OB Breaker' if is_high_momentum else '15m OB+FVG'
+                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
         std_dev = np.std(c[-bb_window:])
-        upper_bb = sma_20 + (2 * std_dev)
-        lower_bb = sma_20 - (2 * std_dev)
+        upper_bb, lower_bb = sma_20 + (2 * std_dev), sma_20 - (2 * std_dev)
         bb_width = (upper_bb - lower_bb) / sma_20 * 100
         grid_has_volume = (v[-1] > avg_volume * 1.50) or (v[-2] > avg_volume * 1.50)
 
         now_utc = datetime.now(timezone.utc)
-        skip_grid = (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30) or (now_utc.hour in [23, 7, 15] and now_utc.minute >= 45) or (now_utc.hour in [0, 8, 16] and now_utc.minute <= 15)
-        
-        if btc_volatility_pct > 2.5: skip_grid = True 
-        
+        skip_grid = btc_volatility_pct > 2.5 or (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30) or (now_utc.hour in [23, 7, 15] and now_utc.minute >= 45) or (now_utc.hour in [0, 8, 16] and now_utc.minute <= 15)
         grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
-        candle_range = h[-1] - l[-1] if h[-1] - l[-1] > 0 else 0.0001
+        candle_range = max(h[-1] - l[-1], 0.0001)
         
         lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
         upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
 
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
             if (btc_volatility_pct < 2.0 or current_price > ema_200) and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.2: 
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
             elif (btc_volatility_pct < 2.0 or current_price < ema_200) and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.2: 
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': f'BB Scalp (Pinbar)', 'vol_pct': vol_increase_pct, 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
 
         return None
     except Exception: return None
@@ -243,11 +239,13 @@ async def radar_task():
 
             btc_trend, altseason, btc_volatility_pct = 'Short', False, 2.0
             try:
-                btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
+                btc_ohlcv, eth_ohlcv = await asyncio.gather(
+                    exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205),
+                    exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
+                )
                 btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
                 btc_trend = 'Long' if btc_c[-1] > calculate_ema(btc_c, 200) else 'Short'
-                eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
-                altseason = True if (np.array([x[4] for x in eth_ohlcv], dtype=float)[-1] / btc_c[-1]) > calculate_ema((np.array([x[4] for x in eth_ohlcv], dtype=float) / btc_c), 200) else False
+                altseason = (np.array([x[4] for x in eth_ohlcv], dtype=float)[-1] / btc_c[-1]) > calculate_ema((np.array([x[4] for x in eth_ohlcv], dtype=float) / btc_c), 200)
                 btc_sma = np.mean(btc_c[-20:])
                 btc_volatility_pct = (4 * np.std(btc_c[-20:])) / btc_sma * 100
             except: pass
@@ -264,11 +262,10 @@ async def radar_task():
                 if not tick or float(tick.get('quoteVolume') or 0) < MIN_VOLUME_USDT: continue
                 ask, bid = float(tick.get('ask') or 0), float(tick.get('bid') or 0)
                 if ask > 0 and bid > 0 and (ask - bid) / ask > MAX_SPREAD_PERCENT: continue
-                if not any(pos['symbol'].split('/')[0].split('-')[0].split(':')[0] == sym.split('/')[0].split('-')[0].split(':')[0] for pos in active_positions):
+                if not any(pos['symbol'].split(':')[0] == sym.split(':')[0] for pos in active_positions):
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
 
-            temp_symbols.sort(key=lambda x: x[1], reverse=True)
-            valid_symbols = [x[0] for x in temp_symbols[:SCAN_LIMIT]]
+            valid_symbols = [x[0] for x in sorted(temp_symbols, key=lambda x: x[1], reverse=True)[:SCAN_LIMIT]]
             
             sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
             results = []
@@ -293,18 +290,20 @@ async def radar_task():
             await asyncio.sleep(300) 
         except Exception: await asyncio.sleep(60)
 
-async def execute_trade(signal):
-    global COOLDOWN_CACHE
+# v8.24 ОПТИМИЗАЦИЯ: Убраны fetch_balance и fetch_ticker, цена берется из WS.
+async def execute_trade(signal, current_ws_price):
+    global COOLDOWN_CACHE, LEVERAGE_CACHE
     sym = signal['symbol']
     clean_name = sym.split(':')[0]
     
     if len(active_positions) >= MAX_POSITIONS or any(p['symbol'] == sym for p in active_positions): return
     if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: return
+    if GLOBAL_BALANCE <= 0: return # Failsafe защиты
 
     try:
         contract_size = float(exchange.market(sym).get('contractSize', 1.0))
-        free_usdt = float((await exchange.fetch_balance())['USDT']['free'])
-        current_market_price = (await exchange.fetch_ticker(sym))['last']
+        current_market_price = current_ws_price # ZERO-LATENCY 
+        free_usdt = GLOBAL_BALANCE # ZERO-LATENCY 
         
         actual_sl_dist = max(abs(signal['entry_price'] - signal['sl']), current_market_price * 0.004)
         is_long = signal['direction'] == 'Long'
@@ -317,10 +316,9 @@ async def execute_trade(signal):
         tp1_price = float(exchange.price_to_precision(sym, tp1_raw))
         tp2_price = float(exchange.price_to_precision(sym, tp2_raw))
 
-        if is_long and sl_price >= current_market_price: return
-        if not is_long and sl_price <= current_market_price: return
+        if (is_long and sl_price >= current_market_price) or (not is_long and sl_price <= current_market_price): return
 
-        risk_amount = free_usdt * RISK_PER_TRADE * signal.get('dynamic_risk', 1.0)
+        risk_amount = free_usdt * RISK_PER_TRADE
         final_qty_coins = min(risk_amount / actual_sl_dist if actual_sl_dist > 0 else 0, ((free_usdt * 0.95) / MAX_POSITIONS) * LEVERAGE / current_market_price)
         qty = float(exchange.amount_to_precision(sym, final_qty_coins / contract_size if contract_size > 0 else final_qty_coins))
         if qty <= 0 or qty * contract_size * current_market_price < MIN_NOTIONAL_USDT: return 
@@ -328,16 +326,20 @@ async def execute_trade(signal):
         pos_side = 'LONG' if is_long else 'SHORT'
         bot_client_id = f"OMNI_{clean_name}_{int(time.time()*100)}"
         
-        await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
+        # Кэшируем установку плеча
+        if f"{sym}_{pos_side}" not in LEVERAGE_CACHE:
+            await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
+            LEVERAGE_CACHE.add(f"{sym}_{pos_side}")
+            
         await exchange.create_market_order(sym, 'buy' if is_long else 'sell', qty, params={'positionSide': pos_side, 'clientOrderId': bot_client_id})
-        sl_ord = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price, 'clientOrderId': f"{bot_client_id}_SL"})
+        sl_ord = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price})
         
         active_positions.append({
             'symbol': sym, 'direction': signal['direction'], 'entry_price': current_market_price, 'initial_qty': qty, 
             'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 'atr': signal.get('atr', current_market_price*0.015),
             'tp1_hit': False, 'pre_tp1_hit': False, 'sl_order_id': sl_ord['id'], 'position_side': pos_side, 
             'open_time': datetime.now(timezone.utc).isoformat(), 'mode': signal['mode'],
-            'timeout_profit': 0.75 if signal['mode'] == 'GRID' else 3.0, 'timeout_any': 1.5 if signal['mode'] == 'GRID' else 6.0, 'client_tag': bot_client_id
+            'timeout_profit': 0.75 if signal['mode'] == 'GRID' else 3.0, 'timeout_any': 1.5 if signal['mode'] == 'GRID' else 6.0
         })
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
@@ -346,16 +348,14 @@ async def execute_trade(signal):
     except Exception as e: 
         if "101204" in str(e) or "Insufficient margin" in str(e):
             COOLDOWN_CACHE[sym] = time.time() + 1800 
-            logging.error(f"🚫 Маржа для {clean_name}. Кулдаун 30 мин.")
 
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
-    base_coin = sym.split('/')[0].split('-')[0].split(':')[0]
+    base_coin = sym.split(':')[0]
     clean_name = base_coin  
-    
     sym_bingx_s, sym_bingx_f = f"{base_coin}-USDT", f"{base_coin}-USDT"
     sym_mexc, sym_bybit = f"{base_coin}USDT", f"{base_coin}USDT"
-    sym_binance, sym_binance_1000 = f"{base_coin}usdt".lower(), f"1000{base_coin}usdt".lower()
+    sym_binance = f"{base_coin}usdt".lower()
 
     state = {'trades': [], 'start_time': time.time(), 'active': True, 'current_price': setup_data['entry_price']}
 
@@ -417,10 +417,8 @@ async def wss_sniper_worker(sym, setup_data):
                 
             vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
             tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
-            
             vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
             
-            # v8.23: Пороги. Binance и Bybit - наши Оракулы.
             thresh = {'bx_s': 6000*vol_mod, 'bx_f': 6000*vol_mod, 'mc_s': 6000*vol_mod, 'mc_f': 6000*vol_mod, 'bb_s': 6000*vol_mod, 'bb_f': 15000*vol_mod, 'bn_f': 20000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
@@ -431,8 +429,7 @@ async def wss_sniper_worker(sym, setup_data):
             if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
                 is_whale = True
             
-            valid_names = []
-            valid_exchanges_str = []
+            valid_names, valid_exchanges_str = [], []
             for ex, limit in thresh.items():
                 if tots[ex] > limit:
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
@@ -440,49 +437,34 @@ async def wss_sniper_worker(sym, setup_data):
                         valid_names.append(labels[ex])
                         valid_exchanges_str.append(f"{labels[ex]} ({pct:.0f}%)")
 
-            # ВЕРДИКТ ОРАКУЛА: Если Binance или Bybit кричат "ПОШЛО ДВИЖЕНИЕ!"
             oracle_triggered = 'Binance (F)' in valid_names or 'Bybit (F)' in valid_names
             
-            # Выполняем выстрел, если сработал Оракул ИЛИ есть Кит ИЛИ подтвердили любые 2 мелкие биржи
             if oracle_triggered or len(valid_names) >= 2 or is_whale:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
                 if (setup_data['ob_low'] - ob_range*0.5) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.5):
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                     
-                    cvd_buffer = 15000 
-                    if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
-                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта против тренда ({global_delta:,.0f}$)")
+                    if (is_long and global_delta < -15000) or (not is_long and global_delta > 15000):
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
-                    slippage_limit = 0.35
-                    if (is_long and price_shift_pct < -slippage_limit) or (not is_long and price_shift_pct > slippage_limit):
-                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена ушла против нас (Проскальзывание {price_shift_pct:.2f}%)")
+                    if (is_long and price_shift_pct < -0.35) or (not is_long and price_shift_pct > 0.35):
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
                     if sym in HOT_LIST: del HOT_LIST[sym]
                     
-                    if is_whale: 
-                        setup_data['score_info'] = f"🐋 ВХОД С КИТОМ! (Объем: {max_vol:,.0f}$)"
-                    elif oracle_triggered:
-                        setup_data['score_info'] = f"🔮 СИГНАЛ ОРАКУЛА! ({', '.join(valid_exchanges_str)}) за {int(elapsed_time)}с"
-                    else:
-                        setup_data['score_info'] = f"🔥 СТАНДАРТ ПОДТВЕРЖДЕНИЕ ({len(valid_names)} бирж) за {int(elapsed_time)}с" 
+                    if is_whale: setup_data['score_info'] = f"🐋 ВХОД С КИТОМ! (Объем: {max_vol:,.0f}$)"
+                    elif oracle_triggered: setup_data['score_info'] = f"🔮 СИГНАЛ ОРАКУЛА! ({', '.join(valid_exchanges_str)}) за {int(elapsed_time)}с"
+                    else: setup_data['score_info'] = f"🔥 СТАНДАРТ ПОДТВЕРЖДЕНИЕ ({len(valid_names)} бирж) за {int(elapsed_time)}с" 
                     
-                    await execute_trade(setup_data)
+                    # ПЕРЕДАЕМ ТЕКУЩУЮ ЦЕНУ ИЗ СОКЕТА В ФУНКЦИЮ ОТКРЫТИЯ СДЕЛКИ
+                    await execute_trade(setup_data, state['current_price']) 
                 else:
-                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вышла из зоны Ордерблока")
                     if sym in HOT_LIST: del HOT_LIST[sym]
-            
-            # v8.23: Окно слежки за Оракулом - ровно 60 секунд.
             elif elapsed_time >= 60:
-                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Истек таймаут 60с (Оракул молчит)")
                 if sym in HOT_LIST: del HOT_LIST[sym]
                 continue
-            else:
-                pass 
-                
     finally:
         state['active'] = False
         for t in tasks: t.cancel()
@@ -497,6 +479,7 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
+# v8.24 ОПТИМИЗАЦИЯ: Асинхронный массовый мониторинг позиций
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES
     while True:
@@ -504,25 +487,33 @@ async def monitor_positions_job():
         try:
             positions_raw = await exchange.fetch_positions()
             if not active_positions: continue
-            updated = []
             
-            for pos in active_positions:
+            # Запрашиваем все тикеры одновременно для всех открытых позиций!
+            symbols_to_fetch = [p['symbol'] for p in active_positions]
+            tickers = await exchange.fetch_tickers(symbols_to_fetch)
+            
+            # Запрашиваем 1m свечи одновременно
+            ohlcv_tasks = [exchange.fetch_ohlcv(sym, timeframe='1m', limit=2) for sym in symbols_to_fetch]
+            ohlcv_results = await asyncio.gather(*ohlcv_tasks, return_exceptions=True)
+
+            updated = []
+            for idx, pos in enumerate(active_positions):
                 sym = pos['symbol']
                 clean_name = sym.split(':')[0]
                 is_long = pos['direction'] == 'Long'
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
+                ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 
                 if not curr:
-                    ticker = await exchange.fetch_ticker(sym); pnl = (ticker['last'] - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - ticker['last']) * pos['initial_qty']
+                    pnl = (ticker - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - ticker) * pos['initial_qty']
                     daily_stats['trades'] += 1; daily_stats['pnl'] += pnl
                     if pnl > 0: daily_stats['wins'] += 1; CONSECUTIVE_LOSSES = 0; await send_tg_msg(f"✅ **{clean_name} закрыта в плюс!**\nPNL: +{pnl:.2f} USDT")
                     else: CONSECUTIVE_LOSSES += 1; await send_tg_msg(f"🛑 **{clean_name} выбита по SL.**\nPNL: {pnl:.2f} USDT")
                     continue
 
-                last_p = (await exchange.fetch_ticker(sym))['last']
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
-                pnl = (last_p - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - last_p) * float(curr['contracts'])
+                pnl = (ticker - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - ticker) * float(curr['contracts'])
 
                 if hours_passed >= pos.get('timeout_any', 4.0) or (hours_passed >= pos.get('timeout_profit', 2.0) and pnl > 0):
                     try:
@@ -532,8 +523,8 @@ async def monitor_positions_job():
                         continue 
                     except: pass
 
-                ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
-                if not ohlcv: updated.append(pos); continue
+                ohlcv = ohlcv_results[idx]
+                if isinstance(ohlcv, Exception) or not ohlcv: updated.append(pos); continue
                 high_p, low_p = max([float(c[2]) for c in ohlcv]), min([float(c[3]) for c in ohlcv])
 
                 if not pos.get('tp1_hit') and not pos.get('pre_tp1_hit'):
@@ -584,7 +575,6 @@ async def daily_report_task():
             pnl = daily_stats['pnl']
             winrate = (wins / trades * 100) if trades > 0 else 0
             prev_winrate = daily_stats.get('prev_winrate', 0.0)
-            
             diff = winrate - prev_winrate
             diff_str = f"+{diff:.1f}%" if diff > 0 else f"{diff:.1f}%"
             
@@ -592,21 +582,15 @@ async def daily_report_task():
                       f"📈 Открыто сделок за день: {trades}\n"
                       f"🎯 Винрейт: {winrate:.1f}% ({diff_str} к вчерашнему)\n"
                       f"💵 Прибыль за день: {pnl:.2f} USDT")
-            
             await send_tg_msg(report)
             
-            daily_stats['prev_winrate'] = winrate
-            daily_stats['pnl'] = 0.0
-            daily_stats['trades'] = 0
-            daily_stats['wins'] = 0
+            daily_stats['prev_winrate'] = winrate; daily_stats['pnl'] = 0.0; daily_stats['trades'] = 0; daily_stats['wins'] = 0
             await asyncio.to_thread(save_positions)
             reported_today = True
-            
-        elif now.hour != 20:
-            reported_today = False
+        elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.23 Active (Oracle Lead-Lag Model 60s)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.24 Active (Zero-Latency Oracle Model)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -615,8 +599,14 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.23: Oracle Lead-Lag Model (Binance/Bybit Trigger)...")
-    await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task())
+    logging.info("🚀 Запуск ядра v8.24: Zero-Latency Execution + Oracle Lead-Lag Model...")
+    await asyncio.gather(
+        radar_task(), 
+        sniper_manager(), 
+        monitor_positions_job(), 
+        daily_report_task(),
+        update_balance_task() # Запускаем фоновое обновление баланса
+    )
 
 if __name__ == '__main__':
     Thread(target=run_server, daemon=True).start()
