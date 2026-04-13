@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.21 (True Liquidity Seeker: 60s Window + Inst. Volumes) ===
+# === НАСТРОЙКИ v8.22 (The Ultimate Quant Model: 20s Velocity Window) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -27,8 +27,8 @@ MAX_SPREAD_PERCENT = 0.002
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
 
-# v8.21: Возвращаем объем Кита к серьезным значениям (150к)
-WHALE_VOLUME_THRESHOLD = 150000 
+# v8.22: Порог агрессивного маркет-ордера Кита для мгновенного входа
+WHALE_VOLUME_THRESHOLD = 80000 
 
 SMC_TIMEFRAME = '15m'
 
@@ -409,37 +409,46 @@ async def wss_sniper_worker(sym, setup_data):
         is_altseason = setup_data.get('altseason', False)
         
         while (sym in HOT_LIST or any(p['symbol'] == sym for p in active_positions)) and state['active']:
-            await asyncio.sleep(3) 
+            await asyncio.sleep(1) 
             now = time.time()
             state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
             GLOBAL_CVD[sym] = sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 'b') - sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 's')
             
             elapsed_time = now - state['start_time']
             
-            if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS: continue
+            # Ждем минимум 2 секунды перед началом анализа, чтобы веб-сокеты успели подключиться
+            if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or elapsed_time < 2: continue
                 
             vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
             tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
             
             vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
             
-            # v8.21: ИНСТИТУЦИОНАЛЬНЫЕ ОБЪЕМЫ возвращены (т.к. окно поиска теперь 60 секунд)
-            thresh = {'bx_s': 8000*vol_mod, 'bx_f': 8000*vol_mod, 'mc_s': 8000*vol_mod, 'mc_f': 8000*vol_mod, 'bb_s': 8000*vol_mod, 'bb_f': 20000*vol_mod, 'bn_f': 25000*vol_mod}
+            # v8.22: Оптимизированные объемы для окна 20 секунд (Trade Intensity Model)
+            thresh = {'bx_s': 4000*vol_mod, 'bx_f': 4000*vol_mod, 'mc_s': 4000*vol_mod, 'mc_f': 4000*vol_mod, 'bb_s': 4000*vol_mod, 'bb_f': 12000*vol_mod, 'bn_f': 18000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
+            
+            # v8.22: Абсолютный триггер Кита (Instant Execution)
+            max_vol = max([tots[ex] for ex in tots]) if tots else 0
+            global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
+            is_whale = False
+            if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
+                is_whale = True
             
             valid_exchanges = []
             for ex, limit in thresh.items():
                 if tots[ex] > limit:
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
-                    if pct >= 55: valid_exchanges.append((labels[ex], tots[ex], pct))
+                    # v8.22: Доминация увеличена до 58% для фильтрации шума
+                    if pct >= 58: valid_exchanges.append((labels[ex], tots[ex], pct))
 
             req_exchanges = 1 if is_altseason else 2
             
-            if len(valid_exchanges) >= req_exchanges:
+            # Если выполнились условия пулов ИЛИ залетел агрессивный Кит
+            if len(valid_exchanges) >= req_exchanges or is_whale:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
                 if (setup_data['ob_low'] - ob_range*0.5) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.5):
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
-                    global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                     
                     cvd_buffer = 15000 
                     if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
@@ -454,18 +463,20 @@ async def wss_sniper_worker(sym, setup_data):
                         continue
                     
                     if sym in HOT_LIST: del HOT_LIST[sym]
-                    setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Пулов: {len(valid_exchanges)}, Собран за {int(elapsed_time)}с)" 
+                    if is_whale: setup_data['score_info'] = f"🐋 ВХОД С КИТОМ! (Объем: {max_vol:,.0f}$)"
+                    else: setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Пулов: {len(valid_exchanges)}, Собран за {int(elapsed_time)}с)" 
                     await execute_trade(setup_data)
                 else:
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вышла из зоны Ордерблока")
                     if sym in HOT_LIST: del HOT_LIST[sym]
             
-            elif elapsed_time >= 60:
-                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Истек таймаут 60с (Подтвердило бирж: {len(valid_exchanges)} из {req_exchanges})")
+            # v8.22: ЖЕСТКИЙ ТАЙМАУТ 20 СЕКУНД
+            elif elapsed_time >= 20:
+                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Истек таймаут 20с (Подтвердило бирж: {len(valid_exchanges)} из {req_exchanges})")
                 if sym in HOT_LIST: del HOT_LIST[sym]
                 continue
             else:
-                pass
+                pass # Ждем дальше (в пределах 20 секунд)
                 
     finally:
         state['active'] = False
@@ -590,7 +601,7 @@ async def daily_report_task():
             reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.21 Active (True Liquidity Seeker + Inst. Volumes)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.22 Active (The Ultimate Quant Model: 20s Velocity)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -599,7 +610,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.21: True Liquidity Seeker (60s Window + Inst. Volumes)...")
+    logging.info("🚀 Запуск ядра v8.22: Ultimate Quant Model (20s Velocity Window)...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task())
 
 if __name__ == '__main__':
