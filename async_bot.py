@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.19 (Time-Adjusted Volume Thresholds) ===
+# === НАСТРОЙКИ v8.21 (True Liquidity Seeker: 60s Window + Inst. Volumes) ===
 DB_PATH = '/data/bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,9 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_THRESHOLD = 60000 # Снижено пропорционально 5-секундному окну
+
+# v8.21: Возвращаем объем Кита к серьезным значениям (150к)
+WHALE_VOLUME_THRESHOLD = 150000 
 
 SMC_TIMEFRAME = '15m'
 
@@ -89,8 +91,7 @@ def load_positions():
     try:
         conn = get_db_conn(); c = conn.cursor()
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
-        if row: 
-            active_positions = json.loads(row[0])
+        if row: active_positions = json.loads(row[0])
         c.execute("SELECT pnl, trades, wins, prev_winrate FROM daily_stats WHERE id = 1")
         stat_row = c.fetchone()
         if stat_row: 
@@ -413,14 +414,17 @@ async def wss_sniper_worker(sym, setup_data):
             state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
             GLOBAL_CVD[sym] = sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 'b') - sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 's')
             
-            if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or now - state['start_time'] < 5: continue
+            elapsed_time = now - state['start_time']
+            
+            if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS: continue
                 
             vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
             tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
             
             vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
-            # v8.19: Пороги объема уменьшены в 3 раза, так как мы собираем данные всего 5 секунд!
-            thresh = {'bx_s': 2500*vol_mod, 'bx_f': 2500*vol_mod, 'mc_s': 2500*vol_mod, 'mc_f': 2500*vol_mod, 'bb_s': 2500*vol_mod, 'bb_f': 7000*vol_mod, 'bn_f': 10000*vol_mod}
+            
+            # v8.21: ИНСТИТУЦИОНАЛЬНЫЕ ОБЪЕМЫ возвращены (т.к. окно поиска теперь 60 секунд)
+            thresh = {'bx_s': 8000*vol_mod, 'bx_f': 8000*vol_mod, 'mc_s': 8000*vol_mod, 'mc_f': 8000*vol_mod, 'bb_s': 8000*vol_mod, 'bb_f': 20000*vol_mod, 'bn_f': 25000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
             valid_exchanges = []
@@ -431,39 +435,37 @@ async def wss_sniper_worker(sym, setup_data):
 
             req_exchanges = 1 if is_altseason else 2
             
-            if len(valid_exchanges) < req_exchanges:
-                global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
-                max_vol = max([tots[ex] for ex in tots]) if tots else 0
-                if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
-                    valid_exchanges.append(("WHALE_OVERRIDE", max_vol, 100))
-                else:
-                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Нехватка объемов (Подтвердило бирж: {len(valid_exchanges)} из {req_exchanges})")
-                    if sym in HOT_LIST: del HOT_LIST[sym]
-                    continue
+            if len(valid_exchanges) >= req_exchanges:
+                ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
+                if (setup_data['ob_low'] - ob_range*0.5) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.5):
+                    price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
+                    global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
                     
-            ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
-            if (setup_data['ob_low'] - ob_range*0.5) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.5):
-                price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
-                global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
-                
-                cvd_buffer = 15000 
-                if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
-                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта против тренда ({global_delta:,.0f}$)")
+                    cvd_buffer = 15000 
+                    if (is_long and global_delta < -cvd_buffer) or (not is_long and global_delta > cvd_buffer):
+                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта против тренда ({global_delta:,.0f}$)")
+                        if sym in HOT_LIST: del HOT_LIST[sym]
+                        continue
+                    
+                    slippage_limit = 0.35
+                    if (is_long and price_shift_pct < -slippage_limit) or (not is_long and price_shift_pct > slippage_limit):
+                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена ушла против нас (Проскальзывание {price_shift_pct:.2f}%)")
+                        if sym in HOT_LIST: del HOT_LIST[sym]
+                        continue
+                    
                     if sym in HOT_LIST: del HOT_LIST[sym]
-                    continue
-                
-                slippage_limit = 0.35
-                if (is_long and price_shift_pct < -slippage_limit) or (not is_long and price_shift_pct > slippage_limit):
-                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена ушла против нас (Проскальзывание {price_shift_pct:.2f}%)")
+                    setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Пулов: {len(valid_exchanges)}, Собран за {int(elapsed_time)}с)" 
+                    await execute_trade(setup_data)
+                else:
+                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вышла из зоны Ордерблока")
                     if sym in HOT_LIST: del HOT_LIST[sym]
-                    continue
-                
+            
+            elif elapsed_time >= 60:
+                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Истек таймаут 60с (Подтвердило бирж: {len(valid_exchanges)} из {req_exchanges})")
                 if sym in HOT_LIST: del HOT_LIST[sym]
-                setup_data['score_info'] = f"🔥 ТОП СИГНАЛ (Пулов: {len(valid_exchanges)})" 
-                await execute_trade(setup_data)
+                continue
             else:
-                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вышла из зоны Ордерблока")
-                if sym in HOT_LIST: del HOT_LIST[sym]
+                pass
                 
     finally:
         state['active'] = False
@@ -588,7 +590,7 @@ async def daily_report_task():
             reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.19 Active (Time-Adjusted Volume Thresholds)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.21 Active (True Liquidity Seeker + Inst. Volumes)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -597,7 +599,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.19: Time-Adjusted Volume Thresholds...")
+    logging.info("🚀 Запуск ядра v8.21: True Liquidity Seeker (60s Window + Inst. Volumes)...")
     await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task())
 
 if __name__ == '__main__':
