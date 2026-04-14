@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.25 (The Burst Oracle Model: 15s Window, Verbose Logging) ===
+# === НАСТРОЙКИ v8.26 (Dual-Window Oracle & X-Ray Telemetry) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -356,6 +356,9 @@ async def wss_sniper_worker(sym, setup_data):
     sym_binance = f"{base_coin}usdt".lower()
 
     state = {'trades': [], 'start_time': time.time(), 'active': True, 'current_price': setup_data['entry_price']}
+    
+    # X-Ray Telemetry: отслеживаем пиковые показатели по биржам во время слежки
+    peak_metrics = {ex: {'vol': 0, 'dom': 0} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
 
     async def l_ws(url, payload, ex_code, is_binance=False):
         while state['active']:
@@ -406,47 +409,67 @@ async def wss_sniper_worker(sym, setup_data):
         while (sym in HOT_LIST or any(p['symbol'] == sym for p in active_positions)) and state['active']:
             await asyncio.sleep(1) 
             now = time.time()
-            # Очистка старых трейдов
             state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
             elapsed_time = now - state['start_time']
             
             if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or elapsed_time < 2: continue
             
-            # v8.25 ВЗРЫВНОЙ ОРАКУЛ: Мы считаем объемы только за последние 15 секунд (окно пампа)
-            burst_trades = [t for t in state['trades'] if now - t['ts'] <= 15]
+            # v8.26 ОПТИМИЗАЦИЯ: Считаем 5s и 15s окна за один проход (O(N))
+            vols_5s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
+            vols_15s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
             
-            vols = {ex: {'b': sum(t['v'] for t in burst_trades if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in burst_trades if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
-            tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
+            for t in state['trades']:
+                dt = now - t['ts']
+                if dt <= 15:
+                    vols_15s[t['ex']][t['side']] += t['v']
+                    if dt <= 5:
+                        vols_5s[t['ex']][t['side']] += t['v']
+
+            tots_5s = {ex: vols_5s[ex]['b'] + vols_5s[ex]['s'] for ex in peak_metrics}
+            tots_15s = {ex: vols_15s[ex]['b'] + vols_15s[ex]['s'] for ex in peak_metrics}
+            
             vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
             
-            # Пороги адаптированы под 15-секундный всплеск
-            thresh = {'bx_s': 3000*vol_mod, 'bx_f': 3000*vol_mod, 'mc_s': 3000*vol_mod, 'mc_f': 3000*vol_mod, 'bb_s': 3000*vol_mod, 'bb_f': 8000*vol_mod, 'bn_f': 12000*vol_mod}
+            # Пороги для Dual-Window
+            thresh_5s = {'bx_s': 1000*vol_mod, 'bx_f': 1000*vol_mod, 'mc_s': 1000*vol_mod, 'mc_f': 1000*vol_mod, 'bb_s': 1000*vol_mod, 'bb_f': 3000*vol_mod, 'bn_f': 5000*vol_mod}
+            thresh_15s = {'bx_s': 3000*vol_mod, 'bx_f': 3000*vol_mod, 'mc_s': 3000*vol_mod, 'mc_f': 3000*vol_mod, 'bb_s': 3000*vol_mod, 'bb_f': 8000*vol_mod, 'bn_f': 12000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
-            # Глобальная дельта для фильтра против тренда
-            all_vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
-            global_delta = sum(all_vols[ex]['b'] for ex in all_vols) - sum(all_vols[ex]['s'] for ex in all_vols)
+            # Обновление X-Ray метрик (максимальные значения за всё время слежки)
+            for ex in peak_metrics:
+                t15 = tots_15s[ex]
+                if t15 > peak_metrics[ex]['vol']:
+                    peak_metrics[ex]['vol'] = t15
+                pct15 = (vols_15s[ex]['b'] / t15 * 100) if is_long and t15 > 0 else (vols_15s[ex]['s'] / t15 * 100) if not is_long and t15 > 0 else 0
+                if pct15 > peak_metrics[ex]['dom']:
+                    peak_metrics[ex]['dom'] = pct15
+
+            oracle_triggered = False
+            valid_names = []
+            valid_exchanges_str = []
             
-            max_vol = max([tots[ex] for ex in tots]) if tots else 0
+            # Логика Оракула: Достаточно пробить либо резкий пик (5s/60%), либо затяжной тренд (15s/55%)
+            for ex in peak_metrics:
+                t5, t15 = tots_5s[ex], tots_15s[ex]
+                pct5 = (vols_5s[ex]['b'] / t5 * 100) if is_long and t5 > 0 else (vols_5s[ex]['s'] / t5 * 100) if not is_long and t5 > 0 else 0
+                pct15 = (vols_15s[ex]['b'] / t15 * 100) if is_long and t15 > 0 else (vols_15s[ex]['s'] / t15 * 100) if not is_long and t15 > 0 else 0
+                
+                if (t5 >= thresh_5s[ex] and pct5 >= 60) or (t15 >= thresh_15s[ex] and pct15 >= 55):
+                    if ex in ['bn_f', 'bb_f']: oracle_triggered = True
+                    valid_names.append(labels[ex])
+                    valid_exchanges_str.append(f"{labels[ex]} ({max(pct5, pct15):.0f}%)")
+
+            # Глобальная дельта для фильтра против тренда и Китов
+            all_vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in peak_metrics}
+            global_delta = sum(all_vols[ex]['b'] for ex in all_vols) - sum(all_vols[ex]['s'] for ex in all_vols)
+            max_vol = max([tots_15s[ex] for ex in tots_15s]) if tots_15s else 0
+            
             is_whale = False
             if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
                 is_whale = True
             
-            valid_names, valid_exchanges_str = [], []
-            for ex, limit in thresh.items():
-                if tots[ex] > limit:
-                    pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
-                    # Смягчили доминацию до 55% для короткого рывка
-                    if pct >= 55: 
-                        valid_names.append(labels[ex])
-                        valid_exchanges_str.append(f"{labels[ex]} ({pct:.0f}%)")
-
-            oracle_triggered = 'Binance (F)' in valid_names or 'Bybit (F)' in valid_names
-            
             if oracle_triggered or len(valid_names) >= 2 or is_whale:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
-                
-                # Расширенный буфер проскальзывания при подтвержденном сигнале
                 allowed_upper = setup_data['ob_high'] + ob_range * 1.5
                 allowed_lower = setup_data['ob_low'] - ob_range * 1.5
                 
@@ -458,7 +481,6 @@ async def wss_sniper_worker(sym, setup_data):
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
-                    # Проскальзывание расширено до 0.5% (Оракул работает быстро, но цена летит)
                     if (is_long and price_shift_pct < -0.5) or (not is_long and price_shift_pct > 0.5):
                         logging.info(f"🗑 [ОТМЕНА] {clean_name}: Проскальзывание превысило 0.5% ({price_shift_pct:.2f}%)")
                         if sym in HOT_LIST: del HOT_LIST[sym]
@@ -474,8 +496,13 @@ async def wss_sniper_worker(sym, setup_data):
                 else:
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вылетела за пределы расширенного OB")
                     if sym in HOT_LIST: del HOT_LIST[sym]
+            
             elif elapsed_time >= 60:
-                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Истекло 60с (Оракул не дал импульс)")
+                # ВЫВОД X-RAY ТЕЛЕМЕТРИИ В ЛОГИ
+                log_bn = f"{int(peak_metrics['bn_f']['vol'])}$ ({peak_metrics['bn_f']['dom']:.0f}%)"
+                log_bb = f"{int(peak_metrics['bb_f']['vol'])}$ ({peak_metrics['bb_f']['dom']:.0f}%)"
+                logging.info(f"🗑 [ОТМЕНА] {clean_name}: 60с. Пик 15с объемов -> Binance: {log_bn} | Bybit: {log_bb}")
+                
                 if sym in HOT_LIST: del HOT_LIST[sym]
                 continue
     finally:
@@ -600,7 +627,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.25 Active (The Burst Oracle Model)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.26 Active (X-Ray Telemetry & Dual-Window)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -609,7 +636,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.25: The Burst Oracle Model (15s Window, Verbose Logging)...")
+    logging.info("🚀 Запуск ядра v8.26: Dual-Window Oracle & X-Ray Telemetry...")
     await asyncio.gather(
         radar_task(), 
         sniper_manager(), 
