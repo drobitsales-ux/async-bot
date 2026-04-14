@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.27 (Omni-Adaptive Oracle & Dynamic Thresholds) ===
+# === НАСТРОЙКИ v8.28 (Ticker Normalization & 30% Vol Filter) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,7 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_MULTIPLIER = 10.0 # Кит = 10x от среднего 15с объема
+WHALE_VOLUME_MULTIPLIER = 10.0 
 
 SMC_TIMEFRAME = '15m'
 
@@ -39,6 +39,18 @@ MAX_CONCURRENT_TASKS = 10
 SCAN_LIMIT = 300           
 
 EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
+
+# Словарь для нормализации тикеров между BingX и Binance/Bybit
+SYMBOL_MAP = {
+    'TONCOIN': 'TON',
+    'SATS': '1000SATS',
+    'RATS': '1000RATS',
+    'PEPE': '1000PEPE',
+    'BONK': '1000BONK',
+    'FLOKI': '1000FLOKI',
+    'SHIB': '1000SHIB',
+    'LUNA': 'LUNA2' # Зависит от биржи, LUNA на BingX = LUNA2 на Binance
+}
 
 GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
@@ -152,10 +164,9 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        # v8.27: УЖЕСТОЧЕНИЕ - требуем всплеск объема минимум на 50% от среднего
-        has_volume = (v[-1] > avg_volume * 1.5) or (v[-2] > avg_volume * 1.5)
+        # v8.28: ОПТИМИЗАЦИЯ - Всплеск 30% вместо 50%
+        has_volume = (v[-1] > avg_volume * 1.3) or (v[-2] > avg_volume * 1.3)
         
-        # v8.27: Защита от мертвых зон (свеча должна быть больше половины ATR)
         if (h[-1] - l[-1]) < (atr * 0.5): return None
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
@@ -202,7 +213,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         std_dev = np.std(c[-bb_window:])
         upper_bb, lower_bb = sma_20 + (2 * std_dev), sma_20 - (2 * std_dev)
         bb_width = (upper_bb - lower_bb) / sma_20 * 100
-        grid_has_volume = (v[-1] > avg_volume * 1.50) or (v[-2] > avg_volume * 1.50)
+        grid_has_volume = (v[-1] > avg_volume * 1.30) or (v[-2] > avg_volume * 1.30)
 
         now_utc = datetime.now(timezone.utc)
         skip_grid = btc_volatility_pct > 2.5 or (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30) or (now_utc.hour in [23, 7, 15] and now_utc.minute >= 45) or (now_utc.hour in [0, 8, 16] and now_utc.minute <= 15)
@@ -353,21 +364,30 @@ async def execute_trade(signal, current_ws_price):
 
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
-    base_coin = sym.split(':')[0]
-    clean_name = base_coin  
-    sym_bingx_s, sym_bingx_f = f"{base_coin}-USDT", f"{base_coin}-USDT"
-    sym_mexc, sym_bybit = f"{base_coin}USDT", f"{base_coin}USDT"
-    sym_binance = f"{base_coin}usdt".lower()
+    # Получаем чистое имя базовой монеты (например, TONCOIN, DOGE)
+    raw_base_coin = sym.split(':')[0].split('/')[0]
+    clean_name = raw_base_coin  
+    
+    # v8.28: НОРМАЛИЗАЦИЯ ТИКЕРОВ
+    # Если монета есть в словаре (например, TONCOIN), переводим ее в TON для WS
+    ws_base_coin = SYMBOL_MAP.get(raw_base_coin, raw_base_coin)
+
+    # BingX использует оригинальное имя
+    sym_bingx_s = f"{raw_base_coin}-USDT"
+    sym_bingx_f = f"{raw_base_coin}-USDT"
+    
+    # MEXC, Bybit, Binance используют нормализованное имя
+    sym_mexc = f"{ws_base_coin}USDT"
+    sym_bybit = f"{ws_base_coin}USDT"
+    sym_binance = f"{ws_base_coin}usdt".lower()
 
     state = {'trades': [], 'start_time': time.time(), 'active': True, 'current_price': setup_data['entry_price']}
     peak_metrics = {ex: {'vol': 0, 'dom': 0} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
 
-    # v8.27: Динамический расчет требуемых объемов
     vol_24h = setup_data.get('vol_24h', 1000000)
-    avg_15s_vol = vol_24h / 5760 # 5760 отрезков по 15 секунд в сутках
+    avg_15s_vol = vol_24h / 5760 
     
-    # Мы ищем аномалию: от 3x до 5x от среднего 15-секундного объема
-    base_thresh_15s = max(avg_15s_vol * 3.0, 3000) # Минимум 3000 USDT, чтобы отсечь микро-сделки
+    base_thresh_15s = max(avg_15s_vol * 3.0, 3000) 
     base_thresh_5s = base_thresh_15s * 0.4
     
     thresh_5s = {'bx_s': base_thresh_5s*0.3, 'bx_f': base_thresh_5s*0.3, 'mc_s': base_thresh_5s*0.3, 'mc_f': base_thresh_5s*0.3, 'bb_s': base_thresh_5s*0.5, 'bb_f': base_thresh_5s*1.2, 'bn_f': base_thresh_5s*2.0}
@@ -412,7 +432,7 @@ async def wss_sniper_worker(sym, setup_data):
         asyncio.create_task(l_ws("wss://open-api-ws.bingx.com/market", {"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_s}@trade"}, 'bx_s')),
         asyncio.create_task(l_ws("wss://open-api-swap.bingx.com/swap-market", {"id": "1", "reqType": "sub", "dataType": f"{sym_bingx_f}@trade"}, 'bx_f')),
         asyncio.create_task(l_ws("wss://wbs-api.mexc.com/ws", {"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_mexc}"]}, 'mc_s')),
-        asyncio.create_task(l_ws("wss://contract.mexc.com/edge", {"method": "sub.deal", "param": {"symbol": f"{base_coin}_USDT"}}, 'mc_f')),
+        asyncio.create_task(l_ws("wss://contract.mexc.com/edge", {"method": "sub.deal", "param": {"symbol": f"{ws_base_coin}_USDT"}}, 'mc_f')),
         asyncio.create_task(l_ws("wss://stream.bybit.com/v5/public/spot", {"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}, 'bb_s')),
         asyncio.create_task(l_ws("wss://stream.bybit.com/v5/public/linear", {"op": "subscribe", "args": [f"publicTrade.{sym_bybit}"]}, 'bb_f')),
         asyncio.create_task(l_ws(f"wss://fstream.binance.com/ws/{sym_binance}@aggTrade", None, 'bn_f', True))
@@ -632,7 +652,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.27 Active (Omni-Adaptive Oracle)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.28 Active (Ticker Normalization & 30% Vol Filter)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -641,7 +661,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.27: Omni-Adaptive Oracle (Dynamic Thresholds)...")
+    logging.info("🚀 Запуск ядра v8.28: Ticker Normalization & 30% Vol Filter...")
     await asyncio.gather(
         radar_task(), 
         sniper_manager(), 
