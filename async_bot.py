@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.26 (Dual-Window Oracle & X-Ray Telemetry) ===
+# === НАСТРОЙКИ v8.27 (Omni-Adaptive Oracle & Dynamic Thresholds) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,7 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_THRESHOLD = 80000 
+WHALE_VOLUME_MULTIPLIER = 10.0 # Кит = 10x от среднего 15с объема
 
 SMC_TIMEFRAME = '15m'
 
@@ -140,7 +140,7 @@ def find_fvg_details(h, l, direction):
         elif direction == 'Short' and h[i] < l[i-2]: return {'found': True, 'top': l[i-2], 'bottom': h[i]}
     return {'found': False}
 
-async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
+async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
     try:
         ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=205)
         if not ohlcv or len(ohlcv) < 200: return None
@@ -152,8 +152,11 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        has_volume = (v[-1] > avg_volume * 1.05) or (v[-2] > avg_volume * 1.05)
-        vol_increase_pct = ((max(v[-1], v[-2]) / avg_volume) - 1) * 100 if avg_volume > 0 else 0
+        # v8.27: УЖЕСТОЧЕНИЕ - требуем всплеск объема минимум на 50% от среднего
+        has_volume = (v[-1] > avg_volume * 1.5) or (v[-2] > avg_volume * 1.5)
+        
+        # v8.27: Защита от мертвых зон (свеча должна быть больше половины ATR)
+        if (h[-1] - l[-1]) < (atr * 0.5): return None
 
         leg_high, leg_low = np.max(h[-50:-1]), np.min(l[-50:-1])
         is_high_momentum = btc_volatility_pct > 2.0
@@ -168,7 +171,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                 if fvg['found']:
                     if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
                         sl = fvg['bottom'] - (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
@@ -176,7 +179,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                 if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
                                     sl = ob_low - (atr * 0.8)  
                                     patt = '15m OB Breaker' if is_high_momentum else '15m OB+FVG'
-                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
@@ -184,7 +187,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                 if fvg['found']:
                     if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
                         sl = fvg['top'] + (atr * 0.8)
-                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
@@ -192,7 +195,7 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
                                 if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
                                     sl = ob_high + (atr * 0.8)
                                     patt = '15m OB Breaker' if is_high_momentum else '15m OB+FVG'
-                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
@@ -211,17 +214,17 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct):
 
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
             if (btc_volatility_pct < 2.0 or current_price > ema_200) and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.2: 
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
             elif (btc_volatility_pct < 2.0 or current_price < ema_200) and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.2: 
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
         return None
     except Exception: return None
 
-async def process_single_coin(sym, btc_trend, altseason, btc_volatility_pct, sem):
+async def process_single_coin(sym, btc_trend, altseason, btc_volatility_pct, vol_24h, sem):
     async with sem: 
         try:
-            signal = await detect_setups(sym, btc_trend, altseason, btc_volatility_pct)
+            signal = await detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h)
             await asyncio.sleep(0.05) 
             return sym, signal
         except Exception: return sym, None
@@ -259,19 +262,20 @@ async def radar_task():
                 if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: continue
                 
                 tick = tickers.get(sym)
-                if not tick or float(tick.get('quoteVolume') or 0) < MIN_VOLUME_USDT: continue
+                q_vol = float(tick.get('quoteVolume') or 0)
+                if not tick or q_vol < MIN_VOLUME_USDT: continue
                 ask, bid = float(tick.get('ask') or 0), float(tick.get('bid') or 0)
                 if ask > 0 and bid > 0 and (ask - bid) / ask > MAX_SPREAD_PERCENT: continue
                 if not any(pos['symbol'].split(':')[0] == sym.split(':')[0] for pos in active_positions):
-                    temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
+                    temp_symbols.append((sym, q_vol))
 
-            valid_symbols = [x[0] for x in sorted(temp_symbols, key=lambda x: x[1], reverse=True)[:SCAN_LIMIT]]
+            valid_symbols_data = [(x[0], x[1]) for x in sorted(temp_symbols, key=lambda x: x[1], reverse=True)[:SCAN_LIMIT]]
             
             sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
             results = []
-            for i in range(0, len(valid_symbols), 10):
-                chunk = valid_symbols[i:i+10]
-                tasks = [process_single_coin(s, btc_trend, altseason, btc_volatility_pct, sem) for s in chunk if s.split(':')[0] not in last_signals or (datetime.now(timezone.utc) - last_signals[s.split(':')[0]] > timedelta(hours=4))]
+            for i in range(0, len(valid_symbols_data), 10):
+                chunk = valid_symbols_data[i:i+10]
+                tasks = [process_single_coin(s, btc_trend, altseason, btc_volatility_pct, v, sem) for s, v in chunk if s.split(':')[0] not in last_signals or (datetime.now(timezone.utc) - last_signals[s.split(':')[0]] > timedelta(hours=4))]
                 if tasks: results.extend(await asyncio.gather(*tasks))
                 await asyncio.sleep(0.1)
 
@@ -281,7 +285,7 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку!")
+                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку! (24h Vol: {signal['vol_24h']/1000000:.1f}M)")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
@@ -356,9 +360,20 @@ async def wss_sniper_worker(sym, setup_data):
     sym_binance = f"{base_coin}usdt".lower()
 
     state = {'trades': [], 'start_time': time.time(), 'active': True, 'current_price': setup_data['entry_price']}
-    
-    # X-Ray Telemetry: отслеживаем пиковые показатели по биржам во время слежки
     peak_metrics = {ex: {'vol': 0, 'dom': 0} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
+
+    # v8.27: Динамический расчет требуемых объемов
+    vol_24h = setup_data.get('vol_24h', 1000000)
+    avg_15s_vol = vol_24h / 5760 # 5760 отрезков по 15 секунд в сутках
+    
+    # Мы ищем аномалию: от 3x до 5x от среднего 15-секундного объема
+    base_thresh_15s = max(avg_15s_vol * 3.0, 3000) # Минимум 3000 USDT, чтобы отсечь микро-сделки
+    base_thresh_5s = base_thresh_15s * 0.4
+    
+    thresh_5s = {'bx_s': base_thresh_5s*0.3, 'bx_f': base_thresh_5s*0.3, 'mc_s': base_thresh_5s*0.3, 'mc_f': base_thresh_5s*0.3, 'bb_s': base_thresh_5s*0.5, 'bb_f': base_thresh_5s*1.2, 'bn_f': base_thresh_5s*2.0}
+    thresh_15s = {'bx_s': base_thresh_15s*0.3, 'bx_f': base_thresh_15s*0.3, 'mc_s': base_thresh_15s*0.3, 'mc_f': base_thresh_15s*0.3, 'bb_s': base_thresh_15s*0.5, 'bb_f': base_thresh_15s*1.2, 'bn_f': base_thresh_15s*2.0}
+    
+    dynamic_whale_limit = avg_15s_vol * WHALE_VOLUME_MULTIPLIER
 
     async def l_ws(url, payload, ex_code, is_binance=False):
         while state['active']:
@@ -414,7 +429,6 @@ async def wss_sniper_worker(sym, setup_data):
             
             if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or elapsed_time < 2: continue
             
-            # v8.26 ОПТИМИЗАЦИЯ: Считаем 5s и 15s окна за один проход (O(N))
             vols_5s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
             vols_15s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
             
@@ -428,14 +442,8 @@ async def wss_sniper_worker(sym, setup_data):
             tots_5s = {ex: vols_5s[ex]['b'] + vols_5s[ex]['s'] for ex in peak_metrics}
             tots_15s = {ex: vols_15s[ex]['b'] + vols_15s[ex]['s'] for ex in peak_metrics}
             
-            vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
-            
-            # Пороги для Dual-Window
-            thresh_5s = {'bx_s': 1000*vol_mod, 'bx_f': 1000*vol_mod, 'mc_s': 1000*vol_mod, 'mc_f': 1000*vol_mod, 'bb_s': 1000*vol_mod, 'bb_f': 3000*vol_mod, 'bn_f': 5000*vol_mod}
-            thresh_15s = {'bx_s': 3000*vol_mod, 'bx_f': 3000*vol_mod, 'mc_s': 3000*vol_mod, 'mc_f': 3000*vol_mod, 'bb_s': 3000*vol_mod, 'bb_f': 8000*vol_mod, 'bn_f': 12000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
-            # Обновление X-Ray метрик (максимальные значения за всё время слежки)
             for ex in peak_metrics:
                 t15 = tots_15s[ex]
                 if t15 > peak_metrics[ex]['vol']:
@@ -448,7 +456,6 @@ async def wss_sniper_worker(sym, setup_data):
             valid_names = []
             valid_exchanges_str = []
             
-            # Логика Оракула: Достаточно пробить либо резкий пик (5s/60%), либо затяжной тренд (15s/55%)
             for ex in peak_metrics:
                 t5, t15 = tots_5s[ex], tots_15s[ex]
                 pct5 = (vols_5s[ex]['b'] / t5 * 100) if is_long and t5 > 0 else (vols_5s[ex]['s'] / t5 * 100) if not is_long and t5 > 0 else 0
@@ -459,13 +466,12 @@ async def wss_sniper_worker(sym, setup_data):
                     valid_names.append(labels[ex])
                     valid_exchanges_str.append(f"{labels[ex]} ({max(pct5, pct15):.0f}%)")
 
-            # Глобальная дельта для фильтра против тренда и Китов
             all_vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in peak_metrics}
             global_delta = sum(all_vols[ex]['b'] for ex in all_vols) - sum(all_vols[ex]['s'] for ex in all_vols)
             max_vol = max([tots_15s[ex] for ex in tots_15s]) if tots_15s else 0
             
             is_whale = False
-            if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
+            if max_vol >= dynamic_whale_limit and ((is_long and global_delta > dynamic_whale_limit * 0.4) or (not is_long and global_delta < -dynamic_whale_limit * 0.4)):
                 is_whale = True
             
             if oracle_triggered or len(valid_names) >= 2 or is_whale:
@@ -477,12 +483,12 @@ async def wss_sniper_worker(sym, setup_data):
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                     
                     if (is_long and global_delta < -15000) or (not is_long and global_delta > 15000):
-                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта CVD против нас ({global_delta:.0f})")
+                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: CVD против нас ({global_delta:.0f})")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
                     if (is_long and price_shift_pct < -0.5) or (not is_long and price_shift_pct > 0.5):
-                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Проскальзывание превысило 0.5% ({price_shift_pct:.2f}%)")
+                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Проскальзывание > 0.5% ({price_shift_pct:.2f}%)")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
@@ -498,10 +504,9 @@ async def wss_sniper_worker(sym, setup_data):
                     if sym in HOT_LIST: del HOT_LIST[sym]
             
             elif elapsed_time >= 60:
-                # ВЫВОД X-RAY ТЕЛЕМЕТРИИ В ЛОГИ
-                log_bn = f"{int(peak_metrics['bn_f']['vol'])}$ ({peak_metrics['bn_f']['dom']:.0f}%)"
-                log_bb = f"{int(peak_metrics['bb_f']['vol'])}$ ({peak_metrics['bb_f']['dom']:.0f}%)"
-                logging.info(f"🗑 [ОТМЕНА] {clean_name}: 60с. Пик 15с объемов -> Binance: {log_bn} | Bybit: {log_bb}")
+                bn_target = int(thresh_15s['bn_f'])
+                log_bn = f"{int(peak_metrics['bn_f']['vol'])}$/{bn_target}$ ({peak_metrics['bn_f']['dom']:.0f}%)"
+                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Недобор объемов. Binance: {log_bn}")
                 
                 if sym in HOT_LIST: del HOT_LIST[sym]
                 continue
@@ -627,7 +632,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.26 Active (X-Ray Telemetry & Dual-Window)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.27 Active (Omni-Adaptive Oracle)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -636,7 +641,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.26: Dual-Window Oracle & X-Ray Telemetry...")
+    logging.info("🚀 Запуск ядра v8.27: Omni-Adaptive Oracle (Dynamic Thresholds)...")
     await asyncio.gather(
         radar_task(), 
         sniper_manager(), 
