@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.28 (Ticker Normalization & 30% Vol Filter) ===
+# === НАСТРОЙКИ v8.29 (Liquidity-Adjusted Oracle & Extended Timeouts) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,7 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_MULTIPLIER = 10.0 
+WHALE_VOLUME_MULTIPLIER = 8.0 # Немного снижен порог "Кита" для текущего рынка
 
 SMC_TIMEFRAME = '15m'
 
@@ -40,7 +40,6 @@ SCAN_LIMIT = 300
 
 EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
-# Словарь для нормализации тикеров между BingX и Binance/Bybit
 SYMBOL_MAP = {
     'TONCOIN': 'TON',
     'SATS': '1000SATS',
@@ -49,7 +48,7 @@ SYMBOL_MAP = {
     'BONK': '1000BONK',
     'FLOKI': '1000FLOKI',
     'SHIB': '1000SHIB',
-    'LUNA': 'LUNA2' # Зависит от биржи, LUNA на BingX = LUNA2 на Binance
+    'LUNA': 'LUNA2'
 }
 
 GLOBAL_STOP_UNTIL = None
@@ -164,7 +163,6 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-24:])
         
         avg_volume = np.mean(v[-22:-2])
-        # v8.28: ОПТИМИЗАЦИЯ - Всплеск 30% вместо 50%
         has_volume = (v[-1] > avg_volume * 1.3) or (v[-2] > avg_volume * 1.3)
         
         if (h[-1] - l[-1]) < (atr * 0.5): return None
@@ -347,12 +345,16 @@ async def execute_trade(signal, current_ws_price):
         await exchange.create_market_order(sym, 'buy' if is_long else 'sell', qty, params={'positionSide': pos_side, 'clientOrderId': bot_client_id})
         sl_ord = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price})
         
+        # v8.29: Увеличены таймауты для GRID паттернов (1.5h профит, 3h глобально)
+        timeout_p = 1.5 if signal['mode'] == 'GRID' else 3.0
+        timeout_a = 3.0 if signal['mode'] == 'GRID' else 6.0
+        
         active_positions.append({
             'symbol': sym, 'direction': signal['direction'], 'entry_price': current_market_price, 'initial_qty': qty, 
             'sl_price': sl_price, 'tp1': tp1_price, 'tp2': tp2_price, 'atr': signal.get('atr', current_market_price*0.015),
             'tp1_hit': False, 'pre_tp1_hit': False, 'sl_order_id': sl_ord['id'], 'position_side': pos_side, 
             'open_time': datetime.now(timezone.utc).isoformat(), 'mode': signal['mode'],
-            'timeout_profit': 0.75 if signal['mode'] == 'GRID' else 3.0, 'timeout_any': 1.5 if signal['mode'] == 'GRID' else 6.0
+            'timeout_profit': timeout_p, 'timeout_any': timeout_a
         })
         last_signals[clean_name] = datetime.now(timezone.utc)
         await asyncio.to_thread(save_positions)
@@ -364,19 +366,14 @@ async def execute_trade(signal, current_ws_price):
 
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
-    # Получаем чистое имя базовой монеты (например, TONCOIN, DOGE)
     raw_base_coin = sym.split(':')[0].split('/')[0]
     clean_name = raw_base_coin  
     
-    # v8.28: НОРМАЛИЗАЦИЯ ТИКЕРОВ
-    # Если монета есть в словаре (например, TONCOIN), переводим ее в TON для WS
     ws_base_coin = SYMBOL_MAP.get(raw_base_coin, raw_base_coin)
 
-    # BingX использует оригинальное имя
     sym_bingx_s = f"{raw_base_coin}-USDT"
     sym_bingx_f = f"{raw_base_coin}-USDT"
     
-    # MEXC, Bybit, Binance используют нормализованное имя
     sym_mexc = f"{ws_base_coin}USDT"
     sym_bybit = f"{ws_base_coin}USDT"
     sym_binance = f"{ws_base_coin}usdt".lower()
@@ -387,11 +384,14 @@ async def wss_sniper_worker(sym, setup_data):
     vol_24h = setup_data.get('vol_24h', 1000000)
     avg_15s_vol = vol_24h / 5760 
     
-    base_thresh_15s = max(avg_15s_vol * 3.0, 3000) 
+    # v8.29: Смягчаем требования к объемам
+    # Теперь ищем превышение в 2.0 раза от среднего (было 3.0)
+    base_thresh_15s = max(avg_15s_vol * 2.0, 2000) 
     base_thresh_5s = base_thresh_15s * 0.4
     
-    thresh_5s = {'bx_s': base_thresh_5s*0.3, 'bx_f': base_thresh_5s*0.3, 'mc_s': base_thresh_5s*0.3, 'mc_f': base_thresh_5s*0.3, 'bb_s': base_thresh_5s*0.5, 'bb_f': base_thresh_5s*1.2, 'bn_f': base_thresh_5s*2.0}
-    thresh_15s = {'bx_s': base_thresh_15s*0.3, 'bx_f': base_thresh_15s*0.3, 'mc_s': base_thresh_15s*0.3, 'mc_f': base_thresh_15s*0.3, 'bb_s': base_thresh_15s*0.5, 'bb_f': base_thresh_15s*1.2, 'bn_f': base_thresh_15s*2.0}
+    # Снижаем перевес Binance (было x2.0, стало x1.5)
+    thresh_5s = {'bx_s': base_thresh_5s*0.3, 'bx_f': base_thresh_5s*0.3, 'mc_s': base_thresh_5s*0.3, 'mc_f': base_thresh_5s*0.3, 'bb_s': base_thresh_5s*0.5, 'bb_f': base_thresh_5s*1.0, 'bn_f': base_thresh_5s*1.5}
+    thresh_15s = {'bx_s': base_thresh_15s*0.3, 'bx_f': base_thresh_15s*0.3, 'mc_s': base_thresh_15s*0.3, 'mc_f': base_thresh_15s*0.3, 'bb_s': base_thresh_15s*0.5, 'bb_f': base_thresh_15s*1.0, 'bn_f': base_thresh_15s*1.5}
     
     dynamic_whale_limit = avg_15s_vol * WHALE_VOLUME_MULTIPLIER
 
@@ -652,7 +652,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.28 Active (Ticker Normalization & 30% Vol Filter)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.29 Active (Liquidity-Adjusted Oracle & Extended Timeouts)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -661,7 +661,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.28: Ticker Normalization & 30% Vol Filter...")
+    logging.info("🚀 Запуск ядра v8.29: Liquidity-Adjusted Oracle & Extended Timeouts...")
     await asyncio.gather(
         radar_task(), 
         sniper_manager(), 
