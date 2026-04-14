@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.24 (Oracle Model + ZERO-LATENCY Execution) ===
+# === НАСТРОЙКИ v8.25 (The Burst Oracle Model: 15s Window, Verbose Logging) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -33,7 +33,7 @@ SMC_TIMEFRAME = '15m'
 CRITICAL_CVD_USDT = 150000  
 GLOBAL_CVD = {}             
 COOLDOWN_CACHE = {}         
-LEVERAGE_CACHE = set() # Кэш для ускорения: не ставим плечо, если уже стоит
+LEVERAGE_CACHE = set()
 
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
@@ -44,7 +44,7 @@ GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
 last_signals = {} 
 NOTIFIED_SYMBOLS = set() 
-GLOBAL_BALANCE = 0.0 # HFT Кэш баланса
+GLOBAL_BALANCE = 0.0 
 
 HOT_LIST = {}  
 ACTIVE_WSS_CONNECTIONS = set()
@@ -114,7 +114,7 @@ async def update_balance_task():
             bal = await exchange.fetch_balance()
             GLOBAL_BALANCE = float(bal['USDT']['free'])
         except Exception: pass
-        await asyncio.sleep(10) # Обновляем каждые 10 секунд
+        await asyncio.sleep(10)
 
 def calculate_ema(data, window):
     if len(data) < window: return data[-1]
@@ -290,7 +290,6 @@ async def radar_task():
             await asyncio.sleep(300) 
         except Exception: await asyncio.sleep(60)
 
-# v8.24 ОПТИМИЗАЦИЯ: Убраны fetch_balance и fetch_ticker, цена берется из WS.
 async def execute_trade(signal, current_ws_price):
     global COOLDOWN_CACHE, LEVERAGE_CACHE
     sym = signal['symbol']
@@ -298,12 +297,12 @@ async def execute_trade(signal, current_ws_price):
     
     if len(active_positions) >= MAX_POSITIONS or any(p['symbol'] == sym for p in active_positions): return
     if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: return
-    if GLOBAL_BALANCE <= 0: return # Failsafe защиты
+    if GLOBAL_BALANCE <= 0: return 
 
     try:
         contract_size = float(exchange.market(sym).get('contractSize', 1.0))
-        current_market_price = current_ws_price # ZERO-LATENCY 
-        free_usdt = GLOBAL_BALANCE # ZERO-LATENCY 
+        current_market_price = current_ws_price 
+        free_usdt = GLOBAL_BALANCE 
         
         actual_sl_dist = max(abs(signal['entry_price'] - signal['sl']), current_market_price * 0.004)
         is_long = signal['direction'] == 'Long'
@@ -326,7 +325,6 @@ async def execute_trade(signal, current_ws_price):
         pos_side = 'LONG' if is_long else 'SHORT'
         bot_client_id = f"OMNI_{clean_name}_{int(time.time()*100)}"
         
-        # Кэшируем установку плеча
         if f"{sym}_{pos_side}" not in LEVERAGE_CACHE:
             await exchange.set_leverage(LEVERAGE, sym, params={'side': pos_side})
             LEVERAGE_CACHE.add(f"{sym}_{pos_side}")
@@ -408,23 +406,28 @@ async def wss_sniper_worker(sym, setup_data):
         while (sym in HOT_LIST or any(p['symbol'] == sym for p in active_positions)) and state['active']:
             await asyncio.sleep(1) 
             now = time.time()
+            # Очистка старых трейдов
             state['trades'] = [t for t in state['trades'] if now - t['ts'] <= 60]
-            GLOBAL_CVD[sym] = sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 'b') - sum(t['v'] for t in [t for t in state['trades'] if now - t['ts'] <= 30] if t['side'] == 's')
-            
             elapsed_time = now - state['start_time']
             
             if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or elapsed_time < 2: continue
-                
-            vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
+            
+            # v8.25 ВЗРЫВНОЙ ОРАКУЛ: Мы считаем объемы только за последние 15 секунд (окно пампа)
+            burst_trades = [t for t in state['trades'] if now - t['ts'] <= 15]
+            
+            vols = {ex: {'b': sum(t['v'] for t in burst_trades if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in burst_trades if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
             tots = {ex: vols[ex]['b'] + vols[ex]['s'] for ex in vols}
             vol_mod = max(0.4, min(1.0, setup_data.get('btc_vol', 1.0)))
             
-            thresh = {'bx_s': 6000*vol_mod, 'bx_f': 6000*vol_mod, 'mc_s': 6000*vol_mod, 'mc_f': 6000*vol_mod, 'bb_s': 6000*vol_mod, 'bb_f': 15000*vol_mod, 'bn_f': 20000*vol_mod}
+            # Пороги адаптированы под 15-секундный всплеск
+            thresh = {'bx_s': 3000*vol_mod, 'bx_f': 3000*vol_mod, 'mc_s': 3000*vol_mod, 'mc_f': 3000*vol_mod, 'bb_s': 3000*vol_mod, 'bb_f': 8000*vol_mod, 'bn_f': 12000*vol_mod}
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
-            global_delta = sum(vols[ex]['b'] for ex in vols) - sum(vols[ex]['s'] for ex in vols)
-            max_vol = max([tots[ex] for ex in tots]) if tots else 0
+            # Глобальная дельта для фильтра против тренда
+            all_vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
+            global_delta = sum(all_vols[ex]['b'] for ex in all_vols) - sum(all_vols[ex]['s'] for ex in all_vols)
             
+            max_vol = max([tots[ex] for ex in tots]) if tots else 0
             is_whale = False
             if max_vol >= WHALE_VOLUME_THRESHOLD and ((is_long and global_delta > WHALE_VOLUME_THRESHOLD * 0.4) or (not is_long and global_delta < -WHALE_VOLUME_THRESHOLD * 0.4)):
                 is_whale = True
@@ -433,7 +436,8 @@ async def wss_sniper_worker(sym, setup_data):
             for ex, limit in thresh.items():
                 if tots[ex] > limit:
                     pct = (vols[ex]['b'] / tots[ex]) * 100 if is_long else (vols[ex]['s'] / tots[ex]) * 100
-                    if pct >= 58: 
+                    # Смягчили доминацию до 55% для короткого рывка
+                    if pct >= 55: 
                         valid_names.append(labels[ex])
                         valid_exchanges_str.append(f"{labels[ex]} ({pct:.0f}%)")
 
@@ -441,14 +445,22 @@ async def wss_sniper_worker(sym, setup_data):
             
             if oracle_triggered or len(valid_names) >= 2 or is_whale:
                 ob_range = abs(setup_data['ob_high'] - setup_data['ob_low'])
-                if (setup_data['ob_low'] - ob_range*0.5) <= state['current_price'] <= (setup_data['ob_high'] + ob_range*0.5):
+                
+                # Расширенный буфер проскальзывания при подтвержденном сигнале
+                allowed_upper = setup_data['ob_high'] + ob_range * 1.5
+                allowed_lower = setup_data['ob_low'] - ob_range * 1.5
+                
+                if allowed_lower <= state['current_price'] <= allowed_upper:
                     price_shift_pct = ((state['current_price'] - setup_data['entry_price']) / setup_data['entry_price']) * 100
                     
                     if (is_long and global_delta < -15000) or (not is_long and global_delta > 15000):
+                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Дельта CVD против нас ({global_delta:.0f})")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
-                    if (is_long and price_shift_pct < -0.35) or (not is_long and price_shift_pct > 0.35):
+                    # Проскальзывание расширено до 0.5% (Оракул работает быстро, но цена летит)
+                    if (is_long and price_shift_pct < -0.5) or (not is_long and price_shift_pct > 0.5):
+                        logging.info(f"🗑 [ОТМЕНА] {clean_name}: Проскальзывание превысило 0.5% ({price_shift_pct:.2f}%)")
                         if sym in HOT_LIST: del HOT_LIST[sym]
                         continue
                     
@@ -458,11 +470,12 @@ async def wss_sniper_worker(sym, setup_data):
                     elif oracle_triggered: setup_data['score_info'] = f"🔮 СИГНАЛ ОРАКУЛА! ({', '.join(valid_exchanges_str)}) за {int(elapsed_time)}с"
                     else: setup_data['score_info'] = f"🔥 СТАНДАРТ ПОДТВЕРЖДЕНИЕ ({len(valid_names)} бирж) за {int(elapsed_time)}с" 
                     
-                    # ПЕРЕДАЕМ ТЕКУЩУЮ ЦЕНУ ИЗ СОКЕТА В ФУНКЦИЮ ОТКРЫТИЯ СДЕЛКИ
                     await execute_trade(setup_data, state['current_price']) 
                 else:
+                    logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вылетела за пределы расширенного OB")
                     if sym in HOT_LIST: del HOT_LIST[sym]
             elif elapsed_time >= 60:
+                logging.info(f"🗑 [ОТМЕНА] {clean_name}: Истекло 60с (Оракул не дал импульс)")
                 if sym in HOT_LIST: del HOT_LIST[sym]
                 continue
     finally:
@@ -479,7 +492,6 @@ async def sniper_manager():
                 asyncio.create_task(wss_sniper_worker(sym, setup_data))
         await asyncio.sleep(5)
 
-# v8.24 ОПТИМИЗАЦИЯ: Асинхронный массовый мониторинг позиций
 async def monitor_positions_job():
     global active_positions, daily_stats, CONSECUTIVE_LOSSES
     while True:
@@ -488,11 +500,9 @@ async def monitor_positions_job():
             positions_raw = await exchange.fetch_positions()
             if not active_positions: continue
             
-            # Запрашиваем все тикеры одновременно для всех открытых позиций!
             symbols_to_fetch = [p['symbol'] for p in active_positions]
             tickers = await exchange.fetch_tickers(symbols_to_fetch)
             
-            # Запрашиваем 1m свечи одновременно
             ohlcv_tasks = [exchange.fetch_ohlcv(sym, timeframe='1m', limit=2) for sym in symbols_to_fetch]
             ohlcv_results = await asyncio.gather(*ohlcv_tasks, return_exceptions=True)
 
@@ -590,7 +600,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.24 Active (Zero-Latency Oracle Model)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.25 Active (The Burst Oracle Model)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -599,13 +609,13 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.24: Zero-Latency Execution + Oracle Lead-Lag Model...")
+    logging.info("🚀 Запуск ядра v8.25: The Burst Oracle Model (15s Window, Verbose Logging)...")
     await asyncio.gather(
         radar_task(), 
         sniper_manager(), 
         monitor_positions_job(), 
         daily_report_task(),
-        update_balance_task() # Запускаем фоновое обновление баланса
+        update_balance_task() 
     )
 
 if __name__ == '__main__':
