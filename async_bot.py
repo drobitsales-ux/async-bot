@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.29 (Liquidity-Adjusted Oracle & Extended Timeouts) ===
+# === НАСТРОЙКИ v8.30 (Adaptive Volatility-Aware Oracle) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -26,7 +26,7 @@ LEVERAGE = 10
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
 MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_MULTIPLIER = 8.0 # Немного снижен порог "Кита" для текущего рынка
+WHALE_VOLUME_MULTIPLIER = 8.0 
 
 SMC_TIMEFRAME = '15m'
 
@@ -345,7 +345,6 @@ async def execute_trade(signal, current_ws_price):
         await exchange.create_market_order(sym, 'buy' if is_long else 'sell', qty, params={'positionSide': pos_side, 'clientOrderId': bot_client_id})
         sl_ord = await exchange.create_order(sym, 'stop_market', 'sell' if is_long else 'buy', qty, params={'triggerPrice': sl_price, 'positionSide': pos_side, 'stopLossPrice': sl_price})
         
-        # v8.29: Увеличены таймауты для GRID паттернов (1.5h профит, 3h глобально)
         timeout_p = 1.5 if signal['mode'] == 'GRID' else 3.0
         timeout_a = 3.0 if signal['mode'] == 'GRID' else 6.0
         
@@ -384,12 +383,22 @@ async def wss_sniper_worker(sym, setup_data):
     vol_24h = setup_data.get('vol_24h', 1000000)
     avg_15s_vol = vol_24h / 5760 
     
-    # v8.29: Смягчаем требования к объемам
-    # Теперь ищем превышение в 2.0 раза от среднего (было 3.0)
-    base_thresh_15s = max(avg_15s_vol * 2.0, 2000) 
+    # v8.30: ADAPTIVE LIQUIDITY THRESHOLDS
+    # Если на рынке сильный флэт (<1.2%), боту хватает меньшего всплеска для входа.
+    btc_vol = setup_data.get('btc_vol', 2.0)
+    if btc_vol < 1.2:
+        dyn_mult = 1.4
+        min_thresh = 1500
+    elif btc_vol < 1.8:
+        dyn_mult = 1.7
+        min_thresh = 2000
+    else:
+        dyn_mult = 2.0
+        min_thresh = 2500
+        
+    base_thresh_15s = max(avg_15s_vol * dyn_mult, min_thresh)
     base_thresh_5s = base_thresh_15s * 0.4
     
-    # Снижаем перевес Binance (было x2.0, стало x1.5)
     thresh_5s = {'bx_s': base_thresh_5s*0.3, 'bx_f': base_thresh_5s*0.3, 'mc_s': base_thresh_5s*0.3, 'mc_f': base_thresh_5s*0.3, 'bb_s': base_thresh_5s*0.5, 'bb_f': base_thresh_5s*1.0, 'bn_f': base_thresh_5s*1.5}
     thresh_15s = {'bx_s': base_thresh_15s*0.3, 'bx_f': base_thresh_15s*0.3, 'mc_s': base_thresh_15s*0.3, 'mc_f': base_thresh_15s*0.3, 'bb_s': base_thresh_15s*0.5, 'bb_f': base_thresh_15s*1.0, 'bn_f': base_thresh_15s*1.5}
     
@@ -652,7 +661,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.29 Active (Liquidity-Adjusted Oracle & Extended Timeouts)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.30 Active (Adaptive Volatility-Aware Oracle)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -661,7 +670,7 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.29: Liquidity-Adjusted Oracle & Extended Timeouts...")
+    logging.info("🚀 Запуск ядра v8.30: Adaptive Volatility-Aware Oracle...")
     await asyncio.gather(
         radar_task(), 
         sniper_manager(), 
