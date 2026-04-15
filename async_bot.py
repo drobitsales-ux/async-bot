@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.30 (Adaptive Volatility-Aware Oracle) ===
+# === НАСТРОЙКИ v8.31 (Expanded 1.5 ATR SL & Micro-Volatility Mode) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -40,16 +40,7 @@ SCAN_LIMIT = 300
 
 EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
 
-SYMBOL_MAP = {
-    'TONCOIN': 'TON',
-    'SATS': '1000SATS',
-    'RATS': '1000RATS',
-    'PEPE': '1000PEPE',
-    'BONK': '1000BONK',
-    'FLOKI': '1000FLOKI',
-    'SHIB': '1000SHIB',
-    'LUNA': 'LUNA2'
-}
+SYMBOL_MAP = {'TONCOIN': 'TON', 'SATS': '1000SATS', 'RATS': '1000RATS', 'PEPE': '1000PEPE', 'BONK': '1000BONK', 'FLOKI': '1000FLOKI', 'SHIB': '1000SHIB', 'LUNA': 'LUNA2'}
 
 GLOBAL_STOP_UNTIL = None
 CONSECUTIVE_LOSSES = 0
@@ -84,9 +75,9 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, data TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (id INTEGER PRIMARY KEY, pnl REAL, trades INTEGER, wins INTEGER)''')
     try: c.execute("ALTER TABLE daily_stats ADD COLUMN wins INTEGER DEFAULT 0")
-    except sqlite3.OperationalError: pass
+    except: pass
     try: c.execute("ALTER TABLE daily_stats ADD COLUMN prev_winrate REAL DEFAULT 0.0")
-    except sqlite3.OperationalError: pass
+    except: pass
     conn.commit(); conn.close()
 
 def save_positions():
@@ -104,8 +95,7 @@ def load_positions():
         if row: active_positions = json.loads(row[0])
         c.execute("SELECT pnl, trades, wins, prev_winrate FROM daily_stats WHERE id = 1")
         stat_row = c.fetchone()
-        if stat_row: 
-            daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'] = stat_row
+        if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'] = stat_row
         conn.close()
     except Exception: pass
 
@@ -116,7 +106,7 @@ async def send_tg_msg(text):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp: pass
-    except Exception: pass
+    except: pass
 
 async def update_balance_task():
     global GLOBAL_BALANCE
@@ -124,7 +114,7 @@ async def update_balance_task():
         try:
             bal = await exchange.fetch_balance()
             GLOBAL_BALANCE = float(bal['USDT']['free'])
-        except Exception: pass
+        except: pass
         await asyncio.sleep(10)
 
 def calculate_ema(data, window):
@@ -137,13 +127,10 @@ def calculate_ema(data, window):
 def calculate_rsi(data, window=14):
     if len(data) <= window: return 50
     diffs = np.diff(data)
-    gains = np.maximum(diffs, 0)
-    losses = np.abs(np.minimum(diffs, 0))
-    avg_gain = np.mean(gains[-window:])
-    avg_loss = np.mean(losses[-window:])
+    gains = np.maximum(diffs, 0); losses = np.abs(np.minimum(diffs, 0))
+    avg_gain = np.mean(gains[-window:]); avg_loss = np.mean(losses[-window:])
     if avg_loss == 0: return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 def find_fvg_details(h, l, direction):
     for i in range(len(h)-1, len(h)-12, -1):
@@ -174,37 +161,36 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         eq_level_long = leg_low + (leg_high - leg_low) * discount_ratio  
         eq_level_short = leg_low + (leg_high - leg_low) * premium_ratio 
 
+        # ИЗМЕНЕНО: SMC SL расширен с 0.8 до 1.5 ATR
         if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                 fvg = find_fvg_details(h, l, 'Long')
                 if fvg['found']:
                     if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
-                        sl = fvg['bottom'] - (atr * 0.8)
+                        sl = fvg['bottom'] - (atr * 1.5)
                         return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
                             if i >= 15 and (is_high_momentum or ob_low <= np.min(l[i-15:i])):
                                 if current_price > ob_high and (current_price - ob_high) < (atr * 1.0):
-                                    sl = ob_low - (atr * 0.8)  
-                                    patt = '15m OB Breaker' if is_high_momentum else '15m OB+FVG'
-                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
+                                    sl = ob_low - (atr * 1.5)  
+                                    return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB Breaker', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
         if (btc_trend == 'Short') and current_price < ema_200:
             if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
                 fvg = find_fvg_details(h, l, 'Short')
                 if fvg['found']:
                     if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
-                        sl = fvg['top'] + (atr * 0.8)
+                        sl = fvg['top'] + (atr * 1.5)
                         return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
                             if i >= 15 and (is_high_momentum or ob_high >= np.max(h[i-15:i])):
                                 if current_price < ob_low and (ob_low - current_price) < (atr * 1.0):
-                                    sl = ob_high + (atr * 0.8)
-                                    patt = '15m OB Breaker' if is_high_momentum else '15m OB+FVG'
-                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': patt, 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
+                                    sl = ob_high + (atr * 1.5)
+                                    return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB Breaker', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
         bb_window = 20
         sma_20 = calculate_ema(c, bb_window) 
@@ -214,18 +200,19 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         grid_has_volume = (v[-1] > avg_volume * 1.30) or (v[-2] > avg_volume * 1.30)
 
         now_utc = datetime.now(timezone.utc)
-        skip_grid = btc_volatility_pct > 2.5 or (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30) or (now_utc.hour in [23, 7, 15] and now_utc.minute >= 45) or (now_utc.hour in [0, 8, 16] and now_utc.minute <= 15)
+        skip_grid = btc_volatility_pct > 2.5 or (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30)
         grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
         candle_range = max(h[-1] - l[-1], 0.0001)
         
         lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
         upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
 
+        # ИЗМЕНЕНО: GRID SL расширен с 0.5 до 1.5 ATR
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
             if (btc_volatility_pct < 2.0 or current_price > ema_200) and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.2: 
-                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
+                return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 1.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
             elif (btc_volatility_pct < 2.0 or current_price < ema_200) and current_price >= upper_bb * 0.998 and rsi_15m > 55 and upper_wick_ratio >= 0.2: 
-                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 0.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
+                return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': upper_bb + (atr * 1.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
         return None
     except Exception: return None
@@ -264,7 +251,6 @@ async def radar_task():
 
             tickers = await exchange.fetch_tickers()
             temp_symbols = []
-            
             for sym, m in exchange.markets.items():
                 if m.get('type') != 'swap' or not m.get('active'): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
@@ -301,7 +287,7 @@ async def radar_task():
             logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {get_mem_usage()} | BTC Vol: {btc_volatility_pct:.2f}%")
             gc.collect() 
             await asyncio.sleep(300) 
-        except Exception: await asyncio.sleep(60)
+        except: await asyncio.sleep(60)
 
 async def execute_trade(signal, current_ws_price):
     global COOLDOWN_CACHE, LEVERAGE_CACHE
@@ -360,48 +346,33 @@ async def execute_trade(signal, current_ws_price):
         
         await send_tg_msg(f"💥 **ВЫСТРЕЛ [{signal['mode']}]: {clean_name}**\nНаправление: **#{signal['direction'].upper()}**\n{signal.get('score_info', 'ТОП Сигнал')}\nПаттерн: {signal.get('pattern', 'N/A')}\n\nЦена: {current_market_price}\nОбъем: {qty} контр.\nSL: {sl_price}\nTP1: {tp1_price}\nTP2: {tp2_price}")
     except Exception as e: 
-        if "101204" in str(e) or "Insufficient margin" in str(e):
-            COOLDOWN_CACHE[sym] = time.time() + 1800 
+        if "101204" in str(e) or "Insufficient margin" in str(e): COOLDOWN_CACHE[sym] = time.time() + 1800 
 
 async def wss_sniper_worker(sym, setup_data):
     global GLOBAL_CVD
     raw_base_coin = sym.split(':')[0].split('/')[0]
     clean_name = raw_base_coin  
-    
     ws_base_coin = SYMBOL_MAP.get(raw_base_coin, raw_base_coin)
-
-    sym_bingx_s = f"{raw_base_coin}-USDT"
-    sym_bingx_f = f"{raw_base_coin}-USDT"
-    
-    sym_mexc = f"{ws_base_coin}USDT"
-    sym_bybit = f"{ws_base_coin}USDT"
-    sym_binance = f"{ws_base_coin}usdt".lower()
+    sym_bingx_s = f"{raw_base_coin}-USDT"; sym_bingx_f = f"{raw_base_coin}-USDT"
+    sym_mexc = f"{ws_base_coin}USDT"; sym_bybit = f"{ws_base_coin}USDT"; sym_binance = f"{ws_base_coin}usdt".lower()
 
     state = {'trades': [], 'start_time': time.time(), 'active': True, 'current_price': setup_data['entry_price']}
     peak_metrics = {ex: {'vol': 0, 'dom': 0} for ex in ['bx_s', 'bx_f', 'mc_s', 'mc_f', 'bb_s', 'bb_f', 'bn_f']}
 
     vol_24h = setup_data.get('vol_24h', 1000000)
     avg_15s_vol = vol_24h / 5760 
-    
-    # v8.30: ADAPTIVE LIQUIDITY THRESHOLDS
-    # Если на рынке сильный флэт (<1.2%), боту хватает меньшего всплеска для входа.
     btc_vol = setup_data.get('btc_vol', 2.0)
-    if btc_vol < 1.2:
-        dyn_mult = 1.4
-        min_thresh = 1500
-    elif btc_vol < 1.8:
-        dyn_mult = 1.7
-        min_thresh = 2000
-    else:
-        dyn_mult = 2.0
-        min_thresh = 2500
+    
+    # ИЗМЕНЕНО: Режим Micro-Volatility (когда биток стоит на месте)
+    if btc_vol < 1.0: dyn_mult = 1.2; min_thresh = 1000
+    elif btc_vol < 1.8: dyn_mult = 1.7; min_thresh = 2000
+    else: dyn_mult = 2.0; min_thresh = 2500
         
     base_thresh_15s = max(avg_15s_vol * dyn_mult, min_thresh)
     base_thresh_5s = base_thresh_15s * 0.4
     
     thresh_5s = {'bx_s': base_thresh_5s*0.3, 'bx_f': base_thresh_5s*0.3, 'mc_s': base_thresh_5s*0.3, 'mc_f': base_thresh_5s*0.3, 'bb_s': base_thresh_5s*0.5, 'bb_f': base_thresh_5s*1.0, 'bn_f': base_thresh_5s*1.5}
     thresh_15s = {'bx_s': base_thresh_15s*0.3, 'bx_f': base_thresh_15s*0.3, 'mc_s': base_thresh_15s*0.3, 'mc_f': base_thresh_15s*0.3, 'bb_s': base_thresh_15s*0.5, 'bb_f': base_thresh_15s*1.0, 'bn_f': base_thresh_15s*1.5}
-    
     dynamic_whale_limit = avg_15s_vol * WHALE_VOLUME_MULTIPLIER
 
     async def l_ws(url, payload, ex_code, is_binance=False):
@@ -458,33 +429,24 @@ async def wss_sniper_worker(sym, setup_data):
             
             if sym not in HOT_LIST or len(active_positions) >= MAX_POSITIONS or elapsed_time < 2: continue
             
-            vols_5s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
-            vols_15s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
-            
+            vols_5s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}; vols_15s = {ex: {'b': 0, 's': 0} for ex in peak_metrics}
             for t in state['trades']:
                 dt = now - t['ts']
                 if dt <= 15:
                     vols_15s[t['ex']][t['side']] += t['v']
-                    if dt <= 5:
-                        vols_5s[t['ex']][t['side']] += t['v']
+                    if dt <= 5: vols_5s[t['ex']][t['side']] += t['v']
 
             tots_5s = {ex: vols_5s[ex]['b'] + vols_5s[ex]['s'] for ex in peak_metrics}
             tots_15s = {ex: vols_15s[ex]['b'] + vols_15s[ex]['s'] for ex in peak_metrics}
-            
             labels = {'bx_s': 'BingX (S)', 'bx_f': 'BingX (F)', 'mc_s': 'MEXC (S)', 'mc_f': 'MEXC (F)', 'bb_s': 'Bybit (S)', 'bb_f': 'Bybit (F)', 'bn_f': 'Binance (F)'}
             
             for ex in peak_metrics:
                 t15 = tots_15s[ex]
-                if t15 > peak_metrics[ex]['vol']:
-                    peak_metrics[ex]['vol'] = t15
+                if t15 > peak_metrics[ex]['vol']: peak_metrics[ex]['vol'] = t15
                 pct15 = (vols_15s[ex]['b'] / t15 * 100) if is_long and t15 > 0 else (vols_15s[ex]['s'] / t15 * 100) if not is_long and t15 > 0 else 0
-                if pct15 > peak_metrics[ex]['dom']:
-                    peak_metrics[ex]['dom'] = pct15
+                if pct15 > peak_metrics[ex]['dom']: peak_metrics[ex]['dom'] = pct15
 
-            oracle_triggered = False
-            valid_names = []
-            valid_exchanges_str = []
-            
+            oracle_triggered = False; valid_names = []; valid_exchanges_str = []
             for ex in peak_metrics:
                 t5, t15 = tots_5s[ex], tots_15s[ex]
                 pct5 = (vols_5s[ex]['b'] / t5 * 100) if is_long and t5 > 0 else (vols_5s[ex]['s'] / t5 * 100) if not is_long and t5 > 0 else 0
@@ -492,8 +454,7 @@ async def wss_sniper_worker(sym, setup_data):
                 
                 if (t5 >= thresh_5s[ex] and pct5 >= 60) or (t15 >= thresh_15s[ex] and pct15 >= 55):
                     if ex in ['bn_f', 'bb_f']: oracle_triggered = True
-                    valid_names.append(labels[ex])
-                    valid_exchanges_str.append(f"{labels[ex]} ({max(pct5, pct15):.0f}%)")
+                    valid_names.append(labels[ex]); valid_exchanges_str.append(f"{labels[ex]} ({max(pct5, pct15):.0f}%)")
 
             all_vols = {ex: {'b': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 'b'), 's': sum(t['v'] for t in state['trades'] if t['ex'] == ex and t['side'] == 's')} for ex in peak_metrics}
             global_delta = sum(all_vols[ex]['b'] for ex in all_vols) - sum(all_vols[ex]['s'] for ex in all_vols)
@@ -522,21 +483,17 @@ async def wss_sniper_worker(sym, setup_data):
                         continue
                     
                     if sym in HOT_LIST: del HOT_LIST[sym]
-                    
                     if is_whale: setup_data['score_info'] = f"🐋 ВХОД С КИТОМ! (Объем: {max_vol:,.0f}$)"
                     elif oracle_triggered: setup_data['score_info'] = f"🔮 СИГНАЛ ОРАКУЛА! ({', '.join(valid_exchanges_str)}) за {int(elapsed_time)}с"
                     else: setup_data['score_info'] = f"🔥 СТАНДАРТ ПОДТВЕРЖДЕНИЕ ({len(valid_names)} бирж) за {int(elapsed_time)}с" 
-                    
                     await execute_trade(setup_data, state['current_price']) 
                 else:
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вылетела за пределы расширенного OB")
                     if sym in HOT_LIST: del HOT_LIST[sym]
             
             elif elapsed_time >= 60:
-                bn_target = int(thresh_15s['bn_f'])
-                log_bn = f"{int(peak_metrics['bn_f']['vol'])}$/{bn_target}$ ({peak_metrics['bn_f']['dom']:.0f}%)"
+                log_bn = f"{int(peak_metrics['bn_f']['vol'])}$/{int(thresh_15s['bn_f'])}$ ({peak_metrics['bn_f']['dom']:.0f}%)"
                 logging.info(f"🗑 [ОТМЕНА] {clean_name}: Недобор объемов. Binance: {log_bn}")
-                
                 if sym in HOT_LIST: del HOT_LIST[sym]
                 continue
     finally:
@@ -563,7 +520,6 @@ async def monitor_positions_job():
             
             symbols_to_fetch = [p['symbol'] for p in active_positions]
             tickers = await exchange.fetch_tickers(symbols_to_fetch)
-            
             ohlcv_tasks = [exchange.fetch_ohlcv(sym, timeframe='1m', limit=2) for sym in symbols_to_fetch]
             ohlcv_results = await asyncio.gather(*ohlcv_tasks, return_exceptions=True)
 
@@ -632,7 +588,7 @@ async def monitor_positions_job():
                 updated.append(pos)
             active_positions = updated
             await asyncio.to_thread(save_positions)
-        except Exception: pass
+        except: pass
 
 async def daily_report_task():
     global daily_stats
@@ -641,27 +597,19 @@ async def daily_report_task():
         await asyncio.sleep(30)
         now = datetime.now(timezone.utc)
         if now.hour == 20 and now.minute == 0 and not reported_today:
-            trades = daily_stats['trades']
-            wins = daily_stats['wins']
-            pnl = daily_stats['pnl']
+            trades = daily_stats['trades']; wins = daily_stats['wins']; pnl = daily_stats['pnl']
             winrate = (wins / trades * 100) if trades > 0 else 0
-            prev_winrate = daily_stats.get('prev_winrate', 0.0)
-            diff = winrate - prev_winrate
+            prev_winrate = daily_stats.get('prev_winrate', 0.0); diff = winrate - prev_winrate
             diff_str = f"+{diff:.1f}%" if diff > 0 else f"{diff:.1f}%"
-            
-            report = (f"🗓 **ИТОГИ ДНЯ (Async Bot):** {now.strftime('%d.%m.%Y')}\n\n"
-                      f"📈 Открыто сделок за день: {trades}\n"
-                      f"🎯 Винрейт: {winrate:.1f}% ({diff_str} к вчерашнему)\n"
-                      f"💵 Прибыль за день: {pnl:.2f} USDT")
+            report = (f"🗓 **ИТОГИ ДНЯ (Async Bot):** {now.strftime('%d.%m.%Y')}\n\n📉 Открыто сделок за день: {trades}\n🎯 Винрейт: {winrate:.1f}% ({diff_str})\n💵 Прибыль за день: {pnl:.2f} USDT")
             await send_tg_msg(report)
-            
             daily_stats['prev_winrate'] = winrate; daily_stats['pnl'] = 0.0; daily_stats['trades'] = 0; daily_stats['wins'] = 0
             await asyncio.to_thread(save_positions)
             reported_today = True
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.30 Active (Adaptive Volatility-Aware Oracle)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.31 Active (Expanded SL & Micro-Vol)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -670,14 +618,8 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.30: Adaptive Volatility-Aware Oracle...")
-    await asyncio.gather(
-        radar_task(), 
-        sniper_manager(), 
-        monitor_positions_job(), 
-        daily_report_task(),
-        update_balance_task() 
-    )
+    logging.info("🚀 Запуск ядра v8.31: Expanded SL & Micro-Vol Oracle...")
+    await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task(), update_balance_task())
 
 if __name__ == '__main__':
     Thread(target=run_server, daemon=True).start()
