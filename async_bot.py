@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.31 (Expanded 1.5 ATR SL & Micro-Volatility Mode) ===
+# === НАСТРОЙКИ v8.33 (1h Telemetry Logging & USDC Filter) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
@@ -38,7 +38,7 @@ LEVERAGE_CACHE = set()
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
 
-EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/']
+EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/', 'USDC']
 
 SYMBOL_MAP = {'TONCOIN': 'TON', 'SATS': '1000SATS', 'RATS': '1000RATS', 'PEPE': '1000PEPE', 'BONK': '1000BONK', 'FLOKI': '1000FLOKI', 'SHIB': '1000SHIB', 'LUNA': 'LUNA2'}
 
@@ -161,7 +161,6 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         eq_level_long = leg_low + (leg_high - leg_low) * discount_ratio  
         eq_level_short = leg_low + (leg_high - leg_low) * premium_ratio 
 
-        # ИЗМЕНЕНО: SMC SL расширен с 0.8 до 1.5 ATR
         if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
             if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                 fvg = find_fvg_details(h, l, 'Long')
@@ -207,7 +206,6 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         lower_wick_ratio = (np.minimum(o[-1], c[-1]) - l[-1]) / candle_range
         upper_wick_ratio = (h[-1] - np.maximum(o[-1], c[-1])) / candle_range
 
-        # ИЗМЕНЕНО: GRID SL расширен с 0.5 до 1.5 ATR
         if not skip_grid and bb_width < grid_width_limit and grid_has_volume:
             if (btc_volatility_pct < 2.0 or current_price > ema_200) and current_price <= lower_bb * 1.002 and rsi_15m < 45 and lower_wick_ratio >= 0.2: 
                 return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': lower_bb - (atr * 1.5), 'atr': atr, 'ob_low': lower_bb, 'ob_high': upper_bb, 'pattern': 'BB Scalp (Pinbar)', 'mode': 'GRID', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
@@ -363,7 +361,6 @@ async def wss_sniper_worker(sym, setup_data):
     avg_15s_vol = vol_24h / 5760 
     btc_vol = setup_data.get('btc_vol', 2.0)
     
-    # ИЗМЕНЕНО: Режим Micro-Volatility (когда биток стоит на месте)
     if btc_vol < 1.0: dyn_mult = 1.2; min_thresh = 1000
     elif btc_vol < 1.8: dyn_mult = 1.7; min_thresh = 2000
     else: dyn_mult = 2.0; min_thresh = 2500
@@ -590,6 +587,14 @@ async def monitor_positions_job():
             await asyncio.to_thread(save_positions)
         except: pass
 
+# === НОВАЯ ФУНКЦИЯ: ТЕЛЕМЕТРИЯ ===
+async def log_bot_status_task():
+    while True:
+        await asyncio.sleep(3600) # Изменено на 3600 (Печать в логи каждые 60 минут)
+        winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
+        active = ", ".join([f"{p['symbol'].split(':')[0]} ({p['direction']})" for p in active_positions]) or "Нет"
+        logging.info(f"📊 [СТАТИСТИКА] Сделок: {daily_stats['trades']} | Винрейт: {winrate:.1f}% | PNL: {daily_stats['pnl']:.2f}$ | Открыто: {active}")
+
 async def daily_report_task():
     global daily_stats
     reported_today = False
@@ -609,7 +614,7 @@ async def daily_report_task():
         elif now.hour != 20: reported_today = False
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.31 Active (Expanded SL & Micro-Vol)")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Bot v8.33 Active (1h Telemetry Logging)")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -618,8 +623,15 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск ядра v8.31: Expanded SL & Micro-Vol Oracle...")
-    await asyncio.gather(radar_task(), sniper_manager(), monitor_positions_job(), daily_report_task(), update_balance_task())
+    logging.info("🚀 Запуск ядра v8.33: 1h Telemetry Logging & USDC Filter...")
+    await asyncio.gather(
+        radar_task(), 
+        sniper_manager(), 
+        monitor_positions_job(), 
+        daily_report_task(), 
+        update_balance_task(),
+        log_bot_status_task() 
+    )
 
 if __name__ == '__main__':
     Thread(target=run_server, daemon=True).start()
