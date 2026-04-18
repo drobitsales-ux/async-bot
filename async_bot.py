@@ -161,13 +161,23 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         eq_level_long = leg_low + (leg_high - leg_low) * discount_ratio  
         eq_level_short = leg_low + (leg_high - leg_low) * premium_ratio 
 
-        if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
-            if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
-                fvg = find_fvg_details(h, l, 'Long')
-                if fvg['found']:
-                    if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
-                        sl = fvg['bottom'] - (atr * 1.5)
-                        return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
+        # 1. СНАЧАЛА РАССЧИТЫВАЕМ SMA-200 (до проверок!)
+        sma_200 = np.mean(c[-200:]) if len(c) >= 200 else np.mean(c)
+
+        # Проверяем сигналы с учетом Макро-Тренда
+        if is_long_signal:
+            if current_price < sma_200:
+                logging.info(f"🗑 [ОТМЕНА] {sym}: Игнорируем LONG, монета в глобальном даунтренде (Цена < SMA200)")
+                continue # Пропускаем монету, летит вниз      
+            
+            # ОТСТУП ИСПРАВЛЕН: Теперь этот блок выполняется, если мы НЕ попали в continue
+            if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
+                if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
+                    fvg = find_fvg_details(h, l, 'Long')
+                    if fvg['found']:
+                        if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
+                            sl = fvg['bottom'] - (atr * 1.5)
+                            return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] < o[i]:  
                             ob_low, ob_high = l[i], h[i]
@@ -176,13 +186,19 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
                                     sl = ob_low - (atr * 1.5)  
                                     return {'symbol': sym, 'direction': 'Long', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': ob_low, 'ob_high': ob_high, 'pattern': '15m OB Breaker', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
 
-        if (btc_trend == 'Short') and current_price < ema_200:
-            if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
-                fvg = find_fvg_details(h, l, 'Short')
-                if fvg['found']:
-                    if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
-                        sl = fvg['top'] + (atr * 1.5)
-                        return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
+        if is_short_signal:
+            if current_price > sma_200:
+                logging.info(f"🗑 [ОТМЕНА] {sym}: Игнорируем SHORT, монета в глобальном аптренде (Цена > SMA200)")
+                continue # Пропускаем монету, летит в космос
+            
+            # ОТСТУП ИСПРАВЛЕН
+            if (btc_trend == 'Short') and current_price < ema_200:
+                if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
+                    fvg = find_fvg_details(h, l, 'Short')
+                    if fvg['found']:
+                        if is_high_momentum and fvg['bottom'] <= current_price <= fvg['top']:
+                            sl = fvg['top'] + (atr * 1.5)
+                            return {'symbol': sym, 'direction': 'Short', 'entry_price': current_price, 'sl': sl, 'atr': atr, 'ob_low': fvg['bottom'], 'ob_high': fvg['top'], 'pattern': '15m Momentum FVG', 'mode': 'SMC', 'btc_vol': btc_volatility_pct, 'altseason': altseason, 'vol_24h': vol_24h}
                     for i in range(len(c)-2, len(c)-11, -1):
                         if c[i] > o[i]:  
                             ob_high, ob_low = h[i], l[i]
@@ -198,6 +214,15 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         bb_width = (upper_bb - lower_bb) / sma_20 * 100
         grid_has_volume = (v[-1] > avg_volume * 1.30) or (v[-2] > avg_volume * 1.30)
 
+        # Рассчитываем Макро-Тренд (SMA-200) для защиты от входов против паровоза
+        sma_200 = np.mean(c[-200:]) if len(c) >= 200 else np.mean(c)
+
+        # Рассчитываем средний объем для вывода в Telegram
+        avg_vol = np.mean(v[-20:]) if len(v) >= 20 else np.mean(v)
+        current_volume = v[-1]
+        # Высчитываем на сколько процентов текущий объем больше среднего
+        vol_percent = int((current_volume / avg_vol) * 100) if avg_vol > 0 else 0
+        
         now_utc = datetime.now(timezone.utc)
         skip_grid = btc_volatility_pct > 2.5 or (now_utc.hour == 13 and now_utc.minute >= 30) or (now_utc.hour == 14 and now_utc.minute <= 30)
         grid_width_limit = max(1.5, min(3.0, btc_volatility_pct * 1.5))
