@@ -161,16 +161,15 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         eq_level_long = leg_low + (leg_high - leg_low) * discount_ratio  
         eq_level_short = leg_low + (leg_high - leg_low) * premium_ratio 
 
-        # 1. СНАЧАЛА РАССЧИТЫВАЕМ SMA-200 (до проверок!)
+# 1. СНАЧАЛА РАССЧИТЫВАЕМ SMA-200 (до проверок!)
         sma_200 = np.mean(c[-200:]) if len(c) >= 200 else np.mean(c)
 
         # Проверяем сигналы с учетом Макро-Тренда
         if is_long_signal:
             if current_price < sma_200:
                 logging.info(f"🗑 [ОТМЕНА] {sym}: Игнорируем LONG, монета в глобальном даунтренде (Цена < SMA200)")
-                continue # Пропускаем монету, летит вниз      
+                return None # <--- ИСПРАВЛЕНО (Вместо continue)     
             
-            # ОТСТУП ИСПРАВЛЕН: Теперь этот блок выполняется, если мы НЕ попали в continue
             if ((btc_trend == 'Long') or altseason) and current_price > ema_200:
                 if (c[-1] > np.max(h[-11:-1])) and has_volume and current_price <= eq_level_long:
                     fvg = find_fvg_details(h, l, 'Long')
@@ -189,9 +188,8 @@ async def detect_setups(sym, btc_trend, altseason, btc_volatility_pct, vol_24h):
         if is_short_signal:
             if current_price > sma_200:
                 logging.info(f"🗑 [ОТМЕНА] {sym}: Игнорируем SHORT, монета в глобальном аптренде (Цена > SMA200)")
-                continue # Пропускаем монету, летит в космос
+                return None # <--- ИСПРАВЛЕНО (Вместо continue)
             
-            # ОТСТУП ИСПРАВЛЕН
             if (btc_trend == 'Short') and current_price < ema_200:
                 if (c[-1] < np.min(l[-11:-1])) and has_volume and current_price >= eq_level_short:
                     fvg = find_fvg_details(h, l, 'Short')
