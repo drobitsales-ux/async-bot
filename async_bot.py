@@ -505,9 +505,17 @@ async def wss_sniper_worker(sym, setup_data):
                         continue
                     
                     if sym in HOT_LIST: del HOT_LIST[sym]
-                    if is_whale: setup_data['score_info'] = f"🐋 ВХОД С КИТОМ! (Объем: {max_vol:,.0f}$)"
-                    elif oracle_triggered: setup_data['score_info'] = f"🔮 СИГНАЛ ОРАКУЛА! ({', '.join(valid_exchanges_str)}) за {int(elapsed_time)}с"
-                    else: setup_data['score_info'] = f"🔥 СТАНДАРТ ПОДТВЕРЖДЕНИЕ ({len(valid_names)} бирж) за {int(elapsed_time)}с" 
+                    
+                    # === ИЗМЕНЕНИЕ ЗДЕСЬ: Расчет и вывод % объема в Telegram ===
+                    vol_percent = int((max_vol / avg_15s_vol) * 100) if avg_15s_vol > 0 else 0
+                    
+                    if is_whale: 
+                        setup_data['score_info'] = f"🐋 ВХОД С КИТОМ! (Объем: +{vol_percent}% от среднего)"
+                    elif oracle_triggered: 
+                        setup_data['score_info'] = f"🔮 СИГНАЛ ОРАКУЛА! ({', '.join(valid_exchanges_str)}) за {int(elapsed_time)}с, Объем: +{vol_percent}%"
+                    else: 
+                        setup_data['score_info'] = f"🔥 СТАНДАРТ ПОДТВЕРЖДЕНИЕ ({len(valid_names)} бирж) за {int(elapsed_time)}с" 
+                    
                     await execute_trade(setup_data, state['current_price']) 
                 else:
                     logging.info(f"🗑 [ОТМЕНА] {clean_name}: Цена вылетела за пределы расширенного OB")
