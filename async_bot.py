@@ -574,6 +574,16 @@ async def monitor_positions_job():
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']), params={'positionSide': pos['position_side']})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
+                        
+                        # ИСПРАВЛЕНИЕ: Добавляем сделку по таймауту в статистику
+                        daily_stats['trades'] += 1
+                        daily_stats['pnl'] += pnl
+                        if pnl > 0: 
+                            daily_stats['wins'] += 1
+                            CONSECUTIVE_LOSSES = 0
+                        else: 
+                            CONSECUTIVE_LOSSES += 1
+                            
                         await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} **{clean_name} закрыта по ТАЙМАУТУ!**\nPNL: {pnl:.2f} USDT")
                         continue 
                     except: pass
