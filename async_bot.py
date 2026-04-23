@@ -271,32 +271,56 @@ async def radar_task():
             except: pass
 
             tickers = await exchange.fetch_tickers()
+            
+            # === ДОБАВЛЯЕМ СТАТИСТИКУ РАДАРА ===
+            stats = {'total': 0, 'low_vol': 0, 'waiting': 0, 'passed': 0}
+            
             temp_symbols = []
             for sym, m in exchange.markets.items():
                 if m.get('type') != 'swap' or not m.get('active'): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: continue
                 
+                stats['total'] += 1 # Считаем все монеты
+                
                 tick = tickers.get(sym)
                 q_vol = float(tick.get('quoteVolume') or 0)
-                if not tick or q_vol < MIN_VOLUME_USDT: continue
+                if not tick or q_vol < MIN_VOLUME_USDT: 
+                    stats['low_vol'] += 1 # Считаем неликвид
+                    continue
+                    
                 ask, bid = float(tick.get('ask') or 0), float(tick.get('bid') or 0)
-                if ask > 0 and bid > 0 and (ask - bid) / ask > MAX_SPREAD_PERCENT: continue
+                if ask > 0 and bid > 0 and (ask - bid) / ask > MAX_SPREAD_PERCENT: 
+                    continue
+                    
                 if not any(pos['symbol'].split(':')[0] == sym.split(':')[0] for pos in active_positions):
                     temp_symbols.append((sym, q_vol))
-
+                    
             valid_symbols_data = [(x[0], x[1]) for x in sorted(temp_symbols, key=lambda x: x[1], reverse=True)[:SCAN_LIMIT]]
-            
             sem = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
             results = []
+            
             for i in range(0, len(valid_symbols_data), 10):
                 chunk = valid_symbols_data[i:i+10]
+                # Запускаем задачи анализа FVG и структуры
                 tasks = [process_single_coin(s, btc_trend, altseason, btc_volatility_pct, v, sem) for s, v in chunk if s.split(':')[0] not in last_signals or (datetime.now(timezone.utc) - last_signals[s.split(':')[0]] > timedelta(hours=4))]
-                if tasks: results.extend(await asyncio.gather(*tasks))
-                await asyncio.sleep(0.1)
+                if tasks:
+                    results.extend(await asyncio.gather(*tasks, return_exceptions=True))
+                    
+            # === ПОДСЧЕТ И ВЫВОД РАДАРА ===
+            # ИСПРАВЛЕНО: Async бот возвращает кортежи (sym, signal), где signal может быть None
+            valid_results = [r for r in results if isinstance(r, tuple) and len(r) == 2 and r[1] is not None]
+            stats['passed'] = len(valid_results)
+            stats['waiting'] = stats['total'] - stats['low_vol'] - stats['passed']
+            
+            logging.info(f"🔎 [РАДАР] Всего: {stats['total']} -> Неликвид: {stats['low_vol']} -> Ждем Сетап: {stats['waiting']} -> ВХОДЫ: {stats['passed']}")
 
             new_hot_list = {}
-            for sym, signal in results:
+            for res in results:
+                # Защита от ошибок, если gather вернул Exception вместо кортежа
+                if not isinstance(res, tuple) or len(res) != 2: continue
+                sym, signal = res
+                
                 if signal:
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
@@ -305,10 +329,19 @@ async def radar_task():
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
-            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {get_mem_usage()} | BTC Vol: {btc_volatility_pct:.2f}%")
+            
+            # В Async-боте есть функция get_mem_usage, поэтому оставляем этот лог
+            try:
+                mem_log = get_mem_usage()
+            except:
+                mem_log = "N/A"
+                
+            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(HOT_LIST)} | ОЗУ: {mem_log} | BTC Vol: {btc_volatility_pct:.2f}%")
             gc.collect() 
             await asyncio.sleep(300) 
-        except: await asyncio.sleep(60)
+        except Exception as e: 
+            logging.error(f"Radar Loop Error: {e}")
+            await asyncio.sleep(60)
 
 async def execute_trade(signal, current_ws_price):
     global COOLDOWN_CACHE, LEVERAGE_CACHE
