@@ -284,9 +284,13 @@ async def radar_task():
                 stats['total'] += 1 # Считаем все монеты
                 
                 tick = tickers.get(sym)
+                if not tick: 
+                    stats['low_vol'] += 1
+                    continue
+                
                 q_vol = float(tick.get('quoteVolume') or 0)
-                if not tick or q_vol < MIN_VOLUME_USDT: 
-                    stats['low_vol'] += 1 # Считаем неликвид
+                if q_vol < MIN_VOLUME_USDT: 
+                    stats['low_vol'] += 1
                     continue
                     
                 ask, bid = float(tick.get('ask') or 0), float(tick.get('bid') or 0)
