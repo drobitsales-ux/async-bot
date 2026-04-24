@@ -38,7 +38,15 @@ LEVERAGE_CACHE = set()
 MAX_CONCURRENT_TASKS = 10  
 SCAN_LIMIT = 300           
 
-EXCLUDED_KEYWORDS = ['NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 'USTC', 'BTC/', 'ETH/', 'BNB/', 'SOL/', 'XRP/', 'ADA/', 'TRX/', 'USDC']
+EXCLUDED_KEYWORDS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
+    'NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 
+    'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 
+    'USTC', 'USDC',
+    # --- Блок Мем-коинов и Мусора ---
+    'FART', 'PEPE', 'SHIB', 'DOGE', 'WIF', 'BONK', 'FLOKI', 'BOME',
+    'MEME', 'TURBO', 'SATS', 'RATS', 'ORDI'
+]
 
 SYMBOL_MAP = {'TONCOIN': 'TON', 'SATS': '1000SATS', 'RATS': '1000RATS', 'PEPE': '1000PEPE', 'BONK': '1000BONK', 'FLOKI': '1000FLOKI', 'SHIB': '1000SHIB', 'LUNA': 'LUNA2'}
 
