@@ -150,6 +150,22 @@ async def execute_trade(sym, signal_data):
         contract_size = float(market.get('contractSize', 1.0))
         
         qty_coins = risk_amount / actual_sl_dist
+        
+        # --- МАРЖИНАЛЬНЫЙ ПРЕДОХРАНИТЕЛЬ (ИСПРАВЛЕНИЕ ОШИБОК 101204 и 101209) ---
+        target_notional = qty_coins * current_price
+        
+        # Максимум по балансу (90% от маржи с плечом, чтобы не биться в лимит при скачках)
+        max_notional_margin = free_usdt * LEVERAGE * 0.90
+        # Максимум по лимитам биржи BingX для низколиквидных токенов (ARIA, ENA и т.д.)
+        max_notional_exchange = 4500.0 
+        
+        allowed_notional = min(max_notional_margin, max_notional_exchange)
+        
+        if target_notional > allowed_notional:
+            qty_coins = allowed_notional / current_price
+            logging.info(f"⚠️ {sym}: Объем позиции урезан с {target_notional:.1f}$ до {allowed_notional:.1f}$ (Защита от ошибки Margin/Limit)")
+        # -------------------------------------------------------------------------
+        
         qty = float(exchange.amount_to_precision(sym, qty_coins / contract_size if contract_size > 0 else qty_coins))
         if qty <= 0: return
         
@@ -215,7 +231,6 @@ async def monitor_positions_task():
                 pos_side = 'LONG' if is_long else 'SHORT'
                 
                 if not curr:
-                    # ИСПРАВЛЕНИЕ БАГА: Если биржа закрыла ордер, берем цену SL, а не отскочившую рыночную
                     exit_price = pos['sl_price']
                     pnl = (exit_price - pos['entry_price']) * pos['initial_qty'] * contract_size if is_long else (pos['entry_price'] - exit_price) * pos['initial_qty'] * contract_size
                     
