@@ -12,14 +12,14 @@ from datetime import datetime, timezone
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.34 (BingX Real Trade, Telemetry Restored) ===
+# === НАСТРОЙКИ v8.35 (DUAL MODE: SMC + GRID Oracle, Safe Margin) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-RISK_PER_TRADE = 0.02       # Риск 2% 
+RISK_PER_TRADE = 0.02       
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MIN_VOLUME_USDT = 1000000   
@@ -51,6 +51,13 @@ exchange = ccxt_async.bingx({
     'options': {'defaultType': 'swap', 'marginMode': 'isolated'}, 
     'enableRateLimit': True
 })
+
+# === ОРАКУЛЫ ДЛЯ GRID РЕЖИМА ===
+ORACLES = [
+    ccxt_async.binance({'enableRateLimit': True}),
+    ccxt_async.bybit({'enableRateLimit': True}),
+    ccxt_async.mexc({'enableRateLimit': True})
+]
 
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -122,7 +129,24 @@ def analyze_structure(h, l, c):
         elif trend == 'Bullish' and c[-1] < recent[-1]['price']: bos_choch = 'CHoCH_Bearish'
     return trend, bos_choch
 
-async def execute_trade(sym, signal_data):
+# === ЛОГИКА ОРАКУЛА (ТОЛЬКО ДЛЯ GRID) ===
+async def verify_global_volume(base_coin):
+    check_sym = f"{base_coin}/USDT"
+    async def fetch_ex(ex):
+        try:
+            ohlcv = await ex.fetch_ohlcv(check_sym, timeframe=SMC_TIMEFRAME, limit=25)
+            if not ohlcv or len(ohlcv) < 20: return False
+            v = np.array([x[5] for x in ohlcv])
+            avg_vol = np.mean(v[-22:-2])
+            return v[-2] > (avg_vol * 1.20) 
+        except: return False
+        
+    tasks = [fetch_ex(ex) for ex in ORACLES]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    confirmations = [r for r in results if r is True]
+    return len(confirmations) >= 1
+
+async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
     global active_positions, COOLDOWN_CACHE
     if len(active_positions) >= MAX_POSITIONS or any(p['symbol'] == sym for p in active_positions): return
     if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: return
@@ -186,11 +210,13 @@ async def execute_trade(sym, signal_data):
     active_positions.append({
         'symbol': sym, 'direction': direction, 'entry_price': current_price, 
         'initial_qty': qty, 'sl_price': sl_price, 'tp1': tp_price, 
-        'sl_order_id': sl_id, 'tp_order_id': tp_id, 'open_time': datetime.now(timezone.utc).isoformat()
+        'sl_order_id': sl_id, 'tp_order_id': tp_id, 'open_time': datetime.now(timezone.utc).isoformat(),
+        'strategy': strategy_name
     })
     await asyncio.to_thread(save_positions)
     
-    msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async v8.34]: {sym.split(':')[0]}</b>\n"
+    oracle_text = "\n🌐 <i>Подтверждено Оракулом (Multi-Exchange)</i>" if strategy_name == "GRID Oracle" else ""
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name}]: {sym.split(':')[0]}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
     await send_tg_msg(msg)
 
@@ -250,7 +276,8 @@ async def monitor_positions_task():
         except Exception as e: pass
         await asyncio.sleep(15)
 
-async def process_single_coin(sym, btc_trend, sem):
+# === ПОТОК 1: SMC РАДАР (БЕЗ ОРАКУЛА) ===
+async def process_smc_coin(sym, btc_trend, sem):
     async with sem:
         try:
             await asyncio.sleep(0.3)
@@ -281,10 +308,10 @@ async def process_single_coin(sym, btc_trend, sem):
                 if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'btc_trend': btc_trend}
+            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price}
         except: return sym, 'error'
 
-async def radar_task():
+async def smc_radar_task():
     global NOTIFIED_SYMBOLS
     await exchange.load_markets() 
     while True:
@@ -302,16 +329,10 @@ async def radar_task():
             temp_symbols = [(sym, float(tick.get('quoteVolume') or 0)) for sym, tick in tickers.items() if sym.endswith(':USDT') and exchange.markets[sym].get('active') is not False and not any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS) and sym not in COOLDOWN_CACHE and not any(pos['symbol'].split(':')[0] == sym.split(':')[0] for pos in active_positions)]
             
             stats = {'total': len(tickers), 'low_vol': 0, 'no_choch': 0, 'no_fvg': 0, 'wrong_trend': 0, 'passed': 0}
+            valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
+            stats['low_vol'] = len(temp_symbols) - len(valid_symbols_data)
             
-            # Фильтр объема
-            valid_symbols_data = []
-            for sym, vol in temp_symbols:
-                if vol < MIN_VOLUME_USDT: stats['low_vol'] += 1
-                else: valid_symbols_data.append(sym)
-            
-            valid_symbols_data = valid_symbols_data[:SCAN_LIMIT]
-            
-            sem = asyncio.Semaphore(10); tasks = [process_single_coin(s, btc_trend, sem) for s in valid_symbols_data]
+            sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, btc_trend, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             valid_results = []
@@ -325,14 +346,85 @@ async def radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [РАДАР] Всего: {stats['total']} -> Неликвид: {stats['low_vol']} -> Нет CHoCH: {stats['no_choch']} -> Нет FVG: {stats['no_fvg']} -> Контртренд: {stats['wrong_trend']} -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC РАДАР] Всего: {stats['total']} -> Неликвид: {stats['low_vol']} -> Нет CHoCH: {stats['no_choch']} -> Нет FVG: {stats['no_fvg']} -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
                     NOTIFIED_SYMBOLS.add(sym)
-                    await execute_trade(sym, signal)
+                    await execute_trade(sym, signal, "SMC Async")
             gc.collect(); await asyncio.sleep(60) 
-        except Exception as e: logging.error(f"Radar Error: {e}"); await asyncio.sleep(60)
+        except Exception as e: logging.error(f"SMC Radar Error: {e}"); await asyncio.sleep(60)
+
+# === ПОТОК 2: GRID РАДАР (С ОРАКУЛОМ) ===
+async def process_grid_coin(sym, sem):
+    async with sem:
+        try:
+            await asyncio.sleep(0.3)
+            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=25)
+            if not ohlcv or len(ohlcv) < 20: return sym, 'no_data'
+            
+            o, h, l, c, v = np.array([x[1] for x in ohlcv]), np.array([x[2] for x in ohlcv]), np.array([x[3] for x in ohlcv]), np.array([x[4] for x in ohlcv]), np.array([x[5] for x in ohlcv])
+            avg_vol = np.mean(v[-22:-2])
+            
+            # Локальный пробой: Рост объема +20% и свеча больше 2%
+            if v[-2] < (avg_vol * 1.20): return sym, 'no_vol_spike'
+            candle_size_pct = abs(c[-2] - o[-2]) / o[-2] * 100
+            if candle_size_pct < 2.0: return sym, 'no_price_spike'
+            
+            direction = 'Long' if c[-2] > o[-2] else 'Short'
+            current_price = c[-1]
+            
+            # Проверка глобального объема (Оракул)
+            base_coin = sym.split('/')[0]
+            if not await verify_global_volume(base_coin):
+                return sym, 'oracle_rejected'
+
+            if direction == 'Long':
+                sl_price = l[-2] * 0.998
+                if (current_price - sl_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 - MIN_SL_PCT/100)
+                tp_price = current_price + (current_price - sl_price) * 1.5
+            else:
+                sl_price = h[-2] * 1.002
+                if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 + MIN_SL_PCT/100)
+                tp_price = current_price - (sl_price - current_price) * 1.5
+
+            return sym, {'mode': direction, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price}
+        except: return sym, 'error'
+
+async def grid_radar_task():
+    global NOTIFIED_SYMBOLS
+    await asyncio.sleep(30) # Сдвиг по времени, чтобы не спамить API одновременно с SMC
+    while True:
+        try:
+            if len(active_positions) >= MAX_POSITIONS: await asyncio.sleep(60); continue
+            tickers = await exchange.fetch_tickers()
+            temp_symbols = [(sym, float(tick.get('quoteVolume') or 0)) for sym, tick in tickers.items() if sym.endswith(':USDT') and exchange.markets[sym].get('active') is not False and not any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS) and sym not in COOLDOWN_CACHE and not any(pos['symbol'].split(':')[0] == sym.split(':')[0] for pos in active_positions)]
+            
+            stats = {'vol_fail': 0, 'price_fail': 0, 'oracle_reject': 0, 'passed': 0}
+            valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
+            
+            sem = asyncio.Semaphore(10); tasks = [process_grid_coin(s, sem) for s in valid_symbols_data]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            valid_results = []
+            for r in results:
+                if isinstance(r, tuple) and len(r) == 2:
+                    sym, signal = r
+                    if signal == 'no_vol_spike': stats['vol_fail'] += 1
+                    elif signal == 'no_price_spike': stats['price_fail'] += 1
+                    elif signal == 'oracle_rejected': stats['oracle_reject'] += 1
+                    elif isinstance(signal, dict): 
+                        stats['passed'] += 1
+                        valid_results.append((sym, signal))
+
+            logging.info(f"🌐 [GRID РАДАР] Отклонено объемом: {stats['vol_fail']} -> Нет пробоя: {stats['price_fail']} -> Зарубил Оракул: {stats['oracle_reject']} -> ВХОДЫ: {stats['passed']}")
+
+            for sym, signal in valid_results:
+                if sym not in NOTIFIED_SYMBOLS: 
+                    NOTIFIED_SYMBOLS.add(sym)
+                    await execute_trade(sym, signal, "GRID Oracle")
+            await asyncio.sleep(60) 
+        except Exception as e: logging.error(f"GRID Radar Error: {e}"); await asyncio.sleep(60)
 
 async def print_stats_hourly():
     global daily_stats, REPORTED_TODAY
@@ -344,20 +436,19 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (SMC Async v8.34):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.35):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
             
-            # Ежечасная телеметрия
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0] for p in active_positions]) or "Нет"
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.34] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.35] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.34")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.35")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -369,10 +460,15 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.34 (SMC, Telemetry Restored, Safe Margin)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.34</b> запущен (Оракул отключен, Логи восстановлены)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.35 (DUAL MODE: SMC + GRID Oracle)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.35</b> запущен (Режимы: SMC и GRID-Оракул работают параллельно)!")
     Thread(target=run_server, daemon=True).start()
-    asyncio.create_task(monitor_positions_task()); asyncio.create_task(print_stats_hourly()); await radar_task()
+    
+    # ЗАПУСКАЕМ ОБА РАДАРА ПАРАЛЛЕЛЬНО
+    asyncio.create_task(monitor_positions_task())
+    asyncio.create_task(print_stats_hourly())
+    asyncio.create_task(smc_radar_task())
+    await grid_radar_task()
 
 if __name__ == '__main__':
     try: asyncio.run(main())
