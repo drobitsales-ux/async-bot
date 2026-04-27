@@ -9,16 +9,17 @@ import ccxt.async_support as ccxt_async
 import numpy as np
 import aiohttp
 from datetime import datetime, timezone
+from threading import Thread
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ BINGX (Real Trade) ===
 DB_PATH = 'bot.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-RISK_PER_TRADE = 0.02       
-MAX_POSITIONS = 3           
+RISK_PER_TRADE = 0.02       # СТАНДАРТНЫЙ РИСК 2%
+MAX_POSITIONS = 3           # ЛИМИТ 3 СДЕЛКИ
 LEVERAGE = 10               
 MIN_VOLUME_USDT = 1000000   
 MIN_SL_PCT = 1.0            
@@ -144,15 +145,10 @@ async def execute_trade(sym, signal_data):
         risk_amount = free_usdt * RISK_PER_TRADE
         qty_coins = risk_amount / actual_sl_dist
         
-        # Маржинальный предохранитель
         target_notional = qty_coins * current_price
-        max_notional_margin = free_usdt * LEVERAGE * 0.90
-        allowed_notional = min(max_notional_margin, 4500.0) 
+        allowed_notional = min(free_usdt * LEVERAGE * 0.90, 4500.0) 
+        if target_notional > allowed_notional: qty_coins = allowed_notional / current_price
         
-        if target_notional > allowed_notional:
-            qty_coins = allowed_notional / current_price
-        
-        # БЕЗ contract_size! CCXT сам все сделает.
         qty = float(exchange.amount_to_precision(sym, qty_coins))
         if qty <= 0: return
         
@@ -164,29 +160,33 @@ async def execute_trade(sym, signal_data):
         sl_side = 'sell' if direction == 'Long' else 'buy'
         
         order = await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
-        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={
-            'triggerPrice': sl_price, 'stopLossPrice': sl_price, 'positionSide': pos_side
-        })
-        
-        active_positions.append({
-            'symbol': sym, 'direction': direction, 'entry_price': current_price, 
-            'initial_qty': qty, 'sl_price': sl_price, 'tp1': tp_price, 
-            'sl_order_id': sl_ord['id'], 'open_time': datetime.now(timezone.utc).isoformat()
-        })
-        await asyncio.to_thread(save_positions)
-        
-        msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async BINGX]: {sym.split(':')[0]}</b>\n"
-               f"Направление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
-        await send_tg_msg(msg)
-    except Exception as e: logging.error(f"Trade execution error {sym}: {e}")
+    except Exception as e: 
+        logging.error(f"Trade execution error {sym} (Market): {e}")
+        return
+
+    sl_id = None
+    try:
+        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'triggerPrice': sl_price, 'reduceOnly': True, 'positionSide': pos_side})
+        sl_id = sl_ord['id']
+    except Exception as e:
+        logging.error(f"SL Error {sym}: {e}. Emergency close!")
+        try: await exchange.create_market_order(sym, sl_side, qty, params={'positionSide': pos_side, 'reduceOnly': True})
+        except: pass
+        return
+
+    active_positions.append({
+        'symbol': sym, 'direction': direction, 'entry_price': current_price, 
+        'initial_qty': qty, 'sl_price': sl_price, 'tp1': tp_price, 
+        'sl_order_id': sl_id, 'open_time': datetime.now(timezone.utc).isoformat()
+    })
+    await asyncio.to_thread(save_positions)
+    await send_tg_msg(f"💥 <b>ВЫСТРЕЛ [SMC Async BINGX]: {sym.split(':')[0]}</b>\nНаправление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
 
 async def monitor_positions_task():
     global active_positions, daily_stats, COOLDOWN_CACHE
     while True:
         try:
-            if not active_positions:
-                await asyncio.sleep(15); continue
-                
+            if not active_positions: await asyncio.sleep(15); continue
             positions_raw = await exchange.fetch_positions()
             symbols_to_fetch = [p['symbol'] for p in active_positions]
             tickers = await exchange.fetch_tickers(symbols_to_fetch)
@@ -200,16 +200,11 @@ async def monitor_positions_task():
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 pos_side = 'LONG' if is_long else 'SHORT'
                 
-                # Идеально чистый расчет PNL через initial_qty
                 if not curr:
-                    exit_price = pos['sl_price']
-                    pnl = (exit_price - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['initial_qty']
-                    daily_stats['trades'] = daily_stats.get('trades', 0) + 1
-                    daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
-                    daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
+                    pnl = (pos['sl_price'] - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - pos['sl_price']) * pos['initial_qty']
+                    daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl; daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
                     COOLDOWN_CACHE[sym] = time.time() + 14400
-                    await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL.</b>\nPNL: {pnl:.2f} USDT")
-                    continue
+                    await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL.</b>\nPNL: {pnl:.2f} USDT"); continue
 
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
@@ -217,30 +212,24 @@ async def monitor_positions_task():
 
                 if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
                     try:
-                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'positionSide': pos_side})
+                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
-                        daily_stats['trades'] = daily_stats.get('trades', 0) + 1
-                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
+                        daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                         if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
                         else: daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl); COOLDOWN_CACHE[sym] = time.time() + 14400
-                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT")
-                        continue
+                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT"); continue
                     except: pass
 
                 if (is_long and ticker >= pos['tp1']) or (not is_long and ticker <= pos['tp1']):
                     try:
-                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'positionSide': pos_side})
+                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['wins'] = daily_stats.get('wins', 0) + 1
                         daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
-                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USDT")
-                        continue
+                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USDT"); continue
                     except: pass
-
                 updated.append(pos)
-                
-            active_positions = updated
-            await asyncio.to_thread(save_positions)
+            active_positions = updated; await asyncio.to_thread(save_positions)
         except Exception as e: pass
         await asyncio.sleep(15)
 
@@ -251,18 +240,13 @@ async def process_single_coin(sym, btc_trend, sem):
             ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=200)
             if not ohlcv or len(ohlcv) < 50: return sym, None
             
-            o = np.array([x[1] for x in ohlcv], dtype=float)
-            h = np.array([x[2] for x in ohlcv], dtype=float)
-            l = np.array([x[3] for x in ohlcv], dtype=float)
-            c = np.array([x[4] for x in ohlcv], dtype=float)
-            
+            o, h, l, c = np.array([x[1] for x in ohlcv], dtype=float), np.array([x[2] for x in ohlcv], dtype=float), np.array([x[3] for x in ohlcv], dtype=float), np.array([x[4] for x in ohlcv], dtype=float)
             trend, bos_choch = analyze_structure(h, l, c)
             fvgs = analyze_fvg(o, h, l, c)
             current_price = c[-1]; ema200 = calculate_ema(c, 200)
             
             active_fvg = next((fvg for fvg in reversed(fvgs) if (fvg['type'] == 'Bullish' and current_price > fvg['top']) or (fvg['type'] == 'Bearish' and current_price < fvg['bottom'])), None)
             if not active_fvg or not bos_choch: return sym, None
-            
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             if not mode or (mode == 'Long' and btc_trend != 'Long') or (mode == 'Short' and btc_trend != 'Short'): return sym, None
 
@@ -275,7 +259,7 @@ async def process_single_coin(sym, btc_trend, sem):
                 if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'fvg_size': abs(active_fvg['top'] - active_fvg['bottom']) / current_price * 100, 'ema_dist': abs(current_price - ema200) / current_price * 100, 'btc_trend': btc_trend, 'vol_24h': 0}
+            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'btc_trend': btc_trend}
         except: return sym, None
 
 async def radar_task():
@@ -309,12 +293,40 @@ async def radar_task():
             gc.collect(); await asyncio.sleep(60) 
         except Exception as e: logging.error(f"Radar Error: {e}"); await asyncio.sleep(60)
 
+async def print_stats_hourly():
+    global daily_stats, REPORTED_TODAY
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            if now.hour == 20 and not REPORTED_TODAY:
+                bal = await exchange.fetch_balance(); current_balance = float(bal.get('USDT', {}).get('total', 0))
+                start_bal = daily_stats.get('start_balance', 0.0)
+                pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
+                winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (BINGX Async):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
+                await asyncio.to_thread(save_positions); REPORTED_TODAY = True
+            elif now.hour != 20: REPORTED_TODAY = False
+        except: pass
+        await asyncio.sleep(3600)
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active")
+    def log_message(self, format, *args): return 
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler); server.serve_forever()
+
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск BINGX ASYNC БОТА (Real Trade, Fixed Qty & PNL)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ</b> успешно запущен и готов к реальной торговле!")
-    asyncio.create_task(monitor_positions_task()) 
-    await radar_task()
+    if daily_stats.get('start_balance', 0.0) == 0.0:
+        try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
+        except: pass
+        
+    logging.info("🚀 Запуск BINGX ASYNC БОТА (Real Trade, 2% Risk, 3 Pos)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ</b> успешно запущен (Risk: 2%, Max Pos: 3)!")
+    Thread(target=run_server, daemon=True).start()
+    asyncio.create_task(monitor_positions_task()); asyncio.create_task(print_stats_hourly()); await radar_task()
 
 if __name__ == '__main__':
     try: asyncio.run(main())
