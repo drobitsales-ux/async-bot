@@ -18,8 +18,8 @@ GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-RISK_PER_TRADE = 0.02       # СТАНДАРТНЫЙ РИСК 2%
-MAX_POSITIONS = 3           # ЛИМИТ 3 СДЕЛКИ
+RISK_PER_TRADE = 0.02       
+MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MIN_VOLUME_USDT = 1000000   
 MIN_SL_PCT = 1.0            
@@ -51,7 +51,6 @@ exchange = ccxt_async.bingx({
     'enableRateLimit': True
 })
 
-# === ИНИЦИАЛИЗАЦИЯ ОРАКУЛОВ (Binance, Bybit, MEXC) ===
 ORACLES = [
     ccxt_async.binance({'enableRateLimit': True}),
     ccxt_async.bybit({'enableRateLimit': True}),
@@ -102,8 +101,7 @@ async def send_tg_msg(text):
 
 def calculate_ema(data, window):
     if len(data) < window: return data[-1]
-    alpha = 2 / (window + 1)
-    ema = data[0]
+    alpha = 2 / (window + 1); ema = data[0]
     for price in data[1:]: ema = (price * alpha) + (ema * (1 - alpha))
     return ema
 
@@ -129,7 +127,6 @@ def analyze_structure(h, l, c):
         elif trend == 'Bullish' and c[-1] < recent[-1]['price']: bos_choch = 'CHoCH_Bearish'
     return trend, bos_choch
 
-# === ЛОГИКА ОРАКУЛА: ПРОВЕРКА ГЛОБАЛЬНЫХ ОБЪЕМОВ ===
 async def verify_global_volume(base_coin):
     check_sym = f"{base_coin}/USDT"
     async def fetch_ex(ex):
@@ -138,7 +135,7 @@ async def verify_global_volume(base_coin):
             if not ohlcv or len(ohlcv) < 20: return False
             v = np.array([x[5] for x in ohlcv])
             avg_vol = np.mean(v[-22:-2])
-            return v[-2] > (avg_vol * 1.20) # Фильтр +20%
+            return v[-2] > (avg_vol * 1.20) 
         except: return False
         
     tasks = [fetch_ex(ex) for ex in ORACLES]
@@ -160,7 +157,6 @@ async def execute_trade(sym, signal_data):
 
         actual_sl_dist = abs(current_price - sl_price)
         if actual_sl_dist <= 0: return
-        
         sl_pct = (actual_sl_dist / current_price) * 100
         if sl_pct > MAX_SL_PCT:
             COOLDOWN_CACHE[sym] = time.time() + 3600
@@ -169,9 +165,13 @@ async def execute_trade(sym, signal_data):
         risk_amount = free_usdt * RISK_PER_TRADE
         qty_coins = risk_amount / actual_sl_dist
         
+        # === ЖЕСТКАЯ ЗАЩИТА МАРЖИ ===
+        max_margin_lock = free_usdt * 0.15 # Максимум 15% депозита на сделку
+        max_notional_usdt = max_margin_lock * LEVERAGE
         target_notional = qty_coins * current_price
-        allowed_notional = min(free_usdt * LEVERAGE * 0.90, 4500.0) 
-        if target_notional > allowed_notional: qty_coins = allowed_notional / current_price
+        
+        if target_notional > max_notional_usdt: 
+            qty_coins = max_notional_usdt / current_price
         
         qty = float(exchange.amount_to_precision(sym, qty_coins))
         if qty <= 0: return
@@ -183,25 +183,34 @@ async def execute_trade(sym, signal_data):
         side = 'buy' if direction == 'Long' else 'sell'
         sl_side = 'sell' if direction == 'Long' else 'buy'
         
+        # ОТКРЫТИЕ СДЕЛКИ
         order = await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
     except Exception as e: 
-        logging.error(f"Trade execution error {sym} (Market): {e}")
+        logging.error(f"Trade Open Error {sym}: {e}")
         return
 
-    sl_id = None
+    # === БЕЗОПАСНАЯ УСТАНОВКА SL/TP С АЛАРМОМ ===
+    sl_id = None; tp_id = None
     try:
         sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'triggerPrice': sl_price, 'reduceOnly': True, 'positionSide': pos_side})
         sl_id = sl_ord['id']
+        try:
+            tp_ord = await exchange.create_order(sym, 'take_profit_market', sl_side, qty, params={'triggerPrice': tp_price, 'reduceOnly': True, 'positionSide': pos_side})
+            tp_id = tp_ord['id']
+        except: pass # Если биржа не пустит TP, мы всё равно закроем его в памяти бота
     except Exception as e:
-        logging.error(f"SL Error {sym}: {e}. Emergency close!")
-        try: await exchange.create_market_order(sym, sl_side, qty, params={'positionSide': pos_side, 'reduceOnly': True})
-        except: pass
-        return
+        await send_tg_msg(f"🚨 <b>АВАРИЯ ПО {sym.split(':')[0]}</b>\nБот вошел в сделку, но API не дал поставить Stop-Loss!\nОшибка: <code>{e}</code>\nПытаюсь экстренно закрыть позицию...")
+        try: 
+            await exchange.create_market_order(sym, sl_side, qty, params={'positionSide': pos_side, 'reduceOnly': True})
+            await send_tg_msg(f"✅ Успешно: Сделка по {sym.split(':')[0]} экстренно закрыта. Убытков удалось избежать.")
+        except Exception as e_close: 
+            await send_tg_msg(f"❌ <b>КРИТИЧЕСКИЙ СБОЙ</b>\nБот не смог закрыть {sym.split(':')[0]}!\n<b>СРОЧНО ЗАКРОЙТЕ СДЕЛКУ РУКАМИ В ПРИЛОЖЕНИИ BINGX!</b>\nОшибка закрытия: <code>{e_close}</code>")
+        return # Выходим, чтобы зависшая сделка не попала в базу
 
     active_positions.append({
         'symbol': sym, 'direction': direction, 'entry_price': current_price, 
         'initial_qty': qty, 'sl_price': sl_price, 'tp1': tp_price, 
-        'sl_order_id': sl_id, 'open_time': datetime.now(timezone.utc).isoformat()
+        'sl_order_id': sl_id, 'tp_order_id': tp_id, 'open_time': datetime.now(timezone.utc).isoformat()
     })
     await asyncio.to_thread(save_positions)
     
@@ -232,7 +241,8 @@ async def monitor_positions_task():
                     pnl = (pos['sl_price'] - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - pos['sl_price']) * pos['initial_qty']
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl; daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
                     COOLDOWN_CACHE[sym] = time.time() + 14400
-                    await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL.</b>\nPNL: {pnl:.2f} USDT"); continue
+                    await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL или закрыта руками.</b>\nPNL: {pnl:.2f} USDT")
+                    continue
 
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
@@ -242,19 +252,24 @@ async def monitor_positions_task():
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
+                        if pos.get('tp_order_id'): await exchange.cancel_order(pos['tp_order_id'], sym)
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                         if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
                         else: daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl); COOLDOWN_CACHE[sym] = time.time() + 14400
-                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT"); continue
+                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT")
+                        continue
                     except: pass
 
+                # Дублирующий контроль TP в памяти
                 if (is_long and ticker >= pos['tp1']) or (not is_long and ticker <= pos['tp1']):
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
+                        if pos.get('tp_order_id'): await exchange.cancel_order(pos['tp_order_id'], sym)
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['wins'] = daily_stats.get('wins', 0) + 1
                         daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
-                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USDT"); continue
+                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USDT")
+                        continue
                     except: pass
                 updated.append(pos)
             active_positions = updated; await asyncio.to_thread(save_positions)
@@ -278,7 +293,6 @@ async def process_single_coin(sym, btc_trend, sem):
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             if not mode or (mode == 'Long' and btc_trend != 'Long') or (mode == 'Short' and btc_trend != 'Short'): return sym, None
 
-            # ПРОВЕРКА ОРАКУЛОМ (Глобальный объем)
             base_coin = sym.split('/')[0]
             if not await verify_global_volume(base_coin):
                 return sym, None
@@ -356,8 +370,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА (Real Trade, 2% Risk, Oracle GRID)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ</b> успешно запущен (Risk: 2%, Max Pos: 3, Оракул: Вкл)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА (Safe Margin, Robust SL/TP)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ</b> запущен (Safe Margin Limit, TG Alerts on errors)!")
     Thread(target=run_server, daemon=True).start()
     asyncio.create_task(monitor_positions_task()); asyncio.create_task(print_stats_hourly()); await radar_task()
 
