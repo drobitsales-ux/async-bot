@@ -51,6 +51,13 @@ exchange = ccxt_async.bingx({
     'enableRateLimit': True
 })
 
+# === ИНИЦИАЛИЗАЦИЯ ОРАКУЛОВ (Binance, Bybit, MEXC) ===
+ORACLES = [
+    ccxt_async.binance({'enableRateLimit': True}),
+    ccxt_async.bybit({'enableRateLimit': True}),
+    ccxt_async.mexc({'enableRateLimit': True})
+]
+
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -122,6 +129,23 @@ def analyze_structure(h, l, c):
         elif trend == 'Bullish' and c[-1] < recent[-1]['price']: bos_choch = 'CHoCH_Bearish'
     return trend, bos_choch
 
+# === ЛОГИКА ОРАКУЛА: ПРОВЕРКА ГЛОБАЛЬНЫХ ОБЪЕМОВ ===
+async def verify_global_volume(base_coin):
+    check_sym = f"{base_coin}/USDT"
+    async def fetch_ex(ex):
+        try:
+            ohlcv = await ex.fetch_ohlcv(check_sym, timeframe=SMC_TIMEFRAME, limit=25)
+            if not ohlcv or len(ohlcv) < 20: return False
+            v = np.array([x[5] for x in ohlcv])
+            avg_vol = np.mean(v[-22:-2])
+            return v[-2] > (avg_vol * 1.20) # Фильтр +20%
+        except: return False
+        
+    tasks = [fetch_ex(ex) for ex in ORACLES]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    confirmations = [r for r in results if r is True]
+    return len(confirmations) >= 1
+
 async def execute_trade(sym, signal_data):
     global active_positions, COOLDOWN_CACHE
     if len(active_positions) >= MAX_POSITIONS or any(p['symbol'] == sym for p in active_positions): return
@@ -180,7 +204,11 @@ async def execute_trade(sym, signal_data):
         'sl_order_id': sl_id, 'open_time': datetime.now(timezone.utc).isoformat()
     })
     await asyncio.to_thread(save_positions)
-    await send_tg_msg(f"💥 <b>ВЫСТРЕЛ [SMC Async BINGX]: {sym.split(':')[0]}</b>\nНаправление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
+    
+    msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async BINGX]: {sym.split(':')[0]}</b>\n"
+           f"🌐 <i>Подтверждено Оракулом (Binance/Bybit/MEXC)</i>\n"
+           f"Направление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
+    await send_tg_msg(msg)
 
 async def monitor_positions_task():
     global active_positions, daily_stats, COOLDOWN_CACHE
@@ -250,6 +278,11 @@ async def process_single_coin(sym, btc_trend, sem):
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             if not mode or (mode == 'Long' and btc_trend != 'Long') or (mode == 'Short' and btc_trend != 'Short'): return sym, None
 
+            # ПРОВЕРКА ОРАКУЛОМ (Глобальный объем)
+            base_coin = sym.split('/')[0]
+            if not await verify_global_volume(base_coin):
+                return sym, None
+
             if mode == 'Long':
                 sl_price = min(l[active_fvg['index']:]) * 0.998
                 if (current_price - sl_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 - MIN_SL_PCT/100)
@@ -286,7 +319,7 @@ async def radar_task():
                 if tasks: results.extend(await asyncio.gather(*tasks, return_exceptions=True))
                     
             valid_results = [r for r in results if isinstance(r, tuple) and len(r) == 2 and r[1] is not None]
-            logging.info(f"🔎 [РАДАР] Всего: {len(tickers)} -> ВХОДЫ: {len(valid_results)}")
+            logging.info(f"🔎 [РАДАР] Всего: {len(tickers)} -> ВХОДЫ (Одобренные Оракулом): {len(valid_results)}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: NOTIFIED_SYMBOLS.add(sym); await execute_trade(sym, signal)
@@ -323,8 +356,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА (Real Trade, 2% Risk, 3 Pos)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ</b> успешно запущен (Risk: 2%, Max Pos: 3)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА (Real Trade, 2% Risk, Oracle GRID)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ</b> успешно запущен (Risk: 2%, Max Pos: 3, Оракул: Вкл)!")
     Thread(target=run_server, daemon=True).start()
     asyncio.create_task(monitor_positions_task()); asyncio.create_task(print_stats_hourly()); await radar_task()
 
