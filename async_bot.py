@@ -19,10 +19,10 @@ GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-RISK_PER_TRADE = 0.02       # Риск 2% на сделку (для реального депозита)
+RISK_PER_TRADE = 0.02       
 MAX_POSITIONS = 3           
-LEVERAGE = 10               # Плечо х10
-MIN_VOLUME_USDT = 1000000   # Жесткий фильтр объема для BingX
+LEVERAGE = 10               
+MIN_VOLUME_USDT = 1000000   
 MIN_SL_PCT = 1.0            
 MAX_SL_PCT = 5.0            
 
@@ -30,7 +30,6 @@ SMC_TIMEFRAME = '15m'
 COOLDOWN_CACHE = {}         
 SCAN_LIMIT = 300           
 
-# Расширенный черный список для BingX
 EXCLUDED_KEYWORDS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
     'NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 
@@ -40,22 +39,13 @@ EXCLUDED_KEYWORDS = [
     'MEME', 'TURBO', 'SATS', 'RATS', 'ORDI'
 ]
 
-daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': 0.0, 'start_balance': 0.0}
+daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': 0.0, 'start_balance': 0.0, 'gross_profit': 0.0, 'gross_loss': 0.0}
 active_positions = []
 NOTIFIED_SYMBOLS = set() 
 REPORTED_TODAY = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
-def get_mem_usage():
-    try:
-        with open('/proc/self/status') as f:
-            for line in f:
-                if 'VmRSS' in line: return f"{int(line.split()[1]) / 1024:.1f} MB"
-    except: pass
-    return "N/A"
-
-# Инициализация BingX (БЕЗ Sandbox, маржа Isolated)
 exchange = ccxt_async.bingx({
     'apiKey': BINGX_API_KEY, 
     'secret': BINGX_SECRET,
@@ -69,20 +59,18 @@ def init_db():
     conn = get_db_conn(); c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, data TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (id INTEGER PRIMARY KEY, pnl REAL, trades INTEGER, wins INTEGER)''')
-    try: c.execute("ALTER TABLE daily_stats ADD COLUMN wins INTEGER DEFAULT 0")
-    except: pass
-    try: c.execute("ALTER TABLE daily_stats ADD COLUMN prev_winrate REAL DEFAULT 0.0")
-    except: pass
-    try: c.execute("ALTER TABLE daily_stats ADD COLUMN start_balance REAL DEFAULT 0.0")
-    except: pass
+    for col in ['wins', 'prev_winrate', 'start_balance', 'gross_profit', 'gross_loss']:
+        try: c.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} REAL DEFAULT 0.0")
+        except: pass
     conn.commit(); conn.close()
 
 def save_positions():
     conn = get_db_conn(); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO active_positions (id, data) VALUES (1, ?)", (json.dumps(active_positions),))
-    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins, prev_winrate, start_balance) VALUES (1, ?, ?, ?, ?, ?)", 
+    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins, prev_winrate, start_balance, gross_profit, gross_loss) VALUES (1, ?, ?, ?, ?, ?, ?, ?)", 
               (daily_stats.get('pnl', 0.0), daily_stats.get('trades', 0), daily_stats.get('wins', 0), 
-               daily_stats.get('prev_winrate', 0.0), daily_stats.get('start_balance', 0.0)))
+               daily_stats.get('prev_winrate', 0.0), daily_stats.get('start_balance', 0.0),
+               daily_stats.get('gross_profit', 0.0), daily_stats.get('gross_loss', 0.0)))
     conn.commit(); conn.close()
 
 def load_positions():
@@ -91,10 +79,10 @@ def load_positions():
         conn = get_db_conn(); c = conn.cursor()
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
         if row: active_positions = json.loads(row[0])
-        c.execute("SELECT pnl, trades, wins, prev_winrate, start_balance FROM daily_stats WHERE id = 1")
+        c.execute("SELECT pnl, trades, wins, prev_winrate, start_balance, gross_profit, gross_loss FROM daily_stats WHERE id = 1")
         stat_row = c.fetchone()
         if stat_row: 
-            daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'], daily_stats['start_balance'] = stat_row
+            daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'], daily_stats['start_balance'], daily_stats['gross_profit'], daily_stats['gross_loss'] = stat_row
         conn.close()
     except Exception: pass
 
@@ -172,7 +160,6 @@ async def execute_trade(sym, signal_data):
         side = 'buy' if direction == 'Long' else 'sell'
         sl_side = 'sell' if direction == 'Long' else 'buy'
         
-        # Специфичные параметры ордеров для BingX
         order = await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
         sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={
             'triggerPrice': sl_price,
@@ -188,7 +175,7 @@ async def execute_trade(sym, signal_data):
         await asyncio.to_thread(save_positions)
         
         msg = (
-            f"💥 <b>ВЫСТРЕЛ [SMC Async]: {sym.split(':')[0]}</b>\n"
+            f"💥 <b>ВЫСТРЕЛ [SMC Async BINGX]: {sym.split(':')[0]}</b>\n"
             f"Направление: <b>#{direction}</b>\n\n"
             f"Цена: {current_price}\n"
             f"Объем (контр.): {qty}\n"
@@ -228,16 +215,16 @@ async def monitor_positions_task():
                 pos_side = 'LONG' if is_long else 'SHORT'
                 
                 if not curr:
-                    pnl = (ticker - pos['entry_price']) * pos['initial_qty'] * contract_size if is_long else (pos['entry_price'] - ticker) * pos['initial_qty'] * contract_size
+                    # ИСПРАВЛЕНИЕ БАГА: Если биржа закрыла ордер, берем цену SL, а не отскочившую рыночную
+                    exit_price = pos['sl_price']
+                    pnl = (exit_price - pos['entry_price']) * pos['initial_qty'] * contract_size if is_long else (pos['entry_price'] - exit_price) * pos['initial_qty'] * contract_size
+                    
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                     daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
+                    daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
                     
-                    if pnl > 0: 
-                        daily_stats['wins'] = daily_stats.get('wins', 0) + 1
-                        await send_tg_msg(f"✅ <b>{clean_name} закрыта в плюс!</b>\nPNL: {pnl:+.2f} USDT")
-                    else: 
-                        COOLDOWN_CACHE[sym] = time.time() + 14400
-                        await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL.</b>\nPNL: {pnl:.2f} USDT\n❄️ Монета заморожена.")
+                    COOLDOWN_CACHE[sym] = time.time() + 14400
+                    await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL.</b>\nPNL: {pnl:.2f} USDT\n❄️ Монета заморожена.")
                     continue
 
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
@@ -250,8 +237,12 @@ async def monitor_positions_task():
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                         daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
-                        if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1
-                        else: COOLDOWN_CACHE[sym] = time.time() + 14400
+                        if pnl > 0: 
+                            daily_stats['wins'] = daily_stats.get('wins', 0) + 1
+                            daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
+                        else: 
+                            daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
+                            COOLDOWN_CACHE[sym] = time.time() + 14400
                         await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT")
                         continue
                     except: pass
@@ -263,6 +254,7 @@ async def monitor_positions_task():
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                         daily_stats['wins'] = daily_stats.get('wins', 0) + 1
                         daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
+                        daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
                         await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USDT")
                         continue
                     except: pass
@@ -398,7 +390,8 @@ async def print_stats_hourly():
         try:
             now = datetime.now(timezone.utc)
             trades = daily_stats.get('trades', 0)
-            winrate = (daily_stats['wins'] / trades * 100) if trades > 0 else 0
+            wins = daily_stats.get('wins', 0)
+            winrate = (wins / trades * 100) if trades > 0 else 0
             pnl = daily_stats.get('pnl', 0.0)
             
             active = ", ".join([f"{p['symbol'].split(':')[0]}" for p in active_positions]) or "Нет"
@@ -411,19 +404,29 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 
+                g_profit = daily_stats.get('gross_profit', 0.0)
+                g_loss = daily_stats.get('gross_loss', 0.0)
+                avg_win = (g_profit / wins) if wins > 0 else 0.0
+                losses_count = trades - wins
+                avg_loss = (g_loss / losses_count) if losses_count > 0 else 0.0
+                profit_factor = (g_profit / g_loss) if g_loss > 0 else float('inf')
+                
                 report = (
                     f"🗓 <b>ИТОГИ ДНЯ (BINGX Async Bot):</b> {now.strftime('%d.%m.%Y')}\n\n"
                     f"📉 Закрыто сделок: {trades}\n"
                     f"🎯 Винрейт: {winrate:.1f}%\n"
-                    f"💵 PNL сделок: {pnl:+.2f} USDT\n\n"
+                    f"💵 Net PNL: {pnl:+.2f} USDT\n\n"
+                    f"📊 <b>Детальная Аналитика:</b>\n"
+                    f"🔸 Средняя прибыль: +{avg_win:.2f} $\n"
+                    f"🔸 Средний убыток: -{avg_loss:.2f} $\n"
+                    f"🔸 Profit Factor: {profit_factor:.2f}\n\n"
                     f"🏦 <b>Баланс аккаунта:</b> {current_balance:.2f} USDT\n"
                     f"📊 <b>Изменение за день:</b> {pct_change:+.2f}%\n\n"
                     f"<i>*Сделок в работе: {len(active_positions)}</i>"
                 )
                 await send_tg_msg(report)
                 
-                daily_stats['prev_winrate'] = winrate; daily_stats['pnl'] = 0.0; daily_stats['trades'] = 0; daily_stats['wins'] = 0
-                daily_stats['start_balance'] = current_balance
+                daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions)
                 REPORTED_TODAY = True
             elif now.hour != 20:
