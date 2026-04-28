@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === SMART DISK DETECTION FOR RENDER ===
 DB_PATH = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -199,7 +198,6 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
 
     sl_id = None
     try:
-        # ВНИМАНИЕ: Ставим ТОЛЬКО Stop-Loss. Тейк-профиты бот забирает динамически.
         sl_ord = await safe_create_order(sym, 'stop_market', sl_side, qty, {'triggerPrice': sl_price, 'reduceOnly': True, 'positionSide': pos_side})
         sl_id = sl_ord['id']
     except Exception as e:
@@ -214,13 +212,29 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         'initial_qty': qty, 'current_qty': qty, 'sl_price': sl_price, 'current_sl': sl_price, 
         'tp1': tp_price, 'sl_order_id': sl_id, 'open_time': datetime.now(timezone.utc).isoformat(),
         'strategy': strategy_name, 'be_moved': False, 'tp80_hit': False, 'tp100_hit': False,
-        'atr': actual_sl_dist * 0.5 # Шаг для трейлинга
+        'atr': actual_sl_dist * 0.5
     })
     await asyncio.to_thread(save_positions)
     
     oracle_text = "\n🌐 <i>Подтверждено Оракулом (Multi-Exchange)</i>" if strategy_name == "GRID Oracle" else ""
+    
+    analytics_text = ""
+    if strategy_name == "SMC Async":
+        analytics_text = (f"📊 <b>Параметры входа (SMC):</b>\n"
+                          f"• Макро-тренд (BTC): {signal_data.get('btc_trend', 'N/A')}\n"
+                          f"• Слом структуры: {signal_data.get('choch_type', 'N/A')}\n"
+                          f"• Зона интереса: {signal_data.get('fvg_type', 'N/A')} FVG\n"
+                          f"• Отклонение от EMA200: {signal_data.get('ema_dist', 0):+.2f}%")
+    else: 
+        analytics_text = (f"📊 <b>Параметры входа (GRID):</b>\n"
+                          f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
+                          f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
+
     msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name}]: {sym.split(':')[0]}</b>{oracle_text}\n"
-           f"Направление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nSmart TP Цель: {tp_price}")
+           f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
+           f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
+           f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
+    
     await send_tg_msg(msg)
 
 async def monitor_positions_task():
@@ -236,18 +250,26 @@ async def monitor_positions_task():
                 sym = pos['symbol']
                 clean_name = sym.split(':')[0]
                 is_long = pos['direction'] == 'Long'
+                
+                # БЛОК ОБРАТНОЙ СОВМЕСТИМОСТИ (Для горячего деплоя старых сделок)
+                if 'current_qty' not in pos: pos['current_qty'] = pos['initial_qty']
+                if 'be_moved' not in pos: pos['be_moved'] = False
+                if 'tp80_hit' not in pos: pos['tp80_hit'] = False
+                if 'tp100_hit' not in pos: pos['tp100_hit'] = False
+                if 'atr' not in pos: pos['atr'] = abs(pos['entry_price'] - pos['sl_price']) * 0.5
+                if 'current_sl' not in pos: pos['current_sl'] = pos['sl_price']
+
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 pos_side = 'LONG' if is_long else 'SHORT'
                 sl_side = 'sell' if is_long else 'buy'
                 
-                # Защита от закрытия биржей по SL
                 if not curr:
-                    exit_price = pos.get('current_sl', pos['sl_price'])
+                    exit_price = pos['current_sl']
                     chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['current_qty']
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                     daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
-                    if chunk_pnl < 0 and not pos.get('be_moved'):
+                    if chunk_pnl < 0 and not pos['be_moved']:
                         daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(chunk_pnl)
                         COOLDOWN_CACHE[sym] = time.time() + 14400
                         await send_tg_msg(f"🛑 <b>{clean_name} закрыта по SL.</b>\nPNL: {chunk_pnl:.2f} USDT")
@@ -259,7 +281,6 @@ async def monitor_positions_task():
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
 
-                # Тайм-аут
                 if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
@@ -272,7 +293,6 @@ async def monitor_positions_task():
                         continue
                     except: pass
 
-                # === SMART TRAIL & SCALE MODULE ===
                 try: 
                     ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
                     high_p = max([float(c[2]) for c in ohlcv]); low_p = min([float(c[3]) for c in ohlcv])
@@ -284,8 +304,7 @@ async def monitor_positions_task():
                 tp80 = entry + dist * 0.80
                 tp100 = pos['tp1']
 
-                # ШАГ 1: БЕЗУБЫТОК (60%)
-                if not pos.get('be_moved'):
+                if not pos['be_moved']:
                     if (is_long and high_p >= tp60) or (not is_long and low_p <= tp60):
                         be_price = float(exchange.price_to_precision(sym, entry * (1.002 if is_long else 0.998)))
                         if pos.get('sl_order_id'): 
@@ -295,8 +314,7 @@ async def monitor_positions_task():
                         pos.update({'be_moved': True, 'sl_order_id': new_sl['id'], 'current_sl': be_price})
                         await send_tg_msg(f"🛡 <b>{clean_name}</b>: Цена прошла 60%. SL перенесен в Б/У.")
 
-                # ШАГ 2: ФИКСАЦИЯ 25% (80%)
-                if pos.get('be_moved') and not pos.get('tp80_hit'):
+                if pos['be_moved'] and not pos['tp80_hit']:
                     if (is_long and high_p >= tp80) or (not is_long and low_p <= tp80):
                         close_qty = float(exchange.amount_to_precision(sym, pos['initial_qty'] * 0.25))
                         if close_qty > 0:
@@ -312,8 +330,7 @@ async def monitor_positions_task():
                             pos.update({'tp80_hit': True, 'sl_order_id': new_sl['id']})
                             await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла 80%. Закрыто 25% объема. (PNL: +{chunk_pnl:.2f})")
 
-                # ШАГ 3: ФИКСАЦИЯ 50% и ТРЕЙЛИНГ (100%)
-                if pos.get('tp80_hit') and not pos.get('tp100_hit'):
+                if pos['tp80_hit'] and not pos['tp100_hit']:
                     if (is_long and high_p >= tp100) or (not is_long and low_p <= tp100):
                         close_qty = float(exchange.amount_to_precision(sym, pos['initial_qty'] * 0.50))
                         if close_qty > 0:
@@ -332,8 +349,7 @@ async def monitor_positions_task():
                             pos.update({'tp100_hit': True, 'sl_order_id': new_sl['id'], 'current_sl': trail_sl})
                             await send_tg_msg(f"💰 <b>{clean_name}</b>: Тейк 100% взят! Закрыто еще 50%. Включен Трейлинг. (PNL: +{chunk_pnl:.2f})")
 
-                # ШАГ 4: ДИНАМИЧЕСКИЙ ТРЕЙЛИНГ
-                if pos.get('tp100_hit'):
+                if pos['tp100_hit']:
                     trail_sl = float(exchange.price_to_precision(sym, high_p - pos['atr'] if is_long else low_p + pos['atr']))
                     if (is_long and trail_sl > pos['current_sl']) or (not is_long and trail_sl < pos['current_sl']):
                         if pos.get('sl_order_id'): 
@@ -360,6 +376,7 @@ async def process_smc_coin(sym, btc_trend, sem):
             trend, bos_choch = analyze_structure(h, l, c)
             fvgs = analyze_fvg(o, h, l, c)
             current_price = c[-1]; ema200 = calculate_ema(c, 200)
+            ema_dist = ((current_price - ema200) / ema200) * 100
             
             active_fvg = next((fvg for fvg in reversed(fvgs) if (fvg['type'] == 'Bullish' and current_price > fvg['top']) or (fvg['type'] == 'Bearish' and current_price < fvg['bottom'])), None)
             
@@ -380,7 +397,7 @@ async def process_smc_coin(sym, btc_trend, sem):
                 if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price}
+            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'btc_trend': btc_trend, 'fvg_type': active_fvg['type'], 'choch_type': bos_choch, 'ema_dist': ema_dist}
         except: return sym, 'error'
 
 async def smc_radar_task():
@@ -439,7 +456,8 @@ async def process_grid_coin(sym, sem):
             o, h, l, c, v = np.array([x[1] for x in ohlcv]), np.array([x[2] for x in ohlcv]), np.array([x[3] for x in ohlcv]), np.array([x[4] for x in ohlcv]), np.array([x[5] for x in ohlcv])
             avg_vol = np.mean(v[-22:-2])
             
-            if v[-2] < (avg_vol * 1.20): return sym, 'no_vol_spike'
+            vol_ratio = v[-2] / avg_vol if avg_vol > 0 else 0
+            if vol_ratio < 1.20: return sym, 'no_vol_spike'
             candle_size_pct = abs(c[-2] - o[-2]) / o[-2] * 100
             if candle_size_pct < 2.0: return sym, 'no_price_spike'
             
@@ -459,7 +477,7 @@ async def process_grid_coin(sym, sem):
                 if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            return sym, {'mode': direction, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price}
+            return sym, {'mode': direction, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'vol_ratio': vol_ratio, 'candle_size': candle_size_pct}
         except: return sym, 'error'
 
 async def grid_radar_task():
@@ -510,7 +528,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.36):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.38):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -518,12 +536,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.36] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.38] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.36")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.38")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -535,8 +553,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.36 (Smart Scale & Render Disk)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.36</b> запущен (Smart Trailing & Scaling включен)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.38 (Full Analytics & Backward Compat)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.38</b> запущен (Smart Trailing + Полная аналитика)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
