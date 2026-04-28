@@ -23,8 +23,9 @@ RISK_PER_TRADE = 0.02
 MAX_POSITIONS = 3           
 LEVERAGE = 10               
 MIN_VOLUME_USDT = 1000000   
-MIN_SL_PCT = 1.0            
-MAX_SL_PCT = 5.0            
+# Было 1.0, делаем шире, чтобы дать цене "подышать"
+MIN_SL_PCT = 1.5            
+MAX_SL_PCT = 6.0
 
 SMC_TIMEFRAME = '15m'
 COOLDOWN_CACHE = {}         
@@ -372,17 +373,30 @@ async def process_smc_coin(sym, btc_trend, sem):
             ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=200)
             if not ohlcv or len(ohlcv) < 50: return sym, 'no_data'
             
-            o, h, l, c = np.array([x[1] for x in ohlcv], dtype=float), np.array([x[2] for x in ohlcv], dtype=float), np.array([x[3] for x in ohlcv], dtype=float), np.array([x[4] for x in ohlcv], dtype=float)
+            o, h, l, c, v = np.array([x[1] for x in ohlcv], dtype=float), np.array([x[2] for x in ohlcv], dtype=float), np.array([x[3] for x in ohlcv], dtype=float), np.array([x[4] for x in ohlcv], dtype=float), np.array([x[5] for x in ohlcv], dtype=float)
             trend, bos_choch = analyze_structure(h, l, c)
             fvgs = analyze_fvg(o, h, l, c)
             current_price = c[-1]; ema200 = calculate_ema(c, 200)
             ema_dist = ((current_price - ema200) / ema200) * 100
             
-            active_fvg = next((fvg for fvg in reversed(fvgs) if (fvg['type'] == 'Bullish' and current_price > fvg['top']) or (fvg['type'] == 'Bearish' and current_price < fvg['bottom'])), None)
+            # 1. ЖЕСТКИЙ ФИЛЬТР FVG (только свежие имбалансы, максимум 15 свечей назад)
+            active_fvg = next((fvg for fvg in reversed(fvgs) if (
+                (fvg['type'] == 'Bullish' and current_price > fvg['top'] and (len(c) - fvg['index']) <= 15) or 
+                (fvg['type'] == 'Bearish' and current_price < fvg['bottom'] and (len(c) - fvg['index']) <= 15)
+            )), None)
             
             if not bos_choch: return sym, 'no_choch'
             if not active_fvg: return sym, 'no_fvg'
             
+            # 2. ФИЛЬТР ОБЪЕМА (Умные деньги всегда оставляют след в объемах)
+            avg_vol = np.mean(v[-22:-2])
+            vol_ratio = v[-2] / avg_vol if avg_vol > 0 else 0
+            if vol_ratio < 1.30: return sym, 'no_volume' # Требуем всплеск объема +30%
+            
+            # 3. ФИЛЬТР ТЕЛА СВЕЧИ (Отсекаем доджи и шум)
+            candle_body = abs(c[-2] - o[-2]) / o[-2] * 100
+            if candle_body < 0.5: return sym, 'weak_candle'
+
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             
             if not mode: return sym, 'no_setup'
@@ -417,7 +431,7 @@ async def smc_radar_task():
             tickers = await exchange.fetch_tickers()
             temp_symbols = [(sym, float(tick.get('quoteVolume') or 0)) for sym, tick in tickers.items() if sym.endswith(':USDT') and exchange.markets.get(sym, {}).get('active') is not False and not any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS) and sym not in COOLDOWN_CACHE and not any(pos['symbol'].split(':')[0] == sym.split(':')[0] for pos in active_positions)]
             
-            stats = {'total': len(tickers), 'low_vol': 0, 'no_choch': 0, 'no_fvg': 0, 'wrong_trend': 0, 'passed': 0}
+            stats = {'total': len(tickers), 'low_vol': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'weak_candle': 0, 'wrong_trend': 0, 'passed': 0}
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
             stats['low_vol'] = len(temp_symbols) - len(valid_symbols_data)
             
@@ -433,11 +447,13 @@ async def smc_radar_task():
                     if signal == 'wrong_trend': stats['wrong_trend'] += 1
                     elif signal == 'no_choch': stats['no_choch'] += 1
                     elif signal == 'no_fvg': stats['no_fvg'] += 1
+                    elif signal == 'no_volume': stats['no_volume'] += 1
+                    elif signal == 'weak_candle': stats['weak_candle'] += 1
                     elif isinstance(signal, dict): 
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC РАДАР] Всего: {stats['total']} -> Неликвид: {stats['low_vol']} -> Нет CHoCH: {stats['no_choch']} -> Нет FVG: {stats['no_fvg']} -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC РАДАР] Всего: {stats['total']} -> Нет CHoCH: {stats['no_choch']} -> Старый/Нет FVG: {stats['no_fvg']} -> Мало объема: {stats['no_volume']} -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
