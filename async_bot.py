@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-DB_PATH = 'bot.db' 
+# === SMART DISK DETECTION FOR RENDER ===
+DB_PATH = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
+
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
@@ -143,7 +145,6 @@ async def verify_global_volume(base_coin):
     confirmations = [r for r in results if r is True]
     return len(confirmations) >= 1
 
-# === УМНАЯ ОБЕРТКА ДЛЯ ОРДЕРОВ (Адаптация к Hedge Mode) ===
 async def safe_create_order(sym, order_type, side, qty, params):
     try:
         return await exchange.create_order(sym, order_type, side, qty, params=params)
@@ -175,13 +176,11 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
             
         risk_amount = free_usdt * RISK_PER_TRADE
         qty_coins = risk_amount / actual_sl_dist
-        
         max_margin_lock = free_usdt * 0.15 
         max_notional_usdt = max_margin_lock * LEVERAGE
         target_notional = qty_coins * current_price
         
         if target_notional > max_notional_usdt: qty_coins = max_notional_usdt / current_price
-        
         qty = float(exchange.amount_to_precision(sym, qty_coins))
         if qty <= 0: return
         
@@ -195,19 +194,16 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         order = await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
     except Exception as e: 
         logging.error(f"Trade Open Error {sym}: {e}")
-        COOLDOWN_CACHE[sym] = time.time() + 3600 # Блок на час при сбое
+        COOLDOWN_CACHE[sym] = time.time() + 3600 
         return
 
-    sl_id = None; tp_id = None
+    sl_id = None
     try:
+        # ВНИМАНИЕ: Ставим ТОЛЬКО Stop-Loss. Тейк-профиты бот забирает динамически.
         sl_ord = await safe_create_order(sym, 'stop_market', sl_side, qty, {'triggerPrice': sl_price, 'reduceOnly': True, 'positionSide': pos_side})
         sl_id = sl_ord['id']
-        try:
-            tp_ord = await safe_create_order(sym, 'take_profit_market', sl_side, qty, {'triggerPrice': tp_price, 'reduceOnly': True, 'positionSide': pos_side})
-            tp_id = tp_ord['id']
-        except: pass 
     except Exception as e:
-        COOLDOWN_CACHE[sym] = time.time() + 14400 # ЖЕСТКАЯ БЛОКИРОВКА НА 4 ЧАСА!
+        COOLDOWN_CACHE[sym] = time.time() + 14400 
         await send_tg_msg(f"🚨 <b>АВАРИЯ ПО {sym.split(':')[0]}</b>\nОшибка установки SL: <code>{e}</code>\nЭкстренное закрытие...")
         try: await safe_create_order(sym, 'market', sl_side, qty, {'positionSide': pos_side, 'reduceOnly': True})
         except: pass
@@ -215,15 +211,16 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
 
     active_positions.append({
         'symbol': sym, 'direction': direction, 'entry_price': current_price, 
-        'initial_qty': qty, 'sl_price': sl_price, 'tp1': tp_price, 
-        'sl_order_id': sl_id, 'tp_order_id': tp_id, 'open_time': datetime.now(timezone.utc).isoformat(),
-        'strategy': strategy_name
+        'initial_qty': qty, 'current_qty': qty, 'sl_price': sl_price, 'current_sl': sl_price, 
+        'tp1': tp_price, 'sl_order_id': sl_id, 'open_time': datetime.now(timezone.utc).isoformat(),
+        'strategy': strategy_name, 'be_moved': False, 'tp80_hit': False, 'tp100_hit': False,
+        'atr': actual_sl_dist * 0.5 # Шаг для трейлинга
     })
     await asyncio.to_thread(save_positions)
     
     oracle_text = "\n🌐 <i>Подтверждено Оракулом (Multi-Exchange)</i>" if strategy_name == "GRID Oracle" else ""
     msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name}]: {sym.split(':')[0]}</b>{oracle_text}\n"
-           f"Направление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
+           f"Направление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nSmart TP Цель: {tp_price}")
     await send_tg_msg(msg)
 
 async def monitor_positions_task():
@@ -232,8 +229,7 @@ async def monitor_positions_task():
         try:
             if not active_positions: await asyncio.sleep(15); continue
             positions_raw = await exchange.fetch_positions()
-            symbols_to_fetch = [p['symbol'] for p in active_positions]
-            tickers = await exchange.fetch_tickers(symbols_to_fetch)
+            tickers = await exchange.fetch_tickers([p['symbol'] for p in active_positions])
             
             updated = []
             for pos in active_positions:
@@ -243,40 +239,111 @@ async def monitor_positions_task():
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 pos_side = 'LONG' if is_long else 'SHORT'
+                sl_side = 'sell' if is_long else 'buy'
                 
+                # Защита от закрытия биржей по SL
                 if not curr:
-                    pnl = (pos['sl_price'] - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - pos['sl_price']) * pos['initial_qty']
-                    daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl; daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
-                    COOLDOWN_CACHE[sym] = time.time() + 14400
-                    await send_tg_msg(f"🛑 <b>{clean_name} закрыта по SL/Руками.</b>\nPNL: {pnl:.2f} USDT")
+                    exit_price = pos.get('current_sl', pos['sl_price'])
+                    chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['current_qty']
+                    daily_stats['trades'] = daily_stats.get('trades', 0) + 1
+                    daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
+                    if chunk_pnl < 0 and not pos.get('be_moved'):
+                        daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(chunk_pnl)
+                        COOLDOWN_CACHE[sym] = time.time() + 14400
+                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта по SL.</b>\nPNL: {chunk_pnl:.2f} USDT")
+                    else:
+                        await send_tg_msg(f"🛡 <b>{clean_name} закрыта по Трейлингу/Б/У!</b>\nPNL: {chunk_pnl:+.2f} USDT")
                     continue
 
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
-                pnl = (ticker - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - ticker) * pos['initial_qty']
+                pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
 
+                # Тайм-аут
                 if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
                     try:
-                        await safe_create_order(sym, 'market', 'sell' if is_long else 'buy', pos['initial_qty'], {'positionSide': pos_side, 'reduceOnly': True})
+                        await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
-                        if pos.get('tp_order_id'): await exchange.cancel_order(pos['tp_order_id'], sym)
-                        daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
+                        daily_stats['trades'] = daily_stats.get('trades', 0) + 1
+                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                         if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
                         else: daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl); COOLDOWN_CACHE[sym] = time.time() + 14400
                         await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT")
                         continue
                     except: pass
 
-                if (is_long and ticker >= pos['tp1']) or (not is_long and ticker <= pos['tp1']):
-                    try:
-                        await safe_create_order(sym, 'market', 'sell' if is_long else 'buy', pos['initial_qty'], {'positionSide': pos_side, 'reduceOnly': True})
-                        if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
-                        if pos.get('tp_order_id'): await exchange.cancel_order(pos['tp_order_id'], sym)
-                        daily_stats['trades'] = daily_stats.get('trades', 0) + 1; daily_stats['wins'] = daily_stats.get('wins', 0) + 1
-                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
-                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USDT")
-                        continue
-                    except: pass
+                # === SMART TRAIL & SCALE MODULE ===
+                try: 
+                    ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
+                    high_p = max([float(c[2]) for c in ohlcv]); low_p = min([float(c[3]) for c in ohlcv])
+                except: high_p = low_p = ticker
+
+                entry = pos['entry_price']
+                dist = pos['tp1'] - entry
+                tp60 = entry + dist * 0.60
+                tp80 = entry + dist * 0.80
+                tp100 = pos['tp1']
+
+                # ШАГ 1: БЕЗУБЫТОК (60%)
+                if not pos.get('be_moved'):
+                    if (is_long and high_p >= tp60) or (not is_long and low_p <= tp60):
+                        be_price = float(exchange.price_to_precision(sym, entry * (1.002 if is_long else 0.998)))
+                        if pos.get('sl_order_id'): 
+                            try: await exchange.cancel_order(pos['sl_order_id'], sym)
+                            except: pass
+                        new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': be_price, 'reduceOnly': True, 'positionSide': pos_side})
+                        pos.update({'be_moved': True, 'sl_order_id': new_sl['id'], 'current_sl': be_price})
+                        await send_tg_msg(f"🛡 <b>{clean_name}</b>: Цена прошла 60%. SL перенесен в Б/У.")
+
+                # ШАГ 2: ФИКСАЦИЯ 25% (80%)
+                if pos.get('be_moved') and not pos.get('tp80_hit'):
+                    if (is_long and high_p >= tp80) or (not is_long and low_p <= tp80):
+                        close_qty = float(exchange.amount_to_precision(sym, pos['initial_qty'] * 0.25))
+                        if close_qty > 0:
+                            await safe_create_order(sym, 'market', sl_side, close_qty, {'positionSide': pos_side, 'reduceOnly': True})
+                            if pos.get('sl_order_id'): 
+                                try: await exchange.cancel_order(pos['sl_order_id'], sym)
+                                except: pass
+                            pos['current_qty'] = float(exchange.amount_to_precision(sym, pos['current_qty'] - close_qty))
+                            new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': pos['current_sl'], 'reduceOnly': True, 'positionSide': pos_side})
+                            
+                            chunk_pnl = (tp80 - entry) * close_qty if is_long else (entry - tp80) * close_qty
+                            daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
+                            pos.update({'tp80_hit': True, 'sl_order_id': new_sl['id']})
+                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла 80%. Закрыто 25% объема. (PNL: +{chunk_pnl:.2f})")
+
+                # ШАГ 3: ФИКСАЦИЯ 50% и ТРЕЙЛИНГ (100%)
+                if pos.get('tp80_hit') and not pos.get('tp100_hit'):
+                    if (is_long and high_p >= tp100) or (not is_long and low_p <= tp100):
+                        close_qty = float(exchange.amount_to_precision(sym, pos['initial_qty'] * 0.50))
+                        if close_qty > 0:
+                            await safe_create_order(sym, 'market', sl_side, close_qty, {'positionSide': pos_side, 'reduceOnly': True})
+                            if pos.get('sl_order_id'): 
+                                try: await exchange.cancel_order(pos['sl_order_id'], sym)
+                                except: pass
+                            pos['current_qty'] = float(exchange.amount_to_precision(sym, pos['current_qty'] - close_qty))
+                            
+                            trail_sl = float(exchange.price_to_precision(sym, tp100 - pos['atr'] if is_long else tp100 + pos['atr']))
+                            new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': trail_sl, 'reduceOnly': True, 'positionSide': pos_side})
+                            
+                            chunk_pnl = (tp100 - entry) * close_qty if is_long else (entry - tp100) * close_qty
+                            daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
+                            daily_stats['wins'] = daily_stats.get('wins', 0) + 1 
+                            pos.update({'tp100_hit': True, 'sl_order_id': new_sl['id'], 'current_sl': trail_sl})
+                            await send_tg_msg(f"💰 <b>{clean_name}</b>: Тейк 100% взят! Закрыто еще 50%. Включен Трейлинг. (PNL: +{chunk_pnl:.2f})")
+
+                # ШАГ 4: ДИНАМИЧЕСКИЙ ТРЕЙЛИНГ
+                if pos.get('tp100_hit'):
+                    trail_sl = float(exchange.price_to_precision(sym, high_p - pos['atr'] if is_long else low_p + pos['atr']))
+                    if (is_long and trail_sl > pos['current_sl']) or (not is_long and trail_sl < pos['current_sl']):
+                        if pos.get('sl_order_id'): 
+                            try: await exchange.cancel_order(pos['sl_order_id'], sym)
+                            except: pass
+                        try:
+                            new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': trail_sl, 'reduceOnly': True, 'positionSide': pos_side})
+                            pos.update({'sl_order_id': new_sl['id'], 'current_sl': trail_sl})
+                        except: pass
+
                 updated.append(pos)
             active_positions = updated; await asyncio.to_thread(save_positions)
         except Exception as e: pass
@@ -337,7 +404,7 @@ async def smc_radar_task():
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
             stats['low_vol'] = len(temp_symbols) - len(valid_symbols_data)
             
-            logging.info(f"⏳ [SMC РАДАР] Начинаю опрос {len(valid_symbols_data)} монет, ожидайте...")
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет...")
             
             sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, btc_trend, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -408,7 +475,7 @@ async def grid_radar_task():
             stats = {'vol_fail': 0, 'price_fail': 0, 'oracle_reject': 0, 'passed': 0}
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
             
-            logging.info(f"⏳ [GRID РАДАР] Начинаю опрос {len(valid_symbols_data)} монет, ожидайте...")
+            logging.info(f"⏳ [GRID РАДАР] Опрос {len(valid_symbols_data)} монет...")
             
             sem = asyncio.Semaphore(10); tasks = [process_grid_coin(s, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -424,7 +491,7 @@ async def grid_radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🌐 [GRID РАДАР] Отклонено объемом: {stats['vol_fail']} -> Нет пробоя: {stats['price_fail']} -> Зарубил Оракул: {stats['oracle_reject']} -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🌐 [GRID РАДАР] Откл. объемом: {stats['vol_fail']} -> Нет пробоя: {stats['price_fail']} -> Оракул: {stats['oracle_reject']} -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
@@ -443,19 +510,20 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.35.2):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.36):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
             
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0] for p in active_positions]) or "Нет"
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.35.2] В работе: {active} | Винрейт: {winrate:.1f}%")
+                winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.36] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.35.2")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.36")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -467,8 +535,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.35.2 (Hedge Mode Fix & Anti-Loop)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.35.2</b> запущен (Исправлена установка SL/TP и цикл ошибок)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.36 (Smart Scale & Render Disk)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.36</b> запущен (Smart Trailing & Scaling включен)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
