@@ -114,6 +114,13 @@ def calculate_rsi(prices, window=14):
     if avg_gain == 0: return 0
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
+def calculate_vwap(h, l, c, v):
+    if len(c) < 50: return c[-1]
+    typ_price = (h[-50:] + l[-50:] + c[-50:]) / 3
+    vol_sum = np.sum(v[-50:])
+    if vol_sum == 0: return c[-1]
+    return np.sum(typ_price * v[-50:]) / vol_sum
+
 def analyze_fvg(o, h, l, c):
     fvg_list = []
     for i in range(1, len(c)-1):
@@ -226,22 +233,24 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
     })
     await asyncio.to_thread(save_positions)
     
-    oracle_text = "\n🌐 <i>Подтверждено Оракулом (Multi-Exchange)</i>" if strategy_name == "GRID Oracle" else ""
+    oracle_text = "\n🌐 <i>Подтверждено Оракулом</i>" if strategy_name == "GRID Oracle" else ""
     
     analytics_text = ""
     if strategy_name == "SMC Async":
+        altseason_text = "🟢 Активен (ETH доминирует)" if signal_data.get('altseason') else "🔴 Выключен"
         analytics_text = (f"📊 <b>Параметры входа (SMC):</b>\n"
                           f"• Макро-тренд (BTC): {signal_data.get('btc_trend', 'N/A')}\n"
+                          f"• Альтсезон: {altseason_text}\n"
                           f"• Слом структуры: {signal_data.get('choch_type', 'N/A')}\n"
-                          f"• Зона интереса: {signal_data.get('fvg_type', 'N/A')} FVG\n"
                           f"• Отклонение от EMA200: {signal_data.get('ema_dist', 0):+.2f}%\n"
-                          f"• Осциллятор (RSI): {signal_data.get('rsi', 0):.1f}")
+                          f"• Осциллятор (RSI): {signal_data.get('rsi', 0):.1f}\n"
+                          f"• Цена к VWAP: {'Выше' if current_price > signal_data.get('vwap', 0) else 'Ниже'}")
     else: 
         analytics_text = (f"📊 <b>Параметры входа (GRID):</b>\n"
                           f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
                           f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.41]: {clean_sym}</b>{oracle_text}\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.42]: {clean_sym}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -377,7 +386,7 @@ async def monitor_positions_task():
         except Exception as e: pass
         await asyncio.sleep(15)
 
-async def process_smc_coin(sym, btc_trend, sem):
+async def process_smc_coin(sym, btc_trend, altseason, sem):
     async with sem:
         try:
             await asyncio.sleep(0.3)
@@ -390,6 +399,7 @@ async def process_smc_coin(sym, btc_trend, sem):
             current_price = c[-1]; ema200 = calculate_ema(c, 200)
             ema_dist = ((current_price - ema200) / ema200) * 100
             
+            vwap = calculate_vwap(h, l, c, v)
             rsi = calculate_rsi(c[:-1], 14)
             atr = np.mean(np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))[-14:])
             
@@ -409,21 +419,26 @@ async def process_smc_coin(sym, btc_trend, sem):
             if candle_body < 0.5: return sym, 'weak_candle'
 
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
-            
             if not mode: return sym, 'no_setup'
-            if (mode == 'Long' and btc_trend != 'Long') or (mode == 'Short' and btc_trend != 'Short'): return sym, 'wrong_trend'
+            
+            # --- ЛОГИКА АЛЬТСЕЗОНА И BTC ---
+            # Если Лонг, а биток падает, НО у нас Альтсезон - разрешаем сделку!
+            if mode == 'Long' and btc_trend == 'Short' and not altseason: return sym, 'wrong_trend'
+            # Шорты всегда синхронизируем с битком
+            if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
 
-            # 1. ЖЕСТКИЙ ЗАПРЕТ: НИКАКОЙ ТОРГОВЛИ ПРОТИВ ТРЕНДА EMA200
-            if mode == 'Long' and ema_dist <= 0: return sym, 'counter_trend'
-            if mode == 'Short' and ema_dist >= 0: return sym, 'counter_trend'
+            # --- УМНЫЕ ФИЛЬТРЫ (VWAP и Расширенный EMA) ---
+            # VWAP Фильтр: нельзя лонговать под VWAP, нельзя шортить над VWAP
+            if mode == 'Long' and current_price < vwap: return sym, 'vwap_reject'
+            if mode == 'Short' and current_price > vwap: return sym, 'vwap_reject'
             
-            # 2. ЖЕСТКИЙ ЛИМИТ РАСТЯЖЕНИЯ (МАКСИМУМ 3.5%)
-            if mode == 'Long' and ema_dist > 3.5: return sym, 'overextended'
-            if mode == 'Short' and ema_dist < -3.5: return sym, 'overextended'
+            # Лимит растяжения ослаблен до 4.5% (даем монетам дышать)
+            if mode == 'Long' and ema_dist > 4.5: return sym, 'overextended'
+            if mode == 'Short' and ema_dist < -4.5: return sym, 'overextended'
             
-            # 3. ФИЛЬТР RSI
-            if mode == 'Long' and rsi > 45: return sym, 'rsi_exhausted'
-            if mode == 'Short' and rsi < 55: return sym, 'rsi_exhausted'
+            # ФИЛЬТР RSI (Смягчен благодаря страховке VWAP)
+            if mode == 'Long' and rsi > 55: return sym, 'rsi_exhausted'
+            if mode == 'Short' and rsi < 45: return sym, 'rsi_exhausted'
 
             if mode == 'Long':
                 sl_price = min(l[active_fvg['index']:]) - (atr * 2.0)
@@ -434,7 +449,7 @@ async def process_smc_coin(sym, btc_trend, sem):
                 if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'btc_trend': btc_trend, 'fvg_type': active_fvg['type'], 'choch_type': bos_choch, 'ema_dist': ema_dist, 'rsi': rsi}
+            return sym, {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'btc_trend': btc_trend, 'fvg_type': active_fvg['type'], 'choch_type': bos_choch, 'ema_dist': ema_dist, 'rsi': rsi, 'vwap': vwap, 'altseason': altseason}
         except: return sym, 'error'
 
 async def smc_radar_task():
@@ -443,12 +458,25 @@ async def smc_radar_task():
     while True:
         try:
             if len(active_positions) >= MAX_POSITIONS: await asyncio.sleep(60); continue
+            
             btc_trend = 'Long'
+            altseason = False 
+            
             try:
                 try: btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 except: btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
                 btc_trend = 'Long' if btc_c[-1] > calculate_ema(btc_c, 200) else 'Short'
+
+                try: eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT:USDT', timeframe=SMC_TIMEFRAME, limit=205)
+                except: eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
+                eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
+                
+                eth_return = (eth_c[-1] - eth_c[-50]) / eth_c[-50]
+                btc_return = (btc_c[-1] - btc_c[-50]) / btc_c[-50]
+                
+                if eth_return > btc_return and eth_c[-1] > calculate_ema(eth_c, 200):
+                    altseason = True
             except: pass
 
             tickers = await exchange.fetch_tickers()
@@ -460,13 +488,13 @@ async def smc_radar_task():
                     if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
             
-            stats = {'total': len(tickers), 'low_vol': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'weak_candle': 0, 'wrong_trend': 0, 'counter_trend': 0, 'overextended': 0, 'rsi_exhausted': 0, 'passed': 0}
+            stats = {'total': len(tickers), 'low_vol': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'weak_candle': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'rsi_exhausted': 0, 'passed': 0}
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
             stats['low_vol'] = len(temp_symbols) - len(valid_symbols_data)
             
-            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет...")
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'})...")
             
-            sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, btc_trend, sem) for s in valid_symbols_data]
+            sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, btc_trend, altseason, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             valid_results = []
@@ -478,14 +506,14 @@ async def smc_radar_task():
                     elif signal == 'no_fvg': stats['no_fvg'] += 1
                     elif signal == 'no_volume': stats['no_volume'] += 1
                     elif signal == 'weak_candle': stats['weak_candle'] += 1
-                    elif signal == 'counter_trend': stats['counter_trend'] += 1
+                    elif signal == 'vwap_reject': stats['vwap_reject'] += 1
                     elif signal == 'overextended': stats['overextended'] += 1
                     elif signal == 'rsi_exhausted': stats['rsi_exhausted'] += 1
                     elif isinstance(signal, dict): 
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC] Откл: Против Тренда({stats['counter_trend']}) Пузырь({stats['overextended']}) RSI({stats['rsi_exhausted']}) FVG({stats['no_fvg']}) -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC] Откл: Тренд({stats['wrong_trend']}) VWAP({stats['vwap_reject']}) Пузырь({stats['overextended']}) RSI({stats['rsi_exhausted']}) FVG({stats['no_fvg']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
@@ -584,7 +612,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.41):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.42):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -592,12 +620,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.41] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.42] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.41")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.42")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -609,8 +637,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.41 (Absolute Trend Alignment)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.41</b> запущен (Полный запрет торговли против локального тренда)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.42 (Smart VWAP & Altseason)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.42</b> запущен (Режим Альтсезона и Фильтр объемов VWAP включены)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
