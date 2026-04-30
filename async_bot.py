@@ -295,9 +295,15 @@ async def monitor_positions_task():
     global active_positions, daily_stats, COOLDOWN_CACHE
     while True:
         try:
-            if not active_positions: await asyncio.sleep(15); continue
-            positions_raw = await exchange.fetch_positions()
-            tickers = await exchange.fetch_tickers([p['symbol'] for p in active_positions])
+            if not active_positions: 
+                await asyncio.sleep(15)
+                continue
+                
+            # ИСПРАВЛЕНИЕ 1: Явно передаем символы в fetch_positions, 
+            # чтобы BingX API в Isolated режиме принудительно отдавал данные.
+            symbols_to_fetch = [p['symbol'] for p in active_positions]
+            positions_raw = await exchange.fetch_positions(symbols_to_fetch)
+            tickers = await exchange.fetch_tickers(symbols_to_fetch)
             
             updated = []
             for pos in active_positions:
@@ -311,13 +317,22 @@ async def monitor_positions_task():
                 if 'tp100_hit' not in pos: pos['tp100_hit'] = False
                 if 'atr' not in pos: pos['atr'] = abs(pos['entry_price'] - pos['sl_price']) * 0.5
                 if 'current_sl' not in pos: pos['current_sl'] = pos['sl_price']
+                if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
 
-                curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
+                # ИСПРАВЛЕНИЕ 2: Используем модуль abs() для контрактов на всякий случай
+                curr = next((r for r in positions_raw if r['symbol'] == sym and abs(float(r.get('contracts', 0))) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 pos_side = 'LONG' if is_long else 'SHORT'
                 sl_side = 'sell' if is_long else 'buy'
                 
                 if not curr:
+                    # ИСПРАВЛЕНИЕ 3: Защита от рассинхрона API (Grace Period). 
+                    # Даем бирже 60 секунд, чтобы сделка появилась в списках fetch_positions
+                    seconds_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds()
+                    if seconds_passed < 60:
+                        updated.append(pos)
+                        continue
+
                     exit_price = pos['current_sl']
                     chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['current_qty']
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
@@ -331,7 +346,6 @@ async def monitor_positions_task():
                         await send_tg_msg(f"🛡 <b>{clean_name} закрыта по Трейлингу/Б/У!</b>\nPNL: {chunk_pnl:+.2f} USDT")
                     continue
 
-                if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
 
@@ -702,7 +716,7 @@ async def main():
         except: pass
         
     logging.info("🚀 Запуск BINGX ASYNC БОТА v8.45 (Sniper Unchained)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.45</b> запущен (Исправлен удушающий лимит RSI, открыта охота на FVG)!")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.45</b> запущен (Исправлен баг «потери» изолированных позиций)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
