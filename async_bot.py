@@ -326,24 +326,42 @@ async def monitor_positions_task():
                 sl_side = 'sell' if is_long else 'buy'
                 
                 if not curr:
-                    # ИСПРАВЛЕНИЕ 3: Защита от рассинхрона API (Grace Period). 
-                    # Даем бирже 60 секунд, чтобы сделка появилась в списках fetch_positions
+                    # ЗАЩИТА 60 СЕКУНД (От рассинхрона API)
                     seconds_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds()
                     if seconds_passed < 60:
                         updated.append(pos)
                         continue
 
+                    # --- НОВЫЙ БЛОК: РЕАЛЬНЫЙ PNL И ЦЕНА ВЫХОДА ---
                     exit_price = pos['current_sl']
+                    real_close_type = "SL (Синтетика)"
+                    try:
+                        # Пытаемся получить реальную историю закрытия с биржи
+                        trades = await exchange.fetch_my_trades(sym, limit=5)
+                        if trades:
+                            open_ts = int(datetime.fromisoformat(pos['open_time']).timestamp() * 1000)
+                            valid_trades = [t for t in trades if t['timestamp'] >= open_ts]
+                            if valid_trades:
+                                exit_price = valid_trades[-1]['price']
+                                real_close_type = "Биржа (Реал. цена)"
+                    except Exception:
+                        # Если биржа не отдает трейды, берем текущий тикер (идеально для ручных закрытий и TP)
+                        exit_price = ticker
+                        real_close_type = "Тикер"
+
                     chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['current_qty']
+                    
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                     daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
                     COOLDOWN_CACHE[clean_name] = time.time() + 14400
                     
                     if chunk_pnl < 0 and not pos['be_moved']:
                         daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(chunk_pnl)
-                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта по SL.</b>\nPNL: {chunk_pnl:.2f} USDT")
+                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:.2f} USDT")
                     else:
-                        await send_tg_msg(f"🛡 <b>{clean_name} закрыта по Трейлингу/Б/У!</b>\nPNL: {chunk_pnl:+.2f} USDT")
+                        daily_stats['wins'] = daily_stats.get('wins', 0) + 1
+                        daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + chunk_pnl
+                        await send_tg_msg(f"✅ <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:+.2f} USDT")
                     continue
 
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
@@ -465,7 +483,7 @@ async def process_smc_coin(sym, ctx, sem):
             
             avg_vol = np.mean(v[-22:-2])
             vol_ratio = v[-2] / avg_vol if avg_vol > 0 else 0
-            if vol_ratio < 1.30 or vol_ratio > 5.0: return sym, 'no_volume'
+            if vol_ratio < 1.20 or vol_ratio > 5.0: return sym, 'no_volume'
             
             candle_body = abs(c[-2] - o[-2]) / o[-2] * 100
             if candle_body < 0.5: return sym, 'weak_candle'
@@ -611,7 +629,7 @@ async def process_grid_coin(sym, sem):
             avg_vol = np.mean(v[-22:-2])
             
             vol_ratio = v[-2] / avg_vol if avg_vol > 0 else 0
-            if vol_ratio < 1.30 or vol_ratio > 6.0: return sym, 'no_vol_spike'
+            if vol_ratio < 1.20 or vol_ratio > 6.0: return sym, 'no_vol_spike'
             
             candle_size_pct = abs(c[-2] - o[-2]) / o[-2] * 100
             if candle_size_pct < 1.0: return sym, 'no_price_spike'
