@@ -229,7 +229,8 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         'initial_qty': qty, 'current_qty': qty, 'sl_price': sl_price, 'current_sl': sl_price, 
         'tp1': tp_price, 'sl_order_id': sl_id, 'open_time': datetime.now(timezone.utc).isoformat(),
         'strategy': strategy_name, 'be_moved': False, 'tp80_hit': False, 'tp100_hit': False,
-        'atr': actual_sl_dist * 0.5 
+        'atr': actual_sl_dist * 0.5,
+        'mfe_price': current_price, 'mae_price': current_price
     })
     await asyncio.to_thread(save_positions)
     
@@ -260,16 +261,16 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
 
         rsi = signal_data.get('rsi', 0)
         if mode == 'Long':
-            rsi_eval = "🔥 Идеально (Остыл)" if rsi < 45 else "👍 Норма" if rsi <= 60 else "⚠️ Перегрет"
+            rsi_eval = "🔥 Идеально (Остыл)" if rsi < 45 else "👍 Норма" if rsi <= 55 else "⚠️ Перегрет"
         else:
-            rsi_eval = "🔥 Идеально (Перегрет)" if rsi > 55 else "👍 Норма" if rsi >= 40 else "⚠️ Остыл"
+            rsi_eval = "🔥 Идеально (Перегрет)" if rsi > 55 else "👍 Норма" if rsi >= 45 else "⚠️ Остыл"
 
         vwap = signal_data.get('vwap', 0)
         vwap_dist = (current_price - vwap) / vwap * 100
         if mode == 'Long':
-            vwap_eval = f"Выше (Поддержка {vwap_dist:+.2f}%) 🟢" if vwap_dist > 0 else f"Ниже (Давление {vwap_dist:+.2f}%) 🔴"
+            vwap_eval = f"Ниже (Дисконт {vwap_dist:+.2f}%) 💎" if vwap_dist <= 0 else f"Выше (Норма {vwap_dist:+.2f}%) 🟢"
         else:
-            vwap_eval = f"Ниже (Сопротивление {vwap_dist:+.2f}%) 🟢" if vwap_dist < 0 else f"Выше (Опасно {vwap_dist:+.2f}%) 🔴"
+            vwap_eval = f"Выше (Премия {vwap_dist:+.2f}%) 💎" if vwap_dist >= 0 else f"Ниже (Норма {vwap_dist:+.2f}%) 🟢"
 
         analytics_text = (f"📊 <b>Аналитика сетапа (SMC):</b>\n"
                           f"• Тренд BTC: {btc_trend_str}\n"
@@ -284,7 +285,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                           f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
                           f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.45]: {clean_sym}</b>{oracle_text}\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.50]: {clean_sym}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -299,8 +300,6 @@ async def monitor_positions_task():
                 await asyncio.sleep(15)
                 continue
                 
-            # ИСПРАВЛЕНИЕ 1: Явно передаем символы в fetch_positions, 
-            # чтобы BingX API в Isolated режиме принудительно отдавал данные.
             symbols_to_fetch = [p['symbol'] for p in active_positions]
             positions_raw = await exchange.fetch_positions(symbols_to_fetch)
             tickers = await exchange.fetch_tickers(symbols_to_fetch)
@@ -318,25 +317,35 @@ async def monitor_positions_task():
                 if 'atr' not in pos: pos['atr'] = abs(pos['entry_price'] - pos['sl_price']) * 0.5
                 if 'current_sl' not in pos: pos['current_sl'] = pos['sl_price']
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
+                if 'mfe_price' not in pos: pos['mfe_price'] = pos['entry_price']
+                if 'mae_price' not in pos: pos['mae_price'] = pos['entry_price']
 
-                # ИСПРАВЛЕНИЕ 2: Используем модуль abs() для контрактов на всякий случай
                 curr = next((r for r in positions_raw if r['symbol'] == sym and abs(float(r.get('contracts', 0))) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 pos_side = 'LONG' if is_long else 'SHORT'
                 sl_side = 'sell' if is_long else 'buy'
                 
+                try: 
+                    ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
+                    high_p = max([float(c[2]) for c in ohlcv]); low_p = min([float(c[3]) for c in ohlcv])
+                except: high_p = low_p = ticker
+
+                if is_long:
+                    pos['mfe_price'] = max(pos['mfe_price'], high_p)
+                    pos['mae_price'] = min(pos['mae_price'], low_p)
+                else:
+                    pos['mfe_price'] = min(pos['mfe_price'], low_p)
+                    pos['mae_price'] = max(pos['mae_price'], high_p)
+                
                 if not curr:
-                    # ЗАЩИТА 60 СЕКУНД (От рассинхрона API)
                     seconds_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds()
                     if seconds_passed < 60:
                         updated.append(pos)
                         continue
 
-                    # --- НОВЫЙ БЛОК: РЕАЛЬНЫЙ PNL И ЦЕНА ВЫХОДА ---
                     exit_price = pos['current_sl']
                     real_close_type = "SL (Синтетика)"
                     try:
-                        # Пытаемся получить реальную историю закрытия с биржи
                         trades = await exchange.fetch_my_trades(sym, limit=5)
                         if trades:
                             open_ts = int(datetime.fromisoformat(pos['open_time']).timestamp() * 1000)
@@ -345,23 +354,35 @@ async def monitor_positions_task():
                                 exit_price = valid_trades[-1]['price']
                                 real_close_type = "Биржа (Реал. цена)"
                     except Exception:
-                        # Если биржа не отдает трейды, берем текущий тикер (идеально для ручных закрытий и TP)
                         exit_price = ticker
                         real_close_type = "Тикер"
 
+                    # Обновляем MFE/MAE по реальной цене выхода
+                    if is_long:
+                        pos['mfe_price'] = max(pos['mfe_price'], exit_price)
+                        pos['mae_price'] = min(pos['mae_price'], exit_price)
+                    else:
+                        pos['mfe_price'] = min(pos['mfe_price'], exit_price)
+                        pos['mae_price'] = max(pos['mae_price'], exit_price)
+
                     chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['current_qty']
                     
+                    mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                    mae_pct = abs(pos['mae_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                    duration_min = seconds_passed / 60
+                    metrics_str = f"\n⏱ Время в сделке: {int(duration_min)} мин.\n📈 MFE (Max Профит): +{mfe_pct:.2f}%\n📉 MAE (Max Просадка): -{mae_pct:.2f}%"
+
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                     daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
                     COOLDOWN_CACHE[clean_name] = time.time() + 14400
                     
                     if chunk_pnl < 0 and not pos['be_moved']:
                         daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(chunk_pnl)
-                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:.2f} USDT")
+                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:.2f} USDT{metrics_str}")
                     else:
                         daily_stats['wins'] = daily_stats.get('wins', 0) + 1
                         daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + chunk_pnl
-                        await send_tg_msg(f"✅ <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:+.2f} USDT")
+                        await send_tg_msg(f"✅ <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:+.2f} USDT{metrics_str}")
                     continue
 
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
@@ -371,19 +392,27 @@ async def monitor_positions_task():
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
+                        
+                        if is_long:
+                            pos['mfe_price'] = max(pos['mfe_price'], ticker)
+                            pos['mae_price'] = min(pos['mae_price'], ticker)
+                        else:
+                            pos['mfe_price'] = min(pos['mfe_price'], ticker)
+                            pos['mae_price'] = max(pos['mae_price'], ticker)
+
+                        mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                        mae_pct = abs(pos['mae_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                        duration_min = hours_passed * 60
+                        metrics_str = f"\n⏱ Время в сделке: {int(duration_min)} мин.\n📈 MFE (Max Профит): +{mfe_pct:.2f}%\n📉 MAE (Max Просадка): -{mae_pct:.2f}%"
+
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                         daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                         COOLDOWN_CACHE[clean_name] = time.time() + 14400
                         if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
                         else: daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
-                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT")
+                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT{metrics_str}")
                         continue
                     except: pass
-
-                try: 
-                    ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
-                    high_p = max([float(c[2]) for c in ohlcv]); low_p = min([float(c[3]) for c in ohlcv])
-                except: high_p = low_p = ticker
 
                 entry = pos['entry_price']
                 dist = pos['tp1'] - entry
@@ -497,22 +526,22 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Long' and btc_trend == 'Short' and not altseason: return sym, 'wrong_trend'
             if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
 
-            if mode == 'Long' and current_price < vwap: return sym, 'vwap_reject'
-            if mode == 'Short' and current_price > vwap: return sym, 'vwap_reject'
+            vwap_dist = ((current_price - vwap) / vwap) * 100
+            if mode == 'Long' and vwap_dist > 0.5: return sym, 'vwap_reject'
+            if mode == 'Short' and vwap_dist < -0.5: return sym, 'vwap_reject'
             
-            # --- ИСПРАВЛЕННЫЕ СНАЙПЕРСКИЕ ФИЛЬТРЫ V8.45 ---
             confirm_type = ""
             if mode == 'Long':
                 if not is_green_candle: return sym, 'no_confirm'
                 if rsi_curr < rsi_prev: return sym, 'rsi_falling'
-                if ema_dist > 3.5: return sym, 'overextended'        # Ослабили лимит
-                if rsi_curr > 60: return sym, 'rsi_exhausted'        # Отсекаем только перегретые, даем покупать на низах
+                if ema_dist > 3.5: return sym, 'overextended'
+                if rsi_curr > 55: return sym, 'rsi_exhausted'
                 confirm_type = "Зеленая свеча + Загиб RSI"
             else:
                 if not is_red_candle: return sym, 'no_confirm'
                 if rsi_curr > rsi_prev: return sym, 'rsi_falling'
-                if ema_dist < -3.5: return sym, 'overextended'       # Ослабили лимит
-                if rsi_curr < 40: return sym, 'rsi_exhausted'        # Отсекаем только остывшие
+                if ema_dist < -3.5: return sym, 'overextended'
+                if rsi_curr < 45: return sym, 'rsi_exhausted'
                 confirm_type = "Красная свеча + Загиб RSI"
 
             if mode == 'Long':
@@ -582,7 +611,6 @@ async def smc_radar_task():
                     if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
             
-            # Прозрачные логи воронки фильтрации
             stats = {'total': len(tickers), 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_falling': 0, 'rsi_exhausted': 0, 'passed': 0}
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
             
@@ -608,7 +636,6 @@ async def smc_radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            # Полный вывод аналитики в лог
             logging.info(f"🔎 [SMC] Откл: Структура({stats['no_choch']}) FVG({stats['no_fvg']}) Объем({stats['no_volume']}) Тренд({stats['wrong_trend']}) VWAP({stats['vwap_reject']}) Пузырь({stats['overextended']}) Свеча/Хук({stats['no_confirm'] + stats['rsi_falling']}) RSI_лимит({stats['rsi_exhausted']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
@@ -708,7 +735,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.45):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.50):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -716,12 +743,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.45] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.50] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.45")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.50")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -733,8 +760,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.45 (Sniper Unchained)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.45</b> запущен (Исправлен баг «потери» изолированных позиций)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.50 (Sniper Unchained + MAE/MFE)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.50</b> запущен (Добавлена Pro-аналитика MFE/MAE и усилены фильтры)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
