@@ -254,12 +254,13 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         vol_ratio = signal_data.get('vol_ratio', 0)
         setup_eval = "💎 Топовый (Высокий объем)" if vol_ratio > 2.0 else "👍 Хороший (Средний объем)"
 
+        # Меняем оценку EMA (теперь большие отклонения - это хорошо, а не опасно)
         ema_dist = signal_data.get('ema_dist', 0)
         mode = signal_data['mode']
         if mode == 'Long':
-            ema_eval = "💎 Идеально" if 0 < ema_dist <= 2.0 else "🟡 Норма" if 2.0 < ema_dist <= 3.5 else "⚠️ Опасно"
+            ema_eval = "💎 Идеальный дисконт" if ema_dist < -3.5 else "👍 Хороший откат" if ema_dist < 0 else "🟡 Норма"
         else:
-            ema_eval = "💎 Идеально" if -2.0 <= ema_dist < 0 else "🟡 Норма" if -3.5 <= ema_dist < -2.0 else "⚠️ Опасно"
+            ema_eval = "💎 Идеальная премия" if ema_dist > 3.5 else "👍 Хороший памп" if ema_dist > 0 else "🟡 Норма"
 
         rsi = signal_data.get('rsi', 0)
         if mode == 'Long':
@@ -389,7 +390,7 @@ async def monitor_positions_task():
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
 
-                if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
+                if hours_passed >= 3.0 or (hours_passed >= 2.5 and pnl > 0):
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
@@ -498,6 +499,10 @@ async def process_smc_coin(sym, ctx, sem):
             fvgs = analyze_fvg(o, h, l, c)
             current_price = c[-1]; ema200 = calculate_ema(c, 200)
             ema_dist = ((current_price - ema200) / ema200) * 100
+
+# НОВЫЙ ФИЛЬТР: Запрещаем входы, если цена "прилипла" к EMA (отклонение меньше 0.8%)
+            if abs(ema_dist) < 0.8:
+                return sym, 'ema_too_close'
             
             is_green_candle = c[-1] > o[-1]
             is_red_candle = c[-1] < o[-1]
@@ -617,7 +622,7 @@ async def smc_radar_task():
                     if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
             
-            stats = {'total': len(tickers), 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_falling': 0, 'rsi_exhausted': 0, 'passed': 0}
+            stats = {'total': len(tickers), 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_falling': 0, 'rsi_exhausted': 0, 'passed': 0, 'ema_too_close': 0}
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
             
             logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'})...")
