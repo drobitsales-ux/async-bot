@@ -643,11 +643,12 @@ async def smc_radar_task():
                     elif signal == 'no_confirm': stats['no_confirm'] += 1
                     elif signal == 'rsi_falling': stats['rsi_falling'] += 1
                     elif signal == 'rsi_exhausted': stats['rsi_exhausted'] += 1
+                    elif signal == 'ema_too_close': stats['ema_too_close'] += 1 # <--- ДОБАВИТЬ ЭТУ СТРОКУ    
                     elif isinstance(signal, dict): 
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC] Откл: Структура({stats['no_choch']}) FVG({stats['no_fvg']}) Объем({stats['no_volume']}) Тренд({stats['wrong_trend']}) VWAP({stats['vwap_reject']}) Пузырь({stats['overextended']}) Свеча/Хук({stats['no_confirm'] + stats['rsi_falling']}) RSI_лимит({stats['rsi_exhausted']}) -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC] Откл: Структура({stats['no_choch']}) Пила_EMA({stats['ema_too_close']}) FVG({stats['no_fvg']}) Объем({stats['no_volume']}) Тренд({stats['wrong_trend']}) VWAP({stats['vwap_reject']}) Пузырь({stats['overextended']}) Свеча/Хук({stats['no_confirm'] + stats['rsi_falling']}) RSI_лимит({stats['rsi_exhausted']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
