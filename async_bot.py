@@ -390,7 +390,11 @@ async def monitor_positions_task():
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
 
-                if hours_passed >= 3.0 or (hours_passed >= 2.5 and pnl > 0):
+                # Считаем текущий максимальный профит (MFE) в процентах
+                mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
+
+                # НОВОЕ УСЛОВИЕ: Добавлен жесткий отсев мертвых сделок через 1 час (hours_passed >= 1.0), если MFE < 0.5%
+                if hours_passed >= 3.0 or (hours_passed >= 2.5 and pnl > 0) or (hours_passed >= 1.0 and mfe_pct < 0.5):
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
@@ -537,20 +541,20 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
 
             vwap_dist = ((current_price - vwap) / vwap) * 100
-            if mode == 'Long' and vwap_dist > 0.5: return sym, 'vwap_reject'
-            if mode == 'Short' and vwap_dist < -0.5: return sym, 'vwap_reject'
+            if mode == 'Long' and vwap_dist > 0.0: return sym, 'vwap_reject' # Только дисконт
+            if mode == 'Short' and vwap_dist < 0.0: return sym, 'vwap_reject' # Только премия
             
             confirm_type = ""
             if mode == 'Long':
                 if not is_green_candle: return sym, 'no_confirm'
                 if rsi_curr < rsi_prev: return sym, 'rsi_falling'
-                if ema_dist > 3.5: return sym, 'overextended'
+                if ema_dist > 0.5: return sym, 'overextended'
                 if rsi_curr > 55: return sym, 'rsi_exhausted'
                 confirm_type = "Зеленая свеча + Загиб RSI"
             else:
                 if not is_red_candle: return sym, 'no_confirm'
                 if rsi_curr > rsi_prev: return sym, 'rsi_falling'
-                if ema_dist < -3.5: return sym, 'overextended'
+                if ema_dist < -0.5: return sym, 'overextended'
                 if rsi_curr < 45: return sym, 'rsi_exhausted'
                 confirm_type = "Красная свеча + Загиб RSI"
 
