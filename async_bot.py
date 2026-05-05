@@ -254,7 +254,6 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         vol_ratio = signal_data.get('vol_ratio', 0)
         setup_eval = "💎 Топовый (Высокий объем)" if vol_ratio > 2.0 else "👍 Хороший (Средний объем)"
 
-        # Меняем оценку EMA (теперь большие отклонения - это хорошо, а не опасно)
         ema_dist = signal_data.get('ema_dist', 0)
         mode = signal_data['mode']
         if mode == 'Long':
@@ -390,10 +389,8 @@ async def monitor_positions_task():
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
 
-                # Считаем текущий максимальный профит (MFE) в процентах
                 mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
 
-                # НОВОЕ УСЛОВИЕ: Добавлен жесткий отсев мертвых сделок через 1 час (hours_passed >= 1.0), если MFE < 0.5%
                 if hours_passed >= 3.0 or (hours_passed >= 2.5 and pnl > 0) or (hours_passed >= 1.0 and mfe_pct < 0.5):
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
@@ -423,10 +420,7 @@ async def monitor_positions_task():
                 entry = pos['entry_price']
                 dist = pos['tp1'] - entry
                 
-                # --- АДАПТАЦИЯ ПОД PROP FIRM ---
-                # Фиксируем Б/У быстрее (на 50% пути), т.к. MFE низкий
                 tp50 = entry + dist * 0.50
-                # Забираем первую прибыль быстрее (на 70% пути)
                 tp70 = entry + dist * 0.70
                 tp100 = pos['tp1']
 
@@ -504,7 +498,6 @@ async def process_smc_coin(sym, ctx, sem):
             current_price = c[-1]; ema200 = calculate_ema(c, 200)
             ema_dist = ((current_price - ema200) / ema200) * 100
 
-# НОВЫЙ ФИЛЬТР: Запрещаем входы, если цена "прилипла" к EMA (отклонение меньше 0.8%)
             if abs(ema_dist) < 0.8:
                 return sym, 'ema_too_close'
             
@@ -541,24 +534,23 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
 
             vwap_dist = ((current_price - vwap) / vwap) * 100
-            if mode == 'Long' and vwap_dist > 0.0: return sym, 'vwap_reject' # Только дисконт
-            if mode == 'Short' and vwap_dist < 0.0: return sym, 'vwap_reject' # Только премия
+            if mode == 'Long' and vwap_dist > 0.5: return sym, 'vwap_reject' 
+            if mode == 'Short' and vwap_dist < -0.5: return sym, 'vwap_reject' 
             
             confirm_type = ""
             if mode == 'Long':
                 if not is_green_candle: return sym, 'no_confirm'
                 if rsi_curr < rsi_prev: return sym, 'rsi_falling'
-                if ema_dist > 0.5: return sym, 'overextended'
-                if rsi_curr > 55: return sym, 'rsi_exhausted'
+                if ema_dist > 3.5: return sym, 'overextended'
+                if rsi_curr > 60: return sym, 'rsi_exhausted'
                 confirm_type = "Зеленая свеча + Загиб RSI"
             else:
                 if not is_red_candle: return sym, 'no_confirm'
                 if rsi_curr > rsi_prev: return sym, 'rsi_falling'
-                if ema_dist < -0.5: return sym, 'overextended'
-                if rsi_curr < 45: return sym, 'rsi_exhausted'
+                if ema_dist < -3.5: return sym, 'overextended'
+                if rsi_curr < 40: return sym, 'rsi_exhausted'
                 confirm_type = "Красная свеча + Загиб RSI"
 
-            # --- ПРОП АДАПТАЦИЯ: РАСШИРЕННЫЙ СТОП ДЛЯ SMC ---
             if mode == 'Long':
                 sl_price = min(l[active_fvg['index']:]) - (atr * 3.0) 
                 if (current_price - sl_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 - MIN_SL_PCT/100)
@@ -647,7 +639,7 @@ async def smc_radar_task():
                     elif signal == 'no_confirm': stats['no_confirm'] += 1
                     elif signal == 'rsi_falling': stats['rsi_falling'] += 1
                     elif signal == 'rsi_exhausted': stats['rsi_exhausted'] += 1
-                    elif signal == 'ema_too_close': stats['ema_too_close'] += 1 # <--- ДОБАВИТЬ ЭТУ СТРОКУ    
+                    elif signal == 'ema_too_close': stats['ema_too_close'] += 1 
                     elif isinstance(signal, dict): 
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
@@ -672,7 +664,7 @@ async def process_grid_coin(sym, sem):
             avg_vol = np.mean(v[-22:-2])
             
             vol_ratio = v[-2] / avg_vol if avg_vol > 0 else 0
-            if vol_ratio < 1.20 or vol_ratio > 6.0: return sym, 'no_vol_spike'
+            if vol_ratio < 1.10 or vol_ratio > 6.0: return sym, 'no_vol_spike'
             
             candle_size_pct = abs(c[-2] - o[-2]) / o[-2] * 100
             if candle_size_pct < 1.0: return sym, 'no_price_spike'
