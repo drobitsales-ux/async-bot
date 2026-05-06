@@ -22,11 +22,11 @@ BINGX_SECRET = os.getenv('BINGX_SECRET')
 # --- НАСТРОЙКИ ДЛЯ ПРОП-КОМПАНИЙ ---
 RISK_PER_TRADE = 0.02       
 MAX_POSITIONS = 3           
-LEVERAGE = 5                # Снижено до х5 для пропа
-MAX_MARGIN_PCT = 0.15       # Максимум 15% депозита в залог на 1 сделку
+LEVERAGE = 5                
+MAX_MARGIN_PCT = 0.15       
 MIN_VOLUME_USDT = 1000000   
 MIN_SL_PCT = 1.5            
-MAX_SL_PCT = 8.0            # Расширено для более "дышащих" стопов
+MAX_SL_PCT = 8.0            
 
 SMC_TIMEFRAME = '15m'
 COOLDOWN_CACHE = {}         
@@ -534,8 +534,9 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
 
             vwap_dist = ((current_price - vwap) / vwap) * 100
-            if mode == 'Long' and vwap_dist > 0.5: return sym, 'vwap_reject' 
-            if mode == 'Short' and vwap_dist < -0.5: return sym, 'vwap_reject' 
+            # ИЗМЕНЕНИЕ: Жесткий фильтр VWAP Clearance. Нужно минимум 0.8% "воздуха" до VWAP.
+            if mode == 'Long' and vwap_dist > -0.8: return sym, 'vwap_reject' 
+            if mode == 'Short' and vwap_dist < 0.8: return sym, 'vwap_reject' 
             
             confirm_type = ""
             if mode == 'Long':
@@ -769,7 +770,7 @@ async def main():
         except: pass
         
     logging.info("🚀 Запуск BINGX ASYNC БОТА v8.60 (Режим PROP FIRM: Плечо x5, Широкий SL)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.60 PROP</b> запущен (Плечо х5, маржа макс 15%, ранний Б/У)!")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.60 PROP</b> запущен (Плечо х5, маржа макс 15%, ранний Б/У, VWAP Clearance)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
