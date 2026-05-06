@@ -534,7 +534,6 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
 
             vwap_dist = ((current_price - vwap) / vwap) * 100
-            # ИЗМЕНЕНИЕ: Жесткий фильтр VWAP Clearance. Нужно минимум 0.8% "воздуха" до VWAP.
             if mode == 'Long' and vwap_dist > -0.8: return sym, 'vwap_reject' 
             if mode == 'Short' and vwap_dist < 0.8: return sym, 'vwap_reject' 
             
@@ -665,10 +664,10 @@ async def process_grid_coin(sym, sem):
             avg_vol = np.mean(v[-22:-2])
             
             vol_ratio = v[-2] / avg_vol if avg_vol > 0 else 0
-            if vol_ratio < 1.10 or vol_ratio > 6.0: return sym, 'no_vol_spike'
-            
             candle_size_pct = abs(c[-2] - o[-2]) / o[-2] * 100
-            if candle_size_pct < 1.0: return sym, 'no_price_spike'
+            
+            if vol_ratio < 1.10 or vol_ratio > 6.0: return sym, ('no_vol_spike', vol_ratio)
+            if candle_size_pct < 1.0: return sym, ('no_price_spike', vol_ratio)
             
             direction = 'Long' if c[-2] > o[-2] else 'Short'
             current_price = c[-1]
@@ -676,7 +675,7 @@ async def process_grid_coin(sym, sem):
             
             base_coin = sym.split('/')[0]
             if not await verify_global_volume(base_coin):
-                return sym, 'oracle_rejected'
+                return sym, ('oracle_rejected', vol_ratio)
 
             if direction == 'Long':
                 sl_price = l[-2] - (atr * 2.5)
@@ -715,17 +714,30 @@ async def grid_radar_task():
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             valid_results = []
+            max_vol = 0.0
+            max_vol_sym = "Н/Д"
+            
             for r in results:
                 if isinstance(r, tuple) and len(r) == 2:
                     sym, signal = r
-                    if signal == 'no_vol_spike': stats['vol_fail'] += 1
-                    elif signal == 'no_price_spike': stats['price_fail'] += 1
-                    elif signal == 'oracle_rejected': stats['oracle_reject'] += 1
+                    current_vol = 0.0
+                    
+                    if isinstance(signal, tuple): 
+                        reason, current_vol = signal
+                        if reason == 'no_vol_spike': stats['vol_fail'] += 1
+                        elif reason == 'no_price_spike': stats['price_fail'] += 1
+                        elif reason == 'oracle_rejected': stats['oracle_reject'] += 1
                     elif isinstance(signal, dict): 
+                        current_vol = signal['vol_ratio']
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🌐 [GRID РАДАР] Откл. объемом: {stats['vol_fail']} -> Нет пробоя: {stats['price_fail']} -> Оракул: {stats['oracle_reject']} -> ВХОДЫ: {stats['passed']}")
+                    clean_name = sym.split(':')[0].split('/')[0]
+                    if current_vol > max_vol and current_vol < 10.0: 
+                        max_vol = current_vol
+                        max_vol_sym = clean_name
+
+            logging.info(f"🌐 [GRID РАДАР] Откл. объемом: {stats['vol_fail']} -> Нет пробоя: {stats['price_fail']} -> Оракул: {stats['oracle_reject']} -> ВХОДЫ: {stats['passed']} | 🔥 Макс. объем: {max_vol:.1f}x ({max_vol_sym})")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
