@@ -26,7 +26,7 @@ LEVERAGE = 5
 MAX_MARGIN_PCT = 0.15       
 MIN_VOLUME_USDT = 1000000   
 MIN_SL_PCT = 1.5            
-MAX_SL_PCT = 8.0            
+MAX_SL_PCT = 4.5            # ЖЕСТКИЙ ФИЛЬТР: Отсекаем широкие стопы
 
 SMC_TIMEFRAME = '15m'
 COOLDOWN_CACHE = {}         
@@ -287,7 +287,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                           f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
                           f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.60 PROP]: {clean_sym}</b>{oracle_text}\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.61 PROP]: {clean_sym}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -424,18 +424,22 @@ async def monitor_positions_task():
                 tp70 = entry + dist * 0.70
                 tp100 = pos['tp1']
 
+                # --- НОВОВВЕДЕНИЕ: Smart Абсолютные пороги ---
+                abs_1_5_pct = entry * 1.015 if is_long else entry * 0.985
+                abs_2_5_pct = entry * 1.025 if is_long else entry * 0.975
+
                 if not pos['be_moved']:
-                    if (is_long and high_p >= tp50) or (not is_long and low_p <= tp50):
+                    if (is_long and (high_p >= tp50 or high_p >= abs_1_5_pct)) or (not is_long and (low_p <= tp50 or low_p <= abs_1_5_pct)):
                         be_price = float(exchange.price_to_precision(sym, entry * (1.002 if is_long else 0.998)))
                         if pos.get('sl_order_id'): 
                             try: await exchange.cancel_order(pos['sl_order_id'], sym)
                             except: pass
                         new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': be_price, 'reduceOnly': True, 'positionSide': pos_side})
                         pos.update({'be_moved': True, 'sl_order_id': new_sl['id'], 'current_sl': be_price})
-                        await send_tg_msg(f"🛡 <b>{clean_name}</b>: Цена прошла 50%. SL перенесен в Б/У.")
+                        await send_tg_msg(f"🛡 <b>{clean_name}</b>: Сработал Smart Б/У (+1.5%). SL перенесен в безубыток.")
 
                 if pos['be_moved'] and not pos['tp80_hit']:
-                    if (is_long and high_p >= tp70) or (not is_long and low_p <= tp70):
+                    if (is_long and (high_p >= tp70 or high_p >= abs_2_5_pct)) or (not is_long and (low_p <= tp70 or low_p <= abs_2_5_pct)):
                         close_qty = float(exchange.amount_to_precision(sym, pos['initial_qty'] * 0.25))
                         if close_qty > 0:
                             await safe_create_order(sym, 'market', sl_side, close_qty, {'positionSide': pos_side, 'reduceOnly': True})
@@ -445,10 +449,11 @@ async def monitor_positions_task():
                             pos['current_qty'] = float(exchange.amount_to_precision(sym, pos['current_qty'] - close_qty))
                             new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': pos['current_sl'], 'reduceOnly': True, 'positionSide': pos_side})
                             
-                            chunk_pnl = (tp70 - entry) * close_qty if is_long else (entry - tp70) * close_qty
+                            exec_price = abs_2_5_pct if (is_long and high_p >= abs_2_5_pct) or (not is_long and low_p <= abs_2_5_pct) else tp70
+                            chunk_pnl = (exec_price - entry) * close_qty if is_long else (entry - exec_price) * close_qty
                             daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
                             pos.update({'tp80_hit': True, 'sl_order_id': new_sl['id']})
-                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла 70%. Закрыто 25% объема. (PNL: +{chunk_pnl:.2f})")
+                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла +2.5%. Ранняя фиксация 25% объема. (PNL: +{chunk_pnl:.2f})")
 
                 if pos['tp80_hit'] and not pos['tp100_hit']:
                     if (is_long and high_p >= tp100) or (not is_long and low_p <= tp100):
@@ -756,7 +761,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.60 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.61 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -764,12 +769,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.60 PROP] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.61 PROP] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.60 PROP")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.61 PROP")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -781,8 +786,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.60 (Режим PROP FIRM: Плечо x5, Широкий SL)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.60 PROP</b> запущен (Плечо х5, маржа макс 15%, ранний Б/У, VWAP Clearance)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.61 (Режим PROP FIRM: Плечо x5, Smart BE)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.61 PROP</b> запущен (Smart Б/У на +1.5%, Макс SL 4.5%)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
