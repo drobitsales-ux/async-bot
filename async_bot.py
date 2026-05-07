@@ -26,7 +26,8 @@ LEVERAGE = 5
 MAX_MARGIN_PCT = 0.15       
 MIN_VOLUME_USDT = 1000000   
 MIN_SL_PCT = 1.5            
-MAX_SL_PCT = 4.5            # ЖЕСТКИЙ ФИЛЬТР: Отсекаем широкие стопы
+MAX_SL_PCT = 4.5            
+FEE_RATE = 0.0005           # 0.05% Комиссия тейкера BingX
 
 SMC_TIMEFRAME = '15m'
 COOLDOWN_CACHE = {}         
@@ -287,7 +288,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                           f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
                           f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.61 PROP]: {clean_sym}</b>{oracle_text}\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.62 PROP]: {clean_sym}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -311,19 +312,20 @@ async def monitor_positions_task():
                 sym = pos['symbol']
                 clean_name = sym.split(':')[0].split('/')[0]
                 is_long = pos['direction'] == 'Long'
+                entry_price = pos['entry_price']
                 
                 if 'current_qty' not in pos: pos['current_qty'] = pos['initial_qty']
                 if 'be_moved' not in pos: pos['be_moved'] = False
                 if 'tp80_hit' not in pos: pos['tp80_hit'] = False
                 if 'tp100_hit' not in pos: pos['tp100_hit'] = False
-                if 'atr' not in pos: pos['atr'] = abs(pos['entry_price'] - pos['sl_price']) * 0.5
+                if 'atr' not in pos: pos['atr'] = abs(entry_price - pos['sl_price']) * 0.5
                 if 'current_sl' not in pos: pos['current_sl'] = pos['sl_price']
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
-                if 'mfe_price' not in pos: pos['mfe_price'] = pos['entry_price']
-                if 'mae_price' not in pos: pos['mae_price'] = pos['entry_price']
+                if 'mfe_price' not in pos: pos['mfe_price'] = entry_price
+                if 'mae_price' not in pos: pos['mae_price'] = entry_price
 
                 curr = next((r for r in positions_raw if r['symbol'] == sym and abs(float(r.get('contracts', 0))) > 0), None)
-                ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
+                ticker = tickers.get(sym, {}).get('last', entry_price)
                 pos_side = 'LONG' if is_long else 'SHORT'
                 sl_side = 'sell' if is_long else 'buy'
                 
@@ -366,10 +368,15 @@ async def monitor_positions_task():
                         pos['mfe_price'] = min(pos['mfe_price'], exit_price)
                         pos['mae_price'] = max(pos['mae_price'], exit_price)
 
-                    chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - exit_price) * pos['current_qty']
+                    # --- РАСЧЕТ ЧИСТОГО PNL С УЧЕТОМ КОМИССИЙ ---
+                    raw_pnl = (exit_price - entry_price) * pos['current_qty'] if is_long else (entry_price - exit_price) * pos['current_qty']
+                    entry_fee = pos['initial_qty'] * entry_price * FEE_RATE
+                    exit_fee = pos['current_qty'] * exit_price * FEE_RATE
+                    chunk_pnl = raw_pnl - (entry_fee + exit_fee)
+                    # --------------------------------------------
                     
-                    mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
-                    mae_pct = abs(pos['mae_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                    mfe_pct = abs(pos['mfe_price'] - entry_price) / entry_price * 100
+                    mae_pct = abs(pos['mae_price'] - entry_price) / entry_price * 100
                     duration_min = seconds_passed / 60
                     metrics_str = f"\n⏱ Время в сделке: {int(duration_min)} мин.\n📈 MFE (Max Профит): +{mfe_pct:.2f}%\n📉 MAE (Max Просадка): -{mae_pct:.2f}%"
 
@@ -379,19 +386,22 @@ async def monitor_positions_task():
                     
                     if chunk_pnl < 0 and not pos['be_moved']:
                         daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(chunk_pnl)
-                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:.2f} USDT{metrics_str}")
+                        await send_tg_msg(f"🛑 <b>{clean_name} закрыта ({real_close_type}).</b>\nЧистый PNL: {chunk_pnl:.2f} USDT{metrics_str}")
                     else:
                         daily_stats['wins'] = daily_stats.get('wins', 0) + 1
                         daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + chunk_pnl
-                        await send_tg_msg(f"✅ <b>{clean_name} закрыта ({real_close_type}).</b>\nРеальный PNL: {chunk_pnl:+.2f} USDT{metrics_str}")
+                        await send_tg_msg(f"✅ <b>{clean_name} закрыта ({real_close_type}).</b>\nЧистый PNL: {chunk_pnl:+.2f} USDT{metrics_str}")
                     continue
 
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
-                pnl = (ticker - pos['entry_price']) * pos['current_qty'] if is_long else (pos['entry_price'] - ticker) * pos['current_qty']
+                
+                raw_pnl_timeout = (ticker - entry_price) * pos['current_qty'] if is_long else (entry_price - ticker) * pos['current_qty']
+                est_fee_timeout = (pos['initial_qty'] * entry_price * FEE_RATE) + (pos['current_qty'] * ticker * FEE_RATE)
+                net_pnl_timeout = raw_pnl_timeout - est_fee_timeout
 
-                mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                mfe_pct = abs(pos['mfe_price'] - entry_price) / entry_price * 100
 
-                if hours_passed >= 3.0 or (hours_passed >= 2.5 and pnl > 0) or (hours_passed >= 1.0 and mfe_pct < 0.5):
+                if hours_passed >= 3.0 or (hours_passed >= 2.5 and net_pnl_timeout > 0) or (hours_passed >= 1.0 and mfe_pct < 0.5):
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
@@ -403,17 +413,17 @@ async def monitor_positions_task():
                             pos['mfe_price'] = min(pos['mfe_price'], ticker)
                             pos['mae_price'] = max(pos['mae_price'], ticker)
 
-                        mfe_pct = abs(pos['mfe_price'] - pos['entry_price']) / pos['entry_price'] * 100
-                        mae_pct = abs(pos['mae_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                        mfe_pct = abs(pos['mfe_price'] - entry_price) / entry_price * 100
+                        mae_pct = abs(pos['mae_price'] - entry_price) / entry_price * 100
                         duration_min = hours_passed * 60
                         metrics_str = f"\n⏱ Время в сделке: {int(duration_min)} мин.\n📈 MFE (Max Профит): +{mfe_pct:.2f}%\n📉 MAE (Max Просадка): -{mae_pct:.2f}%"
 
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1
-                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
+                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + net_pnl_timeout
                         COOLDOWN_CACHE[clean_name] = time.time() + 14400
-                        if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + pnl
-                        else: daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(pnl)
-                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USDT{metrics_str}")
+                        if net_pnl_timeout > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1; daily_stats['gross_profit'] = daily_stats.get('gross_profit', 0.0) + net_pnl_timeout
+                        else: daily_stats['gross_loss'] = daily_stats.get('gross_loss', 0.0) + abs(net_pnl_timeout)
+                        await send_tg_msg(f"{'✅' if net_pnl_timeout > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nЧистый PNL: {net_pnl_timeout:+.2f} USDT{metrics_str}")
                         continue
                     except: pass
 
@@ -424,7 +434,6 @@ async def monitor_positions_task():
                 tp70 = entry + dist * 0.70
                 tp100 = pos['tp1']
 
-                # --- НОВОВВЕДЕНИЕ: Smart Абсолютные пороги ---
                 abs_1_5_pct = entry * 1.015 if is_long else entry * 0.985
                 abs_2_5_pct = entry * 1.025 if is_long else entry * 0.975
 
@@ -450,10 +459,11 @@ async def monitor_positions_task():
                             new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': pos['current_sl'], 'reduceOnly': True, 'positionSide': pos_side})
                             
                             exec_price = abs_2_5_pct if (is_long and high_p >= abs_2_5_pct) or (not is_long and low_p <= abs_2_5_pct) else tp70
-                            chunk_pnl = (exec_price - entry) * close_qty if is_long else (entry - exec_price) * close_qty
-                            daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
+                            raw_chunk = (exec_price - entry) * close_qty if is_long else (entry - exec_price) * close_qty
+                            chunk_net = raw_chunk - (close_qty * exec_price * FEE_RATE)
+                            daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_net
                             pos.update({'tp80_hit': True, 'sl_order_id': new_sl['id']})
-                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла +2.5%. Ранняя фиксация 25% объема. (PNL: +{chunk_pnl:.2f})")
+                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла +2.5%. Ранняя фиксация 25% объема. (Чистый PNL: +{chunk_net:.2f})")
 
                 if pos['tp80_hit'] and not pos['tp100_hit']:
                     if (is_long and high_p >= tp100) or (not is_long and low_p <= tp100):
@@ -468,11 +478,12 @@ async def monitor_positions_task():
                             trail_sl = float(exchange.price_to_precision(sym, tp100 - pos['atr'] if is_long else tp100 + pos['atr']))
                             new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': trail_sl, 'reduceOnly': True, 'positionSide': pos_side})
                             
-                            chunk_pnl = (tp100 - entry) * close_qty if is_long else (entry - tp100) * close_qty
-                            daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_pnl
+                            raw_chunk = (tp100 - entry) * close_qty if is_long else (entry - tp100) * close_qty
+                            chunk_net = raw_chunk - (close_qty * tp100 * FEE_RATE)
+                            daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_net
                             daily_stats['wins'] = daily_stats.get('wins', 0) + 1 
                             pos.update({'tp100_hit': True, 'sl_order_id': new_sl['id'], 'current_sl': trail_sl})
-                            await send_tg_msg(f"💰 <b>{clean_name}</b>: Тейк 100% взят! Закрыто еще 50%. Включен Трейлинг. (PNL: +{chunk_pnl:.2f})")
+                            await send_tg_msg(f"💰 <b>{clean_name}</b>: Тейк 100% взят! Закрыто еще 50%. Включен Трейлинг. (Чистый PNL: +{chunk_net:.2f})")
 
                 if pos['tp100_hit']:
                     trail_sl = float(exchange.price_to_precision(sym, high_p - pos['atr'] if is_long else low_p + pos['atr']))
@@ -532,6 +543,10 @@ async def process_smc_coin(sym, ctx, sem):
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             if not mode: return sym, 'no_setup'
             
+            # --- НОВЫЙ ФИЛЬТР: Защита от покупки хаев в SMC ---
+            if mode == 'Long' and rsi_curr > 55: return sym, 'rsi_exhausted'
+            if mode == 'Short' and rsi_curr < 45: return sym, 'rsi_exhausted'
+            
             btc_trend = ctx['btc_trend']
             altseason = ctx['altseason']
             
@@ -546,14 +561,12 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Long':
                 if not is_green_candle: return sym, 'no_confirm'
                 if rsi_curr < rsi_prev: return sym, 'rsi_falling'
-                if ema_dist > 3.5: return sym, 'overextended'
-                if rsi_curr > 60: return sym, 'rsi_exhausted'
+                if ema_dist > 8.0: return sym, 'overextended' # Ограничение
                 confirm_type = "Зеленая свеча + Загиб RSI"
             else:
                 if not is_red_candle: return sym, 'no_confirm'
                 if rsi_curr > rsi_prev: return sym, 'rsi_falling'
-                if ema_dist < -3.5: return sym, 'overextended'
-                if rsi_curr < 40: return sym, 'rsi_exhausted'
+                if ema_dist < -8.0: return sym, 'overextended'
                 confirm_type = "Красная свеча + Загиб RSI"
 
             if mode == 'Long':
@@ -761,7 +774,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.61 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.62 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -769,12 +782,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.61 PROP] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.62 PROP] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.61 PROP")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.62 PROP")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -786,8 +799,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.61 (Режим PROP FIRM: Плечо x5, Smart BE)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.61 PROP</b> запущен (Smart Б/У на +1.5%, Макс SL 4.5%)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.62 (Режим PROP FIRM: Точный учет Net PNL, Фильтры входов)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.62 PROP</b> запущен (Учет комиссий в PNL, Защита хаев/лоев по RSI)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
