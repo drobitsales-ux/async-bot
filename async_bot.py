@@ -20,9 +20,9 @@ BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
 # --- НАСТРОЙКИ ДЛЯ ПРОП-КОМПАНИЙ (Tier-1) ---
-BASE_RISK_PER_TRADE = 0.02  
+BASE_RISK_PER_TRADE = 0.02  # Для тестов. Перед реальным пропом изменить на 0.005
 MAX_POSITIONS = 3           
-MAX_POSITIONS_PER_DIRECTION = 2  # Корреляционный лимит
+MAX_POSITIONS_PER_DIRECTION = 2  
 LEVERAGE = 5                
 MAX_MARGIN_PCT = 0.15       
 MIN_VOLUME_USDT = 1000000   
@@ -189,13 +189,11 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         
     direction, current_price, sl_price, tp_price = signal_data['mode'], signal_data['price'], signal_data['sl_price'], signal_data['tp_price']
     
-    # --- РИСК-МЕНЕДЖЕР: Корреляционный лимит ---
     same_direction_count = len([p for p in active_positions if p['direction'] == direction])
     if same_direction_count >= MAX_POSITIONS_PER_DIRECTION:
         logging.info(f"🚫 [РИСК] {clean_sym} отклонен: Лимит корреляции ({MAX_POSITIONS_PER_DIRECTION} {direction} уже в рынке).")
         return
 
-    # --- РИСК-МЕНЕДЖЕР: Динамический риск по сессиям ---
     is_weekend = datetime.now(timezone.utc).weekday() >= 5
     active_risk = BASE_RISK_PER_TRADE / 2.0 if is_weekend else BASE_RISK_PER_TRADE
     
@@ -308,7 +306,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                           f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
                           f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.63 PROP]: {clean_sym}</b>{oracle_text}\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} v8.64 PROP]: {clean_sym}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -349,6 +347,13 @@ async def monitor_positions_task():
                 pos_side = 'LONG' if is_long else 'SHORT'
                 sl_side = 'sell' if is_long else 'buy'
                 
+                # --- АБСОЛЮТНАЯ СИНХРОНИЗАЦИЯ ОБЪЕМОВ (DUST FIX) ---
+                if curr:
+                    real_qty = abs(float(curr.get('contracts', 0)))
+                    if real_qty > 0:
+                        pos['current_qty'] = real_qty
+                # ---------------------------------------------------
+
                 try: 
                     ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
                     high_p = max([float(c[2]) for c in ohlcv]); low_p = min([float(c[3]) for c in ohlcv])
@@ -534,7 +539,6 @@ async def process_smc_coin(sym, ctx, sem):
 
             if abs(ema_dist) < 0.8: return sym, 'ema_too_close'
             
-            # --- МАКРО-АНАЛИТИК: Time-in-Trend Decay ---
             emas_array = calculate_ema_array(c, 200)
             trend_candles = 0
             if current_price > emas_array[-1]:
@@ -547,7 +551,6 @@ async def process_smc_coin(sym, ctx, sem):
                     else: break
                     
             if trend_candles > 80: return sym, 'trend_exhausted'
-            # ---------------------------------------------
             
             is_green_candle = c[-1] > o[-1]
             is_red_candle = c[-1] < o[-1]
@@ -600,7 +603,6 @@ async def process_smc_coin(sym, ctx, sem):
                 if ema_dist < -8.0: return sym, 'overextended'
                 confirm_type = "Красная свеча + Загиб RSI"
 
-            # --- АНАЛИТИК МИКРОСТРУКТУРЫ: Funding Rate Protection ---
             try:
                 fr = await exchange.fetch_funding_rate(sym)
                 funding_rate = float(fr.get('fundingRate', 0))
@@ -608,7 +610,6 @@ async def process_smc_coin(sym, ctx, sem):
             
             if mode == 'Short' and funding_rate < -0.00015:
                 return sym, 'short_squeeze_risk'
-            # --------------------------------------------------------
 
             if mode == 'Long':
                 sl_price = min(l[active_fvg['index']:]) - (atr * 3.0) 
@@ -723,7 +724,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.63 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.64 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -731,12 +732,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.63 PROP] В работе: {active} | Винрейт: {winrate:.1f}%\n")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.64 PROP] В работе: {active} | Винрейт: {winrate:.1f}%\n")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.63 PROP")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.64 PROP")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -748,14 +749,13 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.63 (Tier-1: Funding Limits, Correlation, Trend Decay)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.63 PROP</b> запущен (Tier-1 Фильтры: Защита от шорт-сквизов, Износ тренда, Корреляционный лимит)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.64 (Tier-1: Funding Limits, Dust Fix, Trend Decay)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.64 PROP</b> запущен (Внедрена Абсолютная Синхронизация Объемов против микро-маржи)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
     asyncio.create_task(print_stats_hourly())
     asyncio.create_task(smc_radar_task())
-    # Отключен GRID для чистой торговли SMC (можно добавить при необходимости)
     while True: await asyncio.sleep(3600)
 
 if __name__ == '__main__':
