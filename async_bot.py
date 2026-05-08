@@ -19,7 +19,7 @@ GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-# --- НАСТРОЙКИ ДЛЯ ПРОП-КОМПАНИЙ (Tier-1) ---
+# --- НАСТРОЙКИ ДЛЯ ПРОП-КОМПАНИЙ (Tier-1.5) ---
 BASE_RISK_PER_TRADE = 0.02  # Для тестов. Перед реальным пропом изменить на 0.005
 MAX_POSITIONS = 3           
 MAX_POSITIONS_PER_DIRECTION = 2  
@@ -86,7 +86,7 @@ async def fetch_news_task():
         except Exception as e:
             logging.error(f"⚠️ [NEWS FILTER] Сетевая ошибка: {e}")
             await asyncio.sleep(300)
-            
+
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -323,12 +323,10 @@ async def monitor_positions_task():
                 pos_side = 'LONG' if is_long else 'SHORT'
                 sl_side = 'sell' if is_long else 'buy'
                 
-                # --- АБСОЛЮТНАЯ СИНХРОНИЗАЦИЯ ОБЪЕМОВ (DUST FIX) ---
                 if curr:
                     real_qty = abs(float(curr.get('contracts', 0)))
                     if real_qty > 0:
                         pos['current_qty'] = real_qty
-                # ---------------------------------------------------
 
                 try: 
                     ohlcv = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=2)
@@ -685,7 +683,7 @@ async def smc_radar_task():
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
             
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
-            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Спред-отказ: {stats['high_spread']})...").")
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Спред-отказ: {stats['high_spread']})...")
             
             sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, global_ctx, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -709,7 +707,7 @@ async def smc_radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Спред-отказ: {stats['high_spread']})...")
+            logging.info(f"🔎 [SMC] Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) FVG({stats['no_fvg']}) Усталость Тренда({stats['trend_exhausted']}) Объем({stats['no_volume']}) Макро({stats['wrong_trend']}) Фандинг({stats['short_squeeze_risk']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
