@@ -709,7 +709,7 @@ async def smc_radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC] Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) FVG({stats['no_fvg']}) Усталость Тренда({stats['trend_exhausted']}) Объем({stats['no_volume']}) Макро({stats['wrong_trend']}) Фандинг({stats['short_squeeze_risk']}) -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Спред-отказ: {stats['high_spread']})...")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
