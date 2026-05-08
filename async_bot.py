@@ -59,11 +59,15 @@ exchange = ccxt_async.bingx({
 
 async def fetch_news_task():
     global NEWS_EVENTS
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
     while True:
         try:
             url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=15) as resp:
+                async with session.get(url, headers=headers, timeout=15) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         events = []
@@ -74,11 +78,15 @@ async def fetch_news_task():
                                     events.append(dt.timestamp())
                                 except: pass
                         NEWS_EVENTS = events
-                        logging.info(f"📰 [NEWS] Загружено {len(NEWS_EVENTS)} макро-событий по USD на неделю.")
+                        logging.info(f"📰 [NEWS FILTER] Успешно загружено {len(NEWS_EVENTS)} Красных макро-событий по USD.")
+                        await asyncio.sleep(43200) # Успех -> спим 12 часов
+                    else:
+                        logging.error(f"⚠️ [NEWS FILTER] Ошибка API. Cloudflare блок? Статус: {resp.status}")
+                        await asyncio.sleep(300) # Ошибка -> пробуем через 5 минут
         except Exception as e:
-            pass
-        await asyncio.sleep(43200)
-
+            logging.error(f"⚠️ [NEWS FILTER] Сетевая ошибка: {e}")
+            await asyncio.sleep(300)
+            
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -677,7 +685,7 @@ async def smc_radar_task():
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
             
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
-            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Спред-фильтр отсек: {stats['high_spread']})...")
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Спред-отказ: {stats['high_spread']})...").")
             
             sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, global_ctx, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
