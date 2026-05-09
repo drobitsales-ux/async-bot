@@ -19,8 +19,7 @@ GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_API_KEY = os.getenv('BINGX_API_KEY')
 BINGX_SECRET = os.getenv('BINGX_SECRET')
 
-# --- НАСТРОЙКИ ДЛЯ ПРОП-КОМПАНИЙ (Tier-1.5) ---
-BASE_RISK_PER_TRADE = 0.02  # Для тестов. Перед реальным пропом изменить на 0.005
+BASE_RISK_PER_TRADE = 0.02
 MAX_POSITIONS = 3           
 MAX_POSITIONS_PER_DIRECTION = 2  
 LEVERAGE = 5                
@@ -79,12 +78,10 @@ async def fetch_news_task():
                                 except: pass
                         NEWS_EVENTS = events
                         logging.info(f"📰 [NEWS FILTER] Успешно загружено {len(NEWS_EVENTS)} Красных макро-событий по USD.")
-                        await asyncio.sleep(43200) # Успех -> спим 12 часов
+                        await asyncio.sleep(43200)
                     else:
-                        logging.error(f"⚠️ [NEWS FILTER] Ошибка API. Cloudflare блок? Статус: {resp.status}")
-                        await asyncio.sleep(300) # Ошибка -> пробуем через 5 минут
+                        await asyncio.sleep(300)
         except Exception as e:
-            logging.error(f"⚠️ [NEWS FILTER] Сетевая ошибка: {e}")
             await asyncio.sleep(300)
 
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -199,9 +196,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
     direction, current_price, sl_price, tp_price = signal_data['mode'], signal_data['price'], signal_data['sl_price'], signal_data['tp_price']
     
     same_direction_count = len([p for p in active_positions if p['direction'] == direction])
-    if same_direction_count >= MAX_POSITIONS_PER_DIRECTION:
-        logging.info(f"🚫 [РИСК] {clean_sym} отклонен: Лимит корреляции ({MAX_POSITIONS_PER_DIRECTION} {direction} уже в рынке).")
-        return
+    if same_direction_count >= MAX_POSITIONS_PER_DIRECTION: return
 
     is_weekend = datetime.now(timezone.utc).weekday() >= 5
     active_risk = BASE_RISK_PER_TRADE / 2.0 if is_weekend else BASE_RISK_PER_TRADE
@@ -237,7 +232,6 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
         
         order = await exchange.create_market_order(sym, side, qty, params={'positionSide': pos_side})
     except Exception as e: 
-        logging.error(f"Trade Open Error {sym}: {e}")
         COOLDOWN_CACHE[clean_sym] = time.time() + 3600 
         return
 
@@ -282,7 +276,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                       f"• Осциллятор (RSI): {signal_data.get('rsi', 0):.1f}\n"
                       f"• Динамический TP: {tp_mult}x (Волатильность: {tp_eval})")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async v8.65 PROP]: {clean_sym}</b>\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async v8.70 PROP]: {clean_sym}</b>\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -396,9 +390,8 @@ async def monitor_positions_task():
                 est_fee_timeout = (pos['initial_qty'] * entry_price * FEE_RATE) + (pos['current_qty'] * ticker * FEE_RATE)
                 net_pnl_timeout = raw_pnl_timeout - est_fee_timeout
 
-                mfe_pct = abs(pos['mfe_price'] - entry_price) / entry_price * 100
-
-                if hours_passed >= 3.0 or (hours_passed >= 2.5 and net_pnl_timeout > 0) or (hours_passed >= 1.0 and mfe_pct < 0.5):
+                # --- FIX 4: Removed the aggressive 1 hour MFE timeout killer ---
+                if hours_passed >= 4.0 or (hours_passed >= 2.5 and net_pnl_timeout > 0):
                     try:
                         await safe_create_order(sym, 'market', sl_side, pos['current_qty'], {'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
@@ -424,28 +417,27 @@ async def monitor_positions_task():
                         continue
                     except: pass
 
-                entry = pos['entry_price']
-                dist = pos['tp1'] - entry
-                
-                tp50 = entry + dist * 0.50
-                tp70 = entry + dist * 0.70
+                # --- FIX 3: Absolute Breakeven decoupled from Dynamic TP ---
+                actual_sl_dist = abs(entry - pos['sl_price'])
+                rr_0_75 = entry + (actual_sl_dist * 0.75) if is_long else entry - (actual_sl_dist * 0.75)
+                rr_1_50 = entry + (actual_sl_dist * 1.50) if is_long else entry - (actual_sl_dist * 1.50)
                 tp100 = pos['tp1']
 
                 abs_1_5_pct = entry * 1.015 if is_long else entry * 0.985
                 abs_2_5_pct = entry * 1.025 if is_long else entry * 0.975
 
                 if not pos['be_moved']:
-                    if (is_long and (high_p >= tp50 or high_p >= abs_1_5_pct)) or (not is_long and (low_p <= tp50 or low_p <= abs_1_5_pct)):
+                    if (is_long and (high_p >= rr_0_75 or high_p >= abs_1_5_pct)) or (not is_long and (low_p <= rr_0_75 or low_p <= abs_1_5_pct)):
                         be_price = float(exchange.price_to_precision(sym, entry * (1.002 if is_long else 0.998)))
                         if pos.get('sl_order_id'): 
                             try: await exchange.cancel_order(pos['sl_order_id'], sym)
                             except: pass
                         new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': be_price, 'reduceOnly': True, 'positionSide': pos_side})
                         pos.update({'be_moved': True, 'sl_order_id': new_sl['id'], 'current_sl': be_price})
-                        await send_tg_msg(f"🛡 <b>{clean_name}</b>: Сработал Smart Б/У (+1.5%). SL перенесен в безубыток.")
+                        await send_tg_msg(f"🛡 <b>{clean_name}</b>: Сработал Smart Б/У (+RR 0.75). SL перенесен в безубыток.")
 
                 if pos['be_moved'] and not pos['tp80_hit']:
-                    if (is_long and (high_p >= tp70 or high_p >= abs_2_5_pct)) or (not is_long and (low_p <= tp70 or low_p <= abs_2_5_pct)):
+                    if (is_long and (high_p >= rr_1_50 or high_p >= abs_2_5_pct)) or (not is_long and (low_p <= rr_1_50 or low_p <= abs_2_5_pct)):
                         close_qty = float(exchange.amount_to_precision(sym, pos['initial_qty'] * 0.25))
                         if close_qty > 0:
                             await safe_create_order(sym, 'market', sl_side, close_qty, {'positionSide': pos_side, 'reduceOnly': True})
@@ -455,12 +447,12 @@ async def monitor_positions_task():
                             pos['current_qty'] = float(exchange.amount_to_precision(sym, pos['current_qty'] - close_qty))
                             new_sl = await safe_create_order(sym, 'stop_market', sl_side, pos['current_qty'], {'triggerPrice': pos['current_sl'], 'reduceOnly': True, 'positionSide': pos_side})
                             
-                            exec_price = abs_2_5_pct if (is_long and high_p >= abs_2_5_pct) or (not is_long and low_p <= abs_2_5_pct) else tp70
+                            exec_price = abs_2_5_pct if (is_long and high_p >= abs_2_5_pct) or (not is_long and low_p <= abs_2_5_pct) else rr_1_50
                             raw_chunk = (exec_price - entry) * close_qty if is_long else (entry - exec_price) * close_qty
                             chunk_net = raw_chunk - (close_qty * exec_price * FEE_RATE)
                             daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + chunk_net
                             pos.update({'tp80_hit': True, 'sl_order_id': new_sl['id']})
-                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла +2.5%. Ранняя фиксация 25% объема. (Чистый PNL: +{chunk_net:.2f})")
+                            await send_tg_msg(f"💸 <b>{clean_name}</b>: Цена прошла RR 1.5. Ранняя фиксация 25% объема. (Чистый PNL: +{chunk_net:.2f})")
 
                 if pos['tp80_hit'] and not pos['tp100_hit']:
                     if (is_long and high_p >= tp100) or (not is_long and low_p <= tp100):
@@ -533,7 +525,6 @@ async def process_smc_coin(sym, ctx, sem):
             rsi_curr = calculate_rsi(c[:-1], 14)
             rsi_prev = calculate_rsi(c[:-2], 14)
             
-            # --- DYNAMIC TP (ATR MULTIPLIER) ---
             tr = np.maximum(h[1:]-l[1:], np.maximum(np.abs(h[1:]-c[:-1]), np.abs(l[1:]-c[:-1])))
             current_atr = np.mean(tr[-14:])
             baseline_atr = np.mean(tr[-50:-14]) if len(tr) >= 50 else current_atr
@@ -542,7 +533,6 @@ async def process_smc_coin(sym, ctx, sem):
             if baseline_atr > 0:
                 if current_atr > baseline_atr * 2.0: tp_multiplier = 2.5
                 elif current_atr > baseline_atr * 1.5: tp_multiplier = 2.0
-            # -----------------------------------
             
             active_fvg = next((fvg for fvg in reversed(fvgs) if (
                 (fvg['type'] == 'Bullish' and current_price > fvg['top'] and (len(c) - fvg['index']) <= 15) or 
@@ -562,14 +552,17 @@ async def process_smc_coin(sym, ctx, sem):
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             if not mode: return sym, 'no_setup'
             
-            if mode == 'Long' and rsi_curr > 55: return sym, 'rsi_exhausted'
-            if mode == 'Short' and rsi_curr < 45: return sym, 'rsi_exhausted'
+            # --- FIX 5: Stricter RSI Confirmation ---
+            if mode == 'Long' and rsi_curr > 50: return sym, 'rsi_exhausted'
+            if mode == 'Short' and rsi_curr < 50: return sym, 'rsi_exhausted'
             
             btc_trend = ctx['btc_trend']
             altseason = ctx['altseason']
             
+            # --- FIX 1 & 2: Macro Flat Filter & Altseason Short Ban ---
+            if btc_trend == 'Flat': return sym, 'btc_flat'
             if mode == 'Long' and btc_trend == 'Short' and not altseason: return sym, 'wrong_trend'
-            if mode == 'Short' and btc_trend == 'Long': return sym, 'wrong_trend'
+            if mode == 'Short' and (btc_trend == 'Long' or altseason): return sym, 'wrong_trend'
 
             vwap_dist = ((current_price - vwap) / vwap) * 100
             if mode == 'Long' and vwap_dist > -0.8: return sym, 'vwap_reject' 
@@ -619,18 +612,16 @@ async def smc_radar_task():
     await exchange.load_markets() 
     while True:
         try:
-            # --- NEWS FILTER (KILL-SWITCH) ---
             now_ts = datetime.now(timezone.utc).timestamp()
             is_news_pause = any(abs(ev - now_ts) < 15 * 60 for ev in NEWS_EVENTS)
             if is_news_pause:
                 logging.info("🛑 [NEWS FILTER] Обнаружен выход макро-новостей! Пауза торговли на 15 мин...")
                 await asyncio.sleep(60)
                 continue
-            # ---------------------------------
 
             if len(active_positions) >= MAX_POSITIONS: await asyncio.sleep(60); continue
             
-            btc_trend = 'Long'
+            btc_trend = 'Neutral'
             altseason = False
             btc_ema_dist = 0.0
             eth_btc_diff = 0.0
@@ -640,8 +631,12 @@ async def smc_radar_task():
                 except: btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
                 btc_ema = calculate_ema(btc_c, 200)
-                btc_trend = 'Long' if btc_c[-1] > btc_ema else 'Short'
                 btc_ema_dist = (btc_c[-1] - btc_ema) / btc_ema * 100
+                
+                # --- FIX 1: Macro Flat logic ---
+                if btc_ema_dist > 0.5: btc_trend = 'Long'
+                elif btc_ema_dist < -0.5: btc_trend = 'Short'
+                else: btc_trend = 'Flat'
 
                 try: eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT:USDT', timeframe=SMC_TIMEFRAME, limit=205)
                 except: eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT', timeframe=SMC_TIMEFRAME, limit=205)
@@ -655,35 +650,26 @@ async def smc_radar_task():
                     altseason = True
             except: pass
             
-            global_ctx = {
-                'btc_trend': btc_trend,
-                'btc_ema_dist': btc_ema_dist,
-                'altseason': altseason,
-                'eth_btc_diff': eth_btc_diff
-            }
+            global_ctx = {'btc_trend': btc_trend, 'btc_ema_dist': btc_ema_dist, 'altseason': altseason, 'eth_btc_diff': eth_btc_diff}
 
             tickers = await exchange.fetch_tickers()
             temp_symbols = []
-            stats = {'total': len(tickers), 'high_spread': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_exhausted': 0, 'passed': 0, 'ema_too_close': 0, 'trend_exhausted': 0, 'short_squeeze_risk': 0}
+            stats = {'total': len(tickers), 'high_spread': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_exhausted': 0, 'passed': 0, 'ema_too_close': 0, 'trend_exhausted': 0, 'short_squeeze_risk': 0, 'btc_flat': 0}
             
             for sym, tick in tickers.items():
                 clean_sym = sym.split(':')[0].split('/')[0]
                 if sym.endswith(':USDT') and exchange.markets.get(sym, {}).get('active') is not False and not any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS):
-                    
-                    # --- SPREAD PROTECTION ---
-                    ask = float(tick.get('ask') or 0)
-                    bid = float(tick.get('bid') or 0)
+                    ask = float(tick.get('ask') or 0); bid = float(tick.get('bid') or 0)
                     if bid > 0 and ask > 0 and ((ask - bid) / bid * 100) > 0.3:
                         stats['high_spread'] += 1
                         continue
-                    # -------------------------
 
                     if clean_sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[clean_sym]: continue
                     if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
                     temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
             
             valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USDT][:SCAN_LIMIT]
-            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Спред-отказ: {stats['high_spread']})...")
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'} | Тренд BTC: {btc_trend} | Спред-отказ: {stats['high_spread']})...")
             
             sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, global_ctx, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -692,7 +678,8 @@ async def smc_radar_task():
             for r in results:
                 if isinstance(r, tuple) and len(r) == 2:
                     sym, signal = r
-                    if signal == 'no_choch': stats['no_choch'] += 1
+                    if signal == 'btc_flat': stats['btc_flat'] += 1
+                    elif signal == 'no_choch': stats['no_choch'] += 1
                     elif signal == 'no_fvg': stats['no_fvg'] += 1
                     elif signal == 'no_volume' or signal == 'weak_candle': stats['no_volume'] += 1
                     elif signal == 'wrong_trend': stats['wrong_trend'] += 1
@@ -707,7 +694,7 @@ async def smc_radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC] Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) FVG({stats['no_fvg']}) Усталость Тренда({stats['trend_exhausted']}) Объем({stats['no_volume']}) Макро({stats['wrong_trend']}) Фандинг({stats['short_squeeze_risk']}) -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC] Флэт BTC({stats['btc_flat']}) Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) Макро/Альт({stats['wrong_trend']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
@@ -726,20 +713,15 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.65 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.70 PROP):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
-            
-            if now.minute == 0:
-                active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
-                winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.65 PROP] В работе: {active} | Винрейт: {winrate:.1f}%\n")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.65 PROP")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.70 PROP")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -751,8 +733,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.65 (Tier-1.5: News Filter, Spread Protection, Dynamic TP)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.65 PROP</b> запущен (Внедрен News Filter, защита от спреда и Динамический TP)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.70 (Tier-1.5 Prop Fixes)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.70 PROP</b> запущен (Исправлен фильтр макро-флэта, удален агрессивный MFE-timeout, Б/У отвязан от Dynamic TP)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(fetch_news_task())
