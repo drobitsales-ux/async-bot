@@ -50,17 +50,21 @@ REPORTED_TODAY = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
+# --- ИНИЦИАЛИЗАЦИЯ БИРЖ ---
 exchange = ccxt_async.bingx({
     'apiKey': BINGX_API_KEY, 
     'secret': BINGX_SECRET,
     'options': {'defaultType': 'swap', 'marginMode': 'isolated'}, 
     'enableRateLimit': True
 })
+binance_exch = ccxt_async.binance({'enableRateLimit': True})
+bybit_exch = ccxt_async.bybit({'enableRateLimit': True})
+mexc_exch = ccxt_async.mexc({'enableRateLimit': True})
 
 async def fetch_news_task():
     global NEWS_EVENTS
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
     }
     while True:
@@ -82,62 +86,73 @@ async def fetch_news_task():
                         await asyncio.sleep(43200)
                     else:
                         await asyncio.sleep(300)
-        except Exception as e:
+        except Exception:
             await asyncio.sleep(300)
 
+async def fetch_vol_spike(exch, sym):
+    """Проверка аномального объема на конкретной бирже"""
+    try:
+        ohlcv = await exch.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=22)
+        if not ohlcv or len(ohlcv) < 20: return False
+        v = [x[5] for x in ohlcv]
+        avg_v = sum(v[-22:-2]) / 20
+        if avg_v == 0: return False
+        return (v[-2] / avg_v) > 1.5 # Всплеск объема минимум в 1.5 раза
+    except: return False
+
+async def check_global_volume(base_coin):
+    """Мультибиржевой Оракул (GRID режим)"""
+    spot_sym = f"{base_coin}/USDT"
+    tasks = [
+        fetch_vol_spike(binance_exch, spot_sym),
+        fetch_vol_spike(bybit_exch, spot_sym),
+        fetch_vol_spike(mexc_exch, spot_sym)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    clean_results = [r if isinstance(r, bool) else False for r in results]
+    
+    exchanges = ["Binance", "Bybit", "MEXC"]
+    confirmed_by = [exchanges[i] for i, res in enumerate(clean_results) if res]
+    
+    return confirmed_by, len(confirmed_by) > 0
+
 async def get_liquidity_data(sym):
-    """Сбор данных о ликвидности (OI и L/S Ratio)"""
     try:
         oi_data = await exchange.fetch_open_interest(sym)
         oi = float(oi_data.get('openInterest', 0))
     except: oi = 0.0
     
     try:
-        # Пытаемся получить L/S ratio. Если биржа не поддерживает напрямую, возвращаем 1.0 (нейтрально)
         ls_data = await exchange.fetch_long_short_ratio(sym, '15m')
         ls_ratio = float(ls_data[-1].get('longShortRatio', 1.0)) if ls_data else 1.0
     except: ls_ratio = 1.0
-    
     return oi, ls_ratio
 
 async def ask_llm_oracle(setup_data):
-    """Отправка JSON сетапа в Gemini API для скоринга"""
     if not GEMINI_API_KEY:
         return {"confidence": 0, "comment": "Gemini API Key не настроен"}
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    # Зашиваем весь наш контекст прямо в промпт
     prompt = f"""Ты профессиональный риск-менеджер крипто-хедж-фонда. 
 Твоя задача — анализировать сухие цифры сетапа и оценивать вероятность отработки от 0 до 100.
-Контекст стратегий:
-- Для SMC: Мы ищем сделки по тренду BTC, после слома структуры (CHoCH) с тестом имбаланса (FVG). Высокие объемы подтверждают сетап. Шорты в альтсезон запрещены.
-- Для RSI Mean Reversion: Мы ищем сильные отклонения (сквизы) с возвратом к среднему значению при всплеске объемов.
-- Учитывай перекос ликвидности: если мы шортим, а Long/Short Ratio > 1.5 — это топливо для шорт-сквиза, что опасно.
-Верни ТОЛЬКО валидный JSON: {{"decision": "approve" или "reject", "confidence": <число 0-100>, "comment": "<твой краткий вывод на русском>"}}
-Данные для анализа: {json.dumps(setup_data)}"""
+Контекст: Мы ищем сделки по тренду BTC, после слома структуры (CHoCH) с тестом имбаланса (FVG). Высокие объемы подтверждают сетап. Шорты в альтсезон запрещены. Учитывай перекос ликвидности: если шортим, а Long/Short Ratio > 1.5 — это опасно. Глобальный объем подтвержден на других биржах.
+Верни ТОЛЬКО валидный JSON: {{"decision": "approve" или "reject", "confidence": <число 0-100>, "comment": "<твой краткий вывод>"}}
+Данные: {json.dumps(setup_data)}"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2, 
-            "response_mime_type": "application/json" # Заставляем API всегда отдавать чистый JSON
-        }
+        "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json"}
     }
-    
-    headers = {"Content-Type": "application/json"}
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=10) as resp:
+            async with session.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     content = data['candidates'][0]['content']['parts'][0]['text']
                     return json.loads(content)
-                else: 
-                    return {"confidence": 0, "comment": f"API Error: {resp.status}"}
-    except Exception as e:
-        return {"confidence": 0, "comment": "LLM Timeout/Error"}
+                else: return {"confidence": 0, "comment": f"API Error: {resp.status}"}
+    except Exception: return {"confidence": 0, "comment": "LLM Timeout/Error"}
 
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -321,11 +336,13 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
     setup_eval = "💎 Топовый (Высокий объем)" if signal_data.get('vol_ratio', 0) > 2.0 else "👍 Хороший (Средний объем)"
     tp_mult = signal_data.get('tp_mult', 1.5)
     
-    # Расчет скоринга ликвидности для логов
     liq_score_text = "Нейтрально"
     ls = signal_data.get('ls_ratio', 1.0)
     if direction == 'Short' and ls > 1.5: liq_score_text = f"🔥 Лонг-Сквиз Магнит (L/S {ls:.2f})"
     elif direction == 'Long' and ls < 0.8: liq_score_text = f"🔥 Шорт-Сквиз Магнит (L/S {ls:.2f})"
+    
+    global_exchanges = signal_data.get('conf_exchanges', [])
+    global_vol_str = f"Подтверждено ({', '.join(global_exchanges)}) 🌍" if global_exchanges else "Нет"
 
     analytics_text = (f"📊 <b>Аналитика сетапа (SMC):</b>\n"
                       f"• Тренд BTC: {btc_trend_str}\n"
@@ -333,13 +350,14 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                       f"• Защита: {session_text}\n"
                       f"• Подтверждение: {signal_data.get('confirm_type', 'N/A')} ✅\n"
                       f"• Слом структуры: {signal_data.get('choch_type', 'N/A')} [{setup_eval}]\n"
+                      f"• Глобальный объем: {global_vol_str}\n"
                       f"• Осциллятор (RSI): {signal_data.get('rsi', 0):.1f}\n"
                       f"• Динамический TP: {tp_mult}x\n\n"
                       f"💧 <b>Ликвидность:</b> {liq_score_text} | OI: {signal_data.get('oi', 0):.0f}\n"
                       f"🧠 <b>LLM Оракул:</b> Уверенность {signal_data.get('llm_conf', 0)}/100\n"
                       f"<i>💬 \"{signal_data.get('llm_comment', 'API не подключен')}\"</i>")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async v8.80 PROP + AI]: {clean_sym}</b>\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [SMC Async v8.90 + Global Oracle]: {clean_sym}</b>\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -647,6 +665,14 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Short' and funding_rate < -0.00015:
                 return sym, 'short_squeeze_risk'
 
+            # =========================================================
+            # 🔥 МУЛЬТИБИРЖЕВОЙ ОРАКУЛ (GLOBAL VOLUME GRID) 🔥
+            # =========================================================
+            base_coin = sym.split(':')[0].split('/')[0]
+            conf_exchanges, global_vol_ok = await check_global_volume(base_coin)
+            if not global_vol_ok:
+                return sym, 'no_global_volume'
+
             if mode == 'Long':
                 sl_price = min(l[active_fvg['index']:]) - (current_atr * 3.0) 
                 if (current_price - sl_price) / current_price * 100 < MIN_SL_PCT: sl_price = current_price * (1 - MIN_SL_PCT/100)
@@ -661,7 +687,7 @@ async def process_smc_coin(sym, ctx, sem):
             setup_json = {
                 "coin": sym, "strategy": "SMC", "mode": mode, "rsi": round(rsi_curr, 1),
                 "volume_spike_x": round(vol_ratio, 1), "long_short_ratio": round(ls_ratio, 2), 
-                "macro_btc_trend": btc_trend
+                "macro_btc_trend": btc_trend, "global_volume_confirmed": global_vol_ok
             }
             llm_response = await ask_llm_oracle(setup_json)
 
@@ -672,6 +698,7 @@ async def process_smc_coin(sym, ctx, sem):
                 'fvg_type': active_fvg['type'], 'choch_type': bos_choch,
                 'ema_dist': ema_dist, 'rsi': rsi_curr, 'vwap': vwap, 'vol_ratio': vol_ratio,
                 'confirm_type': confirm_type, 'tp_mult': tp_multiplier,
+                'conf_exchanges': conf_exchanges,
                 'oi': oi, 'ls_ratio': ls_ratio, 
                 'llm_conf': llm_response.get('confidence', 0), 'llm_comment': llm_response.get('comment', '')
             }
@@ -723,7 +750,7 @@ async def smc_radar_task():
 
             tickers = await exchange.fetch_tickers()
             temp_symbols = []
-            stats = {'total': len(tickers), 'high_spread': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_exhausted': 0, 'passed': 0, 'ema_too_close': 0, 'trend_exhausted': 0, 'short_squeeze_risk': 0, 'btc_flat': 0}
+            stats = {'total': len(tickers), 'high_spread': 0, 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_exhausted': 0, 'passed': 0, 'ema_too_close': 0, 'trend_exhausted': 0, 'short_squeeze_risk': 0, 'btc_flat': 0, 'no_global_volume': 0}
             
             for sym, tick in tickers.items():
                 clean_sym = sym.split(':')[0].split('/')[0]
@@ -759,11 +786,12 @@ async def smc_radar_task():
                     elif signal == 'ema_too_close': stats['ema_too_close'] += 1 
                     elif signal == 'trend_exhausted': stats['trend_exhausted'] += 1
                     elif signal == 'short_squeeze_risk': stats['short_squeeze_risk'] += 1
+                    elif signal == 'no_global_volume': stats['no_global_volume'] += 1
                     elif isinstance(signal, dict): 
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC] Флэт BTC({stats['btc_flat']}) Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) Макро/Альт({stats['wrong_trend']}) -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC] Флэт BTC({stats['btc_flat']}) Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) БезГлобалОбъема({stats['no_global_volume']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
@@ -782,7 +810,7 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (DUAL Async v8.80 PROP + AI):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (Async v8.90 PROP + Oracle):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USDT\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USDT\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -790,7 +818,7 @@ async def print_stats_hourly():
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.80 PROP")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"BingX Async Bot Active v8.90 PROP")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -802,8 +830,8 @@ async def main():
         try: bal = await exchange.fetch_balance(); daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0)); await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.80 (Tier-1.5 + AI Oracle & Liquidity Module)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.80 PROP</b> запущен (Добавлен ИИ-Оракул и скоринг ликвидности)!")
+    logging.info("🚀 Запуск BINGX ASYNC БОТА v8.90 (Tier-1.5 + AI & Global Volume Oracle)...")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.90 PROP</b> запущен (Восстановлен Мультибиржевой GRID-Оракул)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(fetch_news_task())
