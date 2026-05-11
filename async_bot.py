@@ -631,8 +631,9 @@ async def process_smc_coin(sym, ctx, sem):
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
             if not mode: return sym, 'no_setup'
             
-            if mode == 'Long' and rsi_curr > 50: return sym, 'rsi_exhausted'
-            if mode == 'Short' and rsi_curr < 50: return sym, 'rsi_exhausted'
+            # CHoCH - это импульс, поэтому RSI будет высоким. Режем только реальные экстремумы!
+            if mode == 'Long' and rsi_curr > 75: return sym, 'rsi_exhausted'
+            if mode == 'Short' and rsi_curr < 25: return sym, 'rsi_exhausted'
             
             btc_trend = ctx['btc_trend']
             altseason = ctx['altseason']
@@ -791,7 +792,7 @@ async def smc_radar_task():
                         stats['passed'] += 1
                         valid_results.append((sym, signal))
 
-            logging.info(f"🔎 [SMC] Флэт BTC({stats['btc_flat']}) Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) БезГлобалОбъема({stats['no_global_volume']}) -> ВХОДЫ: {stats['passed']}")
+            logging.info(f"🔎 [SMC] BTC({stats['btc_flat']}) Пила({stats['ema_too_close']}) Слом({stats['no_choch']}) FVG({stats['no_fvg']}) RSI({stats['rsi_exhausted']}) VWAP({stats['vwap_reject']}) Объём({stats['no_volume']}) Глобал({stats['no_global_volume']}) -> ВХОДЫ: {stats['passed']}")
 
             for sym, signal in valid_results:
                 if sym not in NOTIFIED_SYMBOLS: 
