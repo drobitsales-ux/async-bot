@@ -1,70 +1,110 @@
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  UNIFIED SMC + RSI MEAN REVERSION BOT  v10.0  PROP FIRM EDITION     ║
+║  BingX Perpetual Futures | Render-Ready | $10k → $100k Path         ║
+║                                                                      ║
+║  СТРАТЕГИИ:                                                          ║
+║  [SMC]  Smart Money Concepts — CHoCH + FVG + Killzones              ║
+║  [RSI]  Mean Reversion — RSI Extreme + Pattern + SMA/VWAP Magnet    ║
+║                                                                      ║
+║  ИСПРАВЛЕНИЯ vs RSI bot v8.30:                                       ║
+║  [R-FIX-1]  BASE_RISK 2% → 0.75% | MAX_SL 4.5% → 2.5%             ║
+║  [R-FIX-2]  MAX_POSITIONS 3 → 3 shared (SMC+RSI budget)            ║
+║  [R-FIX-3]  SL = min(l) - ATR*3.0 → ATR*1.5 (tight + safe)        ║
+║  [R-FIX-4]  RSI thresholds 28/72 → 25/75 (cleaner signals)         ║
+║  [R-FIX-5]  LLM decision 'reject' теперь реально блокирует вход     ║
+║  [R-FIX-6]  BTC Flat больше не блокирует лонги (лишний фильтр)     ║
+║  [R-FIX-7]  vol_ratio потолок 8x → 12x (не режем лучшие импульсы)  ║
+║  [R-FIX-8]  EXCLUDED_KEYWORDS: фиксирован фильтр (parts, не full)  ║
+║  [R-FIX-9]  telebot + requests → aiohttp (единый async стек)        ║
+║  [R-FIX-10] News: точное совпадение → окно ±15 мин                  ║
+║  [R-FIX-11] Daily circuit breaker: стоп при DD > 2.5% за день      ║
+║  [R-FIX-12] Отдельные таблицы позиций (smc_pos / rsi_pos)          ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
 import asyncio
 import json
 import os
 import logging
 import sqlite3
 import time
-import signal
-import ccxt.async_support as ccxt_async
-import numpy as np
 import aiohttp
-from datetime import datetime, timezone, timedelta
+import numpy as np
+import ccxt.async_support as ccxt_async
+from datetime import datetime, timezone
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
- 
-# ══════════════════════════════════════════════════════════
-#  ГЛОБАЛЬНЫЕ НАСТРОЙКИ
-# ══════════════════════════════════════════════════════════
-DB_PATH          = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
-TOKEN            = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID    = int(os.getenv('GROUP_CHAT_ID', '-1'))   # [FIX-6] убрали хардкод
-BINGX_API_KEY    = os.getenv('BINGX_API_KEY')
-BINGX_SECRET     = os.getenv('BINGX_SECRET')
-GEMINI_API_KEY   = os.getenv('GEMINI_API_KEY')
- 
-# ── Параметры Проп $10k ──────────────────────────────────
-BASE_RISK_PER_TRADE         = 0.0075   # 0.75% риск на сделку
-BASE_RISK_WEEKEND           = 0.00375  # [FIX-4] 0.375% в выходные (риск/2)
-MAX_POSITIONS               = 2
-MAX_POSITIONS_PER_DIRECTION = 1        # не более 1 лонга и 1 шорта одновременно
-LEVERAGE                    = 5
-MIN_VOLUME_USDT             = 3_000_000  # рекомендованный порог для $10k
-MAX_SL_PCT                  = 2.5
-FEE_RATE                    = 0.0005
-SMC_TIMEFRAME               = '15m'
-SCAN_LIMIT                  = 250      # оптимально для 60-сек цикла
-SCAN_CONCURRENCY            = 20       # [FIX-6] параллельных запросов
- 
-# [FIX-1] ИСПРАВЛЕН ФИЛЬТР: проверка через 'in', а не точное совпадение
-# Перечислены ЧАСТИ имени — если часть встречается в символе, монета исключается
+
+# ═══════════════════════════════════════════════════════
+#  КОНФИГУРАЦИЯ
+# ═══════════════════════════════════════════════════════
+DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
+TOKEN         = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID       = int(os.getenv('GROUP_CHAT_ID', '-1'))
+BINGX_KEY     = os.getenv('BINGX_API_KEY')
+BINGX_SECRET  = os.getenv('BINGX_SECRET')
+GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
+
+# ── Риск-параметры (оба алгоритма) ─────────────────────
+RISK_PER_TRADE   = 0.0075   # [R-FIX-1] 0.75% на сделку
+RISK_WEEKEND     = 0.00375  # 0.375% в выходные
+MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
+MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
+LEVERAGE         = 5
+MIN_VOL_USDT     = 3_000_000  # мин. объём монеты
+MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
+MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
+FEE_RATE         = 0.0005
+DAILY_DD_LIMIT   = 0.025    # [R-FIX-11] стоп торговли при -2.5% за день
+SCAN_LIMIT       = 250
+SCAN_SEM         = 20       # параллельных запросов
+
+# ── SMC-параметры ───────────────────────────────────────
+SMC_TF          = '15m'
+SMC_PIVOT_ORDER = 5
+
+# ── RSI-параметры ───────────────────────────────────────
+RSI_TF          = '15m'
+RSI_LONG_MAX    = 25    # [R-FIX-4] был 28
+RSI_SHORT_MIN   = 75    # [R-FIX-4] был 72
+RSI_PERIOD      = 14
+
+# ── Исключения (части имён символов) ───────────────────
+# [R-FIX-8] Проверка через `any(kw in sym for kw in EXCLUDED_PARTS)`
 EXCLUDED_PARTS = [
     'BTC', 'ETH', 'SOL', 'BNB', 'XRP',
     'NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500',
-    'GOLD', 'SILVER', 'XAU', 'PAXG', 'EUR', 'LUNC', 'USTC',
-    'USDC', 'FART', 'PEPE', 'SHIB', 'DOGE', 'WIF', 'BONK',
-    'FLOKI', 'BOME', 'MEME', 'TURBO', 'SATS', 'RATS', 'ORDI', '1000'
+    'GOLD', 'SILVER', 'XAU', 'PAXG', 'EUR',
+    'LUNC', 'USTC', 'USDC', 'FART', 'PEPE', 'SHIB', 'DOGE',
+    'WIF', 'BONK', 'FLOKI', 'BOME', 'MEME', 'TURBO',
+    'SATS', 'RATS', 'ORDI', '1000',
 ]
- 
+
 # ── Состояние ────────────────────────────────────────────
-daily_stats      = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'start_balance': 0.0}
-active_positions = []
-NOTIFIED_SYMBOLS = {}   # {sym: timestamp}
-NEWS_EVENTS      = []
-global_session   = None
-_markets_cache   = None
-_markets_last_refresh = 0.0
-_last_news_refresh    = 0.0
-_last_stats_date      = None   # [FIX-7] для ежесуточного сброса
- 
+smc_positions   = []   # [R-FIX-12] отдельные списки
+rsi_positions   = []
+daily_stats     = {
+    'pnl_pct': 0.0, 'trades': 0, 'wins': 0,
+    'start_balance': 0.0, 'stat_date': None,
+    'smc_trades': 0, 'rsi_trades': 0,
+}
+news_events     = []       # [float timestamp, ...]
+notified        = {}       # {sym: timestamp}  cooldown 4h
+markets_cache   = None
+markets_ts      = 0.0
+news_ts         = 0.0
+http            = None     # единая aiohttp.ClientSession
+circuit_open    = False    # [R-FIX-11] дневной DD-стоп
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s'
 )
- 
+
 # ── Биржи ────────────────────────────────────────────────
 exchange = ccxt_async.bingx({
-    'apiKey':  BINGX_API_KEY,
-    'secret':  BINGX_SECRET,
+    'apiKey': BINGX_KEY, 'secret': BINGX_SECRET,
     'options': {'defaultType': 'swap', 'marginMode': 'isolated'},
     'enableRateLimit': True,
 })
@@ -76,215 +116,213 @@ bybit = ccxt_async.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'linear'},
 })
- 
-# ══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
-# ══════════════════════════════════════════════════════════
-def get_db_conn():
+# ═══════════════════════════════════════════════════════
+def get_db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
- 
+
 def init_db():
-    conn = get_db_conn()
+    conn = get_db()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS active_positions
-                 (id INTEGER PRIMARY KEY, data TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_stats
-                 (id INTEGER PRIMARY KEY, pnl REAL, trades INTEGER,
-                  wins INTEGER, start_balance REAL, stat_date TEXT)''')
+    # [R-FIX-12] раздельные таблицы стратегий
+    c.execute("CREATE TABLE IF NOT EXISTS smc_pos  (id INTEGER PRIMARY KEY, data TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS rsi_pos  (id INTEGER PRIMARY KEY, data TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS stats
+                 (id INTEGER PRIMARY KEY, pnl_pct REAL, trades INTEGER,
+                  wins INTEGER, start_balance REAL, stat_date TEXT,
+                  smc_trades INTEGER, rsi_trades INTEGER)""")
     conn.commit()
     conn.close()
- 
-def save_positions():
+
+def _save(table: str, data: list):
     try:
-        conn = get_db_conn()
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO active_positions (id, data) VALUES (1, ?)",
-                  (json.dumps(active_positions),))
-        c.execute("""INSERT OR REPLACE INTO daily_stats
-                     (id, pnl, trades, wins, start_balance, stat_date)
-                     VALUES (1, ?, ?, ?, ?, ?)""",
-                  (daily_stats['pnl'], daily_stats['trades'],
-                   daily_stats['wins'], daily_stats['start_balance'],
-                   str(_last_stats_date)))
+        conn = get_db()
+        conn.execute(f"INSERT OR REPLACE INTO {table} (id, data) VALUES (1, ?)",
+                     (json.dumps(data),))
         conn.commit()
         conn.close()
     except Exception as e:
-        logging.error(f"DB save error: {e}")
- 
-def load_positions():
-    global active_positions, daily_stats, _last_stats_date
+        logging.error(f"DB save {table}: {e}")
+
+def _load(table: str) -> list:
     try:
-        conn = get_db_conn()
-        c = conn.cursor()
-        c.execute("SELECT data FROM active_positions WHERE id = 1")
-        row = c.fetchone()
-        if row:
-            active_positions = json.loads(row[0])
- 
-        c.execute("SELECT pnl, trades, wins, start_balance, stat_date FROM daily_stats WHERE id = 1")
-        stat_row = c.fetchone()
-        if stat_row:
-            daily_stats['pnl']           = stat_row[0]
-            daily_stats['trades']        = stat_row[1]
-            daily_stats['wins']          = stat_row[2]
-            daily_stats['start_balance'] = stat_row[3]
-            stored_date = stat_row[4]
-            try:
-                _last_stats_date = datetime.strptime(stored_date, "%Y-%m-%d").date()
-            except Exception:
-                _last_stats_date = None
+        conn = get_db()
+        row = conn.execute(f"SELECT data FROM {table} WHERE id=1").fetchone()
         conn.close()
-    except Exception:
-        pass
- 
-# ══════════════════════════════════════════════════════════
-#  ТЕЛЕГРАМ
-# ══════════════════════════════════════════════════════════
-async def send_tg_msg(text: str):
-    if not TOKEN or GROUP_CHAT_ID == -1 or not global_session:
-        return
-    url     = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        return json.loads(row[0]) if row else []
+    except:
+        return []
+
+def save_all():
+    _save('smc_pos', smc_positions)
+    _save('rsi_pos', rsi_positions)
     try:
-        async with global_session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            pass
-    except Exception:
-        pass
- 
-# ══════════════════════════════════════════════════════════
-#  НОВОСТНОЙ ФИЛЬТР  [FIX-3] [FIX-8]
-# ══════════════════════════════════════════════════════════
-async def update_macro_news():
-    """Обновление макро-новостей. Заглушка — заменить на реальный API."""
-    global NEWS_EVENTS, _last_news_refresh
-    NEWS_EVENTS = [
-        # Формат: {'time': 'HH:MM', 'impact': 'High', 'currency': 'USD'}
-        # Здесь подключить https://nfs.faireconomy.media/ff_calendar_thisweek.json
-    ]
-    _last_news_refresh = time.time()
-    logging.info(f"📰 [NEWS] Обновлено: {len(NEWS_EVENTS)} событий")
- 
-def is_news_spike() -> bool:
-    """[FIX-3] Блокировка ±15 минут вокруг красного события."""
-    if not NEWS_EVENTS:
-        return False
-    now_utc = datetime.now(timezone.utc)
-    for ev in NEWS_EVENTS:
-        if ev.get('impact') != 'High':
-            continue
-        try:
-            ev_time = datetime.strptime(ev['time'], "%H:%M").replace(
-                year=now_utc.year, month=now_utc.month, day=now_utc.day,
-                tzinfo=timezone.utc)
-            if abs((now_utc - ev_time).total_seconds()) <= 900:  # 15 мин
-                return True
-        except Exception:
-            pass
-    return False
- 
-# ══════════════════════════════════════════════════════════
-#  ОРАКУЛЫ
-# ══════════════════════════════════════════════════════════
-async def check_global_volume_oracle(sym: str) -> bool:
-    """Проверка объёма на Binance + Bybit."""
-    try:
-        base = sym.split('/')[0]
-        bin_sym = f"{base}/USDT"
-        results = await asyncio.gather(
-            binance.fetch_ticker(bin_sym),
-            bybit.fetch_ticker(bin_sym),
-            return_exceptions=True
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO stats VALUES (1,?,?,?,?,?,?,?)",
+            (daily_stats['pnl_pct'], daily_stats['trades'], daily_stats['wins'],
+             daily_stats['start_balance'], str(daily_stats['stat_date']),
+             daily_stats['smc_trades'], daily_stats['rsi_trades'])
         )
-        vol_bin = results[0]['quoteVolume'] if not isinstance(results[0], Exception) else 0
-        vol_bbt = results[1]['quoteVolume'] if not isinstance(results[1], Exception) else 0
-        return vol_bin > MIN_VOLUME_USDT or vol_bbt > MIN_VOLUME_USDT
-    except Exception:
-        return True  # при ошибке — пропускаем (не блокируем сделку)
- 
-async def ask_gemini_oracle(sym: str, mode: str, price: float) -> bool:
-    """AI-фильтр через Gemini 1.5 Flash."""
-    if not GEMINI_API_KEY or not global_session:
-        return True
-    prompt = (
-        f"Crypto futures analysis: {sym}, timeframe {SMC_TIMEFRAME}, "
-        f"direction {mode}, entry price {price:.6f}. "
-        f"Using Smart Money Concepts (CHoCH, FVG, liquidity). "
-        f"Is this a valid SMC setup? Reply ONLY with YES or NO."
-    )
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    )
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"DB save stats: {e}")
+
+def load_all():
+    global smc_positions, rsi_positions, daily_stats
+    smc_positions = _load('smc_pos')
+    rsi_positions = _load('rsi_pos')
     try:
-        async with global_session.post(
-            url, json=payload, timeout=aiohttp.ClientTimeout(total=6)
-        ) as resp:
-            data = await resp.json()
-            text = data['candidates'][0]['content']['parts'][0]['text'].strip().upper()
-            approved = 'YES' in text
-            if not approved:
-                logging.info(f"🤖 [GEMINI] {sym} {mode} — REJECT")
-            return approved
-    except Exception:
-        return True
- 
-# ══════════════════════════════════════════════════════════
-#  SMC МАТЕМАТИКА
-# ══════════════════════════════════════════════════════════
-def is_trade_session() -> bool:
-    """Killzones: London 07:00–10:30 + NY 13:00–16:30 UTC."""
-    now    = datetime.now(timezone.utc).time()
-    london = (datetime.strptime("07:00", "%H:%M").time(),
-              datetime.strptime("10:30", "%H:%M").time())
-    ny     = (datetime.strptime("13:00", "%H:%M").time(),
-              datetime.strptime("16:30", "%H:%M").time())
-    return (london[0] <= now <= london[1]) or (ny[0] <= now <= ny[1])
- 
+        conn = get_db()
+        row = conn.execute("SELECT * FROM stats WHERE id=1").fetchone()
+        conn.close()
+        if row:
+            (_, daily_stats['pnl_pct'], daily_stats['trades'], daily_stats['wins'],
+             daily_stats['start_balance'], date_str,
+             daily_stats['smc_trades'], daily_stats['rsi_trades']) = row
+            try:
+                daily_stats['stat_date'] = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except:
+                pass
+    except:
+        pass
+
+# ═══════════════════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════════════════
+async def tg(text: str):
+    if not TOKEN or CHAT_ID == -1 or not http:
+        return
+    try:
+        async with http.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=aiohttp.ClientTimeout(total=5)
+        ):
+            pass
+    except:
+        pass
+
+# ═══════════════════════════════════════════════════════
+#  НОВОСТНОЙ ФИЛЬТР  [R-FIX-10]
+# ═══════════════════════════════════════════════════════
+async def refresh_news():
+    """Загружает высоко-импактные USD-события. Обновляется каждые 6 часов."""
+    global news_events, news_ts
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+    try:
+        async with http.get(url, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                news_events = []
+                for item in data:
+                    if item.get('country') == 'USD' and item.get('impact') == 'High':
+                        try:
+                            news_events.append(
+                                datetime.fromisoformat(item['date']).timestamp()
+                            )
+                        except:
+                            pass
+                news_ts = time.time()
+                logging.info(f"📰 [NEWS] {len(news_events)} USD High-Impact events loaded")
+    except Exception as e:
+        logging.warning(f"News fetch failed: {e}")
+
+def is_news_now() -> bool:
+    """[R-FIX-10] ±15 минут вокруг события."""
+    now = time.time()
+    return any(abs(ev - now) < 900 for ev in news_events)
+
+# ═══════════════════════════════════════════════════════
+#  CIRCUIT BREAKER  [R-FIX-11]
+# ═══════════════════════════════════════════════════════
+def check_circuit_breaker() -> bool:
+    """Возвращает True если торговля разрешена."""
+    global circuit_open
+    if daily_stats['pnl_pct'] <= -DAILY_DD_LIMIT:
+        if not circuit_open:
+            circuit_open = True
+            logging.warning(f"🔴 [CIRCUIT BREAKER] Дневной DD {daily_stats['pnl_pct']*100:.2f}% → торговля остановлена")
+            asyncio.create_task(
+                tg(f"🔴 <b>CIRCUIT BREAKER</b>\nДневной убыток {daily_stats['pnl_pct']*100:.2f}% "
+                   f"превысил лимит {DAILY_DD_LIMIT*100:.1f}%\nТорговля остановлена до следующего дня.")
+            )
+        return False
+    circuit_open = False
+    return True
+
+# ═══════════════════════════════════════════════════════
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ═══════════════════════════════════════════════════════
+def is_session() -> bool:
+    """London 07:00–10:30 + NY 13:00–16:30 UTC."""
+    t = datetime.now(timezone.utc).time()
+    return (
+        datetime.strptime("07:00", "%H:%M").time() <= t <=
+        datetime.strptime("10:30", "%H:%M").time()
+    ) or (
+        datetime.strptime("13:00", "%H:%M").time() <= t <=
+        datetime.strptime("16:30", "%H:%M").time()
+    )
+
 def is_weekend() -> bool:
-    """[FIX-4] Суббота или воскресенье (UTC)."""
     return datetime.now(timezone.utc).weekday() >= 5
- 
-def calculate_vwap(h, l, c, v) -> float:
-    """Объёмно-взвешенный VWAP."""
+
+def current_risk() -> float:
+    return RISK_WEEKEND if is_weekend() else RISK_PER_TRADE
+
+def all_positions() -> list:
+    return smc_positions + rsi_positions
+
+def calc_vwap(h, l, c, v) -> float:
     denom = np.sum(v)
-    if denom == 0:
-        return float(c[-1])
-    return float(np.sum(v * (h + l + c) / 3) / denom)
- 
-def calculate_rsi(prices, window: int = 14) -> float:
-    """RSI по последним `window` барам."""
-    if len(prices) < window + 1:
+    return float(np.sum(v * (h + l + c) / 3) / denom) if denom > 0 else float(c[-1])
+
+def calc_rsi(prices, w: int = 14) -> float:
+    if len(prices) < w + 1:
         return 50.0
-    diffs  = np.diff(prices[-window - 1:])
-    gains  = np.maximum(diffs, 0)
-    losses = np.abs(np.minimum(diffs, 0))
-    avg_g  = np.mean(gains)
-    avg_l  = np.mean(losses)
-    if avg_l == 0:
+    d = np.diff(prices[-(w + 1):])
+    g, lo = np.maximum(d, 0), np.abs(np.minimum(d, 0))
+    ag, al = np.mean(g), np.mean(lo)
+    if al == 0:
         return 100.0
-    return float(100 - (100 / (1 + avg_g / avg_l)))
- 
+    return float(100 - 100 / (1 + ag / al))
+
+def calc_atr(h, l, c, w: int = 14) -> float:
+    tr = np.maximum(h[1:] - l[1:],
+         np.maximum(np.abs(h[1:] - c[:-1]),
+                    np.abs(l[1:] - c[:-1])))
+    return float(np.mean(tr[-w:]))
+
+def calc_ema(data, w: int) -> float:
+    if len(data) < w:
+        return float(data[-1])
+    alpha = 2 / (w + 1)
+    ema = float(data[0])
+    for p in data[1:]:
+        ema = p * alpha + ema * (1 - alpha)
+    return ema
+
 def get_pivots(highs, lows, order: int = 5):
-    """Swing High / Swing Low (чистый NumPy, без scipy)."""
+    """Swing High / Low (NumPy, без scipy)."""
     h_idx, l_idx = [], []
     n = len(highs)
     for i in range(order, n - order):
-        window_h = highs[i - order: i + order + 1]
-        if highs[i] == np.max(window_h) and np.sum(window_h == highs[i]) == 1:
+        win_h = highs[i - order: i + order + 1]
+        if highs[i] == np.max(win_h) and np.sum(win_h == highs[i]) == 1:
             h_idx.append(i)
-        window_l = lows[i - order: i + order + 1]
-        if lows[i] == np.min(window_l) and np.sum(window_l == lows[i]) == 1:
+        win_l = lows[i - order: i + order + 1]
+        if lows[i] == np.min(win_l) and np.sum(win_l == lows[i]) == 1:
             l_idx.append(i)
     return h_idx, l_idx
- 
+
 def find_fvg(h, l, mode: str, lookback: int = 10):
-    """
-    Истинный Fair Value Gap:
-    Bullish FVG: high[i-1] < low[i+1]  (разрыв вверх через свечу i)
-    Bearish FVG: low[i-1]  > high[i+1] (разрыв вниз через свечу i)
-    Возвращает самый свежий FVG, не старше `lookback` баров.
-    """
+    """Fair Value Gap: разрыв между свечой i-1 и i+1 через среднюю i."""
     for i in range(1, min(lookback, len(h) - 1)):
         idx = len(h) - 1 - i
         if idx < 1 or idx + 1 >= len(h):
@@ -294,508 +332,902 @@ def find_fvg(h, l, mode: str, lookback: int = 10):
         if mode == 'Short' and l[idx - 1] > h[idx + 1]:
             return {'top': float(l[idx - 1]), 'bottom': float(h[idx + 1])}
     return None
- 
-# ══════════════════════════════════════════════════════════
-#  ОСНОВНАЯ SMC-ЛОГИКА
-# ══════════════════════════════════════════════════════════
-async def process_smc_coin(sym: str):
+
+# ═══════════════════════════════════════════════════════
+#  ОРАКУЛЫ
+# ═══════════════════════════════════════════════════════
+async def oracle_volume(sym: str) -> bool:
+    """Проверка объёма на Binance + Bybit."""
+    try:
+        base = sym.split('/')[0]
+        r = await asyncio.gather(
+            binance.fetch_ticker(f"{base}/USDT"),
+            bybit.fetch_ticker(f"{base}/USDT"),
+            return_exceptions=True
+        )
+        vol_b = r[0]['quoteVolume'] if not isinstance(r[0], Exception) else 0
+        vol_y = r[1]['quoteVolume'] if not isinstance(r[1], Exception) else 0
+        return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT
+    except:
+        return True
+
+async def oracle_gemini(sym: str, strategy: str, mode: str,
+                        price: float, extra: dict = None) -> dict:
     """
-    Полный SMC-пайплайн:
-    1. Killzone + Новости
-    2. Объём (закрытая свеча v[-2])
+    [R-FIX-5] Возвращает {'ok': bool, 'conf': int, 'comment': str}.
+    decision == 'reject' → ok=False → сделка блокируется.
+    """
+    if not GEMINI_KEY or not http:
+        return {'ok': True, 'conf': 0, 'comment': 'API not set'}
+
+    context = {
+        'symbol': sym, 'strategy': strategy, 'direction': mode,
+        'price': round(price, 6),
+    }
+    if extra:
+        context.update(extra)
+
+    system = (
+        "Ты риск-менеджер крипто-хедж-фонда. Анализируй сетап и верни ТОЛЬКО "
+        'валидный JSON: {"decision": "approve"|"reject", "confidence": 0-100, '
+        '"comment": "краткий вывод на русском"}. '
+        "SMC: ищем CHoCH+FVG в сессию. RSI MR: перепроданность/перекупленность+паттерн."
+    )
+    prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/"
+           f"models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}")
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"},
+    }
+    try:
+        async with http.post(url, json=payload,
+                             timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            data = await resp.json()
+            raw = data['candidates'][0]['content']['parts'][0]['text']
+            parsed = json.loads(raw)
+            ok = str(parsed.get('decision', '')).lower() == 'approve'
+            conf = int(parsed.get('confidence', 0))
+            # [R-FIX-5] низкая уверенность тоже блокирует
+            if conf < 55:
+                ok = False
+            return {'ok': ok, 'conf': conf, 'comment': parsed.get('comment', '')}
+    except:
+        return {'ok': True, 'conf': 0, 'comment': 'oracle error'}
+
+# ═══════════════════════════════════════════════════════
+#  ЗАГРУЗКА РЫНКОВ (кэш 1 час)
+# ═══════════════════════════════════════════════════════
+async def get_markets() -> dict:
+    global markets_cache, markets_ts
+    if markets_cache and time.time() - markets_ts < 3600:
+        return markets_cache
+    markets_cache = await exchange.load_markets()
+    markets_ts    = time.time()
+    logging.info(f"🗺 Markets cache updated: {len(markets_cache)} symbols")
+    return markets_cache
+
+def sym_allowed(sym: str) -> bool:
+    """[R-FIX-8] фильтрация через части имени."""
+    return (sym.endswith(':USDT')
+            and not any(kw in sym for kw in EXCLUDED_PARTS))
+
+# ═══════════════════════════════════════════════════════
+#  BTC / MACRO КОНТЕКСТ (общий для обоих алгоритмов)
+# ═══════════════════════════════════════════════════════
+async def get_btc_context() -> dict:
+    """Возвращает {'btc_trend': 'Long'|'Short'|'Flat', 'altseason': bool}."""
+    try:
+        btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
+        if not btc_ohlcv or len(btc_ohlcv) < 200:
+            return {'btc_trend': 'Flat', 'altseason': False}
+        btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
+        ema200 = calc_ema(btc_c, 200)
+        dist = (btc_c[-1] - ema200) / ema200 * 100
+        trend = 'Long' if dist > 0.5 else ('Short' if dist < -0.5 else 'Flat')
+
+        altseason = False
+        try:
+            eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT:USDT', SMC_TF, limit=55)
+            if eth_ohlcv and len(eth_ohlcv) >= 50:
+                eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
+                eth_ret = (eth_c[-1] - eth_c[-50]) / eth_c[-50] * 100
+                btc_ret = (btc_c[-1] - btc_c[-50]) / btc_c[-50] * 100
+                if eth_ret - btc_ret > 0.5 and eth_c[-1] > calc_ema(eth_c, 50):
+                    altseason = True
+        except:
+            pass
+
+        return {'btc_trend': trend, 'altseason': altseason}
+    except:
+        return {'btc_trend': 'Flat', 'altseason': False}
+
+# ═══════════════════════════════════════════════════════
+#  SMC СИГНАЛ
+# ═══════════════════════════════════════════════════════
+async def smc_signal(sym: str):
+    """
+    Полный SMC пайплайн:
+    1. Killzone + News
+    2. Volume (закрытая свеча v[-2])
     3. CHoCH с контекстом структуры
     4. VWAP (объёмно-взвешенный)
     5. RSI 85/15
-    6. FVG (тест зоны, не пробой)
+    6. FVG — тест зоны
     """
-    # 1. Временные фильтры
-    if not is_trade_session():
-        return None, 'out_of_session'
-    if is_news_spike():
-        return None, 'news_spike'
- 
-    # 2. Данные OHLCV
+    if not is_session():
+        return None, 'session'
+    if is_news_now():
+        return None, 'news'
+
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, SMC_TIMEFRAME, limit=100)
-    except Exception:
+        ohlcv = await exchange.fetch_ohlcv(sym, SMC_TF, limit=100)
+    except:
+        return None, 'fetch_err'
+    if not ohlcv or len(ohlcv) < 55:
         return None, 'no_data'
- 
-    if not ohlcv or len(ohlcv) < 55:   # запас для order=5 + lookback
-        return None, 'no_data'
- 
+
     c = np.array([float(x[4]) for x in ohlcv])
     h = np.array([float(x[2]) for x in ohlcv])
     l = np.array([float(x[3]) for x in ohlcv])
     v = np.array([float(x[5]) for x in ohlcv])
-    current_price = float(c[-1])
- 
-    # 3. Объём — проверяем закрытую свечу [-2]
-    avg_vol = np.mean(v[-21:-2]) if len(v) > 21 else 0.0
-    if avg_vol <= 0 or v[-2] < avg_vol * 1.5:
-        return None, 'no_volume'
- 
-    # 4. CHoCH (настоящий: учитываем контекст структуры)
-    h_idx, l_idx = get_pivots(h, l, order=5)
+    price = float(c[-1])
+
+    # Volume: закрытая свеча [-2]
+    avg_v = np.mean(v[-21:-2]) if len(v) > 21 else 0.0
+    if avg_v <= 0 or v[-2] < avg_v * 1.5:
+        return None, 'vol'
+
+    # CHoCH
+    h_idx, l_idx = get_pivots(h, l, order=SMC_PIVOT_ORDER)
     if len(h_idx) < 3 or len(l_idx) < 3:
-        return None, 'no_structure'
- 
-    recent_highs = [h[i] for i in h_idx[-3:]]
-    recent_lows  = [l[i] for i in l_idx[-3:]]
- 
+        return None, 'structure'
+
+    rh = [h[i] for i in h_idx[-3:]]
+    rl = [l[i] for i in l_idx[-3:]]
     mode = None
-    # Bullish CHoCH: предыдущая структура была нисходящей (LH), цена ломает последний LH
-    if recent_highs[-1] < recent_highs[-2] and current_price > recent_highs[-1]:
+    if rh[-1] < rh[-2] and price > rh[-1]:   # Bullish CHoCH
         mode = 'Long'
-    # Bearish CHoCH: предыдущая структура была восходящей (HL), цена ломает последний HL
-    elif recent_lows[-1] > recent_lows[-2] and current_price < recent_lows[-1]:
+    elif rl[-1] > rl[-2] and price < rl[-1]:  # Bearish CHoCH
         mode = 'Short'
- 
     if not mode:
-        return None, 'no_choch'
- 
-    # 5. VWAP — цена должна быть на стороне тренда
-    vwap = calculate_vwap(h, l, c, v)
-    if mode == 'Long'  and current_price < vwap * 0.995:
-        return None, 'vwap_reject'
-    if mode == 'Short' and current_price > vwap * 1.005:
-        return None, 'vwap_reject'
- 
-    # 6. RSI — исключаем настоящие экстремумы, не CHoCH-импульсы
-    rsi = calculate_rsi(c[:-1])   # только закрытые свечи
+        return None, 'choch'
+
+    # VWAP
+    vwap = calc_vwap(h, l, c, v)
+    if mode == 'Long'  and price < vwap * 0.995:
+        return None, 'vwap'
+    if mode == 'Short' and price > vwap * 1.005:
+        return None, 'vwap'
+
+    # RSI
+    rsi = calc_rsi(c[:-1])
     if mode == 'Long'  and rsi > 85:
-        return None, 'rsi_exhausted'
+        return None, 'rsi'
     if mode == 'Short' and rsi < 15:
-        return None, 'rsi_exhausted'
- 
-    # 7. FVG — вход на тесте зоны (не после пробоя!)
+        return None, 'rsi'
+
+    # FVG
     fvg = find_fvg(h, l, mode)
     if not fvg:
-        return None, 'no_fvg'
- 
+        return None, 'fvg'
     if mode == 'Long':
-        if not (fvg['bottom'] <= current_price <= fvg['top'] * 1.002):
-            return None, 'no_fvg_test'
+        if not (fvg['bottom'] <= price <= fvg['top'] * 1.002):
+            return None, 'fvg_test'
     else:
-        if not (fvg['bottom'] * 0.998 <= current_price <= fvg['top']):
-            return None, 'no_fvg_test'
- 
-    return {'symbol': sym, 'mode': mode, 'price': current_price}, 'success'
- 
-# ══════════════════════════════════════════════════════════
-#  ИСПОЛНЕНИЕ ОРДЕРОВ
-# ══════════════════════════════════════════════════════════
-async def execute_trade(sym: str, signal: dict):
-    """Открывает позицию: market entry + stopMarket SL + Telegram уведомление."""
-    global active_positions
- 
-    mode          = signal['mode']
-    current_price = signal['price']
- 
-    # Проверка лимитов позиций
-    if len(active_positions) >= MAX_POSITIONS:
+        if not (fvg['bottom'] * 0.998 <= price <= fvg['top']):
+            return None, 'fvg_test'
+
+    atr = calc_atr(h, l, c)
+    sl  = price * (1 - MAX_SL_PCT / 100) if mode == 'Long' else price * (1 + MAX_SL_PCT / 100)
+    tp  = price * (1 + MAX_SL_PCT / 100 * 2.0) if mode == 'Long' else price * (1 - MAX_SL_PCT / 100 * 2.0)
+
+    return {
+        'sym': sym, 'mode': mode, 'price': price,
+        'sl': sl, 'tp': tp, 'atr': atr, 'rsi': rsi,
+    }, 'ok'
+
+# ═══════════════════════════════════════════════════════
+#  RSI MEAN REVERSION СИГНАЛ
+# ═══════════════════════════════════════════════════════
+async def rsi_signal(sym: str, btc_ctx: dict):
+    """
+    RSI Mean Reversion пайплайн:
+    1. News
+    2. Volume spike (закрытая свеча)
+    3. RSI extreme [R-FIX-4] 25/75 + hook (разворот)
+    4. Свечной паттерн (поглощение / пин-бар)
+    5. SMA200 магнит (цена перегнута)
+    6. VWAP-дистанция (подтверждение перегнутости)
+    7. BTC trend / altseason фильтр [R-FIX-6]
+    8. Funding rate (защита от сквиза)
+    """
+    if is_news_now():
+        return None, 'news'
+
+    try:
+        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=250)
+    except:
+        return None, 'fetch_err'
+    if not ohlcv or len(ohlcv) < 210:
+        return None, 'no_data'
+
+    o = np.array([float(x[1]) for x in ohlcv])
+    h = np.array([float(x[2]) for x in ohlcv])
+    l = np.array([float(x[3]) for x in ohlcv])
+    c = np.array([float(x[4]) for x in ohlcv])
+    v = np.array([float(x[5]) for x in ohlcv])
+    price = float(c[-1])
+
+    # Volume: закрытая [-2]
+    avg_v = np.mean(v[-22:-2]) if len(v) >= 22 else float(np.mean(v[:-2]))
+    if avg_v <= 0:
+        return None, 'vol'
+    vol_ratio = float(v[-2]) / avg_v
+    if vol_ratio < 2.0 or vol_ratio > 12.0:  # [R-FIX-7] потолок 12x
+        return None, 'vol'
+
+    # RSI текущий и предыдущий (только закрытые свечи)
+    rsi_now  = calc_rsi(c[:-1],  RSI_PERIOD)
+    rsi_prev = calc_rsi(c[:-2], RSI_PERIOD)
+
+    if RSI_LONG_MAX < rsi_now < RSI_SHORT_MIN:
+        return None, 'rsi_mid'
+
+    # ATR для расчёта SL
+    atr = calc_atr(h, l, c)
+    baseline_atr = float(np.mean(
+        np.maximum(h[1:] - l[1:],
+        np.maximum(np.abs(h[1:] - c[:-1]),
+                   np.abs(l[1:] - c[:-1])))[-50:-14]
+    )) if len(c) >= 50 else atr
+
+    # Динамический TP
+    tp_mult = 1.5
+    if baseline_atr > 0:
+        ratio = atr / baseline_atr
+        if ratio > 2.0:
+            tp_mult = 2.5
+        elif ratio > 1.5:
+            tp_mult = 2.0
+
+    # SMA200 и VWAP
+    sma200    = float(np.mean(c[-200:]))
+    vwap      = calc_vwap(h, l, c, v)
+    sma_dist  = (price - sma200) / sma200 * 100
+    vwap_dist = (price - vwap) / vwap * 100
+
+    # Свечной паттерн ([-2] — последняя закрытая)
+    c3, o3 = float(c[-3]), float(o[-3])
+    c2, o2, h2, l2 = float(c[-2]), float(o[-2]), float(h[-2]), float(l[-2])
+    body2  = abs(c2 - o2)
+    lwick2 = min(c2, o2) - l2
+    uwick2 = h2 - max(c2, o2)
+
+    bull_pat = (
+        (c3 < o3 and c2 > o2 and c2 > o3)                    # бычье поглощение
+        or (c2 > o2 and lwick2 > body2 * 1.5 and uwick2 < body2 * 0.5)  # пин-бар вниз
+    )
+    bear_pat = (
+        (c3 > o3 and c2 < o2 and c2 < o3)                    # медвежье поглощение
+        or (c2 < o2 and uwick2 > body2 * 1.5 and lwick2 < body2 * 0.5)  # пин-бар вверх
+    )
+
+    btc_trend = btc_ctx.get('btc_trend', 'Flat')
+    altseason = btc_ctx.get('altseason', False)
+    mode = None
+    sl   = 0.0
+
+    if rsi_now <= RSI_LONG_MAX and bull_pat:
+        # [R-FIX-6] Flat BTC больше не блокирует лонг
+        if btc_trend == 'Short' and not altseason:
+            return None, 'trend'
+        if rsi_now >= rsi_prev:           # RSI ещё не развернулся
+            return None, 'hook'
+        if sma_dist > -1.0 or sma_dist < -8.0:   # не перегнут достаточно
+            return None, 'sma_range'
+        if vwap_dist > -1.2:              # должен быть под VWAP
+            return None, 'vwap'
+        # [R-FIX-3] SL под минимумом последних 3 свечей + 1.5x ATR
+        raw_sl = float(np.min(l[-4:-1])) - atr * 1.5
+        sl_pct = abs(price - raw_sl) / price * 100
+        if sl_pct > MAX_SL_PCT:
+            return None, 'sl_wide'
+        sl   = raw_sl
+        mode = 'Long'
+
+    elif rsi_now >= RSI_SHORT_MIN and bear_pat:
+        if btc_trend == 'Long' or altseason:
+            return None, 'trend'
+        if rsi_now <= rsi_prev:
+            return None, 'hook'
+        if sma_dist < 1.0 or sma_dist > 8.0:
+            return None, 'sma_range'
+        if vwap_dist < 1.2:
+            return None, 'vwap'
+        # [R-FIX-3] SL над максимумом + 1.5x ATR
+        raw_sl = float(np.max(h[-4:-1])) + atr * 1.5
+        sl_pct = abs(raw_sl - price) / price * 100
+        if sl_pct > MAX_SL_PCT:
+            return None, 'sl_wide'
+        sl   = raw_sl
+        mode = 'Short'
+
+    if not mode:
+        return None, 'no_pattern'
+
+    # Ensure min SL
+    min_sl_d = price * MIN_SL_PCT / 100
+    if abs(price - sl) < min_sl_d:
+        sl = price - min_sl_d if mode == 'Long' else price + min_sl_d
+
+    sl_dist = abs(price - sl)
+    tp = price + sl_dist * tp_mult if mode == 'Long' else price - sl_dist * tp_mult
+
+    # Funding rate — защита от шорт-сквиза
+    try:
+        fr = await exchange.fetch_funding_rate(sym)
+        funding = float(fr.get('fundingRate', 0))
+    except:
+        funding = 0.0
+    if mode == 'Short' and funding < -0.00015:
+        return None, 'squeeze'
+
+    return {
+        'sym': sym, 'mode': mode, 'price': price,
+        'sl': sl, 'tp': tp, 'atr': atr,
+        'rsi': rsi_now, 'rsi_prev': rsi_prev,
+        'vol_ratio': vol_ratio, 'sma_dist': sma_dist,
+        'vwap_dist': vwap_dist, 'tp_mult': tp_mult,
+        'btc_trend': btc_trend, 'altseason': altseason,
+        'funding': funding,
+    }, 'ok'
+
+# ═══════════════════════════════════════════════════════
+#  ИСПОЛНЕНИЕ ОРДЕРА (общий для обоих стратегий)
+# ═══════════════════════════════════════════════════════
+async def execute(sym: str, sig: dict, strategy: str,
+                  pos_list: list, extra_tg: str = ""):
+    """
+    Общий исполнитель. strategy = 'SMC' | 'RSI'.
+    """
+    global daily_stats
+
+    mode  = sig['mode']
+    price = sig['price']
+    sl    = sig['sl']
+    tp    = sig['tp']
+    atr   = sig['atr']
+
+    # Общие лимиты позиций
+    all_pos = all_positions()
+    if len(all_pos) >= MAX_TOTAL_POS:
         return
-    if sum(1 for p in active_positions if p['direction'] == mode) >= MAX_POSITIONS_PER_DIRECTION:
+    if sum(1 for p in all_pos if p['direction'] == mode) >= MAX_PER_DIR:
         return
- 
-    # Финальные проверки через оракулы (объём + AI)
-    has_volume = await check_global_volume_oracle(sym)
-    if not has_volume:
-        logging.info(f"⚠️ [ORACLE] {sym}: недостаточно объёма на Binance/Bybit")
+
+    # Оракулы
+    has_vol = await oracle_volume(sym)
+    if not has_vol:
+        logging.info(f"[{strategy}] {sym}: volume oracle reject")
         return
- 
-    ai_approved = await ask_gemini_oracle(sym, mode, current_price)
-    if not ai_approved:
+
+    extra_ctx = {k: v for k, v in sig.items()
+                 if k in ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')}
+    ai = await oracle_gemini(sym, strategy, mode, price, extra_ctx)
+    if not ai['ok']:
+        logging.info(f"[{strategy}] {sym}: Gemini reject (conf={ai['conf']}): {ai['comment']}")
         return
- 
+
     # Баланс
     try:
-        bal        = await exchange.fetch_balance()
-        free_usdt  = float(bal.get('USDT', {}).get('free', 0))
+        bal       = await exchange.fetch_balance()
+        free_usdt = float(bal.get('USDT', {}).get('free', 0))
     except Exception as e:
         logging.error(f"Balance error: {e}")
         return
- 
-    if free_usdt < 100:
-        logging.warning(f"⚠️ Недостаточно баланса: {free_usdt} USDT")
+    if free_usdt < 50:
         return
- 
-    # [FIX-4] Риск в выходные вдвое ниже
-    risk_pct    = BASE_RISK_WEEKEND if is_weekend() else BASE_RISK_PER_TRADE
-    risk_amount = free_usdt * risk_pct         # напр. $10000 * 0.0075 = $75
- 
-    sl_dist_pct = MAX_SL_PCT / 100.0           # 0.025
-    sl_price    = (current_price * (1 - sl_dist_pct) if mode == 'Long'
-                   else current_price * (1 + sl_dist_pct))
-    tp_price    = (current_price * (1 + sl_dist_pct * 2.0) if mode == 'Long'
-                   else current_price * (1 - sl_dist_pct * 2.0))
- 
-    # qty = рискуемая сумма / (SL_дистанция_в_$_за_1_контракт)
-    # SL_дистанция_за_1 = entry * sl_dist_pct
-    qty         = risk_amount / (current_price * sl_dist_pct)
- 
-    pos_side    = 'LONG'  if mode == 'Long'  else 'SHORT'
-    order_side  = 'buy'   if mode == 'Long'  else 'sell'
-    sl_side     = 'sell'  if mode == 'Long'  else 'buy'
- 
+
+    risk_usdt = free_usdt * current_risk()
+    sl_dist   = abs(price - sl)
+    if sl_dist <= 0:
+        return
+    qty = risk_usdt / sl_dist
+
+    pos_side   = 'LONG'  if mode == 'Long'  else 'SHORT'
+    order_side = 'buy'   if mode == 'Long'  else 'sell'
+    sl_side    = 'sell'  if mode == 'Long'  else 'buy'
+
     try:
         await exchange.set_margin_mode('isolated', sym)
         await exchange.set_leverage(LEVERAGE, sym)
- 
-        # Основной ордер
         await exchange.create_order(
             sym, 'market', order_side, qty,
             params={'positionSide': pos_side}
         )
- 
-        # Стоп-лосс
         sl_ord = await exchange.create_order(
             sym, 'stopMarket', sl_side, qty,
-            params={
-                'positionSide': pos_side,
-                'stopPrice':    round(sl_price, 8),
-                'reduceOnly':   True,
-            }
+            params={'positionSide': pos_side,
+                    'stopPrice': round(sl, 8),
+                    'reduceOnly': True}
         )
- 
-        position_record = {
-            'symbol':       sym,
-            'direction':    mode,
-            'entry_price':  current_price,
-            'initial_qty':  qty,
-            'current_qty':  qty,
-            'sl_price':     sl_price,
-            'current_sl':   sl_price,
-            'tp1':          tp_price,
-            'sl_order_id':  sl_ord['id'],
-            'be_moved':     False,
-            'tp50_hit':     False,
-            'risk_usdt':    risk_amount,
-        }
-        active_positions.append(position_record)
-        save_positions()
- 
-        weekend_tag = ' (Weekend Risk)' if is_weekend() else ''
-        await send_tg_msg(
-            f"🟢 <b>{sym}</b> Открыт <b>{mode}</b>{weekend_tag}\n"
-            f"Цена входа: <code>{current_price:.6f}</code>\n"
-            f"SL: <code>{sl_price:.6f}</code>  TP: <code>{tp_price:.6f}</code>\n"
-            f"Риск: <b>${risk_amount:.2f}</b>  RR: <b>1:2</b>\n"
-            f"✅ Одобрено: Gemini AI + Global Volume Oracle"
-        )
-        logging.info(f"✅ [TRADE] {sym} {mode} @ {current_price:.6f} | SL:{sl_price:.6f} | Risk:${risk_amount:.2f}")
- 
     except Exception as e:
-        logging.error(f"❌ [TRADE ERROR] {sym}: {e}")
- 
-# ══════════════════════════════════════════════════════════
-#  МОНИТОРИНГ ПОЗИЦИЙ
-# ══════════════════════════════════════════════════════════
-async def monitor_positions_job():
-    """
-    Управление открытыми позициями:
-    - pnl >= 1.5%: Breakeven (SL → вход +0.2%)
-    - pnl >= 2.5%: Зафиксировать 50%, SL → вход
-    - Позиция закрыта на бирже → удалить из списка
-    """
-    global active_positions
- 
-    if not active_positions:
+        logging.error(f"[{strategy}] Order error {sym}: {e}")
         return
- 
-    # [FIX-5] Guard для пустого списка тикеров
-    syms = list({p['symbol'] for p in active_positions})
-    if not syms:
+
+    rec = {
+        'symbol':      sym,
+        'direction':   mode,
+        'strategy':    strategy,
+        'entry_price': price,
+        'initial_qty': qty,
+        'current_qty': qty,
+        'sl_price':    sl,
+        'current_sl':  sl,
+        'tp1':         tp,
+        'sl_order_id': sl_ord['id'],
+        'be_moved':    False,
+        'tp50_hit':    False,
+        'tp100_hit':   False,
+        'atr':         atr,
+        'open_time':   datetime.now(timezone.utc).isoformat(),
+        'mfe_price':   price,
+        'mae_price':   price,
+    }
+    pos_list.append(rec)
+    daily_stats[f"{strategy.lower()}_trades"] = daily_stats.get(f"{strategy.lower()}_trades", 0) + 1
+    save_all()
+
+    wknd = ' (Weekend ½)' if is_weekend() else ''
+    rr = abs(tp - price) / abs(price - sl)
+    msg = (
+        f"{'🟢' if mode=='Long' else '🔴'} <b>[{strategy}] {sym}</b> — {mode}{wknd}\n"
+        f"Цена: <code>{price:.6f}</code>\n"
+        f"SL: <code>{sl:.6f}</code>  TP: <code>{tp:.6f}</code>\n"
+        f"RR: <b>1:{rr:.2f}</b>  Риск: <b>${risk_usdt:.2f}</b>\n"
+        f"🧠 Gemini: {ai['conf']}/100 — <i>{ai['comment']}</i>\n"
+        + extra_tg
+    )
+    await tg(msg)
+    logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
+
+# ═══════════════════════════════════════════════════════
+#  МОНИТОРИНГ ПОЗИЦИЙ (общий)
+# ═══════════════════════════════════════════════════════
+async def monitor_all():
+    """
+    Управление всеми открытыми позициями:
+    - pnl >= 1.5%: Breakeven
+    - pnl >= 2.5%: TP50%, SL → вход
+    - pnl >= TP100: TP25% + трейлинг ATR
+    - Нет позиции на бирже: закрыть и записать результат
+    """
+    global daily_stats, smc_positions, rsi_positions
+
+    all_pos = all_positions()
+    if not all_pos:
         return
- 
+
+    syms = list({p['symbol'] for p in all_pos})
     try:
-        positions_raw = await exchange.fetch_positions(syms)
-        tickers       = await exchange.fetch_tickers(syms)
+        pos_raw = await exchange.fetch_positions(syms)
+        tickers = await exchange.fetch_tickers(syms)
     except Exception as e:
         logging.error(f"Monitor fetch error: {e}")
         return
- 
-    for pos in active_positions[:]:   # копия для безопасной итерации
-        sym       = pos['symbol']
-        is_long   = pos['direction'] == 'Long'
-        entry_price = float(pos['entry_price'])
- 
-        # Текущая цена из тикера
-        ticker_data = tickers.get(sym, {})
-        curr_price  = float(ticker_data.get('last', entry_price))
- 
-        # Проверка живой позиции на бирже
+
+    async def process_pos(pos: dict, pos_list: list):
+        sym      = pos['symbol']
+        is_long  = pos['direction'] == 'Long'
+        entry    = float(pos['entry_price'])
+        strategy = pos.get('strategy', '?')
+
+        ticker_d = tickers.get(sym, {})
+        curr_p   = float(ticker_d.get('last', entry))
+
         live = next(
-            (r for r in positions_raw
-             if r.get('symbol') == sym and abs(float(r.get('contracts', 0))) > 0),
+            (r for r in pos_raw
+             if r.get('symbol') == sym
+             and abs(float(r.get('contracts', 0))) > 0),
             None
         )
- 
         pos_side = 'LONG' if is_long else 'SHORT'
         sl_side  = 'sell' if is_long else 'buy'
- 
+
+        # Обновить MFE/MAE
+        if is_long:
+            pos['mfe_price'] = max(float(pos.get('mfe_price', entry)), curr_p)
+            pos['mae_price'] = min(float(pos.get('mae_price', entry)), curr_p)
+        else:
+            pos['mfe_price'] = min(float(pos.get('mfe_price', entry)), curr_p)
+            pos['mae_price'] = max(float(pos.get('mae_price', entry)), curr_p)
+
         if live:
             real_qty = abs(float(live.get('contracts', 0)))
-            pnl_pct  = ((curr_price - entry_price) / entry_price * 100 if is_long
-                        else (entry_price - curr_price) / entry_price * 100)
- 
-            # ── Breakeven при +1.5% ──────────────────────────────
-            if pnl_pct >= 1.5 and not pos.get('be_moved'):
-                new_sl = (entry_price * 1.002 if is_long else entry_price * 0.998)
+            pos['current_qty'] = real_qty
+
+            pnl = ((curr_p - entry) / entry * 100 if is_long
+                   else (entry - curr_p) / entry * 100)
+
+            # ── Breakeven ──────────────────────────────────────
+            if pnl >= 1.5 and not pos.get('be_moved'):
+                new_sl = entry * 1.002 if is_long else entry * 0.998
                 try:
                     if pos.get('sl_order_id'):
                         await exchange.cancel_order(pos['sl_order_id'], sym)
                     sl_ord = await exchange.create_order(
                         sym, 'stopMarket', sl_side, real_qty,
                         params={'positionSide': pos_side,
-                                'stopPrice':    round(new_sl, 8),
-                                'reduceOnly':   True}
+                                'stopPrice': round(new_sl, 8),
+                                'reduceOnly': True}
                     )
-                    pos['current_sl']  = new_sl
-                    pos['sl_order_id'] = sl_ord['id']
-                    pos['be_moved']    = True
-                    save_positions()
-                    await send_tg_msg(
-                        f"🛡 <b>{sym}</b>: SL перенесён в БУ\n"
-                        f"Новый SL: <code>{new_sl:.6f}</code>  P&L: +{pnl_pct:.2f}%"
-                    )
+                    pos.update({'current_sl': new_sl,
+                                'sl_order_id': sl_ord['id'],
+                                'be_moved': True})
+                    save_all()
+                    await tg(f"🛡 <b>[{strategy}] {sym}</b>: SL → БУ "
+                             f"<code>{new_sl:.6f}</code>  P&L: +{pnl:.2f}%")
                 except Exception as e:
                     logging.error(f"BE error {sym}: {e}")
- 
-            # ── TP 50% при +2.5% ─────────────────────────────────
-            if pnl_pct >= 2.5 and not pos.get('tp50_hit'):
+
+            # ── TP 50% ─────────────────────────────────────────
+            if pnl >= 2.5 and not pos.get('tp50_hit'):
                 close_qty = round(real_qty * 0.5, 8)
-                remain_qty = round(real_qty - close_qty, 8)
+                remain    = round(real_qty - close_qty, 8)
                 try:
-                    # Закрываем 50%
                     await exchange.create_order(
                         sym, 'market', sl_side, close_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
-                    pos['tp50_hit']  = True
-                    pos['current_qty'] = remain_qty
- 
-                    # Переставляем SL для оставшихся 50%
                     if pos.get('sl_order_id'):
                         await exchange.cancel_order(pos['sl_order_id'], sym)
                     sl_ord = await exchange.create_order(
-                        sym, 'stopMarket', sl_side, remain_qty,
+                        sym, 'stopMarket', sl_side, remain,
                         params={'positionSide': pos_side,
-                                'stopPrice':    round(entry_price, 8),
-                                'reduceOnly':   True}
+                                'stopPrice': round(entry, 8),
+                                'reduceOnly': True}
                     )
-                    pos['sl_order_id'] = sl_ord['id']
-                    save_positions()
-                    await send_tg_msg(
-                        f"💰 <b>{sym}</b>: Зафиксировано 50% позиции\n"
-                        f"P&L: +{pnl_pct:.2f}% | Остаток работает"
-                    )
+                    pos.update({'tp50_hit': True, 'current_qty': remain,
+                                'sl_order_id': sl_ord['id']})
+                    save_all()
+                    await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
+                             f"P&L: +{pnl:.2f}%")
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
- 
+
+            # ── TP100 + trailing ───────────────────────────────
+            tp100 = float(pos.get('tp1', entry))
+            if (pos.get('tp50_hit') and not pos.get('tp100_hit')
+                    and ((is_long and curr_p >= tp100)
+                         or (not is_long and curr_p <= tp100))):
+                close_qty = round(float(pos['current_qty']) * 0.5, 8)
+                remain    = round(float(pos['current_qty']) - close_qty, 8)
+                atr_v     = float(pos.get('atr', entry * 0.01))
+                trail_sl  = (tp100 - atr_v if is_long else tp100 + atr_v)
+                try:
+                    await exchange.create_order(
+                        sym, 'market', sl_side, close_qty,
+                        params={'positionSide': pos_side, 'reduceOnly': True}
+                    )
+                    if pos.get('sl_order_id'):
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                    sl_ord = await exchange.create_order(
+                        sym, 'stopMarket', sl_side, remain,
+                        params={'positionSide': pos_side,
+                                'stopPrice': round(trail_sl, 8),
+                                'reduceOnly': True}
+                    )
+                    pos.update({'tp100_hit': True, 'current_qty': remain,
+                                'sl_order_id': sl_ord['id'],
+                                'current_sl': trail_sl})
+                    save_all()
+                    await tg(f"🏆 <b>[{strategy}] {sym}</b>: TP100 взят! "
+                             f"Трейлинг включён P&L: +{pnl:.2f}%")
+                except Exception as e:
+                    logging.error(f"TP100 error {sym}: {e}")
+
+            # ── Обновление трейлинга ────────────────────────────
+            if pos.get('tp100_hit'):
+                atr_v    = float(pos.get('atr', entry * 0.01))
+                new_trail = (curr_p - atr_v if is_long else curr_p + atr_v)
+                cur_sl    = float(pos.get('current_sl', 0))
+                if ((is_long and new_trail > cur_sl)
+                        or (not is_long and new_trail < cur_sl)):
+                    try:
+                        if pos.get('sl_order_id'):
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                        sl_ord = await exchange.create_order(
+                            sym, 'stopMarket', sl_side,
+                            float(pos['current_qty']),
+                            params={'positionSide': pos_side,
+                                    'stopPrice': round(new_trail, 8),
+                                    'reduceOnly': True}
+                        )
+                        pos.update({'sl_order_id': sl_ord['id'],
+                                    'current_sl': new_trail})
+                    except:
+                        pass
+
+            return True  # позиция жива
+
         else:
-            # Позиция закрыта на бирже (SL или TP сработал)
-            pnl_approx = ((curr_price - entry_price) / entry_price * 100 if is_long
-                          else (entry_price - curr_price) / entry_price * 100)
-            result_emoji = "✅" if pnl_approx > 0 else "🔴"
-            active_positions.remove(pos)
+            # Позиция закрыта
+            seconds = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(pos['open_time'])
+            ).total_seconds()
+            if seconds < 45:    # grace period для открытия
+                return True
+
+            exit_p = float(pos.get('current_sl', curr_p))
+            try:
+                trades = await exchange.fetch_my_trades(sym, limit=5)
+                if trades:
+                    open_ts = int(
+                        datetime.fromisoformat(pos['open_time']).timestamp() * 1000
+                    )
+                    valid = [t for t in trades if t['timestamp'] >= open_ts]
+                    if valid:
+                        exit_p = float(valid[-1]['price'])
+            except:
+                exit_p = curr_p
+
+            raw = ((exit_p - entry) * float(pos['current_qty']) if is_long
+                   else (entry - exit_p) * float(pos['current_qty']))
+            fee_in  = float(pos['initial_qty']) * entry * FEE_RATE
+            fee_out = float(pos['current_qty']) * exit_p * FEE_RATE
+            net_pnl = raw - (fee_in + fee_out)
+
+            pnl_pct = (exit_p - entry) / entry * 100 if is_long else (entry - exit_p) / entry * 100
             daily_stats['trades'] += 1
-            if pnl_approx > 0:
+            daily_stats['pnl_pct'] += pnl_pct / 100  # в долях
+
+            if net_pnl > 0:
                 daily_stats['wins'] += 1
-            daily_stats['pnl'] += pnl_approx
-            save_positions()
-            await send_tg_msg(
-                f"🏁 <b>{sym}</b>: Позиция закрыта\n"
-                f"Результат: {result_emoji} <code>{pnl_approx:+.2f}%</code>\n"
-                f"Сделок сегодня: {daily_stats['trades']} | Побед: {daily_stats['wins']}"
+
+            mfe_pct = abs(float(pos['mfe_price']) - entry) / entry * 100
+            mae_pct = abs(float(pos['mae_price']) - entry) / entry * 100
+            dur_min = int(seconds / 60)
+
+            await tg(
+                f"{'✅' if net_pnl > 0 else '🛑'} <b>[{strategy}] {sym}</b> закрыта\n"
+                f"PnL: <code>{net_pnl:+.2f} USDT ({pnl_pct:+.2f}%)</code>\n"
+                f"⏱ {dur_min}мин  📈MFE {mfe_pct:.2f}%  📉MAE {mae_pct:.2f}%\n"
+                f"Итог дня: {daily_stats['trades']} сделок | "
+                f"{daily_stats['wins']} побед"
             )
- 
-# ══════════════════════════════════════════════════════════
-#  HEALTH CHECK (для Render)
-# ══════════════════════════════════════════════════════════
-class HealthCheckHandler(BaseHTTPRequestHandler):
+            save_all()
+            notified[sym] = time.time()   # cooldown после закрытия
+            return False   # удалить из списка
+
+    # Обработка SMC и RSI позиций
+    new_smc, new_rsi = [], []
+    for p in smc_positions:
+        keep = await process_pos(p, smc_positions)
+        if keep:
+            new_smc.append(p)
+    for p in rsi_positions:
+        keep = await process_pos(p, rsi_positions)
+        if keep:
+            new_rsi.append(p)
+    smc_positions[:] = new_smc
+    rsi_positions[:] = new_rsi
+
+# ═══════════════════════════════════════════════════════
+#  СКАНЕРЫ
+# ═══════════════════════════════════════════════════════
+async def scan_smc():
+    """Сканер SMC: запускается каждые 60 сек в торговые сессии."""
+    if not is_session():
+        return
+    if not check_circuit_breaker():
+        return
+
+    markets = await get_markets()
+    scan = [s for s in list(markets.keys()) if sym_allowed(s)][:SCAN_LIMIT]
+    sem  = asyncio.Semaphore(SCAN_SEM)
+    st   = {k: 0 for k in ['session','news','vol','structure','choch',
+                            'vwap','rsi','fvg','fvg_test','ok']}
+
+    async def check(sym):
+        if sym in notified:
+            return
+        async with sem:
+            sig, reason = await smc_signal(sym)
+        st[reason] = st.get(reason, 0) + 1
+        if sig:
+            notified[sym] = time.time()
+            await execute(sym, sig, 'SMC', smc_positions,
+                          f"RSI: {sig['rsi']:.1f}")
+
+    await asyncio.gather(*[check(s) for s in scan])
+    logging.info(
+        f"[SMC SCAN] choch:{st['choch']} vwap:{st['vwap']} "
+        f"rsi:{st['rsi']} fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
+        f"→ ВХОДЫ:{st['ok']}"
+    )
+
+async def scan_rsi():
+    """Сканер RSI MR: запускается каждые 60 сек."""
+    if not check_circuit_breaker():
+        return
+
+    markets   = await get_markets()
+    btc_ctx   = await get_btc_context()
+    scan = [s for s in list(markets.keys()) if sym_allowed(s)][:SCAN_LIMIT]
+    sem  = asyncio.Semaphore(SCAN_SEM)
+    st   = {k: 0 for k in ['news','vol','rsi_mid','trend','hook',
+                            'sma_range','vwap','sl_wide','squeeze',
+                            'no_pattern','ok']}
+
+    async def check(sym):
+        if sym in notified:
+            return
+        # Быстрый pre-фильтр по тикеру (спред)
+        async with sem:
+            sig, reason = await rsi_signal(sym, btc_ctx)
+        st[reason] = st.get(reason, 0) + 1
+        if sig:
+            notified[sym] = time.time()
+            extra = (
+                f"RSI: {sig['rsi']:.1f}→{sig['rsi_prev']:.1f}  "
+                f"Vol: {sig['vol_ratio']:.1f}x  "
+                f"SMA-dist: {sig['sma_dist']:+.1f}%  "
+                f"TP-mult: {sig['tp_mult']}x"
+            )
+            await execute(sym, sig, 'RSI', rsi_positions, extra)
+
+    await asyncio.gather(*[check(s) for s in scan])
+    logging.info(
+        f"[RSI SCAN] BTC:{btc_ctx['btc_trend']} Alt:{btc_ctx['altseason']} | "
+        f"mid:{st['rsi_mid']} hook:{st['hook']} sma:{st['sma_range']} "
+        f"vwap:{st['vwap']} trend:{st['trend']} "
+        f"→ ВХОДЫ:{st['ok']}"
+    )
+
+# ═══════════════════════════════════════════════════════
+#  ЕЖЕДНЕВНЫЙ ОТЧЁТ + СБРОС СТАТИСТИКИ
+# ═══════════════════════════════════════════════════════
+async def daily_reset():
+    global daily_stats, circuit_open
+    today = datetime.now(timezone.utc).date()
+    if daily_stats.get('stat_date') == today:
+        return
+
+    if daily_stats.get('stat_date'):
+        trades = daily_stats['trades']
+        wins   = daily_stats['wins']
+        wrate  = wins / trades * 100 if trades > 0 else 0
+
+        try:
+            bal = await exchange.fetch_balance()
+            bal_usdt = float(bal.get('USDT', {}).get('total', 0))
+        except:
+            bal_usdt = daily_stats['start_balance']
+
+        start = daily_stats['start_balance']
+        day_pct = (bal_usdt - start) / start * 100 if start > 0 else 0
+
+        await tg(
+            f"📊 <b>Итоги дня {daily_stats['stat_date']}</b>\n"
+            f"Сделок: {trades}  WR: {wrate:.1f}%  "
+            f"SMC: {daily_stats.get('smc_trades',0)}  RSI: {daily_stats.get('rsi_trades',0)}\n"
+            f"PnL: <code>{day_pct:+.2f}%</code>  "
+            f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
+        )
+
+    # Сброс
+    try:
+        bal = await exchange.fetch_balance()
+        new_start = float(bal.get('USDT', {}).get('total', 0))
+    except:
+        new_start = daily_stats.get('start_balance', 0.0)
+
+    daily_stats = {
+        'pnl_pct': 0.0, 'trades': 0, 'wins': 0,
+        'start_balance': new_start, 'stat_date': today,
+        'smc_trades': 0, 'rsi_trades': 0,
+    }
+    circuit_open = False
+    save_all()
+    logging.info(f"📅 Daily stats reset for {today}")
+
+# ═══════════════════════════════════════════════════════
+#  HEALTH CHECK (Render keep-alive)
+# ═══════════════════════════════════════════════════════
+class HealthCheck(BaseHTTPRequestHandler):
     def do_GET(self):
+        body = (
+            f"Unified SMC+RSI Bot v10.0 | "
+            f"SMC:{len(smc_positions)} RSI:{len(rsi_positions)} | "
+            f"PnL:{daily_stats['pnl_pct']*100:+.2f}%"
+        ).encode()
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"BingX SMC Bot v9.0 PROP | Status: OK")
- 
-    def log_message(self, format, *args):
-        return  # подавляем HTTP-логи
- 
-def run_health_server():
-    port = int(os.environ.get('PORT', 10000))
-    HTTPServer(('0.0.0.0', port), HealthCheckHandler).serve_forever()
- 
-# ══════════════════════════════════════════════════════════
-#  ЗАГРУЗКА РЫНКОВ С КЭШЕМ [FIX-2]
-# ══════════════════════════════════════════════════════════
-async def get_cached_markets():
-    """[FIX-2] Кэш рынков: обновление раз в час, не каждый цикл."""
-    global _markets_cache, _markets_last_refresh
-    if _markets_cache and (time.time() - _markets_last_refresh < 3600):
-        return _markets_cache
-    _markets_cache        = await exchange.load_markets()
-    _markets_last_refresh = time.time()
-    logging.info(f"🗺 [MARKETS] Кэш обновлён: {len(_markets_cache)} инструментов")
-    return _markets_cache
- 
-# ══════════════════════════════════════════════════════════
-#  ВСПОМОГАТЕЛЬНЫЕ ЗАДАЧИ
-# ══════════════════════════════════════════════════════════
-async def daily_stats_reset():
-    """[FIX-7] Сброс статистики в полночь UTC."""
-    global daily_stats, _last_stats_date
-    today = datetime.now(timezone.utc).date()
-    if _last_stats_date != today:
-        if _last_stats_date is not None:
-            # Отчёт за прошедший день
-            winrate = (daily_stats['wins'] / daily_stats['trades'] * 100
-                       if daily_stats['trades'] > 0 else 0)
-            await send_tg_msg(
-                f"📊 <b>Итоги дня {_last_stats_date}</b>\n"
-                f"Сделок: {daily_stats['trades']} | Побед: {daily_stats['wins']} "
-                f"({winrate:.1f}%)\n"
-                f"PnL: <code>{daily_stats['pnl']:+.2f}%</code>"
-            )
-        daily_stats     = {'pnl': 0.0, 'trades': 0, 'wins': 0,
-                           'start_balance': daily_stats['start_balance']}
-        _last_stats_date = today
-        save_positions()
-        logging.info(f"📅 [STATS] Сброс суточной статистики ({today})")
- 
-# ══════════════════════════════════════════════════════════
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        return
+
+def run_health():
+    HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))),
+               HealthCheck).serve_forever()
+
+# ═══════════════════════════════════════════════════════
 #  ГЛАВНЫЙ ЦИКЛ
-# ══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 async def main():
-    global global_session, _last_stats_date
- 
-    # Инициализация
+    global http
+
     init_db()
-    load_positions()
-    global_session  = aiohttp.ClientSession()
-    _last_stats_date = datetime.now(timezone.utc).date()
- 
-    # Health-check сервер (отдельный поток — не блокирует asyncio)
-    Thread(target=run_health_server, daemon=True).start()
- 
-    # Первоначальная загрузка новостей
-    await update_macro_news()
- 
-    logging.info("🚀 BingX SMC Bot v9.0 PROP EDITION запущен")
-    await send_tg_msg(
-        "🟢 <b>BingX SMC Bot v9.0 PROP</b> запущен\n"
+    load_all()
+    http = aiohttp.ClientSession()
+
+    Thread(target=run_health, daemon=True).start()
+    await refresh_news()
+
+    # Инициализация баланса
+    try:
+        bal = await exchange.fetch_balance()
+        if daily_stats['start_balance'] == 0.0:
+            daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0))
+    except:
+        pass
+
+    await tg(
+        f"🟢 <b>Unified SMC+RSI Bot v10.0 PROP</b> запущен\n"
+        f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  "
+        f"Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
         f"Сессии: London 07:00–10:30 | NY 13:00–16:30 UTC\n"
-        f"Риск: {BASE_RISK_PER_TRADE*100:.2f}% / {BASE_RISK_WEEKEND*100:.3f}% (WE) | "
-        f"MaxPos: {MAX_POSITIONS} | Leverage: {LEVERAGE}x"
+        f"Circuit breaker: при DD >{DAILY_DD_LIMIT*100:.1f}%/день"
     )
- 
-    # Счётчик для периодических задач
+    logging.info("🚀 Unified SMC+RSI Bot v10.0 started")
+
     cycle = 0
- 
     try:
         while True:
             cycle += 1
-            cycle_start = time.time()
- 
+            t0 = time.time()
             try:
-                # ── Периодические задачи ─────────────────────────────
-                await daily_stats_reset()
- 
-                # [FIX-8] Обновление новостей каждые 30 минут
-                if time.time() - _last_news_refresh > 1800:
-                    await update_macro_news()
- 
-                # ── Фильтр сессий ────────────────────────────────────
-                if not is_trade_session():
-                    if cycle % 5 == 0:
-                        logging.info("💤 [SESSION] Вне торговой сессии — ожидание...")
-                    await asyncio.sleep(60)
-                    continue
- 
-                # ── Загрузка рынков (с кэшем) ────────────────────────
-                markets   = await get_cached_markets()
-                # [FIX-1] ИСПРАВЛЕНО: any(kw in sym) вместо sym not in list
-                all_syms  = [
-                    s for s in markets.keys()
-                    if s.endswith(':USDT')
-                    and not any(kw in s for kw in EXCLUDED_PARTS)
-                ]
-                scan_list = all_syms[:SCAN_LIMIT]
- 
-                logging.info(
-                    f"⏳ [РАДАР] Цикл #{cycle} | "
-                    f"Монет: {len(scan_list)} | "
-                    f"Позиций: {len(active_positions)}/{MAX_POSITIONS}"
-                )
- 
-                # ── [FIX-6] Параллельный скан с Semaphore ────────────
-                sem     = asyncio.Semaphore(SCAN_CONCURRENCY)
-                stats   = {k: 0 for k in
-                           ['session', 'news', 'vol', 'struct', 'choch',
-                            'vwap', 'rsi', 'fvg', 'inputs']}
- 
-                async def scan_one(sym):
-                    if sym in NOTIFIED_SYMBOLS:
-                        return
-                    async with sem:
-                        signal, status = await process_smc_coin(sym)
-                    if signal:
-                        stats['inputs'] += 1
-                        NOTIFIED_SYMBOLS[sym] = time.time()
-                        await execute_trade(sym, signal)
-                    else:
-                        key = {
-                            'out_of_session': 'session',
-                            'news_spike':     'news',
-                            'no_volume':      'vol',
-                            'no_structure':   'struct',
-                            'no_choch':       'choch',
-                            'vwap_reject':    'vwap',
-                            'rsi_exhausted':  'rsi',
-                            'no_fvg':         'fvg',
-                            'no_fvg_test':    'fvg',
-                        }.get(status, '')
-                        if key:
-                            stats[key] += 1
- 
-                await asyncio.gather(*[scan_one(s) for s in scan_list])
- 
-                # Очистка устаревших кулдаунов (4 часа)
-                now_t   = time.time()
-                expired = [k for k, v in NOTIFIED_SYMBOLS.items() if now_t - v > 14400]
+                await daily_reset()
+
+                # Обновление новостей каждые 6 часов
+                if time.time() - news_ts > 21600:
+                    await refresh_news()
+
+                # Очистка cooldown-кэша (4 часа)
+                now_t = time.time()
+                expired = [k for k, v in list(notified.items()) if now_t - v > 14400]
                 for k in expired:
-                    del NOTIFIED_SYMBOLS[k]
- 
-                logging.info(
-                    f"🔎 [SMC] Сессия({stats['session']}) Новости({stats['news']}) "
-                    f"Объём({stats['vol']}) Структура({stats['struct']}) "
-                    f"CHoCH({stats['choch']}) VWAP({stats['vwap']}) "
-                    f"RSI({stats['rsi']}) FVG({stats['fvg']}) "
-                    f"→ ВХОДЫ: {stats['inputs']}"
+                    del notified[k]
+
+                # Мониторинг позиций
+                await monitor_all()
+
+                # Сканеры (параллельно)
+                await asyncio.gather(
+                    scan_smc(),
+                    scan_rsi(),
+                    return_exceptions=True
                 )
- 
-                # ── Мониторинг открытых позиций ──────────────────────
-                await monitor_positions_job()
- 
+
             except Exception as e:
-                logging.error(f"❌ [MAIN LOOP] Ошибка: {e}", exc_info=True)
- 
-            # Пауза до следующего цикла (60 сек минус время выполнения)
-            elapsed = time.time() - cycle_start
-            sleep_t = max(10.0, 60.0 - elapsed)
-            await asyncio.sleep(sleep_t)
- 
+                logging.error(f"Main loop #{cycle} error: {e}", exc_info=True)
+
+            # Динамическая пауза до следующего цикла
+            elapsed = time.time() - t0
+            await asyncio.sleep(max(10.0, 60.0 - elapsed))
+
     finally:
-        # [FIX-9] Graceful shutdown
-        logging.info("🛑 Остановка бота — закрытие соединений...")
-        if global_session:
-            await global_session.close()
+        logging.info("Shutting down...")
+        await tg("🔴 <b>Bot v10.0</b> остановлен")
+        if http:
+            await http.close()
         await exchange.close()
         await binance.close()
         await bybit.close()
-        logging.info("✅ Все соединения закрыты.")
- 
-# ══════════════════════════════════════════════════════════
-#  ТОЧКА ВХОДА
-# ══════════════════════════════════════════════════════════
+
 if __name__ == '__main__':
     asyncio.run(main())
