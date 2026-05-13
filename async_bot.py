@@ -408,7 +408,7 @@ async def main():
     asyncio.create_task(update_macro_news()) 
     
     logging.info("🚀 Запуск BINGX ASYNC БОТА v8.98 (PROP + AI, Global Oracle & News Filter)...")
-    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.98 PROP</b> запущен (Исправлен синтаксис деплоя, все Оракулы активны)")
+    await send_tg_msg("🟢 <b>BINGX ASYNC БОТ v8.98 PROP</b> запущен (Логирование радара восстановлено)")
     
     while True:
         try:
@@ -420,20 +420,42 @@ async def main():
             markets = await exchange.load_markets()
             symbols = [s for s in markets.keys() if s.endswith(':USDT') and s not in EXCLUDED_KEYWORDS]
             
-            for sym in symbols[:SCAN_LIMIT]:
+            scan_list = symbols[:SCAN_LIMIT]
+            logging.info(f"⏳ [SMC РАДАР] Опрос {len(scan_list)} монет (Киллзоны, Новости, Объем)...")
+            
+            stats = {'vol': 0, 'struct': 0, 'choch': 0, 'vwap': 0, 'rsi': 0, 'fvg': 0, 'session': 0, 'news': 0}
+            inputs_count = 0
+            
+            for sym in scan_list:
                 if sym in NOTIFIED_SYMBOLS: 
                     continue
                 
                 signal, status = await process_smc_coin(sym)
+                
                 if signal:
+                    inputs_count += 1
                     NOTIFIED_SYMBOLS[sym] = now
                     await execute_trade(sym, signal)
+                else:
+                    # Собираем статистику отказов для логов
+                    if status == 'no_volume': stats['vol'] += 1
+                    elif status == 'no_structure': stats['struct'] += 1
+                    elif status == 'no_choch': stats['choch'] += 1
+                    elif status == 'vwap_reject': stats['vwap'] += 1
+                    elif status == 'rsi_exhausted': stats['rsi'] += 1
+                    elif status in ['no_fvg', 'no_fvg_test']: stats['fvg'] += 1
+                    elif status == 'out_of_session': stats['session'] += 1
+                    elif status == 'news_spike': stats['news'] += 1
+                    
+            # Выводим привычную статистику в консоль Render
+            logging.info(f"🔎 [SMC] Вне сессии({stats['session']}) Пила({stats['struct']}) Слом({stats['choch']}) FVG({stats['fvg']}) RSI({stats['rsi']}) VWAP({stats['vwap']}) Объём({stats['vol']}) -> ВХОДЫ: {inputs_count}")
                     
             await monitor_positions_job()
         except Exception as e: 
             logging.error(f"Main loop error: {e}")
             
-        await asyncio.sleep(30)
+        # Пауза в 60 секунд (для 15m таймфрейма чаще опрашивать нет смысла)
+        await asyncio.sleep(60)
 
 if __name__ == '__main__':
     asyncio.run(main())
