@@ -367,21 +367,23 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
     if bingx_vol >= MIN_VOL_USDT:
         return True
 
-    # Пробуем внешние биржи как дополнительное подтверждение
+    # Пробуем внешние биржи как дополнительное подтверждение (Binance + Bybit + MEXC)
     try:
         base = sym.split('/')[0]
         r = await asyncio.gather(
             binance.fetch_ticker(f"{base}/USDT"),
             bybit.fetch_ticker(f"{base}/USDT"),
-            mexc.fetch_ticker(f"{base}/USDT"),   # ← добавлен
-        return_exceptions=True
+            mexc.fetch_ticker(f"{base}/USDT"),
+            return_exceptions=True
         )
+        vol_b = r[0]['quoteVolume'] if not isinstance(r[0], Exception) else 0
+        vol_y = r[1]['quoteVolume'] if not isinstance(r[1], Exception) else 0
         vol_m = r[2]['quoteVolume'] if not isinstance(r[2], Exception) else 0
-        return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
+        logging.debug(f"[VOL] {base} BingX:{bingx_vol:.0f} Binance:{vol_b:.0f} Bybit:{vol_y:.0f} MEXC:{vol_m:.0f}")
         # Если хотя бы BingX объём >= 500k — разрешаем (не блокируем BingX-эксклюзивы)
         if bingx_vol >= 500_000:
             return True
-        return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT
+        return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
     except:
         return True
 
