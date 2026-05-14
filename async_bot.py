@@ -48,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID       = int(os.getenv('GROUP_CHAT_ID', '-1'))
+GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
 BINGX_KEY     = os.getenv('BINGX_API_KEY')
 BINGX_SECRET  = os.getenv('BINGX_SECRET')
 GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
@@ -210,7 +210,12 @@ async def tg(text: str):
         logging.warning("⚠️ [TG] TELEGRAM_TOKEN не задан — сообщение не отправлено")
         return
     if CHAT_ID == -1:
-        logging.warning("⚠️ [TG] GROUP_CHAT_ID не задан или = -1 — сообщение не отправлено")
+        logging.warning(
+            "⚠️ [TG] GROUP_CHAT_ID = -1 (не задан).\n"
+            "    Установите в Render → Environment → GROUP_CHAT_ID\n"
+            "    Для супергруппы формат: -1007436397755 (префикс -100 + ID)\n"
+            "    Для получения ID: перешлите сообщение боту @userinfobot"
+        )
         return
     if not http:
         return
@@ -341,7 +346,7 @@ def get_pivots(highs, lows, order: int = 5):
             l_idx.append(i)
     return h_idx, l_idx
 
-def find_fvg(h, l, mode: str, lookback: int = 10):
+def find_fvg(h, l, mode: str, lookback: int = 20):  # [FIX-FVG] 10→20 баров
     """Fair Value Gap: разрыв между свечой i-1 и i+1 через среднюю i."""
     for i in range(1, min(lookback, len(h) - 1)):
         idx = len(h) - 1 - i
@@ -549,10 +554,10 @@ async def smc_signal(sym: str):
     if not fvg:
         return None, 'fvg'
     if mode == 'Long':
-        if not (fvg['bottom'] <= price <= fvg['top'] * 1.002):
+        if not (fvg['bottom'] * 0.992 <= price <= fvg['top'] * 1.008):  # [FIX-FVG] буфер ±0.8%
             return None, 'fvg_test'
     else:
-        if not (fvg['bottom'] * 0.998 <= price <= fvg['top']):
+        if not (fvg['bottom'] * 0.992 <= price <= fvg['top'] * 1.008):  # [FIX-FVG] буфер ±0.8%
             return None, 'fvg_test'
 
     atr = calc_atr(h, l, c)
@@ -662,7 +667,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
             return None, 'trend'
         if rsi_now >= rsi_prev:           # RSI ещё не развернулся
             return None, 'hook'
-        if sma_dist > -1.0 or sma_dist < -8.0:   # не перегнут достаточно
+        if sma_dist > 2.0 or sma_dist < -15.0:   # [FIX-SMA] смягчено: -1→+2%, -8→-15%
             return None, 'sma_range'
         if vwap_dist > -1.2:              # должен быть под VWAP
             return None, 'vwap'
@@ -679,7 +684,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
             return None, 'trend'
         if rsi_now <= rsi_prev:
             return None, 'hook'
-        if sma_dist < 1.0 or sma_dist > 8.0:
+        if sma_dist < -2.0 or sma_dist > 15.0:  # [FIX-SMA] смягчено: 1→-2%, 8→15%
             return None, 'sma_range'
         if vwap_dist < 1.2:
             return None, 'vwap'
@@ -1211,7 +1216,17 @@ async def main():
     # [P-4] Диагностика env-переменных при старте
     logging.info("=" * 60)
     logging.info(f"🔑 TELEGRAM_TOKEN:  {'✅ задан' if TOKEN else '❌ НЕ ЗАДАН'}")
-    logging.info(f"🔑 GROUP_CHAT_ID:   {'✅ ' + str(CHAT_ID) if CHAT_ID != -1 else '❌ НЕ ЗАДАН (= -1)'}")
+    logging.info(
+        f"🔑 GROUP_CHAT_ID:   "
+        + (f'✅ {CHAT_ID}' if CHAT_ID != -1 else
+           '❌ НЕ ЗАДАН (= -1) → установите в Render Environment Variables')
+    )
+    if CHAT_ID != -1 and not str(abs(CHAT_ID)).startswith('100'):
+        logging.warning(
+            f"⚠️ [TG] CHAT_ID={CHAT_ID} может быть неверным!\n"
+            "    Supergroup IDs начинаются с -100XXXXXXXXXX\n"
+            "    Возможно нужно: -100" + str(abs(CHAT_ID))
+        )
     logging.info(f"🔑 BINGX_API_KEY:   {'✅ задан' if BINGX_KEY else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 BINGX_SECRET:    {'✅ задан' if BINGX_SECRET else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 GEMINI_API_KEY:  {'✅ задан' if GEMINI_KEY else '⚠️ не задан (AI oracle выключен)'}")
