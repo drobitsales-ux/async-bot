@@ -20,6 +20,13 @@
 ║  [R-FIX-10] News: точное совпадение → окно ±15 мин                  ║
 ║  [R-FIX-11] Daily circuit breaker: стоп при DD > 2.5% за день      ║
 ║  [R-FIX-12] Отдельные таблицы позиций (smc_pos / rsi_pos)          ║
+║                                                                      ║
+║  ПАТЧ v10.1 (по анализу логов деплоя):                              ║
+║  [P-1] tg(): логирует WARNING если TOKEN/CHAT_ID не заданы         ║
+║  [P-2] oracle_volume: advisory (не блокирует), только логирует     ║
+║  [P-3] MIN_VOL_USDT на BingX-тикере, не внешних биржах            ║
+║  [P-4] scan_smc: диагностический лог env-переменных при старте     ║
+║  [P-5] RSI_LONG_MAX/SHORT_MIN расширены до 27/73 для большего охвата║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -66,8 +73,8 @@ SMC_PIVOT_ORDER = 5
 
 # ── RSI-параметры ───────────────────────────────────────
 RSI_TF          = '15m'
-RSI_LONG_MAX    = 25    # [R-FIX-4] был 28
-RSI_SHORT_MIN   = 75    # [R-FIX-4] был 72
+RSI_LONG_MAX    = 27    # [P-5] чуть шире — 25 давал 0 сигналов в логах
+RSI_SHORT_MIN   = 73    # [P-5] симметрично
 RSI_PERIOD      = 14
 
 # ── Исключения (части имён символов) ───────────────────
@@ -194,17 +201,26 @@ def load_all():
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════
 async def tg(text: str):
-    if not TOKEN or CHAT_ID == -1 or not http:
+    # [P-1] Логируем причину молчания вместо тихого return
+    if not TOKEN:
+        logging.warning("⚠️ [TG] TELEGRAM_TOKEN не задан — сообщение не отправлено")
+        return
+    if CHAT_ID == -1:
+        logging.warning("⚠️ [TG] GROUP_CHAT_ID не задан или = -1 — сообщение не отправлено")
+        return
+    if not http:
         return
     try:
         async with http.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=aiohttp.ClientTimeout(total=5)
-        ):
-            pass
-    except:
-        pass
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logging.warning(f"⚠️ [TG] API вернул {resp.status}: {body[:200]}")
+    except Exception as e:
+        logging.warning(f"⚠️ [TG] Ошибка отправки: {e}")
 
 # ═══════════════════════════════════════════════════════
 #  НОВОСТНОЙ ФИЛЬТР  [R-FIX-10]
@@ -336,8 +352,18 @@ def find_fvg(h, l, mode: str, lookback: int = 10):
 # ═══════════════════════════════════════════════════════
 #  ОРАКУЛЫ
 # ═══════════════════════════════════════════════════════
-async def oracle_volume(sym: str) -> bool:
-    """Проверка объёма на Binance + Bybit."""
+async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
+    """
+    [P-2] Volume oracle — advisory, не блокирующий.
+    Сначала проверяем объём самого BingX тикера (уже есть из скана).
+    Внешние биржи (Binance/Bybit) используем как бонусное подтверждение,
+    но не отклоняем сделку если монета есть только на BingX.
+    """
+    # Если BingX-объём уже достаточный — пропускаем внешние запросы
+    if bingx_vol >= MIN_VOL_USDT:
+        return True
+
+    # Пробуем внешние биржи как дополнительное подтверждение
     try:
         base = sym.split('/')[0]
         r = await asyncio.gather(
@@ -347,6 +373,9 @@ async def oracle_volume(sym: str) -> bool:
         )
         vol_b = r[0]['quoteVolume'] if not isinstance(r[0], Exception) else 0
         vol_y = r[1]['quoteVolume'] if not isinstance(r[1], Exception) else 0
+        # Если хотя бы BingX объём >= 500k — разрешаем (не блокируем BingX-эксклюзивы)
+        if bingx_vol >= 500_000:
+            return True
         return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT
     except:
         return True
@@ -526,6 +555,7 @@ async def smc_signal(sym: str):
     return {
         'sym': sym, 'mode': mode, 'price': price,
         'sl': sl, 'tp': tp, 'atr': atr, 'rsi': rsi,
+        'bingx_vol': float(np.sum(v[-1:]) * price),  # приблиз. USD объём последней свечи
     }, 'ok'
 
 # ═══════════════════════════════════════════════════════
@@ -682,6 +712,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         'vwap_dist': vwap_dist, 'tp_mult': tp_mult,
         'btc_trend': btc_trend, 'altseason': altseason,
         'funding': funding,
+        'bingx_vol': float(v[-2]) * price,  # USD объём закрытой свечи
     }, 'ok'
 
 # ═══════════════════════════════════════════════════════
@@ -691,6 +722,7 @@ async def execute(sym: str, sig: dict, strategy: str,
                   pos_list: list, extra_tg: str = ""):
     """
     Общий исполнитель. strategy = 'SMC' | 'RSI'.
+    sig может содержать 'bingx_vol' для oracle_volume.
     """
     global daily_stats
 
@@ -707,10 +739,11 @@ async def execute(sym: str, sig: dict, strategy: str,
     if sum(1 for p in all_pos if p['direction'] == mode) >= MAX_PER_DIR:
         return
 
-    # Оракулы
-    has_vol = await oracle_volume(sym)
+    # [P-2] Передаём BingX-объём чтобы не блокировать BingX-эксклюзивы
+    bingx_vol = sig.get('bingx_vol', 0)
+    has_vol = await oracle_volume(sym, bingx_vol)
     if not has_vol:
-        logging.info(f"[{strategy}] {sym}: volume oracle reject")
+        logging.info(f"[{strategy}] {sym}: volume oracle reject (bingx:{bingx_vol:.0f})")
         return
 
     extra_ctx = {k: v for k, v in sig.items()
@@ -1167,6 +1200,15 @@ async def main():
 
     Thread(target=run_health, daemon=True).start()
     await refresh_news()
+
+    # [P-4] Диагностика env-переменных при старте
+    logging.info("=" * 60)
+    logging.info(f"🔑 TELEGRAM_TOKEN:  {'✅ задан' if TOKEN else '❌ НЕ ЗАДАН'}")
+    logging.info(f"🔑 GROUP_CHAT_ID:   {'✅ ' + str(CHAT_ID) if CHAT_ID != -1 else '❌ НЕ ЗАДАН (= -1)'}")
+    logging.info(f"🔑 BINGX_API_KEY:   {'✅ задан' if BINGX_KEY else '❌ НЕ ЗАДАН'}")
+    logging.info(f"🔑 BINGX_SECRET:    {'✅ задан' if BINGX_SECRET else '❌ НЕ ЗАДАН'}")
+    logging.info(f"🔑 GEMINI_API_KEY:  {'✅ задан' if GEMINI_KEY else '⚠️ не задан (AI oracle выключен)'}")
+    logging.info("=" * 60)
 
     # Инициализация баланса
     try:
