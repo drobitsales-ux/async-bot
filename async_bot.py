@@ -48,7 +48,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
+# [FIX-TG] Надёжный парсинг GROUP_CHAT_ID
+# Telegram supergroup IDs имеют формат -100XXXXXXXXXX
+# Пример корректного значения: -1007436397755 (НЕ -7436397755)
+_raw_chat_id = os.getenv('GROUP_CHAT_ID', '').strip().strip('"').strip("'")
+try:
+    CHAT_ID = int(_raw_chat_id) if _raw_chat_id else -1
+except ValueError:
+    CHAT_ID = -1
+    logging.error(f"❌ GROUP_CHAT_ID содержит нечисловое значение: '{_raw_chat_id}'"
+                  " — проверьте переменную окружения на Render")
 BINGX_KEY     = os.getenv('BINGX_API_KEY')
 BINGX_SECRET  = os.getenv('BINGX_SECRET')
 GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
