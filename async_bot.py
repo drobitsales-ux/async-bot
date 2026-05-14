@@ -123,6 +123,10 @@ bybit = ccxt_async.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'linear'},
 })
+mexc = ccxt_async.mexc({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'},
+})
 
 # ═══════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
@@ -369,10 +373,11 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
         r = await asyncio.gather(
             binance.fetch_ticker(f"{base}/USDT"),
             bybit.fetch_ticker(f"{base}/USDT"),
-            return_exceptions=True
+            mexc.fetch_ticker(f"{base}/USDT"),   # ← добавлен
+        return_exceptions=True
         )
-        vol_b = r[0]['quoteVolume'] if not isinstance(r[0], Exception) else 0
-        vol_y = r[1]['quoteVolume'] if not isinstance(r[1], Exception) else 0
+        vol_m = r[2]['quoteVolume'] if not isinstance(r[2], Exception) else 0
+        return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
         # Если хотя бы BingX объём >= 500k — разрешаем (не блокируем BingX-эксклюзивы)
         if bingx_vol >= 500_000:
             return True
@@ -1270,6 +1275,7 @@ async def main():
         await exchange.close()
         await binance.close()
         await bybit.close()
+        await mexc.close()
 
 if __name__ == '__main__':
     asyncio.run(main())
