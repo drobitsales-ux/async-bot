@@ -414,6 +414,10 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
     except:
         return True
 
+# Кэш решений Gemini: {sym_strategy_mode: (timestamp, result)}
+_gemini_cache: dict = {}
+GEMINI_CACHE_TTL = 3600  # 1 час — не спрашиваем повторно
+
 async def oracle_gemini(sym: str, strategy: str, mode: str,
                         price: float, extra: dict = None) -> dict:
     """
@@ -422,6 +426,17 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
     """
     if not GEMINI_KEY or not http:
         return {'ok': True, 'conf': 0, 'comment': 'API not set'}
+
+    # Проверяем кэш — не тратим квоту на повторный запрос
+    cache_key = f'{sym}_{strategy}_{mode}'
+    if cache_key in _gemini_cache:
+        ts, cached = _gemini_cache[cache_key]
+        if time.time() - ts < GEMINI_CACHE_TTL:
+            logging.info(
+                f'🧠 [GEMINI] {sym} — из кэша: '
+                f'{"APPROVE" if cached["ok"] else "REJECT"} (conf={cached["conf"]})'
+            )
+            return cached
 
     context = {
         'symbol': sym, 'strategy': strategy, 'direction': mode,
@@ -439,7 +454,7 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
     prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
 
     url = (f"https://generativelanguage.googleapis.com/v1beta/"
-           f"models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}")
+           f"models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}")
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"},
@@ -499,7 +514,9 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
                 f'🧠 [GEMINI] {sym} {strategy} {mode} -> {verdict} '
                 f'(conf={conf}/100) | {comment}'
             )
-            return {'ok': ok, 'conf': conf, 'comment': comment}
+            result = {'ok': ok, 'conf': conf, 'comment': comment}
+            _gemini_cache[cache_key] = (time.time(), result)  # сохраняем в кэш
+            return result
     except Exception as _ge:
         logging.warning(f'🧠 [GEMINI] {sym} — ошибка: {_ge}')
         return {'ok': True, 'conf': 0, 'comment': 'oracle error'}
@@ -858,7 +875,9 @@ async def execute(sym: str, sig: dict, strategy: str,
 
     try:
         await exchange.set_margin_mode('isolated', sym)
-        await exchange.set_leverage(LEVERAGE, sym)
+        # BingX hedge mode: leverage нужно установить для каждой стороны
+        await exchange.set_leverage(LEVERAGE, sym,
+            params={'side': pos_side})
         await exchange.create_order(
             sym, 'market', order_side, qty,
             params={'positionSide': pos_side}
@@ -1337,6 +1356,12 @@ async def main():
                 expired = [k for k, v in list(notified.items()) if now_t - v > 14400]
                 for k in expired:
                     del notified[k]
+
+                # Чистка кэша Gemini (устаревшие записи)
+                gem_expired = [k for k, (ts, _) in list(_gemini_cache.items())
+                               if now_t - ts > GEMINI_CACHE_TTL]
+                for k in gem_expired:
+                    del _gemini_cache[k]
 
                 # Мониторинг позиций
                 await monitor_all()
