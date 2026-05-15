@@ -48,16 +48,29 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
-# [FIX-TG] Надёжный парсинг GROUP_CHAT_ID
-# Telegram supergroup IDs имеют формат -100XXXXXXXXXX
-# Пример корректного значения: -1007436397755 (НЕ -7436397755)
-_raw_chat_id = os.getenv('GROUP_CHAT_ID', '').strip().strip('"').strip("'")
-try:
-    CHAT_ID = int(_raw_chat_id) if _raw_chat_id else -1
-except ValueError:
-    CHAT_ID = -1
-    logging.error(f"❌ GROUP_CHAT_ID содержит нечисловое значение: '{_raw_chat_id}'"
-                  " — проверьте переменную окружения на Render")
+# ── Telegram Chat ID ────────────────────────────────────
+# Читаем из нескольких возможных названий переменной.
+# На Render добавьте ОДНУ из переменных (любое название):
+#   GROUP_CHAT_ID = -1003407154454
+#   CHAT_ID       = -1003407154454
+#   TG_CHAT_ID    = -1003407154454
+# Значение: результат команды /chatid в вашей группе через @userinfobot
+def _parse_chat_id() -> int:
+    """Читает Chat ID из любого из трёх возможных имён переменной окружения."""
+    for var_name in ('GROUP_CHAT_ID', 'CHAT_ID', 'TG_CHAT_ID'):
+        raw = os.getenv(var_name, '').strip().strip('"').strip("'")
+        if raw:
+            try:
+                val = int(raw)
+                # print используется т.к. logging ещё не сконфигурирован
+                print(f"[INIT] Chat ID прочитан из {var_name}: {val}", flush=True)
+                return val
+            except ValueError:
+                print(f"[INIT] ❌ {var_name}='{raw}' не число — пропуск", flush=True)
+    print("[INIT] ⚠️  GROUP_CHAT_ID/CHAT_ID/TG_CHAT_ID не заданы — Telegram выключен", flush=True)
+    return -1
+
+CHAT_ID = _parse_chat_id()
 BINGX_KEY     = os.getenv('BINGX_API_KEY')
 BINGX_SECRET  = os.getenv('BINGX_SECRET')
 GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
@@ -68,7 +81,7 @@ RISK_WEEKEND     = 0.00375  # 0.375% в выходные
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 LEVERAGE         = 5
-MIN_VOL_USDT     = 3_000_000  # мин. объём монеты
+MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
 FEE_RATE         = 0.0005
@@ -222,7 +235,7 @@ async def tg(text: str):
         logging.warning(
             "⚠️ [TG] GROUP_CHAT_ID = -1 (не задан).\n"
             "    Установите в Render → Environment → GROUP_CHAT_ID\n"
-            "    Для супергруппы формат: -1007436397755 (префикс -100 + ID)\n"
+            "    Для супергруппы формат: -1003407154454 (префикс -100 + ID)\n    Название переменной: GROUP_CHAT_ID, CHAT_ID или TG_CHAT_ID\n"
             "    Для получения ID: перешлите сообщение боту @userinfobot"
         )
         return
@@ -395,7 +408,7 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
         vol_m = r[2]['quoteVolume'] if not isinstance(r[2], Exception) else 0
         logging.debug(f"[VOL] {base} BingX:{bingx_vol:.0f} Binance:{vol_b:.0f} Bybit:{vol_y:.0f} MEXC:{vol_m:.0f}")
         # Если хотя бы BingX объём >= 500k — разрешаем (не блокируем BingX-эксклюзивы)
-        if bingx_vol >= 500_000:
+        if bingx_vol >= 300_000:  # снижен для теста
             return True
         return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
     except:
@@ -439,11 +452,18 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
             parsed = json.loads(raw)
             ok = str(parsed.get('decision', '')).lower() == 'approve'
             conf = int(parsed.get('confidence', 0))
+            comment = parsed.get('comment', '')
             # [R-FIX-5] низкая уверенность тоже блокирует
             if conf < 55:
                 ok = False
-            return {'ok': ok, 'conf': conf, 'comment': parsed.get('comment', '')}
-    except:
+            verdict = 'APPROVE' if ok else 'REJECT'
+            logging.info(
+                f'🧠 [GEMINI] {sym} {strategy} {mode} -> {verdict} '
+                f'(conf={conf}/100) | {comment}'
+            )
+            return {'ok': ok, 'conf': conf, 'comment': comment}
+    except Exception as _ge:
+        logging.warning(f'🧠 [GEMINI] {sym} — ошибка: {_ge}')
         return {'ok': True, 'conf': 0, 'comment': 'oracle error'}
 
 # ═══════════════════════════════════════════════════════
@@ -769,6 +789,10 @@ async def execute(sym: str, sig: dict, strategy: str,
 
     extra_ctx = {k: v for k, v in sig.items()
                  if k in ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')}
+    logging.info(
+        f'🔔 [{strategy}] {sym} {mode} @ {price:.6f} — '
+        f'все фильтры пройдены -> отправка в Gemini...'
+    )
     ai = await oracle_gemini(sym, strategy, mode, price, extra_ctx)
     if not ai['ok']:
         logging.info(f"[{strategy}] {sym}: Gemini reject (conf={ai['conf']}): {ai['comment']}")
