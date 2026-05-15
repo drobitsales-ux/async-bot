@@ -448,12 +448,50 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
         async with http.post(url, json=payload,
                              timeout=aiohttp.ClientTimeout(total=8)) as resp:
             data = await resp.json()
-            raw = data['candidates'][0]['content']['parts'][0]['text']
-            parsed = json.loads(raw)
+
+            # Диагностика: логируем если нет 'candidates'
+            if 'candidates' not in data:
+                # Типичные причины: quota exceeded, safety block, wrong key
+                err_info = data.get('error', data)
+                err_code = err_info.get('code', '?') if isinstance(err_info, dict) else '?'
+                err_msg  = err_info.get('message', str(data))[:200] if isinstance(err_info, dict) else str(data)[:200]
+                err_status = err_info.get('status', '') if isinstance(err_info, dict) else ''
+                logging.warning(
+                    f'🧠 [GEMINI] {sym} — нет candidates в ответе!\n'
+                    f'    HTTP status: {resp.status}\n'
+                    f'    Error code: {err_code} | status: {err_status}\n'
+                    f'    Message: {err_msg}\n'
+                    f'    Вероятные причины:\n'
+                    f'    • QUOTA_EXCEEDED — исчерпан лимит Gemini API\n'
+                    f'    • SAFETY — запрос заблокирован фильтром безопасности\n'
+                    f'    • INVALID_ARGUMENT — неверный формат запроса\n'
+                    f'    • Проверьте GEMINI_API_KEY на https://aistudio.google.com'
+                )
+                return {'ok': True, 'conf': 0, 'comment': f'no candidates: code={err_code}'}
+
+            # Нормальный путь: парсим ответ
+            raw_text = data['candidates'][0]['content']['parts'][0]['text']
+
+            # Gemini может вернуть как чистый JSON так и текст с ```json блоком
+            clean = raw_text.strip()
+            if clean.startswith('```'):
+                clean = clean.split('```')[1]
+                if clean.startswith('json'):
+                    clean = clean[4:]
+                clean = clean.strip()
+
+            try:
+                parsed = json.loads(clean)
+            except json.JSONDecodeError:
+                # Fallback: если JSON не распарсился — ищем YES/NO в тексте
+                logging.warning(f'🧠 [GEMINI] {sym} — не JSON, fallback: {clean[:100]}')
+                ok_fb = 'YES' in clean.upper() or 'APPROVE' in clean.upper()
+                return {'ok': ok_fb, 'conf': 50, 'comment': f'text fallback: {clean[:80]}'}
+
             ok = str(parsed.get('decision', '')).lower() == 'approve'
             conf = int(parsed.get('confidence', 0))
             comment = parsed.get('comment', '')
-            # [R-FIX-5] низкая уверенность тоже блокирует
+            # Низкая уверенность тоже блокирует
             if conf < 55:
                 ok = False
             verdict = 'APPROVE' if ok else 'REJECT'
