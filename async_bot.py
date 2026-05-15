@@ -385,34 +385,38 @@ def find_fvg(h, l, mode: str, lookback: int = 20):  # [FIX-FVG] 10→20 баро
 # ═══════════════════════════════════════════════════════
 async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
     """
-    [P-2] Volume oracle — advisory, не блокирующий.
-    Сначала проверяем объём самого BingX тикера (уже есть из скана).
-    Внешние биржи (Binance/Bybit) используем как бонусное подтверждение,
-    но не отклоняем сделку если монета есть только на BingX.
+    Volume oracle: BingX-объём ≥200k → быстрый пропуск.
+    Иначе проверяем Binance+Bybit+MEXC с таймаутом 2 сек.
     """
-    # Если BingX-объём уже достаточный — пропускаем внешние запросы
-    if bingx_vol >= MIN_VOL_USDT:
+    # Fast-path: BingX-объём достаточен → не тратим время на внешние запросы
+    if bingx_vol >= 200_000:
         return True
 
-    # Пробуем внешние биржи как дополнительное подтверждение (Binance + Bybit + MEXC)
+    # Внешние биржи с жёстким таймаутом — чтобы не блокировать скан
     try:
         base = sym.split('/')[0]
-        r = await asyncio.gather(
-            binance.fetch_ticker(f"{base}/USDT"),
-            bybit.fetch_ticker(f"{base}/USDT"),
-            mexc.fetch_ticker(f"{base}/USDT"),
-            return_exceptions=True
+
+        async def _vol(exch, ticker):
+            try:
+                t = await asyncio.wait_for(exch.fetch_ticker(ticker), timeout=2.0)
+                return float(t.get('quoteVolume', 0) or 0)
+            except Exception:
+                return 0.0
+
+        vol_b, vol_y, vol_m = await asyncio.gather(
+            _vol(binance, f'{base}/USDT'),
+            _vol(bybit,   f'{base}/USDT'),
+            _vol(mexc,    f'{base}/USDT'),
         )
-        vol_b = r[0]['quoteVolume'] if not isinstance(r[0], Exception) else 0
-        vol_y = r[1]['quoteVolume'] if not isinstance(r[1], Exception) else 0
-        vol_m = r[2]['quoteVolume'] if not isinstance(r[2], Exception) else 0
-        logging.debug(f"[VOL] {base} BingX:{bingx_vol:.0f} Binance:{vol_b:.0f} Bybit:{vol_y:.0f} MEXC:{vol_m:.0f}")
-        # Если хотя бы BingX объём >= 500k — разрешаем (не блокируем BingX-эксклюзивы)
-        if bingx_vol >= 300_000:  # снижен для теста
-            return True
+        if any(v > 0 for v in (vol_b, vol_y, vol_m)):
+            logging.debug(
+                f"[VOL] {base} BingX:{bingx_vol:.0f} "
+                f"Bin:{vol_b:.0f} Bbt:{vol_y:.0f} MEXC:{vol_m:.0f}"
+            )
         return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
-    except:
-        return True
+    except Exception:
+        return bingx_vol >= 100_000
+
 
 # Кэш решений Gemini: {sym_strategy_mode: (timestamp, result)}
 _gemini_cache: dict = {}
@@ -749,7 +753,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         # [R-FIX-6] Flat BTC больше не блокирует лонг
         if btc_trend == 'Short' and not altseason:
             return None, 'trend'
-        if rsi_now >= rsi_prev:           # RSI ещё не развернулся
+        # Hook: RSI должен начать разворот (снизился хотя бы на 0.3 пункта)
+        if rsi_now >= rsi_prev - 0.3:
             return None, 'hook'
         if sma_dist > 2.0 or sma_dist < -15.0:   # [FIX-SMA] смягчено: -1→+2%, -8→-15%
             return None, 'sma_range'
@@ -766,7 +771,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     elif rsi_now >= RSI_SHORT_MIN and bear_pat:
         if btc_trend == 'Long' or altseason:
             return None, 'trend'
-        if rsi_now <= rsi_prev:
+        # Hook: RSI должен начать разворот (вырос хотя бы на 0.3 пункта)
+        if rsi_now <= rsi_prev + 0.3:
             return None, 'hook'
         if sma_dist < -2.0 or sma_dist > 15.0:  # [FIX-SMA] смягчено: 1→-2%, 8→15%
             return None, 'sma_range'
@@ -1161,7 +1167,18 @@ async def scan_smc():
         return
 
     markets = await get_markets()
-    scan = [s for s in list(markets.keys()) if sym_allowed(s)][:SCAN_LIMIT]
+    # Предфильтр: получаем объёмы всех монет ОДНИМ запросом
+    # Это в 50x быстрее чем 250 отдельных fetch_ticker
+    try:
+        all_tickers = await exchange.fetch_tickers()
+        scan = [
+            s for s in list(markets.keys())
+            if sym_allowed(s)
+            and float((all_tickers.get(s) or {}).get('quoteVolume', 0) or 0)
+               >= MIN_VOL_USDT * 0.1  # мягкий предпорог
+        ][:SCAN_LIMIT]
+    except Exception:
+        scan = [s for s in list(markets.keys()) if sym_allowed(s)][:SCAN_LIMIT]
     sem  = asyncio.Semaphore(SCAN_SEM)
     st   = {k: 0 for k in ['session','news','vol','structure','choch',
                             'vwap','rsi','fvg','fvg_test','ok']}
@@ -1191,7 +1208,17 @@ async def scan_rsi():
 
     markets   = await get_markets()
     btc_ctx   = await get_btc_context()
-    scan = [s for s in list(markets.keys()) if sym_allowed(s)][:SCAN_LIMIT]
+    # Предфильтр по объёму (общий тикер уже загружен в кэш ccxt)
+    try:
+        all_tickers = await exchange.fetch_tickers()
+        scan = [
+            s for s in list(markets.keys())
+            if sym_allowed(s)
+            and float((all_tickers.get(s) or {}).get('quoteVolume', 0) or 0)
+               >= MIN_VOL_USDT * 0.1
+        ][:SCAN_LIMIT]
+    except Exception:
+        scan = [s for s in list(markets.keys()) if sym_allowed(s)][:SCAN_LIMIT]
     sem  = asyncio.Semaphore(SCAN_SEM)
     st   = {k: 0 for k in ['news','vol','rsi_mid','trend','hook',
                             'sma_range','vwap','sl_wide','squeeze',
@@ -1215,10 +1242,12 @@ async def scan_rsi():
             await execute(sym, sig, 'RSI', rsi_positions, extra)
 
     await asyncio.gather(*[check(s) for s in scan])
+    total_r = sum(st.values())
     logging.info(
         f"[RSI SCAN] BTC:{btc_ctx['btc_trend']} Alt:{btc_ctx['altseason']} | "
-        f"mid:{st['rsi_mid']} hook:{st['hook']} sma:{st['sma_range']} "
-        f"vwap:{st['vwap']} trend:{st['trend']} "
+        f"total:{total_r} mid:{st['rsi_mid']} hook:{st['hook']} "
+        f"sma:{st['sma_range']} vwap:{st['vwap']} trend:{st['trend']} "
+        f"sl:{st['sl_wide']} sqz:{st['squeeze']} pat:{st['no_pattern']} "
         f"→ ВХОДЫ:{st['ok']}"
     )
 
@@ -1367,10 +1396,17 @@ async def main():
                 await monitor_all()
 
                 # Сканеры (параллельно)
+                scan_t0 = time.time()
                 await asyncio.gather(
                     scan_smc(),
                     scan_rsi(),
                     return_exceptions=True
+                )
+                scan_elapsed = time.time() - scan_t0
+                logging.info(
+                    f'⏱ Цикл #{cycle} завершён за {scan_elapsed:.1f}с | '
+                    f'SMC:{len(smc_positions)} RSI:{len(rsi_positions)} поз | '
+                    f'Кэш Gemini: {len(_gemini_cache)} записей'
                 )
 
             except Exception as e:
