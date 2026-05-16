@@ -74,6 +74,7 @@ CHAT_ID = _parse_chat_id()
 BINGX_KEY     = os.getenv('BINGX_API_KEY')
 BINGX_SECRET  = os.getenv('BINGX_SECRET')
 GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
+OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
 RISK_PER_TRADE   = 0.0075   # [R-FIX-1] 0.75% на сделку
@@ -86,8 +87,9 @@ MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = 0.025    # [R-FIX-11] стоп торговли при -2.5% за день
-SCAN_LIMIT       = 250
-SCAN_SEM         = 20       # параллельных запросов
+SCAN_LIMIT       = 150      # [PERF] снижен для ускорения цикла
+SCAN_SEM         = 40       # [PERF] повышен: больше параллельных запросов
+MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
 
 # ── SMC-параметры ───────────────────────────────────────
 SMC_TF          = '15m'
@@ -418,6 +420,121 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
         return bingx_vol >= 100_000
 
 
+# ─── OpenRouter Oracle ──────────────────────────────────────────
+_openrouter_model_idx = 0  # текущая модель (ротируем при ошибке)
+_openrouter_req_times: list = []
+OPENROUTER_RPM = 18  # запас от лимита 20/min
+
+async def oracle_openrouter(sym: str, strategy: str, mode: str,
+                            price: float, extra: dict = None) -> dict:
+    """
+    OpenRouter — мульти-AI шлюз без daily quota.
+    Ротирует модели при ошибке: llama → mistral → gemma.
+    Бесплатные модели, регистрация на https://openrouter.ai
+    """
+    global _openrouter_model_idx
+
+    if not OPENROUTER_KEY or not http:
+        return {'ok': True, 'conf': 0, 'comment': 'openrouter_not_set'}
+
+    # Rate limit: 18 req/min
+    now_t = time.time()
+    _openrouter_req_times[:] = [t for t in _openrouter_req_times if now_t - t < 60]
+    if len(_openrouter_req_times) >= OPENROUTER_RPM:
+        wait_s = 61 - (now_t - _openrouter_req_times[0])
+        await asyncio.sleep(max(0, wait_s))
+
+    context = {'symbol': sym, 'strategy': strategy, 'direction': mode,
+               'price': round(price, 6)}
+    if extra:
+        context.update(extra)
+
+    prompt = (
+        'Ты риск-менеджер крипто-фонда. Оцени торговый сетап и верни ТОЛЬКО JSON: '
+        '{"decision": "approve"|"reject", "confidence": 0-100, "comment": "вывод"}. '
+        f'Данные: {json.dumps(context, ensure_ascii=False)}'
+    )
+
+    model = OPENROUTER_MODELS[_openrouter_model_idx % len(OPENROUTER_MODELS)]
+    url = 'https://openrouter.ai/api/v1/chat/completions'
+    headers = {
+        'Authorization': f'Bearer {OPENROUTER_KEY}',
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://github.com/bingx-smc-bot',
+    }
+    payload = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.1,
+        'max_tokens': 150,
+    }
+
+    _openrouter_req_times.append(time.time())
+    try:
+        async with http.post(url, headers=headers, json=payload,
+                             timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            data = await resp.json()
+
+            if resp.status != 200 or 'choices' not in data:
+                err = data.get('error', {}).get('message', str(data))[:100]
+                logging.warning(f'🔀 [ROUTER] {model} error {resp.status}: {err}')
+                # Ротируем на следующую модель
+                _openrouter_model_idx += 1
+                return {'ok': True, 'conf': 0, 'comment': f'router_err:{resp.status}'}
+
+            raw = data['choices'][0]['message']['content'].strip()
+            # Парсим JSON из ответа
+            clean = raw
+            if '```' in clean:
+                clean = clean.split('```')[1].lstrip('json').strip()
+            try:
+                parsed = json.loads(clean)
+            except json.JSONDecodeError:
+                # Fallback: ищем ключевые слова
+                ok_fb = 'approve' in raw.lower() or 'yes' in raw.lower()
+                return {'ok': ok_fb, 'conf': 50, 'comment': f'text_fallback'}
+
+            ok = str(parsed.get('decision', '')).lower() == 'approve'
+            conf = int(parsed.get('confidence', 50))
+            comment = parsed.get('comment', '')
+            if conf < 55:
+                ok = False
+            verdict = 'APPROVE' if ok else 'REJECT'
+            logging.info(
+                f'🔀 [ROUTER/{model.split("/")[1][:8]}] {sym} {strategy} {mode} '
+                f'-> {verdict} (conf={conf}) | {comment}'
+            )
+            return {'ok': ok, 'conf': conf, 'comment': comment}
+    except Exception as e:
+        logging.warning(f'🔀 [ROUTER] {sym} exception: {e}')
+        _openrouter_model_idx += 1  # ротируем модель
+        return {'ok': True, 'conf': 0, 'comment': 'router_exception'}
+
+
+# ─── Единый AI Oracle: OpenRouter → Gemini → bypass ─────────────
+async def oracle_ai(sym: str, strategy: str, mode: str,
+                    price: float, extra: dict = None) -> dict:
+    """
+    Каскадный AI оракул:
+    1. OpenRouter (бесплатно, без daily cap) — если ключ есть
+    2. Gemini (если OpenRouter недоступен)
+    3. Bypass (approve без AI) — если оба недоступны
+    """
+    # Приоритет 1: OpenRouter
+    if OPENROUTER_KEY:
+        result = await oracle_openrouter(sym, strategy, mode, price, extra)
+        if result['comment'] not in ('openrouter_not_set',):
+            return result
+
+    # Приоритет 2: Gemini (если квота есть)
+    if GEMINI_KEY and _gemini_quota_ok:
+        result = await oracle_gemini(sym, strategy, mode, price, extra)
+        return result
+
+    # Приоритет 3: Bypass
+    return {'ok': True, 'conf': 0, 'comment': 'ai_bypass'}
+
+
 # Кэш решений Gemini: {sym_strategy_mode: (timestamp, result)}
 _gemini_cache: dict = {}
 GEMINI_CACHE_TTL = 3600  # 1 час — не спрашиваем повторно
@@ -432,6 +549,15 @@ _gemini_quota_reset: float = 0 # когда снова пробовать
 _tickers_cache: dict = {}
 _tickers_cache_ts: float = 0.0
 TICKERS_CACHE_TTL = 300  # 5 минут
+
+# OpenRouter модели (в порядке приоритета)
+# Бесплатные: без daily cap, 20 req/min
+# Подключить: https://openrouter.ai/keys (бесплатная регистрация)
+OPENROUTER_MODELS = [
+    'meta-llama/llama-3.1-8b-instruct:free',   # бесплатно, быстро
+    'mistralai/mistral-7b-instruct:free',        # бесплатно, надёжно
+    'google/gemma-2-9b-it:free',                 # бесплатно (Google)
+]
 
 async def oracle_gemini(sym: str, strategy: str, mode: str,
                         price: float, extra: dict = None) -> dict:
@@ -917,11 +1043,12 @@ async def execute(sym: str, sig: dict, strategy: str,
 
     extra_ctx = {k: v for k, v in sig.items()
                  if k in ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')}
+    provider = 'OpenRouter' if OPENROUTER_KEY else 'Gemini' if (_gemini_quota_ok and GEMINI_KEY) else 'bypass'
     logging.info(
         f'🔔 [{strategy}] {sym} {mode} @ {price:.6f} — '
-        f'все фильтры пройдены -> отправка в Gemini...'
+        f'все фильтры пройдены -> AI Oracle [{provider}]'
     )
-    ai = await oracle_gemini(sym, strategy, mode, price, extra_ctx)
+    ai = await oracle_ai(sym, strategy, mode, price, extra_ctx)
     if not ai['ok']:
         logging.info(f"[{strategy}] {sym}: Gemini reject (conf={ai['conf']}): {ai['comment']}")
         return
@@ -999,8 +1126,8 @@ async def execute(sym: str, sig: dict, strategy: str,
         f"Цена: <code>{price:.6f}</code>\n"
         f"SL: <code>{sl:.6f}</code>  TP: <code>{tp:.6f}</code>\n"
         f"RR: <b>1:{rr:.2f}</b>  Риск: <b>${risk_usdt:.2f}</b>\n"
-        + (f"🤖 AI: bypass (daily quota)\n" if 'bypass' in ai['comment']
-           else f"🧠 Gemini: {ai['conf']}/100 — <i>{ai['comment']}</i>\n")
+        + (f"🤖 AI: bypass\n" if 'bypass' in ai['comment']
+           else f"🧠 AI({provider}): {ai['conf']}/100 — <i>{ai['comment']}</i>\n")
         + extra_tg
     )
     await tg(msg)
@@ -1060,6 +1187,28 @@ async def monitor_all():
         if live:
             real_qty = abs(float(live.get('contracts', 0)))
             pos['current_qty'] = real_qty
+
+            # Ghost position guard: закрываем мизерные остатки принудительно
+            pos_value_usdt = real_qty * curr_p
+            if pos_value_usdt < MIN_LOT_USDT and pos_value_usdt > 0:
+                logging.warning(
+                    f'👻 [{strategy}] {sym}: ghost position ({pos_value_usdt:.4f} USDT) — '
+                    f'принудительное закрытие'
+                )
+                try:
+                    if pos.get('sl_order_id'):
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                    await exchange.create_order(
+                        sym, 'market', sl_side, real_qty,
+                        params={'positionSide': pos_side, 'reduceOnly': True}
+                    )
+                    await tg(
+                        f'👻 <b>[{strategy}] {sym}</b>: ghost position закрыта\n'
+                        f'Остаток: {pos_value_usdt:.4f} USDT — слишком мал для SL ордера'
+                    )
+                except Exception as _ge:
+                    logging.error(f'Ghost close error {sym}: {_ge}')
+                return False  # удалить из списка
 
             pnl = ((curr_p - entry) / entry * 100 if is_long
                    else (entry - curr_p) / entry * 100)
@@ -1197,19 +1346,26 @@ async def monitor_all():
             daily_stats['trades'] += 1
             daily_stats['pnl_pct'] += pnl_pct / 100  # в долях
 
-            if net_pnl > 0:
+            # Победа если хотя бы pnl_pct > 0 (даже если net_pnl отрицательный из-за комиссий)
+            # Или если tp50_hit — частичная прибыль уже зафиксирована
+            is_win = pnl_pct > 0 or pos.get('tp50_hit', False)
+            if is_win:
                 daily_stats['wins'] += 1
 
             mfe_pct = abs(float(pos['mfe_price']) - entry) / entry * 100
             mae_pct = abs(float(pos['mae_price']) - entry) / entry * 100
             dur_min = int(seconds / 60)
 
+            winrate_d = (daily_stats['wins'] / daily_stats['trades'] * 100
+                         if daily_stats['trades'] > 0 else 0)
+            tp50_tag = ' (TP50✓)' if pos.get('tp50_hit') else ''
             await tg(
-                f"{'✅' if net_pnl > 0 else '🛑'} <b>[{strategy}] {sym}</b> закрыта\n"
-                f"PnL: <code>{net_pnl:+.2f} USDT ({pnl_pct:+.2f}%)</code>\n"
-                f"⏱ {dur_min}мин  📈MFE {mfe_pct:.2f}%  📉MAE {mae_pct:.2f}%\n"
-                f"Итог дня: {daily_stats['trades']} сделок | "
-                f"{daily_stats['wins']} побед"
+                f"{'✅' if is_win else '🛑'} <b>[{strategy}] {sym}</b> закрыта{tp50_tag}\n"
+                f"PnL: <code>{pnl_pct:+.2f}%</code> | Net: <code>{net_pnl:+.2f} USDT</code>\n"
+                f"📈 MFE {mfe_pct:.2f}% | 📉 MAE {mae_pct:.2f}% | ⏱ {dur_min}мин\n"
+                f"Вход: {entry:.6f} | Выход: {exit_p:.6f}\n"
+                f"День: {daily_stats['trades']} сделок | "
+                f"{daily_stats['wins']} побед | WR {winrate_d:.0f}%"
             )
             save_all()
             notified[sym] = time.time()   # cooldown после закрытия
