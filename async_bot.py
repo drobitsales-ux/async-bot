@@ -554,9 +554,9 @@ TICKERS_CACHE_TTL = 300  # 5 минут
 # Бесплатные: без daily cap, 20 req/min
 # Подключить: https://openrouter.ai/keys (бесплатная регистрация)
 OPENROUTER_MODELS = [
-    'meta-llama/llama-3.1-8b-instruct:free',   # бесплатно, быстро
-    'mistralai/mistral-7b-instruct:free',        # бесплатно, надёжно
-    'google/gemma-2-9b-it:free',                 # бесплатно (Google)
+    'meta-llama/llama-3-8b-instruct:free',   # бесплатно, быстро
+    'mistralai/mistral-nemo:free',        # бесплатно, надёжно
+    'google/gemini-2.0-flash-exp:free',       # бесплатно (Google)
 ]
 
 async def oracle_gemini(sym: str, strategy: str, mode: str,
