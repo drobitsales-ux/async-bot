@@ -455,60 +455,80 @@ async def oracle_openrouter(sym: str, strategy: str, mode: str,
         f'Данные: {json.dumps(context, ensure_ascii=False)}'
     )
 
-    model = OPENROUTER_MODELS[_openrouter_model_idx % len(OPENROUTER_MODELS)]
     url = 'https://openrouter.ai/api/v1/chat/completions'
     headers = {
         'Authorization': f'Bearer {OPENROUTER_KEY}',
         'Content-Type': 'application/json',
         'HTTP-Referer': 'https://github.com/bingx-smc-bot',
-    }
-    payload = {
-        'model': model,
-        'messages': [{'role': 'user', 'content': prompt}],
-        'temperature': 0.1,
-        'max_tokens': 150,
+        'X-Title': 'BingX SMC Bot',
     }
 
     _openrouter_req_times.append(time.time())
-    try:
-        async with http.post(url, headers=headers, json=payload,
-                             timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            data = await resp.json()
 
-            if resp.status != 200 or 'choices' not in data:
-                err = data.get('error', {}).get('message', str(data))[:100]
-                logging.warning(f'🔀 [ROUTER] {model} error {resp.status}: {err}')
-                # Ротируем на следующую модель
-                _openrouter_model_idx += 1
-                return {'ok': True, 'conf': 0, 'comment': f'router_err:{resp.status}'}
+    # Перебираем все модели по кругу пока не найдём рабочую
+    n = len(OPENROUTER_MODELS)
+    for attempt in range(n):
+        model = OPENROUTER_MODELS[(_openrouter_model_idx + attempt) % n]
+        payload = {
+            'model': model,
+            'messages': [{'role': 'user', 'content': prompt}],
+            'temperature': 0.1,
+            'max_tokens': 150,
+        }
+        try:
+            async with http.post(url, headers=headers, json=payload,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json()
 
-            raw = data['choices'][0]['message']['content'].strip()
-            # Парсим JSON из ответа
-            clean = raw
-            if '```' in clean:
-                clean = clean.split('```')[1].lstrip('json').strip()
-            try:
-                parsed = json.loads(clean)
-            except json.JSONDecodeError:
-                # Fallback: ищем ключевые слова
-                ok_fb = 'approve' in raw.lower() or 'yes' in raw.lower()
-                return {'ok': ok_fb, 'conf': 50, 'comment': f'text_fallback'}
+                if resp.status != 200 or 'choices' not in data:
+                    err_msg = ''
+                    if isinstance(data.get('error'), dict):
+                        err_msg = data['error'].get('message', '')[:80]
+                    elif 'error' in data:
+                        err_msg = str(data['error'])[:80]
+                    logging.warning(
+                        f'🔀 [ROUTER] {model} → {resp.status}: {err_msg} '
+                        f'(попытка {attempt+1}/{n})'
+                    )
+                    continue  # следующая модель
 
-            ok = str(parsed.get('decision', '')).lower() == 'approve'
-            conf = int(parsed.get('confidence', 50))
-            comment = parsed.get('comment', '')
-            if conf < 55:
-                ok = False
-            verdict = 'APPROVE' if ok else 'REJECT'
-            logging.info(
-                f'🔀 [ROUTER/{model.split("/")[1][:8]}] {sym} {strategy} {mode} '
-                f'-> {verdict} (conf={conf}) | {comment}'
-            )
-            return {'ok': ok, 'conf': conf, 'comment': comment}
-    except Exception as e:
-        logging.warning(f'🔀 [ROUTER] {sym} exception: {e}')
-        _openrouter_model_idx += 1  # ротируем модель
-        return {'ok': True, 'conf': 0, 'comment': 'router_exception'}
+                raw = data['choices'][0]['message']['content'].strip()
+                # Парсим JSON из ответа
+                clean = raw
+                if '```' in clean:
+                    clean = clean.split('```')[1].lstrip('json').strip()
+                try:
+                    parsed = json.loads(clean)
+                except json.JSONDecodeError:
+                    ok_fb = 'approve' in raw.lower() or 'yes' in raw.lower()
+                    logging.info(f'🔀 [ROUTER/{model.split("/")[1][:8]}] text fallback → {ok_fb}')
+                    # Обновляем индекс на рабочую модель
+                    _openrouter_model_idx = (_openrouter_model_idx + attempt) % n
+                    return {'ok': ok_fb, 'conf': 50, 'comment': 'text_fallback'}
+
+                ok = str(parsed.get('decision', '')).lower() == 'approve'
+                conf = int(parsed.get('confidence', 50))
+                comment = parsed.get('comment', '')
+                if conf < 55:
+                    ok = False
+                verdict = 'APPROVE' if ok else 'REJECT'
+                short_model = model.split('/')[-1][:12].replace(':free', '')
+                logging.info(
+                    f'🔀 [ROUTER/{short_model}] {sym} {strategy} {mode} '
+                    f'-> {verdict} ({conf}/100) | {comment}'
+                )
+                # Запоминаем рабочую модель
+                _openrouter_model_idx = (_openrouter_model_idx + attempt) % n
+                return {'ok': ok, 'conf': conf, 'comment': comment}
+
+        except Exception as e:
+            logging.warning(f'🔀 [ROUTER] {model} exception: {e} (попытка {attempt+1}/{n})')
+            continue  # следующая модель
+
+    # Все модели не ответили
+    logging.warning('🔀 [ROUTER] Все модели недоступны — используем bypass')
+    _openrouter_model_idx = (_openrouter_model_idx + 1) % n
+    return {'ok': True, 'conf': 0, 'comment': 'all_models_failed'}
 
 
 # ─── Единый AI Oracle: OpenRouter → Gemini → bypass ─────────────
@@ -553,10 +573,15 @@ TICKERS_CACHE_TTL = 300  # 5 минут
 # OpenRouter модели (в порядке приоритета)
 # Бесплатные: без daily cap, 20 req/min
 # Подключить: https://openrouter.ai/keys (бесплатная регистрация)
+# Актуальные free-модели OpenRouter (проверены май 2026)
+# Источник актуального списка: https://openrouter.ai/models?q=free
 OPENROUTER_MODELS = [
-    'meta-llama/llama-3-8b-instruct:free',   # бесплатно, быстро
-    'mistralai/mistral-nemo:free',        # бесплатно, надёжно
-    'google/gemini-2.0-flash-exp:free',       # бесплатно (Google)
+    'meta-llama/llama-3.2-3b-instruct:free',     # llama 3.2, быстро
+    'mistralai/mistral-7b-instruct:free',          # mistral, надёжно
+    'google/gemma-2-9b-it:free',                   # Google gemma
+    'microsoft/phi-3-mini-128k-instruct:free',     # Microsoft phi-3
+    'qwen/qwen-2-7b-instruct:free',                # Alibaba Qwen
+    'nousresearch/hermes-3-llama-3.1-405b:free',  # NousResearch
 ]
 
 async def oracle_gemini(sym: str, strategy: str, mode: str,
