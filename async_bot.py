@@ -420,139 +420,219 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
         return bingx_vol >= 100_000
 
 
-# ─── OpenRouter Oracle ──────────────────────────────────────────
-_openrouter_model_idx = 0  # текущая модель (ротируем при ошибке)
-_openrouter_req_times: list = []
-OPENROUTER_RPM = 18  # запас от лимита 20/min
+# ══════════════════════════════════════════════════════════════
+#  AI ORACLE  —  Groq (primary) → Gemini (fallback) → Score (local)
+#
+#  Groq:   бесплатно, 14 400 req/day, стабильно, регистрация на groq.com
+#  Gemini: резерв при ошибке Groq, 1500 req/day
+#  Score:  локальный скоринг — всегда работает без API
+#
+#  Добавьте в Render Environment:
+#    GROQ_API_KEY = gsk_xxxxxxxxxxxxxxxxxxxx
+#    (GEMINI_API_KEY и OPENROUTER_API_KEY можно оставить как резервы)
+# ══════════════════════════════════════════════════════════════
 
-async def oracle_openrouter(sym: str, strategy: str, mode: str,
-                            price: float, extra: dict = None) -> dict:
+# ── Groq ─────────────────────────────────────────────────────
+_groq_req_times: list = []
+_groq_quota_ok  = True
+_groq_quota_reset: float = 0.0
+GROQ_RPM        = 25    # запас от лимита 30/min
+GROQ_MODELS     = [
+    'llama-3.1-8b-instant',     # очень быстро (~100ms)
+    'llama-3.3-70b-versatile',  # лучшее качество
+    'gemma2-9b-it',             # Google, запасная
+]
+
+async def oracle_groq(sym: str, strategy: str, mode: str,
+                      price: float, extra: dict = None) -> dict:
     """
-    OpenRouter — мульти-AI шлюз без daily quota.
-    Ротирует модели при ошибке: llama → mistral → gemma.
-    Бесплатные модели, регистрация на https://openrouter.ai
+    Groq — основной AI Oracle.
+    Бесплатно, 14 400 req/day, стабильные модели без :free суффикса.
+    Регистрация: https://console.groq.com/keys
     """
-    global _openrouter_model_idx
+    global _groq_quota_ok, _groq_quota_reset
 
-    if not OPENROUTER_KEY or not http:
-        return {'ok': True, 'conf': 0, 'comment': 'openrouter_not_set'}
+    groq_key = os.getenv('GROQ_API_KEY', '')
+    if not groq_key or not http:
+        return {'ok': True, 'conf': 0, 'comment': 'groq_not_set'}
 
-    # Rate limit: 18 req/min
+    # Quota check
+    if not _groq_quota_ok:
+        if time.time() < _groq_quota_reset:
+            return {'ok': True, 'conf': 0, 'comment': 'groq_quota_wait'}
+        _groq_quota_ok = True
+
+    # Rate limit
     now_t = time.time()
-    _openrouter_req_times[:] = [t for t in _openrouter_req_times if now_t - t < 60]
-    if len(_openrouter_req_times) >= OPENROUTER_RPM:
-        wait_s = 61 - (now_t - _openrouter_req_times[0])
-        await asyncio.sleep(max(0, wait_s))
+    _groq_req_times[:] = [t for t in _groq_req_times if now_t - t < 60]
+    if len(_groq_req_times) >= GROQ_RPM:
+        wait = 61 - (now_t - _groq_req_times[0])
+        await asyncio.sleep(max(0, wait))
 
-    context = {'symbol': sym, 'strategy': strategy, 'direction': mode,
-               'price': round(price, 6)}
+    context = {'symbol': sym, 'strategy': strategy,
+               'direction': mode, 'price': round(price, 6)}
     if extra:
-        context.update(extra)
+        ctx_keys = ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')
+        context.update({k: v for k, v in extra.items() if k in ctx_keys})
 
     prompt = (
-        'Ты риск-менеджер крипто-фонда. Оцени торговый сетап и верни ТОЛЬКО JSON: '
-        '{"decision": "approve"|"reject", "confidence": 0-100, "comment": "вывод"}. '
-        f'Данные: {json.dumps(context, ensure_ascii=False)}'
+        'You are a crypto risk manager. Evaluate this trade setup and respond '
+        'ONLY with valid JSON (no markdown): '
+        '{"decision":"approve"|"reject","confidence":0-100,"comment":"brief reason"}. '
+        f'Setup: {json.dumps(context)}'
     )
 
-    url = 'https://openrouter.ai/api/v1/chat/completions'
+    url = 'https://api.groq.com/openai/v1/chat/completions'
     headers = {
-        'Authorization': f'Bearer {OPENROUTER_KEY}',
+        'Authorization': f'Bearer {groq_key}',
         'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://github.com/bingx-smc-bot',
-        'X-Title': 'BingX SMC Bot',
     }
 
-    _openrouter_req_times.append(time.time())
+    _groq_req_times.append(time.time())
 
-    # Перебираем все модели по кругу пока не найдём рабочую
-    n = len(OPENROUTER_MODELS)
-    for attempt in range(n):
-        model = OPENROUTER_MODELS[(_openrouter_model_idx + attempt) % n]
-        payload = {
-            'model': model,
-            'messages': [{'role': 'user', 'content': prompt}],
-            'temperature': 0.1,
-            'max_tokens': 150,
-        }
+    for model in GROQ_MODELS:
         try:
+            payload = {
+                'model': model,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0.1,
+                'max_tokens': 120,
+            }
             async with http.post(url, headers=headers, json=payload,
-                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                 timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 data = await resp.json()
 
+                if resp.status == 429:
+                    err_msg = str(data.get('error', {}).get('message', ''))
+                    if 'day' in err_msg.lower() or 'daily' in err_msg.lower():
+                        _groq_quota_ok = False
+                        _groq_quota_reset = time.time() + 86400
+                        logging.warning(f'🤖 [GROQ] Daily quota — резерв на 24ч')
+                    else:
+                        logging.warning(f'🤖 [GROQ] {model} 429 rate limit — следующая модель')
+                    continue
+
                 if resp.status != 200 or 'choices' not in data:
-                    err_msg = ''
-                    if isinstance(data.get('error'), dict):
-                        err_msg = data['error'].get('message', '')[:80]
-                    elif 'error' in data:
-                        err_msg = str(data['error'])[:80]
-                    logging.warning(
-                        f'🔀 [ROUTER] {model} → {resp.status}: {err_msg} '
-                        f'(попытка {attempt+1}/{n})'
-                    )
-                    continue  # следующая модель
+                    err = str(data.get('error', ''))[:80]
+                    logging.warning(f'🤖 [GROQ] {model} {resp.status}: {err}')
+                    continue
 
                 raw = data['choices'][0]['message']['content'].strip()
-                # Парсим JSON из ответа
                 clean = raw
                 if '```' in clean:
                     clean = clean.split('```')[1].lstrip('json').strip()
+
                 try:
                     parsed = json.loads(clean)
                 except json.JSONDecodeError:
-                    ok_fb = 'approve' in raw.lower() or 'yes' in raw.lower()
-                    logging.info(f'🔀 [ROUTER/{model.split("/")[1][:8]}] text fallback → {ok_fb}')
-                    # Обновляем индекс на рабочую модель
-                    _openrouter_model_idx = (_openrouter_model_idx + attempt) % n
+                    ok_fb = 'approve' in raw.lower()
+                    logging.info(f'🤖 [GROQ/{model[:12]}] {sym} text→{ok_fb}')
                     return {'ok': ok_fb, 'conf': 50, 'comment': 'text_fallback'}
 
-                ok = str(parsed.get('decision', '')).lower() == 'approve'
+                ok   = str(parsed.get('decision', '')).lower() == 'approve'
                 conf = int(parsed.get('confidence', 50))
                 comment = parsed.get('comment', '')
                 if conf < 55:
                     ok = False
                 verdict = 'APPROVE' if ok else 'REJECT'
-                short_model = model.split('/')[-1][:12].replace(':free', '')
                 logging.info(
-                    f'🔀 [ROUTER/{short_model}] {sym} {strategy} {mode} '
-                    f'-> {verdict} ({conf}/100) | {comment}'
+                    f'🤖 [GROQ/{model[:12]}] {sym} {strategy} {mode} '
+                    f'→ {verdict} ({conf}/100) | {comment}'
                 )
-                # Запоминаем рабочую модель
-                _openrouter_model_idx = (_openrouter_model_idx + attempt) % n
                 return {'ok': ok, 'conf': conf, 'comment': comment}
 
         except Exception as e:
-            logging.warning(f'🔀 [ROUTER] {model} exception: {e} (попытка {attempt+1}/{n})')
-            continue  # следующая модель
+            logging.warning(f'🤖 [GROQ] {model} exception: {e}')
+            continue
 
-    # Все модели не ответили
-    logging.warning('🔀 [ROUTER] Все модели недоступны — используем bypass')
-    _openrouter_model_idx = (_openrouter_model_idx + 1) % n
-    return {'ok': True, 'conf': 0, 'comment': 'all_models_failed'}
+    logging.warning(f'🤖 [GROQ] все модели недоступны для {sym}')
+    return {'ok': True, 'conf': 0, 'comment': 'groq_all_failed'}
 
 
-# ─── Единый AI Oracle: OpenRouter → Gemini → bypass ─────────────
+# ── Локальный скоринг (резерв без API) ───────────────────────
+def score_setup_local(strategy: str, mode: str, extra: dict) -> dict:
+    """
+    Алгоритмический скоринг сетапа без LLM.
+    Работает всегда, не зависит от внешних API.
+    """
+    score = 50  # базовый балл
+    reasons = []
+
+    rsi = float(extra.get('rsi', 50))
+    vol_ratio = float(extra.get('vol_ratio', 1.0))
+    btc_trend = str(extra.get('btc_trend', 'Flat'))
+    sma_dist = float(extra.get('sma_dist', 0))
+    vwap_dist = float(extra.get('vwap_dist', 0))
+
+    # RSI alignment
+    if mode == 'Long' and rsi < 35:
+        score += 15; reasons.append('RSI oversold')
+    elif mode == 'Short' and rsi > 65:
+        score += 15; reasons.append('RSI overbought')
+    elif mode == 'Long' and rsi > 70:
+        score -= 20; reasons.append('RSI too high for long')
+    elif mode == 'Short' and rsi < 30:
+        score -= 20; reasons.append('RSI too low for short')
+
+    # Volume
+    if vol_ratio >= 3.0:
+        score += 10; reasons.append('strong volume')
+    elif vol_ratio >= 2.0:
+        score += 5
+    elif vol_ratio < 1.5:
+        score -= 10; reasons.append('weak volume')
+
+    # BTC trend alignment
+    if (mode == 'Long' and btc_trend == 'Long') or        (mode == 'Short' and btc_trend == 'Short'):
+        score += 10; reasons.append('BTC aligned')
+    elif (mode == 'Long' and btc_trend == 'Short') or          (mode == 'Short' and btc_trend == 'Long'):
+        score -= 15; reasons.append('BTC opposed')
+
+    # VWAP alignment for RSI
+    if strategy == 'RSI':
+        if mode == 'Long' and vwap_dist < -1.5:
+            score += 8; reasons.append('below VWAP pullback')
+        elif mode == 'Short' and vwap_dist > 1.5:
+            score += 8; reasons.append('above VWAP extension')
+
+    score = max(0, min(100, score))
+    ok = score >= 55
+    comment = ', '.join(reasons) if reasons else 'neutral'
+    logging.info(
+        f'📊 [LOCAL] {strategy} {mode} → {"APPROVE" if ok else "REJECT"} '
+        f'({score}/100) | {comment}'
+    )
+    return {'ok': ok, 'conf': score, 'comment': f'local:{comment}'}
+
+
+# ── Единый каскадный AI Oracle ───────────────────────────────
 async def oracle_ai(sym: str, strategy: str, mode: str,
                     price: float, extra: dict = None) -> dict:
     """
-    Каскадный AI оракул:
-    1. OpenRouter (бесплатно, без daily cap) — если ключ есть
-    2. Gemini (если OpenRouter недоступен)
-    3. Bypass (approve без AI) — если оба недоступны
+    Каскад: Groq → Gemini → Local Score
+    Приоритет 1: Groq (стабильно, бесплатно, 14400/day)
+    Приоритет 2: Gemini (если Groq недоступен)
+    Приоритет 3: Локальный скоринг (всегда работает)
     """
-    # Приоритет 1: OpenRouter
-    if OPENROUTER_KEY:
-        result = await oracle_openrouter(sym, strategy, mode, price, extra)
-        if result['comment'] not in ('openrouter_not_set',):
+    ctx = extra or {}
+
+    # 1. Groq
+    groq_key = os.getenv('GROQ_API_KEY', '')
+    if groq_key and _groq_quota_ok:
+        result = await oracle_groq(sym, strategy, mode, price, ctx)
+        if result['comment'] not in ('groq_not_set', 'groq_quota_wait', 'groq_all_failed'):
             return result
 
-    # Приоритет 2: Gemini (если квота есть)
+    # 2. Gemini
     if GEMINI_KEY and _gemini_quota_ok:
-        result = await oracle_gemini(sym, strategy, mode, price, extra)
-        return result
+        result = await oracle_gemini(sym, strategy, mode, price, ctx)
+        if result['comment'] not in ('API not set', 'quota_wait'):
+            return result
 
-    # Приоритет 3: Bypass
-    return {'ok': True, 'conf': 0, 'comment': 'ai_bypass'}
+    # 3. Локальный скоринг
+    logging.info(f'📊 [{strategy}] {sym} — AI недоступен, используем локальный скоринг')
+    return score_setup_local(strategy, mode, ctx)
+
 
 
 # Кэш решений Gemini: {sym_strategy_mode: (timestamp, result)}
@@ -1068,10 +1148,11 @@ async def execute(sym: str, sig: dict, strategy: str,
 
     extra_ctx = {k: v for k, v in sig.items()
                  if k in ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')}
-    provider = 'OpenRouter' if OPENROUTER_KEY else 'Gemini' if (_gemini_quota_ok and GEMINI_KEY) else 'bypass'
+    groq_key = os.getenv('GROQ_API_KEY', '')
+    provider = ('Groq' if groq_key and _groq_quota_ok else
+                'Gemini' if (GEMINI_KEY and _gemini_quota_ok) else 'LocalScore')
     logging.info(
-        f'🔔 [{strategy}] {sym} {mode} @ {price:.6f} — '
-        f'все фильтры пройдены -> AI Oracle [{provider}]'
+        f'🔔 [{strategy}] {sym} {mode} @ {price:.6f} → AI Oracle [{provider}]'
     )
     ai = await oracle_ai(sym, strategy, mode, price, extra_ctx)
     if not ai['ok']:
@@ -1152,7 +1233,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         f"SL: <code>{sl:.6f}</code>  TP: <code>{tp:.6f}</code>\n"
         f"RR: <b>1:{rr:.2f}</b>  Риск: <b>${risk_usdt:.2f}</b>\n"
         + (f"🤖 AI: bypass\n" if 'bypass' in ai['comment']
-           else f"🧠 AI({provider}): {ai['conf']}/100 — <i>{ai['comment']}</i>\n")
+           else f"🧠 AI({provider}): {ai['conf']}/100 | {ai['comment']}\n")
         + extra_tg
     )
     await tg(msg)
