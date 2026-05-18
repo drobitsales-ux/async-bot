@@ -8,7 +8,7 @@
 ║  [RSI]  Mean Reversion — RSI Extreme + Pattern + SMA/VWAP Magnet    ║
 ║                                                                      ║
 ║  ИСПРАВЛЕНИЯ vs RSI bot v8.30:                                       ║
-║  [R-FIX-1]  BASE_RISK 2% → 0.75% | MAX_SL 4.5% → 2.5%             ║
+║  [R-FIX-1]  BASE_RISK 2% | MAX_SL 4.5%             ║
 ║  [R-FIX-2]  MAX_POSITIONS 3 → 3 shared (SMC+RSI budget)            ║
 ║  [R-FIX-3]  SL = min(l) - ATR*3.0 → ATR*1.5 (tight + safe)        ║
 ║  [R-FIX-4]  RSI thresholds 28/72 → 25/75 (cleaner signals)         ║
@@ -77,8 +77,8 @@ GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
-RISK_PER_TRADE   = 0.0075   # [R-FIX-1] 0.75% на сделку
-RISK_WEEKEND     = 0.00375  # 0.375% в выходные
+RISK_PER_TRADE   = 0.02   # [R-FIX-1] 2% на сделку
+RISK_WEEKEND     = 0.01  # 1% в выходные
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 LEVERAGE         = 5
@@ -90,6 +90,14 @@ DAILY_DD_LIMIT   = 0.025    # [R-FIX-11] стоп торговли при -2.5% 
 SCAN_LIMIT       = 150      # [PERF] снижен для ускорения цикла
 SCAN_SEM         = 40       # [PERF] повышен: больше параллельных запросов
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
+
+# ── Webhook для копи-трейдинга (Bybit Worker и другие) ──────────
+# Когда BingX открывает сделку → POST на воркеры со структурой сигнала
+# Добавьте в Render Environment: WORKER_URLS=https://bybit-worker.onrender.com/signal
+# Несколько воркеров через запятую: url1,url2,url3
+_worker_urls: list = [u.strip() for u in
+                      os.getenv('WORKER_URLS', '').split(',') if u.strip()]
+WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')  # общий секрет
 
 # ── SMC-параметры ───────────────────────────────────────
 SMC_TF          = '15m'
@@ -1118,6 +1126,43 @@ async def rsi_signal(sym: str, btc_ctx: dict):
 # ═══════════════════════════════════════════════════════
 #  ИСПОЛНЕНИЕ ОРДЕРА (общий для обоих стратегий)
 # ═══════════════════════════════════════════════════════
+async def publish_to_workers(sym: str, mode: str, price: float,
+                              sl: float, tp: float, strategy: str,
+                              risk_usdt: float):
+    """
+    Отправляет сигнал всем зарегистрированным Worker-сервисам.
+    BingX-бот продолжает работать независимо от результата.
+    """
+    if not _worker_urls or not http:
+        return
+
+    payload = {
+        'secret':    WORKER_SECRET,
+        'symbol':    sym,
+        'direction': mode,
+        'entry':     round(price, 8),
+        'sl':        round(sl, 8),
+        'tp':        round(tp, 8),
+        'strategy':  strategy,
+        'timestamp': time.time(),
+    }
+
+    for url in _worker_urls:
+        try:
+            async with http.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                status = resp.status
+                if status == 200:
+                    logging.info(f'📡 [WORKER] {sym} {mode} → {url[:40]} OK')
+                else:
+                    body = (await resp.text())[:100]
+                    logging.warning(f'📡 [WORKER] {url[:40]} → {status}: {body}')
+        except Exception as e:
+            logging.warning(f'📡 [WORKER] {url[:40]} недоступен: {e}')
+
+
 async def execute(sym: str, sig: dict, strategy: str,
                   pos_list: list, extra_tg: str = ""):
     """
@@ -1238,6 +1283,8 @@ async def execute(sym: str, sig: dict, strategy: str,
     )
     await tg(msg)
     logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
+    # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
+    asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt))
 
 # ═══════════════════════════════════════════════════════
 #  МОНИТОРИНГ ПОЗИЦИЙ (общий)
