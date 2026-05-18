@@ -1127,8 +1127,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
 #  ИСПОЛНЕНИЕ ОРДЕРА (общий для обоих стратегий)
 # ═══════════════════════════════════════════════════════
 async def publish_to_workers(sym: str, mode: str, price: float,
-                              sl: float, tp: float, strategy: str,
-                              risk_usdt: float):
+                             sl: float, tp: float, strategy: str,
+                             risk_usdt: float):
     """
     Отправляет сигнал всем зарегистрированным Worker-сервисам.
     BingX-бот продолжает работать независимо от результата.
@@ -1283,6 +1283,7 @@ async def execute(sym: str, sig: dict, strategy: str,
     )
     await tg(msg)
     logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
+    
     # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
     asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt))
 
