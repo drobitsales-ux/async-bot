@@ -77,8 +77,8 @@ GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
-RISK_PER_TRADE   = 0.02   # [R-FIX-1] 2% на сделку
-RISK_WEEKEND     = 0.01  # 1% в выходные
+RISK_PER_TRADE   = 0.02     # [USER] 2% на сделку (тест; для проп → 0.0075)
+RISK_WEEKEND     = 0.01     # [USER] 1% в выходные (тест; для проп → 0.00375)
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 LEVERAGE         = 5
@@ -87,8 +87,8 @@ MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = 0.025    # [R-FIX-11] стоп торговли при -2.5% за день
-SCAN_LIMIT       = 100      # [PERF-2] 150→100: топ-100 по объёму достаточно
-SCAN_SEM         = 40       # [PERF] повышен: больше параллельных запросов
+SCAN_LIMIT       = 60       # [PERF-3] 100→60: топ-60 ликвидных, цель цикла <90с
+SCAN_SEM         = 50       # [PERF-3] 40→50 параллельных (60 символов)
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
 
 # ── Webhook для копи-трейдинга (Bybit Worker и другие) ──────────
@@ -378,7 +378,7 @@ def get_pivots(highs, lows, order: int = 5):
             l_idx.append(i)
     return h_idx, l_idx
 
-def find_fvg(h, l, mode: str, lookback: int = 20):  # [FIX-FVG] 10→20 баров
+def find_fvg(h, l, mode: str, lookback: int = 15):  # баров поиска FVG
     """Fair Value Gap: разрыв между свечой i-1 и i+1 через среднюю i."""
     for i in range(1, min(lookback, len(h) - 1)):
         idx = len(h) - 1 - i
@@ -905,7 +905,7 @@ async def smc_signal(sym: str):
         return None, 'news'
 
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, SMC_TF, limit=100)
+        ohlcv = await exchange.fetch_ohlcv(sym, SMC_TF, limit=60)  # [PERF-3] 100→60
     except:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 55:
@@ -994,7 +994,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=100)  # было 250 → ускорение цикла
     except:
         return None, 'fetch_err'
-    if not ohlcv or len(ohlcv) < 55:  # было 210, теперь limit=100
+    if not ohlcv or len(ohlcv) < 45:  # limit=100, нужно минимум 45
         return None, 'no_data'
 
     o = np.array([float(x[1]) for x in ohlcv])
