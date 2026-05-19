@@ -8,7 +8,7 @@
 ║  [RSI]  Mean Reversion — RSI Extreme + Pattern + SMA/VWAP Magnet    ║
 ║                                                                      ║
 ║  ИСПРАВЛЕНИЯ vs RSI bot v8.30:                                       ║
-║  [R-FIX-1]  BASE_RISK 2% | MAX_SL 4.5%             ║
+║  [R-FIX-1]  BASE_RISK 2% → 0.75% | MAX_SL 4.5% → 2.5%             ║
 ║  [R-FIX-2]  MAX_POSITIONS 3 → 3 shared (SMC+RSI budget)            ║
 ║  [R-FIX-3]  SL = min(l) - ATR*3.0 → ATR*1.5 (tight + safe)        ║
 ║  [R-FIX-4]  RSI thresholds 28/72 → 25/75 (cleaner signals)         ║
@@ -77,8 +77,8 @@ GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
-RISK_PER_TRADE   = 0.02   # [R-FIX-1] 2% на сделку
-RISK_WEEKEND     = 0.01  # 1% в выходные
+RISK_PER_TRADE   = 0.0075   # [R-FIX-1] 0.75% на сделку
+RISK_WEEKEND     = 0.00375  # 0.375% в выходные
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 LEVERAGE         = 5
@@ -1055,12 +1055,17 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     mode = None
     sl   = 0.0
 
-    if rsi_now <= RSI_LONG_MAX and bull_pat:
+    # RSI extreme bypass: RSI < 20 = enter without pattern
+    rsi_extreme_long  = rsi_now <= 20
+    rsi_extreme_short = rsi_now >= 80
+
+    if (rsi_now <= RSI_LONG_MAX) and (bull_pat or rsi_extreme_long):
         # [R-FIX-6] Flat BTC больше не блокирует лонг
         if btc_trend == 'Short' and not altseason:
             return None, 'trend'
-        # Hook: RSI должен начать разворот (снизился хотя бы на 0.3 пункта)
-        if rsi_now >= rsi_prev - 0.3:
+        # Hook: RSI в зоне ИЛИ разворачивается (допуск 2.0 пункта)
+        # rsi_now < 25 уже подтверждает перепроданность — hook опциональный
+        if rsi_now > rsi_prev + 2.0:  # RSI растёт быстро — не разворот
             return None, 'hook'
         if sma_dist > 2.0 or sma_dist < -15.0:   # [FIX-SMA] смягчено: -1→+2%, -8→-15%
             return None, 'sma_range'
@@ -1074,11 +1079,11 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         sl   = raw_sl
         mode = 'Long'
 
-    elif rsi_now >= RSI_SHORT_MIN and bear_pat:
+    elif (rsi_now >= RSI_SHORT_MIN) and (bear_pat or rsi_extreme_short):
         if btc_trend == 'Long' or altseason:
             return None, 'trend'
-        # Hook: RSI должен начать разворот (вырос хотя бы на 0.3 пункта)
-        if rsi_now <= rsi_prev + 0.3:
+        # Hook: RSI в зоне ИЛИ разворачивается
+        if rsi_now < rsi_prev - 2.0:  # RSI падает быстро — не разворот
             return None, 'hook'
         if sma_dist < -2.0 or sma_dist > 15.0:  # [FIX-SMA] смягчено: 1→-2%, 8→15%
             return None, 'sma_range'
@@ -1127,8 +1132,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
 #  ИСПОЛНЕНИЕ ОРДЕРА (общий для обоих стратегий)
 # ═══════════════════════════════════════════════════════
 async def publish_to_workers(sym: str, mode: str, price: float,
-                             sl: float, tp: float, strategy: str,
-                             risk_usdt: float):
+                              sl: float, tp: float, strategy: str,
+                              risk_usdt: float):
     """
     Отправляет сигнал всем зарегистрированным Worker-сервисам.
     BingX-бот продолжает работать независимо от результата.
@@ -1283,7 +1288,6 @@ async def execute(sym: str, sig: dict, strategy: str,
     )
     await tg(msg)
     logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
-    
     # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
     asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt))
 
@@ -1369,7 +1373,7 @@ async def monitor_all():
 
             # ── Breakeven ──────────────────────────────────────
             if pnl >= 1.5 and not pos.get('be_moved'):
-                new_sl = entry * 1.002 if is_long else entry * 0.998
+                new_sl = entry * 1.0015 if is_long else entry * 0.9985  # 0.15% > 2×fee
                 try:
                     if pos.get('sl_order_id'):
                         await exchange.cancel_order(pos['sl_order_id'], sym)
@@ -1389,7 +1393,7 @@ async def monitor_all():
                     logging.error(f"BE error {sym}: {e}")
 
             # ── TP 50% ─────────────────────────────────────────
-            if pnl >= 2.5 and not pos.get('tp50_hit'):
+            if pnl >= 2.0 and not pos.get('tp50_hit'):  # [TP] 2.5→2.0%
                 close_qty = round(real_qty * 0.5, 8)
                 remain    = round(real_qty - close_qty, 8)
                 try:
