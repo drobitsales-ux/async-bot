@@ -63,7 +63,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | [BYBIT] %(message)
 exchange = ccxt_async.bybit({
     'apiKey':  BYBIT_KEY,
     'secret':  BYBIT_SECRET,
-    'hostname': 'api.bytick.com',  # 💡 <── ДОБАВЛЯЕМ СЮДА (Резервный URL для обхода CloudFront)
+    'hostname': 'bytick.com',  # <── ИСПРАВЛЕНО: убрали "api.", оставили только домен
     'options': {
         'defaultType':     'linear',
         'fetchCurrencies': False,   # [FIX-403] CloudFront fix
