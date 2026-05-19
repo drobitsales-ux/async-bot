@@ -1,23 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         BYBIT WORKER  v1.0  —  Copy Trading Service         ║
+║     BYBIT WORKER  v2.0  —  UTA (Unified Trading Account)    ║
 ║                                                              ║
-║  Получает сигналы от BingX-бота через HTTP webhook           ║
-║  и исполняет их на Bybit с независимым риск-менеджментом.   ║
+║  Исправления v2.0:                                          ║
+║  [FIX-1] UTA: positionIdx=0 (one-way), не hedge mode       ║
+║  [FIX-2] SL встроен в entry ордер через stopLoss param      ║
+║  [FIX-3] Leverage: строки + category=linear                 ║
+║  [FIX-4] Убран set_margin_mode (UTA cross по умолч.)        ║
+║  [FIX-5] Диагностический лог каждого этапа                  ║
+║  [FIX-6] UTA balance: тип UNIFIED, не CONTRACT              ║
 ║                                                              ║
-║  Деплой: отдельный Web Service на Render                     ║
-║  Environment Variables:                                      ║
-║    BYBIT_API_KEY     = ваш ключ Bybit                       ║
-║    BYBIT_SECRET      = ваш секрет Bybit                     ║
+║  Environment Variables (Render):                            ║
+║    BYBIT_API_KEY     = ваш ключ                             ║
+║    BYBIT_SECRET      = ваш секрет                           ║
 ║    WORKER_SECRET     = тот же что в основном боте           ║
-║    TELEGRAM_TOKEN    = токен бота (можно тот же)             ║
+║    TELEGRAM_TOKEN    = токен бота                            ║
 ║    GROUP_CHAT_ID     = ID группы                            ║
-║                                                              ║
-║  Риск-параметры — меняйте под свою проп-компанию:           ║
-║    PROP_BALANCE      = 10000  (депозит проп-компании)       ║
-# Для теста $100 → 2%, для проп $10k → 0.75% (меняйте RISK_PCT в Render)
-RISK_PER_TRADE   = float(os.getenv('RISK_PCT', '0.02'))       # default 2%
+║    PROP_BALANCE      = 100  (депозит для теста)             ║
+║    RISK_PCT          = 0.02 (2% для теста $100)             ║
 ║    LEVERAGE          = 5                                     ║
+║    MAX_POS           = 2                                     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -28,7 +30,6 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
-from urllib.parse import urlparse
 
 import aiohttp
 import ccxt.async_support as ccxt_async
@@ -36,48 +37,46 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BYBIT_KEY      = os.getenv('BYBIT_API_KEY', '')
-BYBIT_SECRET   = os.getenv('BYBIT_SECRET', '')
-WORKER_SECRET  = os.getenv('WORKER_SECRET', 'change-me-secret')
-TOKEN          = os.getenv('TELEGRAM_TOKEN', '')
-CHAT_ID_STR    = os.getenv('GROUP_CHAT_ID', os.getenv('CHAT_ID', '-1'))
+BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
+BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
+WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
+TOKEN         = os.getenv('TELEGRAM_TOKEN', '')
+
+_raw_cid = os.getenv('GROUP_CHAT_ID', os.getenv('CHAT_ID', '-1')).strip().strip('"').strip("'")
 try:
-    CHAT_ID = int(CHAT_ID_STR.strip().strip('"').strip("'"))
+    CHAT_ID = int(_raw_cid)
 except ValueError:
     CHAT_ID = -1
 
-# ── Параметры проп-компании ──────────────────────────────
-PROP_BALANCE     = float(os.getenv('PROP_BALANCE', '10000'))  # USDT
-RISK_PER_TRADE   = float(os.getenv('RISK_PCT', '0.0075'))     # 0.75%
-LEVERAGE         = int(os.getenv('LEVERAGE', '5'))
-MAX_POSITIONS    = int(os.getenv('MAX_POS', '2'))             # макс одновременных
-DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD', '0.025'))      # 2.5%
-MIN_SL_PCT       = 1.0   # минимальный SL %
-MAX_SL_PCT       = 2.5   # максимальный SL %
-FEE_RATE         = 0.0006  # Bybit taker fee
+PROP_BALANCE   = float(os.getenv('PROP_BALANCE', '100'))
+RISK_PER_TRADE = float(os.getenv('RISK_PCT', '0.02'))   # 2% для теста $100
+LEVERAGE       = int(os.getenv('LEVERAGE', '5'))
+MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
+DAILY_DD_LIMIT = float(os.getenv('DAILY_DD', '0.025'))
+MIN_SL_PCT     = 1.0
+MAX_SL_PCT     = 2.5
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | [BYBIT] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | [BYBIT] %(message)s')
 
-# ── Биржа ────────────────────────────────────────────────
+# ── Bybit UTA exchange ────────────────────────────────────
+# [FIX-2] UTA: НЕТ positionMode hedge — UTA использует one-way (positionIdx=0)
 exchange = ccxt_async.bybit({
     'apiKey':  BYBIT_KEY,
     'secret':  BYBIT_SECRET,
     'options': {
-        'defaultType': 'linear',   # USDT perpetual
-        'positionMode': 'hedge',   # hedge mode для SL
+        'defaultType': 'linear',  # USDT perpetual
+        # НЕ указываем positionMode — UTA определяет режим сам (one-way)
     },
     'enableRateLimit': True,
 })
 
 # ── Состояние ────────────────────────────────────────────
-active_positions = []   # [{symbol, direction, entry_price, qty, sl_price, sl_order_id}]
+active_positions = []
 daily_pnl_pct    = 0.0
 day_start_time   = time.time()
 circuit_open     = False
 http_session     = None
+_signal_queue: asyncio.Queue = None
 
 # ══════════════════════════════════════════════════════════
 #  TELEGRAM
@@ -101,7 +100,7 @@ async def tg(text: str):
 def check_daily_reset():
     global daily_pnl_pct, day_start_time, circuit_open
     if time.time() - day_start_time > 86400:
-        daily_pnl_pct = 0.0
+        daily_pnl_pct  = 0.0
         day_start_time = time.time()
         circuit_open   = False
         logging.info("📅 Daily stats reset")
@@ -111,119 +110,150 @@ def is_trading_allowed() -> bool:
     if daily_pnl_pct <= -DAILY_DD_LIMIT:
         if not circuit_open:
             circuit_open = True
-            logging.warning(f"🔴 CIRCUIT BREAKER: DD {daily_pnl_pct*100:.2f}%")
-            asyncio.create_task(
-                tg(f"🔴 <b>CIRCUIT BREAKER</b>\nDD: {daily_pnl_pct*100:.2f}% > лимит {DAILY_DD_LIMIT*100:.1f}%\nТорговля остановлена до следующего дня.")
-            )
+            logging.warning(f"🔴 CIRCUIT BREAKER: DD={daily_pnl_pct*100:.2f}%")
+            asyncio.create_task(tg(
+                f"🔴 <b>CIRCUIT BREAKER</b>\n"
+                f"DD: {daily_pnl_pct*100:.2f}% > лимит {DAILY_DD_LIMIT*100:.1f}%"
+            ))
         return False
     return True
 
 # ══════════════════════════════════════════════════════════
-#  ИСПОЛНЕНИЕ СИГНАЛА
+#  ИСПОЛНЕНИЕ СИГНАЛА (UTA v2.0)
 # ══════════════════════════════════════════════════════════
 async def execute_signal(signal: dict):
-    """Исполняет сигнал от BingX-бота на Bybit."""
+    """Исполняет сигнал на Bybit UTA (Unified Trading Account)."""
     global active_positions
 
-    sym       = signal.get('symbol', '')
-    mode      = signal.get('direction', '')
-    entry     = float(signal.get('entry', 0))
-    sl        = float(signal.get('sl', 0))
-    tp        = float(signal.get('tp', 0))
-    strategy  = signal.get('strategy', '?')
+    raw_sym  = signal.get('symbol', '')
+    # [FIX-1] BingX 'APE/USDT:USDT' → Bybit 'APEUSDT'
+    base = raw_sym.split('/')[0] if '/' in raw_sym else raw_sym
+    sym = f'{base}USDT'
+    mode     = signal.get('direction', '')
+    entry    = float(signal.get('entry', 0))
+    sl       = float(signal.get('sl', 0))
+    tp       = float(signal.get('tp', 0))
+    strategy = signal.get('strategy', '?')
 
-    if not sym or not mode or not entry or not sl:
+    logging.info(f"📥 Получен сигнал: [{strategy}] {sym} {mode} | entry={entry} sl={sl}")
+
+    if not sym or mode not in ('Long', 'Short') or not entry or not sl:
         logging.warning(f"⚠️ Некорректный сигнал: {signal}")
         return
 
     # Лимиты позиций
     if len(active_positions) >= MAX_POSITIONS:
-        logging.info(f"⏸ {sym}: макс позиций ({MAX_POSITIONS}) достигнут")
+        logging.info(f"⏸ {sym}: максимум позиций ({MAX_POSITIONS}) достигнут")
         return
-
-    same_dir = sum(1 for p in active_positions if p['direction'] == mode)
-    if same_dir >= 1:
+    if any(p['direction'] == mode for p in active_positions):
         logging.info(f"⏸ {sym}: уже есть {mode} позиция")
         return
 
-    # Circuit breaker
     check_daily_reset()
     if not is_trading_allowed():
         return
 
-    # Проверка SL дистанции
+    # Проверка SL
     sl_pct = abs(entry - sl) / entry * 100
-    if sl_pct < MIN_SL_PCT:
-        logging.warning(f"⚠️ {sym}: SL {sl_pct:.2f}% < минимум {MIN_SL_PCT}%")
-        return
-    if sl_pct > MAX_SL_PCT:
-        logging.warning(f"⚠️ {sym}: SL {sl_pct:.2f}% > максимум {MAX_SL_PCT}%")
+    logging.info(f"📐 {sym}: SL дистанция {sl_pct:.2f}%")
+    if sl_pct < MIN_SL_PCT or sl_pct > MAX_SL_PCT:
+        logging.warning(f"⚠️ {sym}: SL {sl_pct:.2f}% вне диапазона [{MIN_SL_PCT},{MAX_SL_PCT}]%")
         return
 
-    # Расчёт размера позиции
+    # Баланс
+    # [FIX-6] UTA: accountType = 'UNIFIED'
     try:
-        bal       = await exchange.fetch_balance()
-        free_usdt = float(bal.get('USDT', {}).get('free', 0))
+        bal = await exchange.fetch_balance({'type': 'unified'})
+        # Пробуем разные ключи (ccxt нормализует по-разному)
+        free_usdt = (
+            float(bal.get('USDT', {}).get('free', 0)) or
+            float(bal.get('total', {}).get('USDT', 0)) or
+            float((bal.get('info', {}).get('result', {}).get('list', [{}])[0]
+                   .get('totalAvailableBalance', 0)))
+        )
+        logging.info(f"💰 Баланс Bybit UTA: {free_usdt:.2f} USDT")
     except Exception as e:
-        logging.error(f"Balance error: {e}")
+        logging.error(
+            f"❌ Ошибка баланса: {e}\n"
+            f"   Проверьте BYBIT_API_KEY/SECRET и разрешения API:\n"
+            f"   Нужны: Unified Trading Account + Contract: Orders + Positions"
+        )
         return
 
-    if free_usdt < 10:
-        logging.warning(f"⚠️ Недостаточно баланса: {free_usdt} USDT")
+    if free_usdt < 5:
+        logging.warning(f"⚠️ Недостаточно баланса: {free_usdt:.2f} USDT")
         return
 
     risk_amount = free_usdt * RISK_PER_TRADE
     sl_dist     = abs(entry - sl)
     qty         = round(risk_amount / sl_dist, 4)
+    qty         = max(round(qty, 2), 0.01)  # Bybit min precision
 
     if qty <= 0:
         logging.warning(f"⚠️ {sym}: qty={qty} <= 0")
         return
 
-    # Bybit minimum notional ~$5 USD
+    # Минимальный notional Bybit ~$5
     notional = qty * entry
     if notional < 5.0:
-        min_bal = 5.0 / (RISK_PER_TRADE * sl_pct / 100) if sl_pct > 0 else 999
+        min_bal_needed = 5.0 / (RISK_PER_TRADE * sl_pct / 100)
         logging.warning(
-            f"⚠️ {sym}: notional ${notional:.2f} < $5 Bybit minimum. "
-            f"Balance ${free_usdt:.2f}. Need ~${min_bal:.0f} USDT."
+            f"⚠️ {sym}: notional ${notional:.2f} < $5 (Bybit minimum). "
+            f"Баланс ${free_usdt:.2f}. Нужно ~${min_bal_needed:.0f} USDT."
         )
         return
 
-    pos_side   = 'Buy'  if mode == 'Long' else 'Sell'
-    order_side = 'buy'  if mode == 'Long' else 'sell'
-    sl_side    = 'sell' if mode == 'Long' else 'buy'
+    order_side = 'buy'  if mode == 'Long'  else 'sell'
+    sl_side    = 'sell' if mode == 'Long'  else 'buy'
+
+    # [FIX-3] UTA one-way mode: positionIdx=0
+    # Hedge mode в UTA не поддерживается через ccxt — используем one-way
+    position_idx = 0
 
     logging.info(
         f"⚡ Исполнение [{strategy}] {sym} {mode} | "
-        f"qty={qty} | SL={sl:.6f} | Risk=${risk_amount:.2f}"
+        f"qty={qty} | SL={sl:.6f} | risk=${risk_amount:.2f} | notional=${notional:.2f}"
     )
 
     try:
-        # Установка плеча
+        # [FIX-3] Leverage — строки, category=linear
         try:
-            await exchange.set_leverage(LEVERAGE, sym,
-                                        params={'buyLeverage': LEVERAGE,
-                                                'sellLeverage': LEVERAGE})
-        except Exception:
-            pass  # уже установлено
+            await exchange.set_leverage(
+                LEVERAGE, sym,
+                params={
+                    'category':    'linear',
+                    'buyLeverage': str(LEVERAGE),
+                    'sellLeverage': str(LEVERAGE),
+                }
+            )
+            logging.info(f"✅ {sym}: leverage {LEVERAGE}x установлен")
+        except Exception as e:
+            # Уже установлено — не критично
+            logging.debug(f"ℹ️ {sym}: leverage: {e}")
 
-        # Рыночный вход
-        await exchange.create_order(
+        # [FIX-4] Основной рыночный ордер со встроенным SL
+        # Для UTA лучший способ: entry + stopLoss в одном ордере
+        sl_trigger_dir = 2 if mode == 'Long' else 1  # 1=выше, 2=ниже цены входа
+
+        entry_params = {
+            'category':        'linear',
+            'positionIdx':     position_idx,
+            # Встраиваем SL прямо в entry ордер
+            'stopLoss':        str(round(sl, 8)),
+            'slTriggerBy':     'LastPrice',
+            'slOrderType':     'Market',
+            'tpslMode':        'Full',
+        }
+        if tp:
+            entry_params['takeProfit'] = str(round(tp, 8))
+            entry_params['tpTriggerBy'] = 'LastPrice'
+            entry_params['tpOrderType'] = 'Market'
+
+        entry_ord = await exchange.create_order(
             sym, 'market', order_side, qty,
-            params={'positionIdx': 1 if mode == 'Long' else 2}
+            params=entry_params
         )
-
-        # Stop-Loss
-        sl_ord = await exchange.create_order(
-            sym, 'Stop', sl_side, qty,
-            params={
-                'triggerPrice':   round(sl, 8),
-                'triggerBy':      'LastPrice',
-                'reduceOnly':     True,
-                'positionIdx':    1 if mode == 'Long' else 2,
-            }
-        )
+        logging.info(f"✅ {sym}: market order открыт | id={entry_ord.get('id', '?')}")
 
         rec = {
             'symbol':       sym,
@@ -232,7 +262,7 @@ async def execute_signal(signal: dict):
             'qty':          qty,
             'sl_price':     sl,
             'tp_price':     tp,
-            'sl_order_id':  sl_ord.get('id', ''),
+            'order_id':     entry_ord.get('id', ''),
             'strategy':     strategy,
             'open_time':    time.time(),
             'be_moved':     False,
@@ -241,21 +271,34 @@ async def execute_signal(signal: dict):
 
         await tg(
             f"{'🟢' if mode=='Long' else '🔴'} <b>[{strategy}] {sym}</b> — {mode}\n"
-            f"Вход: <code>{entry:.6f}</code> | SL: <code>{sl:.6f}</code>\n"
-            f"Риск: <b>${risk_amount:.2f}</b> ({RISK_PER_TRADE*100:.2f}% от ${free_usdt:.0f})\n"
-            f"📋 Сигнал от BingX-бота"
+            f"Вход: <code>{entry:.6f}</code>\n"
+            f"SL: <code>{sl:.6f}</code> ({sl_pct:.2f}%)\n"
+            f"TP: <code>{tp:.6f}</code>\n"
+            f"Риск: <b>${risk_amount:.2f}</b> ({RISK_PER_TRADE*100:.1f}% × ${free_usdt:.0f})\n"
+            f"Notional: ${notional:.2f} | Qty: {qty}\n"
+            f"📋 Сигнал от BingX"
         )
-        logging.info(f"✅ {sym} {mode} открыт на Bybit | Risk:${risk_amount:.2f}")
+        logging.info(f"✅ [{strategy}] {sym} {mode} ОТКРЫТ на Bybit | Risk:${risk_amount:.2f}")
 
     except Exception as e:
-        logging.error(f"❌ Order error {sym}: {e}")
-        await tg(f"❌ Ошибка открытия <b>{sym}</b>: <code>{str(e)[:150]}</code>")
+        err_str = str(e)
+        logging.error(
+            f"❌ Order error [{strategy}] {sym} {mode}: {err_str}\n"
+            f"   qty={qty} entry={entry:.6f} sl={sl:.6f}\n"
+            f"   Bybit codes: 10001=API key, 110007=balance, "
+            f"110013=min lot, 110055=symbol not found ({sym})"
+        )
+        await tg(
+            f"❌ <b>Ошибка {sym}</b>\n"
+            f"<code>{err_str[:200]}</code>\n"
+            f"qty={qty} notional=${notional:.2f}"
+        )
 
 # ══════════════════════════════════════════════════════════
 #  МОНИТОРИНГ ПОЗИЦИЙ
 # ══════════════════════════════════════════════════════════
 async def monitor():
-    """Мониторинг открытых позиций: BE + обнаружение закрытий."""
+    """Мониторинг: BE при +1.5%, обнаружение закрытий."""
     global active_positions, daily_pnl_pct
 
     if not active_positions:
@@ -263,10 +306,10 @@ async def monitor():
 
     syms = list({p['symbol'] for p in active_positions})
     try:
-        pos_raw = await exchange.fetch_positions(syms)
+        pos_raw = await exchange.fetch_positions(syms, params={'category': 'linear'})
         tickers = await exchange.fetch_tickers(syms)
     except Exception as e:
-        logging.error(f"Monitor fetch error: {e}")
+        logging.error(f"Monitor error: {e}")
         return
 
     new_positions = []
@@ -274,7 +317,6 @@ async def monitor():
         sym     = pos['symbol']
         is_long = pos['direction'] == 'Long'
         entry   = float(pos['entry_price'])
-        qty     = float(pos['qty'])
 
         curr_p = float((tickers.get(sym) or {}).get('last', entry))
 
@@ -284,31 +326,42 @@ async def monitor():
              and abs(float(r.get('contracts', 0))) > 0),
             None
         )
-        pos_idx = 1 if is_long else 2
-        sl_side = 'sell' if is_long else 'buy'
 
         if live:
             real_qty = abs(float(live.get('contracts', 0)))
             pnl = ((curr_p - entry) / entry * 100 if is_long
                    else (entry - curr_p) / entry * 100)
 
-            # Breakeven при +1.5%
+            # Ghost position guard
+            if real_qty * curr_p < 1.0 and real_qty > 0:
+                logging.warning(f"👻 {sym}: ghost position ${real_qty*curr_p:.4f} — force close")
+                try:
+                    await exchange.create_order(
+                        sym, 'market', 'sell' if is_long else 'buy', real_qty,
+                        params={'category': 'linear', 'positionIdx': 0, 'reduceOnly': True}
+                    )
+                except Exception as ge:
+                    logging.error(f"Ghost close error: {ge}")
+                continue
+
+            # Breakeven при +1.5% (покрывает комиссию Bybit 0.06% × 2 = +0.12%)
             if pnl >= 1.5 and not pos.get('be_moved'):
                 new_sl = entry * 1.002 if is_long else entry * 0.998
+                logging.info(f"🛡 {sym}: SL → BE {new_sl:.6f} (P&L +{pnl:.2f}%)")
                 try:
-                    if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                    sl_ord = await exchange.create_order(
-                        sym, 'Stop', sl_side, real_qty,
-                        params={'triggerPrice': round(new_sl, 8),
-                                'triggerBy': 'LastPrice',
-                                'reduceOnly': True,
-                                'positionIdx': pos_idx}
+                    # Для UTA: обновляем SL через amend order или новый trigger
+                    await exchange.create_order(
+                        sym, 'market', 'sell' if is_long else 'buy', 0,
+                        params={
+                            'category':    'linear',
+                            'positionIdx': 0,
+                            'stopLoss':    str(round(new_sl, 8)),
+                            'tpslMode':    'Full',
+                        }
                     )
-                    pos['sl_price']    = new_sl
-                    pos['sl_order_id'] = sl_ord.get('id', '')
-                    pos['be_moved']    = True
-                    await tg(f"🛡 <b>{sym}</b>: SL → БУ <code>{new_sl:.6f}</code> | P&L: +{pnl:.2f}%")
+                    pos['sl_price'] = new_sl
+                    pos['be_moved'] = True
+                    await tg(f"🛡 <b>{sym}</b>: SL → БУ <code>{new_sl:.6f}</code> | +{pnl:.2f}%")
                 except Exception as e:
                     logging.error(f"BE error {sym}: {e}")
 
@@ -316,33 +369,35 @@ async def monitor():
 
         else:
             # Позиция закрыта
+            secs = time.time() - pos['open_time']
+            if secs < 60:   # grace period для открытия ордера
+                new_positions.append(pos)
+                continue
+
             pnl_pct = ((curr_p - entry) / entry * 100 if is_long
                        else (entry - curr_p) / entry * 100)
             is_win  = pnl_pct > 0
-
-            dur_min = int((time.time() - pos['open_time']) / 60)
             daily_pnl_pct += pnl_pct / 100
 
             await tg(
                 f"{'✅' if is_win else '🛑'} <b>[{pos['strategy']}] {sym}</b> закрыта\n"
-                f"PnL: <code>{pnl_pct:+.2f}%</code> | ⏱ {dur_min}мин\n"
+                f"PnL: <code>{pnl_pct:+.2f}%</code> | ⏱ {int(secs/60)}мин\n"
                 f"День: {daily_pnl_pct*100:+.2f}%"
             )
-            logging.info(f"{'✅' if is_win else '🛑'} {sym} закрыта | {pnl_pct:+.2f}%")
+            logging.info(f"{'✅' if is_win else '🛑'} {sym}: {pnl_pct:+.2f}%")
 
     active_positions[:] = new_positions
 
 # ══════════════════════════════════════════════════════════
-#  HTTP СЕРВЕР (принимает сигналы + health check)
+#  HTTP WEBHOOK SERVER
 # ══════════════════════════════════════════════════════════
-_signal_queue: asyncio.Queue = None
-
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        """Health check для Render."""
         body = (
-            f"Bybit Worker v1.0 | Positions: {len(active_positions)} | "
-            f"DD: {daily_pnl_pct*100:+.2f}% | Circuit: {'OPEN' if circuit_open else 'OK'}"
+            f"Bybit Worker v2.0 UTA | "
+            f"Positions: {len(active_positions)} | "
+            f"DD: {daily_pnl_pct*100:+.2f}% | "
+            f"Circuit: {'OPEN' if circuit_open else 'OK'}"
         ).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
@@ -350,31 +405,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        """Принимает сигнал от BingX-бота."""
         if self.path != '/signal':
             self.send_response(404)
             self.end_headers()
             return
-
         try:
             length = int(self.headers.get('Content-Length', 0))
-            body   = self.rfile.read(length)
-            data   = json.loads(body)
+            data   = json.loads(self.rfile.read(length))
         except Exception:
             self.send_response(400)
             self.end_headers()
             self.wfile.write(b'Bad JSON')
             return
 
-        # Проверка секрета
         if data.get('secret') != WORKER_SECRET:
+            logging.warning(f"⚠️ Неверный WORKER_SECRET в запросе!")
             self.send_response(403)
             self.end_headers()
-            self.wfile.write(b'Forbidden')
-            logging.warning("⚠️ Получен запрос с неверным WORKER_SECRET")
+            self.wfile.write(b'Forbidden: wrong secret')
             return
 
-        # Ставим сигнал в очередь для asyncio
         if _signal_queue is not None:
             _signal_queue.put_nowait(data)
 
@@ -382,17 +432,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
         self.wfile.write(json.dumps({'status': 'queued'}).encode())
-        logging.info(f"📥 Сигнал получен: {data.get('symbol')} {data.get('direction')}")
+        logging.info(
+            f"📥 Сигнал принят: {data.get('symbol')} {data.get('direction')} "
+            f"@ {data.get('entry')}"
+        )
 
     def log_message(self, *args):
-        return  # подавляем HTTP логи
+        return
 
 
-def run_http_server():
+def run_http():
     port = int(os.environ.get('PORT', 10001))
-    server = HTTPServer(('0.0.0.0', port), WebhookHandler)
-    logging.info(f"🌐 HTTP сервер запущен на порту {port}")
-    server.serve_forever()
+    HTTPServer(('0.0.0.0', port), WebhookHandler).serve_forever()
 
 # ══════════════════════════════════════════════════════════
 #  ГЛАВНЫЙ ЦИКЛ
@@ -402,39 +453,49 @@ async def main():
 
     _signal_queue = asyncio.Queue()
     http_session  = aiohttp.ClientSession()
+    Thread(target=run_http, daemon=True).start()
 
-    # HTTP сервер в отдельном потоке
-    Thread(target=run_http_server, daemon=True).start()
-
-    logging.info("🚀 Bybit Worker v1.0 запущен")
-    logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.2f}%/сделку")
-    logging.info(f"   Плечо: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
-    logging.info(f"   DD-лимит: {DAILY_DD_LIMIT*100:.1f}%/день")
+    # Диагностика при старте
+    logging.info("=" * 55)
+    logging.info(f"🔑 BYBIT_API_KEY:  {'✅ задан' if BYBIT_KEY else '❌ НЕ ЗАДАН'}")
+    logging.info(f"🔑 BYBIT_SECRET:   {'✅ задан' if BYBIT_SECRET else '❌ НЕ ЗАДАН'}")
+    logging.info(f"🔑 WORKER_SECRET:  {WORKER_SECRET[:8]}...")
+    logging.info(f"🔑 TELEGRAM:       {'✅' if TOKEN else '❌'} | CHAT: {CHAT_ID}")
+    logging.info("=" * 55)
+    logging.info("🚀 Bybit Worker v2.0 UTA запущен")
+    logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
+    logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
 
     await tg(
-        f"🟢 <b>Bybit Worker v1.0</b> запущен\n"
-        f"Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.2f}%\n"
-        f"Ожидаю сигналы от BingX-бота..."
+        f"🟢 <b>Bybit Worker v2.0 UTA</b> запущен\n"
+        f"Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%/сделку\n"
+        f"Leverage: {LEVERAGE}x | DD-лимит: {DAILY_DD_LIMIT*100:.1f}%\n"
+        f"Ожидаю сигналы от BingX..."
     )
+
+    # Проверка подключения к бирже
+    try:
+        bal = await exchange.fetch_balance({'type': 'unified'})
+        usdt = float(bal.get('USDT', {}).get('total', 0))
+        logging.info(f"💰 Bybit UTA баланс: {usdt:.2f} USDT")
+        await tg(f"💰 Bybit баланс: <b>{usdt:.2f} USDT</b>")
+    except Exception as e:
+        logging.error(f"❌ Ошибка подключения к Bybit: {e}")
+        await tg(f"❌ <b>Ошибка подключения к Bybit:</b>\n<code>{str(e)[:200]}</code>")
 
     try:
         cycle = 0
         while True:
             cycle += 1
-
-            # Обработка входящих сигналов из очереди
             while not _signal_queue.empty():
                 signal = await _signal_queue.get()
                 await execute_signal(signal)
 
-            # Мониторинг позиций каждые 30 сек
-            if cycle % 2 == 0 and active_positions:
+            if cycle % 4 == 0 and active_positions:
                 await monitor()
 
             await asyncio.sleep(15)
-
     finally:
-        logging.info("🛑 Bybit Worker остановлен")
         if http_session:
             await http_session.close()
         await exchange.close()
