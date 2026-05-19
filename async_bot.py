@@ -821,12 +821,24 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
                 ok_fb = 'YES' in clean.upper() or 'APPROVE' in clean.upper()
                 return {'ok': ok_fb, 'conf': 50, 'comment': f'text fallback: {clean[:80]}'}
 
-            ok = str(parsed.get('decision', '')).lower() == 'approve'
-            conf = int(parsed.get('confidence', 0))
-            comment = parsed.get('comment', '')
-            # Низкая уверенность тоже блокирует
-            if conf < 55:
-                ok = False
+            decision = str(parsed.get('decision', '')).lower()
+            conf     = int(parsed.get('confidence', 0))
+            comment  = parsed.get('comment', '')
+
+            # Логика одобрения зависит от стратегии:
+            # SMC: CHoCH+FVG — RSI нейтрален по природе (импульс, не экстремум)
+            #   → если conf ≥ 70: approve (высокая уверенность важнее decision)
+            #   → если conf ≥ 55 AND decision=approve: approve
+            #   → иначе: reject
+            # RSI MR: требует RSI экстремум — decision=approve AND conf ≥ 55
+            if conf == 0:
+                ok = False  # мусорный ответ
+            elif strategy == 'SMC':
+                # XLM reject(80) → approve (conf 80 > 70, модель ошиблась с RSI)
+                # BCH approve(85) → approve (корректно)
+                ok = conf >= 70 or (decision == 'approve' and conf >= 55)
+            else:  # RSI
+                ok = decision == 'approve' and conf >= 55
             verdict = 'APPROVE' if ok else 'REJECT'
             logging.info(
                 f'🧠 [GEMINI] {sym} {strategy} {mode} -> {verdict} '
@@ -1239,7 +1251,11 @@ async def execute(sym: str, sig: dict, strategy: str,
     )
     ai = await oracle_ai(sym, strategy, mode, price, extra_ctx)
     if not ai['ok']:
-        logging.info(f"[{strategy}] {sym}: Gemini reject (conf={ai['conf']}): {ai['comment']}")
+        thr = 70 if strategy == 'SMC' else 55
+        logging.info(
+            f"[{strategy}] {sym}: AI reject "
+            f"(conf={ai['conf']}/{thr} | {ai['comment']})"
+        )
         return
 
     # Баланс
