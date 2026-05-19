@@ -135,6 +135,7 @@ markets_ts      = 0.0
 news_ts         = 0.0
 http            = None     # единая aiohttp.ClientSession
 circuit_open    = False    # [R-FIX-11] дневной DD-стоп
+_tg_offset      = 0        # Telegram getUpdates offset (персистентный)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1781,70 +1782,73 @@ def run_health():
 # ═══════════════════════════════════════════════════════
 async def check_tg_commands():
     """
-    Проверяет входящие сообщения Telegram на команды управления.
-    /reset  — сбросить circuit breaker и дневную DD
-    /status — текущий статус бота
-    /stop   — остановить торговлю до конца дня (circuit breaker вручную)
+    Обработка команд управления из Telegram группы.
+    Работает ВСЕГДА — даже при circuit_open=True.
+    Команды: /reset  /status  /stop
     """
-    global circuit_open, daily_stats
+    global circuit_open, daily_stats, _tg_offset
     if not TOKEN or CHAT_ID == -1 or not http:
         return
     try:
-        url = f'https://api.telegram.org/bot{TOKEN}/getUpdates'
-        params = {'timeout': 0, 'allowed_updates': ['message'], 'limit': 5}
-        async with http.get(url, params=params,
-                            timeout=aiohttp.ClientTimeout(total=3)) as resp:
+        params = {'offset': _tg_offset, 'limit': 10, 'timeout': 0}
+        async with http.get(
+            f'https://api.telegram.org/bot{TOKEN}/getUpdates',
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
             if resp.status != 200:
                 return
-            data = await resp.json()
-            updates = data.get('result', [])
-            if not updates:
-                return
+            updates = (await resp.json()).get('result', [])
 
-            for upd in updates:
-                msg = upd.get('message', {})
-                text = msg.get('text', '').strip().lower()
-                chat = msg.get('chat', {}).get('id')
-                if str(chat) != str(CHAT_ID):
-                    continue  # только из нашей группы
+        for upd in updates:
+            _tg_offset = upd['update_id'] + 1
+            msg  = upd.get('message') or upd.get('edited_message', {})
+            if not msg:
+                continue
+            text = (msg.get('text') or '').strip()
+            chat = msg.get('chat', {}).get('id')
 
-                if text in ('/reset', '/reset_circuit'):
-                    circuit_open = False
-                    daily_stats['pnl_pct'] = 0.0
-                    save_all()
-                    logging.info('✅ [CMD] /reset — circuit breaker сброшен вручную')
-                    await tg(
-                        '✅ <b>Circuit Breaker сброшен</b>\n'
-                        f'Торговля возобновлена.\n'
-                        f'DD лимит: {DAILY_DD_LIMIT*100:.1f}%'
-                    )
+            # Принимаем из нашей группы (int или str сравнение)
+            if str(chat) != str(CHAT_ID):
+                continue
 
-                elif text == '/status':
-                    all_pos = all_positions()
-                    await tg(
-                        f'📊 <b>Статус бота</b>\n'
-                        f'Circuit: {"🔴 СТОП" if circuit_open else "🟢 ОК"}\n'
-                        f'DD сегодня: {daily_stats["pnl_pct"]*100:+.2f}%\n'
-                        f'Позиций: {len(all_pos)} (SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
-                        f'DD лимит: {DAILY_DD_LIMIT*100:.1f}%\n'
-                        f'Цикл: каждые ~60с'
-                    )
+            cmd = text.lower().split('@')[0].strip()
+            logging.info(f'📨 [CMD] команда: {repr(cmd)} от chat={chat}')
 
-                elif text == '/stop':
-                    circuit_open = True
-                    logging.info('⏸ [CMD] /stop — торговля остановлена вручную')
-                    await tg('⏸ <b>Торговля остановлена</b>\nОтправьте /reset для возобновления.')
-
-            # Подтверждаем обработку обновлений
-            if updates:
-                last_id = updates[-1]['update_id']
-                await http.get(
-                    f'https://api.telegram.org/bot{TOKEN}/getUpdates',
-                    params={'offset': last_id + 1, 'limit': 1, 'timeout': 0},
-                    timeout=aiohttp.ClientTimeout(total=3)
+            if cmd == '/reset':
+                circuit_open = False
+                daily_stats['pnl_pct'] = 0.0
+                daily_stats['be_closes'] = 0
+                save_all()
+                logging.info('✅ [CMD] /reset выполнен')
+                await tg(
+                    f'✅ <b>Circuit Breaker сброшен</b>\n'
+                    f'DD обнулён. Торговля возобновлена.\n'
+                    f'Лимит: {DAILY_DD_LIMIT*100:.1f}%/день'
                 )
-    except Exception:
-        pass  # команды не критичны
+
+            elif cmd == '/status':
+                all_pos = all_positions()
+                status_cb = '🔴 СТОП' if circuit_open else '🟢 OK'
+                await tg(
+                    f'📊 <b>Статус</b>\n'
+                    f'Circuit: {status_cb}\n'
+                    f'DD сегодня: {daily_stats["pnl_pct"]*100:+.2f}% '
+                    f'(лимит: {DAILY_DD_LIMIT*100:.1f}%)\n'
+                    f'Позиций: {len(all_pos)} '
+                    f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
+                    f'Баланс: проверьте на бирже'
+                )
+
+            elif cmd == '/stop':
+                circuit_open = True
+                logging.info('⏸ [CMD] /stop — торговля остановлена вручную')
+                await tg('⏸ Торговля остановлена. /reset для возобновления.')
+
+    except asyncio.TimeoutError:
+        pass  # таймаут — не критично
+    except Exception as e:
+        logging.warning(f'⚠️ [CMD] check_tg_commands error: {e}')
 
 
 async def main():
@@ -1900,6 +1904,9 @@ async def main():
             t0 = time.time()
             try:
                 await daily_reset()
+
+                # Команды Telegram — вызывается ВСЕГДА (включая circuit breaker)
+                await check_tg_commands()
 
                 # Обновление новостей каждые 6 часов
                 if time.time() - news_ts > 21600:
