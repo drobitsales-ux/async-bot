@@ -931,7 +931,7 @@ async def smc_signal(sym: str):
 
     atr = calc_atr(h, l, c)
     sl  = price * (1 - MAX_SL_PCT / 100) if mode == 'Long' else price * (1 + MAX_SL_PCT / 100)
-    tp  = price * (1 + MAX_SL_PCT / 100 * 2.0) if mode == 'Long' else price * (1 - MAX_SL_PCT / 100 * 2.0)
+    tp  = price * (1 + MAX_SL_PCT / 100 * 1.5) if mode == 'Long' else price * (1 - MAX_SL_PCT / 100 * 1.5)  # [FIX-TP] 2.0x→1.5x
 
     return {
         'sym': sym, 'mode': mode, 'price': price,
@@ -1372,7 +1372,9 @@ async def monitor_all():
                    else (entry - curr_p) / entry * 100)
 
             # ── Breakeven ──────────────────────────────────────
-            if pnl >= 1.5 and not pos.get('be_moved'):
+            # BE после TP50: ждём 2.1% если TP50 ещё не сработал
+            be_thr = 2.1 if not pos.get('tp50_hit') else 1.5
+            if pnl >= be_thr and not pos.get('be_moved'):
                 new_sl = entry * 1.0015 if is_long else entry * 0.9985  # 0.15% > 2×fee
                 try:
                     if pos.get('sl_order_id'):
@@ -1504,11 +1506,15 @@ async def monitor_all():
             daily_stats['trades'] += 1
             daily_stats['pnl_pct'] += pnl_pct / 100  # в долях
 
-            # Победа если хотя бы pnl_pct > 0 (даже если net_pnl отрицательный из-за комиссий)
-            # Или если tp50_hit — частичная прибыль уже зафиксирована
-            is_win = pnl_pct > 0 or pos.get('tp50_hit', False)
+            # Реальная победа = ощутимая прибыль (не BE)
+            # pnl < 0.5% = BE-close (LINK+0.21%, APE+0.21%) — НЕ победа
+            min_win_pct = 0.5
+            is_win = pos.get('tp50_hit', False) or pnl_pct >= min_win_pct
+            is_be  = 0 < pnl_pct < min_win_pct
             if is_win:
                 daily_stats['wins'] += 1
+            elif is_be:
+                daily_stats['be_closes'] = daily_stats.get('be_closes', 0) + 1
 
             mfe_pct = abs(float(pos['mfe_price']) - entry) / entry * 100
             mae_pct = abs(float(pos['mae_price']) - entry) / entry * 100
@@ -1516,9 +1522,9 @@ async def monitor_all():
 
             winrate_d = (daily_stats['wins'] / daily_stats['trades'] * 100
                          if daily_stats['trades'] > 0 else 0)
-            tp50_tag = ' (TP50✓)' if pos.get('tp50_hit') else ''
+            result_tag = ' (TP✓)' if pos.get('tp50_hit') else (' (BE)' if is_be else (' (WIN)' if is_win else ' (SL)'))
             await tg(
-                f"{'✅' if is_win else '🛑'} <b>[{strategy}] {sym}</b> закрыта{tp50_tag}\n"
+                f"{'✅' if is_win else ('⚖️' if is_be else '🛑')} <b>[{strategy}] {sym}</b> закрыта{result_tag}\n"
                 f"PnL: <code>{pnl_pct:+.2f}%</code> | Net: <code>{net_pnl:+.2f} USDT</code>\n"
                 f"📈 MFE {mfe_pct:.2f}% | 📉 MAE {mae_pct:.2f}% | ⏱ {dur_min}мин\n"
                 f"Вход: {entry:.6f} | Выход: {exit_p:.6f}\n"
@@ -1671,7 +1677,8 @@ async def daily_reset():
 
         await tg(
             f"📊 <b>Итоги дня {daily_stats['stat_date']}</b>\n"
-            f"Сделок: {trades}  WR: {wrate:.1f}%  "
+            f"Сделок: {trades}  WR: {wrate:.1f}% (реальн.)  "
+            f"BE: {daily_stats.get('be_closes',0)}  "
             f"SMC: {daily_stats.get('smc_trades',0)}  RSI: {daily_stats.get('rsi_trades',0)}\n"
             f"PnL: <code>{day_pct:+.2f}%</code>  "
             f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
