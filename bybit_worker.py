@@ -63,7 +63,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | [BYBIT] %(message)
 exchange = ccxt_async.bybit({
     'apiKey':  BYBIT_KEY,
     'secret':  BYBIT_SECRET,
-    'hostname': 'bytick.com',  # <── ИСПРАВЛЕНО: убрали "api.", оставили только домен
     'options': {
         'defaultType':     'linear',
         'fetchCurrencies': False,   # [FIX-403] CloudFront fix
@@ -156,10 +155,14 @@ async def execute_signal(signal: dict):
         return
 
     # Проверка SL
-    sl_pct = abs(entry - sl) / entry * 100
-    logging.info(f"📐 {sym}: SL дистанция {sl_pct:.2f}%")
-    if sl_pct < MIN_SL_PCT or sl_pct > MAX_SL_PCT:
-        logging.warning(f"⚠️ {sym}: SL {sl_pct:.2f}% вне диапазона [{MIN_SL_PCT},{MAX_SL_PCT}]%")
+    sl_pct = round(abs(entry - sl) / entry * 100, 4)  # [FIX-FLOAT] 2.5000001 → 2.5
+    logging.info(f"📐 {sym}: SL дистанция {sl_pct:.4f}%")
+    # Допуск 0.01% для floating-point edge cases (2.5000000000001 ≈ 2.5)
+    if sl_pct < MIN_SL_PCT - 0.01 or sl_pct > MAX_SL_PCT + 0.01:
+        logging.warning(
+            f"⚠️ {sym}: SL {sl_pct:.4f}% вне диапазона "
+            f"[{MIN_SL_PCT},{MAX_SL_PCT}]% — пропуск"
+        )
         return
 
     # Баланс
