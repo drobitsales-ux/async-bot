@@ -64,8 +64,9 @@ exchange = ccxt_async.bybit({
     'apiKey':  BYBIT_KEY,
     'secret':  BYBIT_SECRET,
     'options': {
-        'defaultType': 'linear',  # USDT perpetual
-        # НЕ указываем positionMode — UTA определяет режим сам (one-way)
+        'defaultType':     'linear',
+        'fetchCurrencies': False,   # [FIX-403] CloudFront fix
+        'adjustForTimeDifference': False,
     },
     'enableRateLimit': True,
 })
