@@ -149,6 +149,11 @@ async def execute_signal(signal: dict):
     if any(p['direction'] == mode for p in active_positions):
         logging.info(f"⏸ {sym}: уже есть {mode} позиция")
         return
+    # [FIX-3] Запрет противоположной позиции по тому же символу
+    if any(p['symbol'] == sym and p['direction'] != mode for p in active_positions):
+        opp = 'Long' if mode == 'Short' else 'Short'
+        logging.warning(f"⛔ {sym}: открыт {opp} — {mode} ЗАПРЕЩЁН (нет хеджа)")
+        return
 
     check_daily_reset()
     if not is_trading_allowed():
@@ -236,29 +241,30 @@ async def execute_signal(signal: dict):
             # Уже установлено — не критично
             logging.debug(f"ℹ️ {sym}: leverage: {e}")
 
-        # [FIX-4] Основной рыночный ордер со встроенным SL
-        # Для UTA лучший способ: entry + stopLoss в одном ордере
-        sl_trigger_dir = 2 if mode == 'Long' else 1  # 1=выше, 2=ниже цены входа
-
-        entry_params = {
-            'category':        'linear',
-            'positionIdx':     position_idx,
-            # Встраиваем SL прямо в entry ордер
-            'stopLoss':        str(round(sl, 8)),
-            'slTriggerBy':     'LastPrice',
-            'slOrderType':     'Market',
-            'tpslMode':        'Full',
-        }
-        if tp:
-            entry_params['takeProfit'] = str(round(tp, 8))
-            entry_params['tpTriggerBy'] = 'LastPrice'
-            entry_params['tpOrderType'] = 'Market'
-
+        # [FIX-2] Сначала чистый entry без SL (inline SL срабатывает мгновенно!)
         entry_ord = await exchange.create_order(
             sym, 'market', order_side, qty,
-            params=entry_params
+            params={'category': 'linear', 'positionIdx': position_idx}
         )
         logging.info(f"✅ {sym}: market order открыт | id={entry_ord.get('id', '?')}")
+        await asyncio.sleep(2.0)  # ждём регистрации позиции
+        try:
+            sl_p = {'category':'linear','symbol':sym,'positionIdx':position_idx,
+                    'stopLoss':str(round(sl,8)),'slTriggerBy':'LastPrice','tpslMode':'Full'}
+            if tp: sl_p.update({'takeProfit':str(round(tp,8)),'tpTriggerBy':'LastPrice'})
+            await exchange.private_post_v5_position_trading_stop(sl_p)
+            logging.info(f"✅ {sym}: SL={sl:.6f} (trading_stop)")
+        except Exception as _sle:
+            logging.warning(f"⚠️ trading_stop: {_sle} — STOP_MARKET fallback")
+            try:
+                sl_side2 = 'sell' if mode=='Long' else 'buy'
+                await exchange.create_order(sym,'STOP_MARKET',sl_side2,qty,params={
+                    'category':'linear','positionIdx':position_idx,
+                    'triggerPrice':round(sl,8),'triggerBy':'LastPrice','reduceOnly':True})
+                logging.info(f"✅ {sym}: SL via STOP_MARKET")
+            except Exception as _sle2:
+                logging.error(f"❌ {sym}: SL не установлен! {_sle2}")
+                await tg(f"🚨 <b>{sym}</b>: ПОЗИЦИЯ БЕЗ SL! Закройте вручную!")
 
         rec = {
             'symbol':       sym,
@@ -325,11 +331,14 @@ async def monitor():
 
         curr_p = float((tickers.get(sym) or {}).get('last', entry))
 
+        bybit_side = 'Buy' if is_long else 'Sell'
         live = next(
-            (r for r in pos_raw
-             if r.get('symbol') == sym
-             and abs(float(r.get('contracts', 0))) > 0),
-            None
+            (r for r in pos_raw if r.get('symbol') == sym
+             and abs(float(r.get('contracts', 0))) > 0
+             and r.get('side', bybit_side) == bybit_side), None
+        ) or next(
+            (r for r in pos_raw if r.get('symbol') == sym
+             and abs(float(r.get('contracts', 0))) > 0), None
         )
 
         if live:
@@ -354,16 +363,10 @@ async def monitor():
                 new_sl = entry * 1.002 if is_long else entry * 0.998
                 logging.info(f"🛡 {sym}: SL → BE {new_sl:.6f} (P&L +{pnl:.2f}%)")
                 try:
-                    # Для UTA: обновляем SL через amend order или новый trigger
-                    await exchange.create_order(
-                        sym, 'market', 'sell' if is_long else 'buy', 0,
-                        params={
-                            'category':    'linear',
-                            'positionIdx': 0,
-                            'stopLoss':    str(round(new_sl, 8)),
-                            'tpslMode':    'Full',
-                        }
-                    )
+                    await exchange.private_post_v5_position_trading_stop({
+                        'category':'linear','symbol':sym,'positionIdx':0,
+                        'stopLoss':str(round(new_sl,8)),
+                        'slTriggerBy':'LastPrice','tpslMode':'Full'})
                     pos['sl_price'] = new_sl
                     pos['be_moved'] = True
                     await tg(f"🛡 <b>{sym}</b>: SL → БУ <code>{new_sl:.6f}</code> | +{pnl:.2f}%")
@@ -375,7 +378,8 @@ async def monitor():
         else:
             # Позиция закрыта
             secs = time.time() - pos['open_time']
-            if secs < 60:   # grace period для открытия ордера
+            if secs < 120:   # [FIX-1b] grace period 120с
+                logging.debug(f"⏳ {sym}: grace {secs:.0f}с/120с")
                 new_positions.append(pos)
                 continue
 
