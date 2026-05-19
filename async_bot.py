@@ -1234,6 +1234,12 @@ async def execute(sym: str, sig: dict, strategy: str,
     if sum(1 for p in all_pos if p['direction'] == mode) >= MAX_PER_DIR:
         return
 
+    # Запрет хеджа: если BCH Short открыт — BCH Long не открываем (и наоборот)
+    if any(p['symbol'] == sym and p['direction'] != mode for p in all_pos):
+        opp = 'Long' if mode == 'Short' else 'Short'
+        logging.info(f'[{strategy}] {sym}: уже открыт {opp} — {mode} пропущен')
+        return
+
     # [P-2] Передаём BingX-объём чтобы не блокировать BingX-эксклюзивы
     bingx_vol = sig.get('bingx_vol', 0)
     has_vol = await oracle_volume(sym, bingx_vol)
