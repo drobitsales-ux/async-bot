@@ -77,8 +77,8 @@ GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
-RISK_PER_TRADE   = 0.0075   # [R-FIX-1] 0.75% на сделку
-RISK_WEEKEND     = 0.00375  # 0.375% в выходные
+RISK_PER_TRADE   = 0.02   # [R-FIX-1] 2% на сделку
+RISK_WEEKEND     = 0.01  # 1% в выходные
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 LEVERAGE         = 5
@@ -87,7 +87,7 @@ MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = 0.025    # [R-FIX-11] стоп торговли при -2.5% за день
-SCAN_LIMIT       = 150      # [PERF] снижен для ускорения цикла
+SCAN_LIMIT       = 100      # [PERF-2] 150→100: топ-100 по объёму достаточно
 SCAN_SEM         = 40       # [PERF] повышен: больше параллельных запросов
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
 
@@ -393,37 +393,59 @@ def find_fvg(h, l, mode: str, lookback: int = 20):  # [FIX-FVG] 10→20 баро
 # ═══════════════════════════════════════════════════════
 #  ОРАКУЛЫ
 # ═══════════════════════════════════════════════════════
+# Кэш объёмов внутри цикла — не делаем внешние запросы повторно
+_vol_cache: dict = {}  # {sym: (timestamp, bool)}
+VOL_CACHE_TTL = 300    # 5 минут — объём не меняется быстро
+
 async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
     """
-    Volume oracle: BingX-объём ≥200k → быстрый пропуск.
-    Иначе проверяем Binance+Bybit+MEXC с таймаутом 2 сек.
+    Volume oracle v2: использует tickers_cache (уже загружен!) вместо
+    3 отдельных API запросов. Экономит 2-3 сек на каждую проверку.
+    Fallback на внешние биржи только если тикеры недоступны.
     """
-    # Fast-path: BingX-объём достаточен → не тратим время на внешние запросы
-    if bingx_vol >= 200_000:
+    # Проверяем кэш внутри цикла
+    now_t = time.time()
+    if sym in _vol_cache:
+        ts, result = _vol_cache[sym]
+        if now_t - ts < VOL_CACHE_TTL:
+            return result
+
+    # Fast-path: BingX-объём из tickers_cache достаточен
+    if bingx_vol >= MIN_VOL_USDT:
+        _vol_cache[sym] = (now_t, True)
         return True
 
-    # Внешние биржи с жёстким таймаутом — чтобы не блокировать скан
+    # Средний объём: BingX < MIN_VOL но >= 200k — принимаем (BingX-эксклюзив)
+    if bingx_vol >= 200_000:
+        # Проверяем через кэш тикеров (уже загружен, без доп. запросов)
+        cached = _tickers_cache.get(sym, {})
+        cached_vol = float((cached or {}).get('quoteVolume', 0) or 0)
+        if cached_vol > 0:
+            result = cached_vol >= MIN_VOL_USDT * 0.5  # 50% порог для BingX
+            _vol_cache[sym] = (now_t, result)
+            return result
+        _vol_cache[sym] = (now_t, True)  # если нет кэша — пропускаем
+        return True
+
+    # Низкий объём: быстрая проверка через внешние биржи (только 1 раз за 5 мин)
     try:
         base = sym.split('/')[0]
-
-        async def _vol(exch, ticker):
+        async def _vol(exch, t):
             try:
-                t = await asyncio.wait_for(exch.fetch_ticker(ticker), timeout=2.0)
-                return float(t.get('quoteVolume', 0) or 0)
+                r = await asyncio.wait_for(exch.fetch_ticker(t), timeout=2.0)
+                return float(r.get('quoteVolume', 0) or 0)
             except Exception:
                 return 0.0
-
         vol_b, vol_y, vol_m = await asyncio.gather(
             _vol(binance, f'{base}/USDT'),
             _vol(bybit,   f'{base}/USDT'),
             _vol(mexc,    f'{base}/USDT'),
         )
+        result = vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
         if any(v > 0 for v in (vol_b, vol_y, vol_m)):
-            logging.debug(
-                f"[VOL] {base} BingX:{bingx_vol:.0f} "
-                f"Bin:{vol_b:.0f} Bbt:{vol_y:.0f} MEXC:{vol_m:.0f}"
-            )
-        return vol_b > MIN_VOL_USDT or vol_y > MIN_VOL_USDT or vol_m > MIN_VOL_USDT
+            logging.debug(f'[VOL] {base} Bin:{vol_b:.0f} Bbt:{vol_y:.0f} MEXC:{vol_m:.0f}')
+        _vol_cache[sym] = (now_t, result)
+        return result
     except Exception:
         return bingx_vol >= 100_000
 
@@ -483,10 +505,21 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         ctx_keys = ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')
         context.update({k: v for k, v in extra.items() if k in ctx_keys})
 
+    # Добавляем контекст BTC в промпт для лучшего решения
+    btc_ctx_str = context.get('btc_trend', 'Flat')
+    alt_ctx_str = 'altseason (altcoins outperform BTC)' if context.get('altseason') else 'no altseason'
+
     prompt = (
-        'You are a crypto risk manager. Evaluate this trade setup and respond '
-        'ONLY with valid JSON (no markdown): '
+        'You are a crypto futures risk manager specializing in SMC and RSI mean reversion. '
+        'Evaluate this trade and respond ONLY with valid JSON: '
         '{"decision":"approve"|"reject","confidence":0-100,"comment":"brief reason"}. '
+        'IMPORTANT RULES: '
+        '1. BTC:Flat does NOT invalidate altcoin setups — evaluate the altcoin independently. '
+        '2. During altseason, long setups on altcoins are MORE valid even with BTC flat. '
+        '3. RSI below 25 = strong oversold → approve with confidence >= 65. '
+        '4. RSI above 75 = strong overbought → approve shorts with confidence >= 65. '
+        '5. Reject ONLY if: RSI is in neutral zone (35-65), OR MAE risk is extreme. '
+        f'Market context: BTC={btc_ctx_str}, {alt_ctx_str}. '
         f'Setup: {json.dumps(context)}'
     )
 
@@ -1793,6 +1826,12 @@ async def main():
                                if now_t - ts > GEMINI_CACHE_TTL]
                 for k in gem_expired:
                     del _gemini_cache[k]
+
+                # Чистка кэша объёмов
+                vol_expired = [k for k, (ts, _) in list(_vol_cache.items())
+                               if now_t - ts > VOL_CACHE_TTL]
+                for k in vol_expired:
+                    del _vol_cache[k]
 
                 # Мониторинг позиций
                 await monitor_all()
