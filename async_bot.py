@@ -85,6 +85,8 @@ LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
+MAX_TRADE_MIN_SMC = 120       # макс. длительность SMC сделки (мин), 15m × 8 свечей
+MAX_TRADE_MIN_RSI = 150       # макс. длительность RSI MR сделки (мин)
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] стоп торговли при -2.5% за день
 SCAN_LIMIT       = 60       # [PERF-3] 100→60: топ-60 ликвидных, цель цикла <90с
@@ -1428,6 +1430,31 @@ async def monitor_all():
             pnl = ((curr_p - entry) / entry * 100 if is_long
                    else (entry - curr_p) / entry * 100)
 
+            # ── Таймаут позиции ────────────────────────────────
+            dur_s   = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(pos['open_time'])).total_seconds()
+            dur_min = dur_s / 60
+            max_dur = MAX_TRADE_MIN_SMC if strategy == 'SMC' else MAX_TRADE_MIN_RSI
+            if dur_min > max_dur and not pos.get('tp50_hit'):
+                logging.warning(
+                    f'⏰ [{strategy}] {sym}: таймаут {dur_min:.0f}мин>={max_dur}мин '
+                    f'pnl={pnl:+.2f}% — принудительное закрытие'
+                )
+                try:
+                    if pos.get('sl_order_id'):
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                    await exchange.create_order(
+                        sym, 'market', sl_side, real_qty,
+                        params={'positionSide': pos_side, 'reduceOnly': True}
+                    )
+                    await tg(
+                        f'⏰ <b>[{strategy}] {sym}</b>: таймаут {dur_min:.0f}мин\n'
+                        f'Закрыто рыночным | PnL: {pnl:+.2f}%'
+                    )
+                except Exception as _te:
+                    logging.error(f'Timeout close error {sym}: {_te}')
+                return False
+
             # ── Breakeven ──────────────────────────────────────
             # BE после TP50: ждём 2.1% если TP50 ещё не сработал
             be_thr = 2.1 if not pos.get('tp50_hit') else 1.5
@@ -1793,32 +1820,44 @@ async def sync_positions_with_exchange() -> int:
         # Получаем все реально открытые позиции на BingX
         real_positions = await exchange.fetch_positions()
         # Множество символов с реально открытыми позициями
-        real_syms: set = set()
+        # Строим set (символ, сторона) — BCH Short ≠ BCH Long!
+        real_pos_set: set = set()
         for rp in real_positions:
             qty = abs(float(rp.get('contracts', 0) or 0))
             if qty > 0:
-                real_syms.add(rp.get('symbol', ''))
+                sym_r  = rp.get('symbol', '')
+                side_r = (rp.get('side') or rp.get('info', {}).get('side', '')).lower()
+                real_pos_set.add((sym_r, side_r))
 
-        logging.info(f'🔄 [SYNC] BingX реальных позиций: {len(real_syms)}: {real_syms}')
+        real_syms = {s for s, _ in real_pos_set}
+        logging.info(f'🔄 [SYNC] BingX: {len(real_syms)} позиций: {real_syms}')
+        logging.info(f'🔄 [SYNC] (sym,side): {real_pos_set}')
+
+        def _is_real(p: dict) -> bool:
+            sym_l  = p['symbol']
+            side_l = 'long' if p['direction'] == 'Long' else 'short'
+            age    = (datetime.now(timezone.utc)
+                      - datetime.fromisoformat(p['open_time'])).total_seconds()
+            if age < 120:
+                return True  # grace period
+            # Проверяем точное совпадение символа И стороны
+            if (sym_l, side_l) in real_pos_set:
+                return True
+            # Fallback: только символ (если биржа не вернула side)
+            if sym_l in real_syms and not any(s == sym_l for s, _ in real_pos_set if _):
+                return True
+            return False
 
         new_smc, new_rsi = [], []
         for p in smc_positions:
-            sym = p['symbol']
-            age = (datetime.now(timezone.utc)
-                   - datetime.fromisoformat(p['open_time'])).total_seconds()
-            if sym in real_syms or age < 120:  # grace 120с для новых
-                new_smc.append(p)
+            if _is_real(p): new_smc.append(p)
             else:
-                logging.warning(f'👻 [SYNC] SMC ghost удалена: {sym}')
+                logging.warning(f'👻 [SYNC] SMC ghost: {p["symbol"]} {p["direction"]}')
                 removed += 1
         for p in rsi_positions:
-            sym = p['symbol']
-            age = (datetime.now(timezone.utc)
-                   - datetime.fromisoformat(p['open_time'])).total_seconds()
-            if sym in real_syms or age < 120:
-                new_rsi.append(p)
+            if _is_real(p): new_rsi.append(p)
             else:
-                logging.warning(f'👻 [SYNC] RSI ghost удалена: {sym}')
+                logging.warning(f'👻 [SYNC] RSI ghost: {p["symbol"]} {p["direction"]}')
                 removed += 1
 
         smc_positions[:] = new_smc
