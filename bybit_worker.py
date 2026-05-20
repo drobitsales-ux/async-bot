@@ -317,10 +317,15 @@ async def monitor():
 
     syms = list({p['symbol'] for p in active_positions})
     try:
-        pos_raw = await exchange.fetch_positions(syms, params={'category': 'linear'})
+        # Запрашиваем ВСЕ позиции без фильтра по символу —
+        # Bybit иногда не находит по конкретному символу из-за формата
+        pos_raw = await exchange.fetch_positions(
+            params={'category': 'linear', 'settleCoin': 'USDT'}
+        )
+        logging.debug(f"[MONITOR] fetch_positions: {len(pos_raw)} позиций, ищем: {syms}")
         tickers = await exchange.fetch_tickers(syms)
     except Exception as e:
-        logging.error(f"Monitor error: {e}")
+        logging.error(f"Monitor fetch error: {e}")
         return
 
     new_positions = []
@@ -329,17 +334,36 @@ async def monitor():
         is_long = pos['direction'] == 'Long'
         entry   = float(pos['entry_price'])
 
-        curr_p = float((tickers.get(sym) or {}).get('last', entry))
+        ticker_d = tickers.get(sym) or {}
+        curr_p = float(ticker_d.get('last', 0) or 0)
+        if curr_p <= 0:
+            curr_p = float(ticker_d.get('close', 0) or 0)
+        if curr_p <= 0:
+            curr_p = entry  # последний fallback — вход
+            logging.warning(f"⚠️ {sym}: curr_p fallback to entry {entry}")
 
         bybit_side = 'Buy' if is_long else 'Sell'
+        # Нормализуем символ: Bybit может хранить как 'STORJUSDT' или 'STORJ/USDT'
+        sym_base = sym.replace('USDT', '').replace('/', '')
         live = next(
-            (r for r in pos_raw if r.get('symbol') == sym
+            (r for r in pos_raw
+             if (r.get('symbol', '').replace('/', '').replace(':USDT','') == sym
+                 or r.get('symbol', '') == sym)
              and abs(float(r.get('contracts', 0))) > 0
-             and r.get('side', bybit_side) == bybit_side), None
+             and r.get('side', bybit_side) == bybit_side),
+            None
         ) or next(
-            (r for r in pos_raw if r.get('symbol') == sym
-             and abs(float(r.get('contracts', 0))) > 0), None
+            (r for r in pos_raw
+             if (r.get('symbol', '').replace('/', '').replace(':USDT','') == sym
+                 or r.get('symbol', '') == sym)
+             and abs(float(r.get('contracts', 0))) > 0),
+            None
         )
+        if live:
+            logging.debug(f"[MONITOR] {sym}: live ✅ contracts={live.get('contracts')}")
+        else:
+            live_syms = [r.get('symbol') for r in pos_raw if abs(float(r.get('contracts',0)))>0]
+            logging.info(f"[MONITOR] {sym}: НЕ найдена | Bybit видит: {live_syms}")
 
         if live:
             real_qty = abs(float(live.get('contracts', 0)))
@@ -378,22 +402,43 @@ async def monitor():
         else:
             # Позиция закрыта
             secs = time.time() - pos['open_time']
-            if secs < 120:   # [FIX-1b] grace period 120с
-                logging.debug(f"⏳ {sym}: grace {secs:.0f}с/120с")
+            if secs < 180:   # grace 180с (запас на регистрацию в Bybit)
+                logging.info(f"⏳ {sym}: grace {secs:.0f}с/180с — позиция не найдена, ждём")
                 new_positions.append(pos)
                 continue
 
-            pnl_pct = ((curr_p - entry) / entry * 100 if is_long
-                       else (entry - curr_p) / entry * 100)
-            is_win  = pnl_pct > 0
-            daily_pnl_pct += pnl_pct / 100
+            # Пробуем ещё раз получить реальную цену выхода через trades
+            exit_p = curr_p  # по умолчанию текущая цена
+            try:
+                open_ts = int(pos['open_time'] * 1000)
+                trades = await exchange.fetch_my_trades(
+                    sym, since=open_ts, limit=5,
+                    params={'category': 'linear'}
+                )
+                # Берём последнюю закрывающую сделку
+                close_trades = [t for t in trades if t.get('timestamp', 0) >= open_ts]
+                if len(close_trades) >= 2:  # вход + выход
+                    exit_p = float(close_trades[-1]['price'])
+                    logging.info(f"📋 {sym}: exit price из trades = {exit_p}")
+            except Exception as te:
+                logging.debug(f"fetch_my_trades {sym}: {te}")
 
+            pnl_pct = ((exit_p - entry) / entry * 100 if is_long
+                       else (entry - exit_p) / entry * 100)
+            is_win  = pnl_pct > 0.5  # реальная победа > 0.5%
+            daily_pnl_pct += pnl_pct / 100
+            icon = '✅' if is_win else ('⚖️' if pnl_pct > 0 else '🛑')
+
+            logging.info(
+                f"{icon} {sym}: закрыта | entry={entry:.6f} exit={exit_p:.6f} "
+                f"pnl={pnl_pct:+.2f}% | {int(secs/60)}мин"
+            )
             await tg(
-                f"{'✅' if is_win else '🛑'} <b>[{pos['strategy']}] {sym}</b> закрыта\n"
+                f"{icon} <b>[{pos['strategy']}] {sym}</b> закрыта\n"
                 f"PnL: <code>{pnl_pct:+.2f}%</code> | ⏱ {int(secs/60)}мин\n"
+                f"Вход: {entry:.6f} | Выход: {exit_p:.6f}\n"
                 f"День: {daily_pnl_pct*100:+.2f}%"
             )
-            logging.info(f"{'✅' if is_win else '🛑'} {sym}: {pnl_pct:+.2f}%")
 
     active_positions[:] = new_positions
 
