@@ -323,7 +323,16 @@ async def monitor():
             params={'category': 'linear', 'settleCoin': 'USDT'}
         )
         logging.debug(f"[MONITOR] fetch_positions: {len(pos_raw)} позиций, ищем: {syms}")
-        tickers = await exchange.fetch_tickers(syms)
+
+        # fetch_ticker (singular) надёжнее для Bybit — не зависит от формата символа
+        tickers = {}
+        for sym_t in syms:
+            try:
+                t = await exchange.fetch_ticker(sym_t)
+                tickers[sym_t] = t
+            except Exception:
+                # Пробуем через unrealized PnL из позиции
+                tickers[sym_t] = {}
     except Exception as e:
         logging.error(f"Monitor fetch error: {e}")
         return
@@ -338,9 +347,19 @@ async def monitor():
         curr_p = float(ticker_d.get('last', 0) or 0)
         if curr_p <= 0:
             curr_p = float(ticker_d.get('close', 0) or 0)
+        # Fallback: берём markPrice из самой позиции (если есть)
+        if curr_p <= 0 and live:
+            info = live.get('info') or {}
+            curr_p = float(info.get('markPrice', 0) or
+                           info.get('unrealisedPnl', 0) or 0)
+            # unrealisedPnl не цена — вычислим из него если есть qty
+            if curr_p != 0 and 'markPrice' not in info:
+                curr_p = 0  # не подходит
+            if 'markPrice' in info:
+                curr_p = float(info.get('markPrice', 0) or 0)
         if curr_p <= 0:
-            curr_p = entry  # последний fallback — вход
-            logging.warning(f"⚠️ {sym}: curr_p fallback to entry {entry}")
+            curr_p = entry
+            logging.debug(f"⚠️ {sym}: curr_p=entry (ticker недоступен)")
 
         bybit_side = 'Buy' if is_long else 'Sell'
         # Нормализуем символ: Bybit может хранить как 'STORJUSDT' или 'STORJ/USDT'
