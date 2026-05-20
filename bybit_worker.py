@@ -146,8 +146,11 @@ async def execute_signal(signal: dict):
     if len(active_positions) >= MAX_POSITIONS:
         logging.info(f"⏸ {sym}: максимум позиций ({MAX_POSITIONS}) достигнут")
         return
-    if any(p['direction'] == mode for p in active_positions):
-        logging.info(f"⏸ {sym}: уже есть {mode} позиция")
+    # Разрешаем до MAX_POSITIONS позиций в одном направлении
+    # (MAX_POSITIONS=2: можно XMR Short + IMX Short одновременно)
+    same_dir = sum(1 for p in active_positions if p['direction'] == mode)
+    if same_dir >= MAX_POSITIONS:
+        logging.info(f"⏸ {sym}: лимит {mode} позиций ({same_dir}/{MAX_POSITIONS})")
         return
     # [FIX-3] Запрет противоположной позиции по тому же символу
     if any(p['symbol'] == sym and p['direction'] != mode for p in active_positions):
