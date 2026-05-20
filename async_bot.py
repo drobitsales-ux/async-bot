@@ -136,6 +136,7 @@ news_ts         = 0.0
 http            = None     # единая aiohttp.ClientSession
 circuit_open    = False    # [R-FIX-11] дневной DD-стоп
 _tg_offset      = 0        # Telegram getUpdates offset (персистентный)
+_sync_counter   = 0        # счётчик циклов до авто-синхронизации
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1536,7 +1537,7 @@ async def monitor_all():
                 datetime.now(timezone.utc)
                 - datetime.fromisoformat(pos['open_time'])
             ).total_seconds()
-            if seconds < 45:    # grace period для открытия
+            if seconds < 120:   # grace period: 2 мин чтобы BingX зарегистрировал позицию
                 return True
 
             exit_p = float(pos.get('current_sl', curr_p))
@@ -1780,6 +1781,56 @@ def run_health():
 # ═══════════════════════════════════════════════════════
 #  ГЛАВНЫЙ ЦИКЛ
 # ═══════════════════════════════════════════════════════
+async def sync_positions_with_exchange() -> int:
+    """
+    Синхронизирует локальный список позиций с реальными на BingX.
+    Удаляет ghost positions (закрытые вручную или по SL без уведомления).
+    Возвращает количество удалённых позиций.
+    """
+    global smc_positions, rsi_positions
+    removed = 0
+    try:
+        # Получаем все реально открытые позиции на BingX
+        real_positions = await exchange.fetch_positions()
+        # Множество символов с реально открытыми позициями
+        real_syms: set = set()
+        for rp in real_positions:
+            qty = abs(float(rp.get('contracts', 0) or 0))
+            if qty > 0:
+                real_syms.add(rp.get('symbol', ''))
+
+        logging.info(f'🔄 [SYNC] BingX реальных позиций: {len(real_syms)}: {real_syms}')
+
+        new_smc, new_rsi = [], []
+        for p in smc_positions:
+            sym = p['symbol']
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(p['open_time'])).total_seconds()
+            if sym in real_syms or age < 120:  # grace 120с для новых
+                new_smc.append(p)
+            else:
+                logging.warning(f'👻 [SYNC] SMC ghost удалена: {sym}')
+                removed += 1
+        for p in rsi_positions:
+            sym = p['symbol']
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(p['open_time'])).total_seconds()
+            if sym in real_syms or age < 120:
+                new_rsi.append(p)
+            else:
+                logging.warning(f'👻 [SYNC] RSI ghost удалена: {sym}')
+                removed += 1
+
+        smc_positions[:] = new_smc
+        rsi_positions[:] = new_rsi
+        save_all()
+        logging.info(f'✅ [SYNC] Удалено ghost: {removed} | '
+                     f'Осталось: SMC={len(smc_positions)} RSI={len(rsi_positions)}')
+    except Exception as e:
+        logging.error(f'❌ [SYNC] Ошибка синхронизации: {e}')
+    return removed
+
+
 async def check_tg_commands():
     """
     Обработка команд управления из Telegram группы.
@@ -1844,6 +1895,19 @@ async def check_tg_commands():
                 circuit_open = True
                 logging.info('⏸ [CMD] /stop — торговля остановлена вручную')
                 await tg('⏸ Торговля остановлена. /reset для возобновления.')
+
+            elif cmd == '/sync':
+                # Синхронизация локального списка позиций с реальными на BingX
+                # Используется когда позиция закрыта вручную на бирже
+                await tg('🔄 Синхронизация позиций с BingX...')
+                removed = await sync_positions_with_exchange()
+                all_pos = all_positions()
+                await tg(
+                    f'✅ <b>Синхронизация завершена</b>\n'
+                    f'Удалено ghost позиций: {removed}\n'
+                    f'Актуальных позиций: {len(all_pos)} '
+                    f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})'
+                )
 
     except asyncio.TimeoutError:
         pass  # таймаут — не критично
@@ -1932,6 +1996,17 @@ async def main():
 
                 # Мониторинг позиций
                 await monitor_all()
+
+                # Авто-синхронизация с BingX каждые 10 циклов (~10 мин)
+                global _sync_counter
+                _sync_counter += 1
+                if _sync_counter % 10 == 0 and all_positions():
+                    removed = await sync_positions_with_exchange()
+                    if removed > 0:
+                        await tg(
+                            f'👻 <b>Авто-синхронизация</b>: удалено {removed} ghost позиций\n'
+                            f'Проверьте биржу — возможно позиции закрыты вручную'
+                        )
 
                 # Сканеры (параллельно)
                 scan_t0 = time.time()
