@@ -517,12 +517,19 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         'You are a crypto futures risk manager specializing in SMC and RSI mean reversion. '
         'Evaluate this trade and respond ONLY with valid JSON: '
         '{"decision":"approve"|"reject","confidence":0-100,"comment":"brief reason"}. '
-        'IMPORTANT RULES: '
-        '1. BTC:Flat does NOT invalidate altcoin setups — evaluate the altcoin independently. '
-        '2. During altseason, long setups on altcoins are MORE valid even with BTC flat. '
-        '3. RSI below 25 = strong oversold → approve with confidence >= 65. '
-        '4. RSI above 75 = strong overbought → approve shorts with confidence >= 65. '
-        '5. Reject ONLY if: RSI is in neutral zone (35-65), OR MAE risk is extreme. '
+        'HARD RULES — proven losses when violated: '
+        'RULE 1 (SMC SHORT): RSI < 45 → REJECT. TIA(28)SL, XMR(30)SL, APE(32)SL, LINK(39)SL. '
+        'RULE 2 (SMC LONG): RSI > 55 → REJECT. Late entry into exhausted uptrend. '
+        'RULE 3 (RSI MR): volume > 3x → REJECT. NEAR(10.8x)SL, IMX(3.5x)SL, DASH(2.9x)SL. '
+        'RULE 4: Words oversold/overbought in SMC context = REJECT the trade. '
+        'High volume = momentum impulse, NOT mean reversion opportunity. '
+        'NEAR Vol=10.8x MFE=0.60%, IMX Vol=3.5x MFE=0.53%, DASH Vol=2.9x MFE=0.07%. '
+        'RULE 4 (RSI MR): If RSI > 88 → REJECT even if volume normal. '
+        'Extreme RSI values with any volume = strong momentum, not reversion. '
+        'SOFT RULES (use judgement): '
+        'BTC:Flat does NOT invalidate altcoin setups. '
+        'During altseason, long setups on altcoins are more valid. '
+        'RSI 40-60 neutral zone for SMC = valid structural trade. '
         f'Market context: BTC={btc_ctx_str}, {alt_ctx_str}. '
         f'Setup: {json.dumps(context)}'
     )
@@ -838,11 +845,27 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
             if conf == 0:
                 ok = False  # мусорный ответ
             elif strategy == 'SMC':
-                # XLM reject(80) → approve (conf 80 > 70, модель ошиблась с RSI)
-                # BCH approve(85) → approve (корректно)
+                # conf >= 70 или approve + conf >= 55 → одобряем
                 ok = conf >= 70 or (decision == 'approve' and conf >= 55)
+                # HARD OVERRIDE: если Groq видит RSI < 40 в comment → reject
+                comment_lower = comment.lower()
+                if ok and ('oversold' in comment_lower or
+                           'rsi' in comment_lower and
+                           any(w in comment_lower
+                               for w in ['below 40', 'below 35', 'below 30',
+                                         'extreme oversold', 'heavily oversold'])):
+                    if mode == 'Short':
+                        ok = False  # Groq сам говорит oversold для шорта → блок
             else:  # RSI
                 ok = decision == 'approve' and conf >= 55
+                # Для RSI: если Groq упоминает volume spike → reject
+                comment_lower = comment.lower()
+                if ok and any(w in comment_lower
+                              for w in ['high volume', 'volume spike',
+                                        'high volatility', 'momentum',
+                                        'strong overbought' if mode == 'Short'
+                                        else 'strong oversold']):
+                    pass  # высокая уверенность с этими факторами — ок
             verdict = 'APPROVE' if ok else 'REJECT'
             logging.info(
                 f'🧠 [GEMINI] {sym} {strategy} {mode} -> {verdict} '
@@ -924,7 +947,7 @@ async def smc_signal(sym: str):
         ohlcv = await exchange.fetch_ohlcv(sym, SMC_TF, limit=60)  # [PERF-3] 100→60
     except:
         return None, 'fetch_err'
-    if not ohlcv or len(ohlcv) < 55:
+    if not ohlcv or len(ohlcv) < 45:
         return None, 'no_data'
 
     c = np.array([float(x[4]) for x in ohlcv])
@@ -960,8 +983,17 @@ async def smc_signal(sym: str):
     if mode == 'Short' and price > vwap * 1.005:
         return None, 'vwap'
 
-    # RSI
+    # RSI — защита от входа в конце тренда
     rsi = calc_rsi(c[:-1])
+    # Short при RSI < 42 = актив перепродан, ловим конец движения
+    # RSI<42 блокирует: TIA(28) SL, APE(32) BE, XMR(30) SL, LINK(39) BE
+    # Пропускает: сделки с RSI 42-70 — нормальный рабочий диапазон для CHoCH
+    if mode == 'Short' and rsi < 45:  # [FIX] 42→45: TIA/APE/XMR/LINK все RSI<45
+        return None, 'rsi'
+    # Long при RSI > 55 = актив перекуплен, входим слишком поздно
+    if mode == 'Long'  and rsi > 55:  # [FIX] 58→55
+        return None, 'rsi'
+    # Крайние значения — однозначный запрет
     if mode == 'Long'  and rsi > 85:
         return None, 'rsi'
     if mode == 'Short' and rsi < 15:
@@ -1025,7 +1057,19 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     if avg_v <= 0:
         return None, 'vol'
     vol_ratio = float(v[-2]) / avg_v
-    if vol_ratio < 2.0 or vol_ratio > 12.0:  # [R-FIX-7] потолок 12x
+    # Минимальный объём для подтверждения сигнала
+    if vol_ratio < 2.0 or vol_ratio > 12.0:
+        return None, 'vol'
+    # Объём-фильтр для RSI Mean Reversion
+    # Vol>3.5x ВСЕГДА reject: NEAR 10.8x SL, IMX 3.5x SL
+    if vol_ratio > 3.5:
+        return None, 'vol'
+    # Vol>3x + SMA<8%: умеренный памп
+    if vol_ratio > 3.0 and abs(sma_dist) < 8.0:
+        return None, 'vol'
+    # Уровень 2: Vol>2.5x при SMA<5% = умеренный импульс, но опасно
+    # Цена ещё не достаточно отклонилась для надёжного разворота
+    if vol_ratio > 2.5 and abs(sma_dist) < 5.0:
         return None, 'vol'
 
     # RSI текущий и предыдущий (только закрытые свечи)
@@ -1116,8 +1160,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         # rsi_now < 25 уже подтверждает перепроданность — hook опциональный
         if rsi_now > rsi_prev + 2.0:  # RSI растёт быстро — не разворот
             return None, 'hook'
-        # [MOMENTUM-FILTER] RSI < 12 + Vol > 2.5x = дамп/импульс, не перепроданность
-        if rsi_now < 12 and vol_ratio > 2.5:
+        # [MOMENTUM-FILTER] Аномальный дамп — нельзя лонговать
+        if (rsi_now < 12 and vol_ratio > 2.5) or (rsi_now < 25 and vol_ratio > 3.0):
             return None, 'momentum'
         if sma_dist > 2.0 or sma_dist < -15.0:   # [FIX-SMA] смягчено: -1→+2%, -8→-15%
             return None, 'sma_range'
@@ -1138,9 +1182,10 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         # Hook: RSI в зоне ИЛИ разворачивается
         if rsi_now < rsi_prev - 2.0:  # RSI падает быстро — не разворот
             return None, 'hook'
-        # [MOMENTUM-FILTER] RSI > 88 + Vol > 2.5x = памп/импульс, не перекупленность
-        # DASH: RSI 92.3, Vol 2.9x, SMA+5.3% → MFE 0.07% (цена сразу вверх)
-        if rsi_now > 88 and vol_ratio > 2.5:
+        # [MOMENTUM-FILTER] Аномальный импульс — нельзя шортить
+        # Уровень 1: RSI>88 + Vol>2.5x (крайний памп) — DASH RSI 92, Vol 2.9x
+        # Уровень 2: RSI>75 + Vol>3.0x (сильный импульс) — NEAR RSI 75, Vol 10.8x
+        if (rsi_now > 88 and vol_ratio > 2.5) or (rsi_now > 75 and vol_ratio > 3.0):
             return None, 'momentum'
         if sma_dist < -2.0 or sma_dist > 15.0:  # [FIX-SMA] смягчено: 1→-2%, 8→15%
             return None, 'sma_range'
