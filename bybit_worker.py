@@ -349,14 +349,16 @@ async def monitor():
             (r for r in pos_raw
              if (r.get('symbol', '').replace('/', '').replace(':USDT','') == sym
                  or r.get('symbol', '') == sym)
-             and abs(float(r.get('contracts', 0))) > 0
+             and (abs(float(r.get('contracts', 0))) > 0
+                  or abs(float((r.get('info') or {}).get('size', 0))) > 0)  # info.size fallback
              and r.get('side', bybit_side) == bybit_side),
             None
         ) or next(
             (r for r in pos_raw
              if (r.get('symbol', '').replace('/', '').replace(':USDT','') == sym
                  or r.get('symbol', '') == sym)
-             and abs(float(r.get('contracts', 0))) > 0),
+             and (abs(float(r.get('contracts', 0))) > 0
+                  or abs(float((r.get('info') or {}).get('size', 0))) > 0)),
             None
         )
         if live:
