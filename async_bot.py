@@ -1116,12 +1116,16 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         # rsi_now < 25 уже подтверждает перепроданность — hook опциональный
         if rsi_now > rsi_prev + 2.0:  # RSI растёт быстро — не разворот
             return None, 'hook'
+        # [MOMENTUM-FILTER] RSI < 12 + Vol > 2.5x = дамп/импульс, не перепроданность
+        if rsi_now < 12 and vol_ratio > 2.5:
+            return None, 'momentum'
         if sma_dist > 2.0 or sma_dist < -15.0:   # [FIX-SMA] смягчено: -1→+2%, -8→-15%
             return None, 'sma_range'
         if vwap_dist > -1.2:              # должен быть под VWAP
             return None, 'vwap'
-        # [R-FIX-3] SL под минимумом последних 3 свечей + 1.5x ATR
-        raw_sl = float(np.min(l[-4:-1])) - atr * 1.5
+        # [DYNAMIC-ATR] SMA-dist > 4% = высокая волатильность → шире SL
+        atr_mult = 2.5 if abs(sma_dist) > 4.0 else 1.5
+        raw_sl = float(np.min(l[-4:-1])) - atr * atr_mult
         sl_pct = abs(price - raw_sl) / price * 100
         if sl_pct > MAX_SL_PCT:
             return None, 'sl_wide'
@@ -1134,12 +1138,17 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         # Hook: RSI в зоне ИЛИ разворачивается
         if rsi_now < rsi_prev - 2.0:  # RSI падает быстро — не разворот
             return None, 'hook'
+        # [MOMENTUM-FILTER] RSI > 88 + Vol > 2.5x = памп/импульс, не перекупленность
+        # DASH: RSI 92.3, Vol 2.9x, SMA+5.3% → MFE 0.07% (цена сразу вверх)
+        if rsi_now > 88 and vol_ratio > 2.5:
+            return None, 'momentum'
         if sma_dist < -2.0 or sma_dist > 15.0:  # [FIX-SMA] смягчено: 1→-2%, 8→15%
             return None, 'sma_range'
         if vwap_dist < 1.2:
             return None, 'vwap'
-        # [R-FIX-3] SL над максимумом + 1.5x ATR
-        raw_sl = float(np.max(h[-4:-1])) + atr * 1.5
+        # [DYNAMIC-ATR] SMA-dist > 4% = высокая волатильность → шире SL
+        atr_mult = 2.5 if abs(sma_dist) > 4.0 else 1.5
+        raw_sl = float(np.max(h[-4:-1])) + atr * atr_mult
         sl_pct = abs(raw_sl - price) / price * 100
         if sl_pct > MAX_SL_PCT:
             return None, 'sl_wide'
@@ -1706,8 +1715,8 @@ async def scan_rsi():
     ][:SCAN_LIMIT]
     sem  = asyncio.Semaphore(SCAN_SEM)
     st   = {k: 0 for k in ['news','vol','rsi_mid','trend','hook',
-                            'sma_range','vwap','sl_wide','squeeze',
-                            'no_pattern','ok']}
+                            'momentum','sma_range','vwap','sl_wide',
+                            'squeeze','no_pattern','ok']}
 
     async def check(sym):
         if sym in notified:
@@ -1731,9 +1740,9 @@ async def scan_rsi():
     logging.info(
         f"[RSI SCAN] BTC:{btc_ctx['btc_trend']} Alt:{btc_ctx['altseason']} | "
         f"total:{total_r} mid:{st['rsi_mid']} hook:{st['hook']} "
-        f"sma:{st['sma_range']} vwap:{st['vwap']} trend:{st['trend']} "
-        f"sl:{st['sl_wide']} sqz:{st['squeeze']} pat:{st['no_pattern']} "
-        f"→ ВХОДЫ:{st['ok']}"
+        f"mom:{st['momentum']} sma:{st['sma_range']} vwap:{st['vwap']} "
+        f"trend:{st['trend']} sl:{st['sl_wide']} sqz:{st['squeeze']} "
+        f"pat:{st['no_pattern']} → ВХОДЫ:{st['ok']}"
     )
 
 # ═══════════════════════════════════════════════════════
