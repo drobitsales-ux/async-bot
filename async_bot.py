@@ -321,15 +321,17 @@ def check_circuit_breaker() -> bool:
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════
 def is_session() -> bool:
-    """London 07:00–10:30 + NY 13:00–16:30 UTC."""
+    """
+    Расширенная сессия: 06:30 – 17:00 UTC (Киев 09:30 – 20:00).
+    Покрывает: Pre-London + London + London/NY overlap + NY.
+    Убран перерыв 10:30-13:00 — именно там происходит Pre-NY buildup
+    и профессионалы делают лучшие CHoCH/FVG сетапы.
+    Крипта 24/7 — форекс-перерывы не актуальны.
+    """
     t = datetime.now(timezone.utc).time()
-    return (
-        datetime.strptime("07:00", "%H:%M").time() <= t <=
-        datetime.strptime("10:30", "%H:%M").time()
-    ) or (
-        datetime.strptime("13:00", "%H:%M").time() <= t <=
-        datetime.strptime("16:30", "%H:%M").time()
-    )
+    session_start = datetime.strptime("06:30", "%H:%M").time()
+    session_end   = datetime.strptime("17:00", "%H:%M").time()
+    return session_start <= t <= session_end
 
 def is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
@@ -1039,7 +1041,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         return None, 'news'
 
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=100)  # было 250 → ускорение цикла
+        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)   # [PERF] 100→60, SMA60 достаточно
     except:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 45:  # limit=100, нужно минимум 45
@@ -1092,8 +1094,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
             tp_mult = 2.0
 
     # SMA200 и VWAP
-    # SMA100 вместо SMA200 (limit=100, больше данных нет)
-    sma200    = float(np.mean(c[-100:]))
+    # SMA60 (limit=60 свечей, достаточно для RSI MR)
+    sma200    = float(np.mean(c[-60:]))
     vwap      = calc_vwap(h, l, c, v)
     sma_dist  = (price - sma200) / sma200 * 100
     vwap_dist = (price - vwap) / vwap * 100
@@ -2062,7 +2064,7 @@ async def main():
         f"🟢 <b>Unified SMC+RSI Bot v10.0 PROP</b> запущен\n"
         f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  "
         f"Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
-        f"Сессии: London 07:00–10:30 | NY 13:00–16:30 UTC\n"
+        f"Сессия: 06:30–17:00 UTC (Киев 09:30–20:00)\n"
         f"Circuit breaker: при DD >{DAILY_DD_LIMIT*100:.1f}%/день"
     )
     logging.info("🚀 Unified SMC+RSI Bot v10.0 started")
