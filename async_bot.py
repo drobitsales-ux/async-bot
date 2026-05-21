@@ -1388,6 +1388,15 @@ async def execute(sym: str, sig: dict, strategy: str,
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
         'mae_price':   price,
+        # Контекст рынка для аналитики
+        'rsi_val':     round(float(sig.get('rsi', 0)), 1),
+        'vol_ratio':   round(float(sig.get('vol_ratio', 0)), 2),
+        'sma_dist':    round(float(sig.get('sma_dist', 0)), 2),
+        'vwap_dist':   round(float(sig.get('vwap_dist', 0)), 2),
+        'btc_trend':   str(sig.get('btc_trend', '')),
+        'ai_conf':     int(ai.get('conf', 0)),
+        'ai_comment':  str(ai.get('comment', '')).replace(',', ';')[:120],
+        'tp_mult':     float(sig.get('tp_mult', 1.5)),
     }
     pos_list.append(rec)
     daily_stats[f"{strategy.lower()}_trades"] = daily_stats.get(f"{strategy.lower()}_trades", 0) + 1
@@ -1506,6 +1515,10 @@ async def monitor_all():
                         sym, 'market', sl_side, real_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
+                    mfe_t = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+                    mae_t = abs(float(pos.get('mae_price', entry)) - entry) / entry * 100
+                    log_trade(pos, curr_p, pnl, 0.0, mfe_t, mae_t,
+                              int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ <b>[{strategy}] {sym}</b>: таймаут {dur_min:.0f}мин\n'
                         f'Закрыто рыночным | PnL: {pnl:+.2f}%'
@@ -1673,6 +1686,15 @@ async def monitor_all():
                 f"Вход: {entry:.6f} | Выход: {exit_p:.6f}\n"
                 f"День: {daily_stats['trades']} сделок | "
                 f"{daily_stats['wins']} побед | WR {winrate_d:.0f}%"
+            )
+            # Determine close reason
+            _close_reason = ('TP' if pos.get('tp50_hit') and pnl_pct >= 0.5
+                             else 'BE' if is_be
+                             else 'SL' if pnl_pct < 0
+                             else 'WIN')
+            log_trade(
+                pos, exit_p, pnl_pct, net_pnl,
+                mfe_pct, mae_pct, dur_min, _close_reason
             )
             save_all()
             notified[sym] = time.time()   # cooldown после закрытия
@@ -1939,6 +1961,147 @@ async def sync_positions_with_exchange() -> int:
     return removed
 
 
+# ═══════════════════════════════════════════════════════
+#  TRADE LOGGER — SQLite + CSV экспорт
+# ═══════════════════════════════════════════════════════
+TRADES_DB = '/tmp/trades.db'  # /tmp не чистится при рестарте на Render
+
+def _init_trades_db():
+    """Создаёт таблицу trades если не существует."""
+    con = sqlite3.connect(TRADES_DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            close_time  TEXT,
+            symbol      TEXT,
+            strategy    TEXT,
+            direction   TEXT,
+            close_reason TEXT,
+            entry_price REAL,
+            exit_price  REAL,
+            pnl_pct     REAL,
+            net_usdt    REAL,
+            mfe_pct     REAL,
+            mae_pct     REAL,
+            dur_min     INTEGER,
+            rsi_val     REAL,
+            vol_ratio   REAL,
+            sma_dist    REAL,
+            vwap_dist   REAL,
+            btc_trend   TEXT,
+            ai_conf     INTEGER,
+            ai_comment  TEXT,
+            tp_mult     REAL,
+            be_moved    INTEGER,
+            tp50_hit    INTEGER
+        )
+    """)
+    con.commit()
+    con.close()
+
+_init_trades_db()
+
+def log_trade(pos: dict, exit_p: float, pnl_pct: float,
+              net_usdt: float, mfe_pct: float, mae_pct: float,
+              dur_min: int, close_reason: str):
+    """
+    Логирует закрытую сделку в SQLite.
+    close_reason: 'SL' | 'TP' | 'BE' | 'Timeout' | 'Manual'
+    """
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute("""
+            INSERT INTO trades (
+                close_time, symbol, strategy, direction, close_reason,
+                entry_price, exit_price, pnl_pct, net_usdt,
+                mfe_pct, mae_pct, dur_min,
+                rsi_val, vol_ratio, sma_dist, vwap_dist, btc_trend,
+                ai_conf, ai_comment, tp_mult, be_moved, tp50_hit
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
+            pos.get('symbol', ''),
+            pos.get('strategy', ''),
+            pos.get('direction', ''),
+            close_reason,
+            round(float(pos.get('entry_price', 0)), 8),
+            round(exit_p, 8),
+            round(pnl_pct, 3),
+            round(net_usdt, 4),
+            round(mfe_pct, 3),
+            round(mae_pct, 3),
+            dur_min,
+            pos.get('rsi_val', 0),
+            pos.get('vol_ratio', 0),
+            pos.get('sma_dist', 0),
+            pos.get('vwap_dist', 0),
+            pos.get('btc_trend', ''),
+            pos.get('ai_conf', 0),
+            pos.get('ai_comment', ''),
+            pos.get('tp_mult', 1.5),
+            int(pos.get('be_moved', False)),
+            int(pos.get('tp50_hit', False)),
+        ))
+        con.commit()
+        con.close()
+        logging.info(f'📊 [LOG] {pos["symbol"]} {close_reason} {pnl_pct:+.2f}% записана')
+    except Exception as e:
+        logging.error(f'❌ [LOG] Ошибка записи сделки: {e}')
+
+def export_trades_csv() -> str:
+    """Экспортирует все сделки из SQLite в CSV строку."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        cur = con.execute('SELECT * FROM trades ORDER BY close_time DESC LIMIT 500')
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        con.close()
+        if not rows:
+            return 'Нет данных. Бот ещё не закрыл ни одной сделки.'
+        lines = [','.join(cols)]
+        for row in rows:
+            lines.append(','.join(str(v) for v in row))
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'Ошибка: {e}'
+
+def get_trades_stats() -> str:
+    """Быстрая статистика из БД для команды /stats."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        cur = con.execute("""
+            SELECT
+                COUNT(*) total,
+                SUM(CASE WHEN pnl_pct >= 0.5 OR tp50_hit=1 THEN 1 ELSE 0 END) wins,
+                ROUND(AVG(pnl_pct),2) avg_pnl,
+                ROUND(AVG(mfe_pct),2) avg_mfe,
+                ROUND(AVG(mae_pct),2) avg_mae,
+                ROUND(AVG(rsi_val),1) avg_rsi,
+                ROUND(AVG(vol_ratio),2) avg_vol,
+                ROUND(AVG(dur_min),0) avg_dur,
+                SUM(CASE WHEN strategy='SMC' THEN 1 ELSE 0 END) smc_cnt,
+                SUM(CASE WHEN strategy='RSI' THEN 1 ELSE 0 END) rsi_cnt,
+                SUM(CASE WHEN close_reason='SL' THEN 1 ELSE 0 END) sl_cnt,
+                SUM(CASE WHEN close_reason='Timeout' THEN 1 ELSE 0 END) timeout_cnt
+            FROM trades
+        """)
+        r = cur.fetchone()
+        con.close()
+        if not r or r[0] == 0:
+            return 'Нет данных'
+        total, wins = r[0], r[1]
+        wr = wins/total*100 if total else 0
+        return (
+            f'📊 <b>Статистика всех сделок</b>\n'
+            f'Всего: {total} | WR: {wr:.1f}% ({wins}/{total})\n'
+            f'Avg PnL: {r[2]:+.2f}% | MFE: {r[3]:.2f}% | MAE: {r[4]:.2f}%\n'
+            f'Avg RSI: {r[5]} | Vol: {r[6]}x | Dur: {r[7]:.0f}мин\n'
+            f'SMC: {r[8]} | RSI: {r[9]} | SL: {r[10]} | Timeout: {r[11]}'
+        )
+    except Exception as e:
+        return f'Ошибка: {e}'
+
+
 async def check_tg_commands():
     """
     Обработка команд управления из Telegram группы.
@@ -1996,13 +2159,35 @@ async def check_tg_commands():
                     f'(лимит: {DAILY_DD_LIMIT*100:.1f}%)\n'
                     f'Позиций: {len(all_pos)} '
                     f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
-                    f'Баланс: проверьте на бирже'
+                    f'Баланс: проверьте на бирже\n'
+                    f'БД сделок: /stats | CSV: /csv'
                 )
 
             elif cmd == '/stop':
                 circuit_open = True
                 logging.info('⏸ [CMD] /stop — торговля остановлена вручную')
                 await tg('⏸ Торговля остановлена. /reset для возобновления.')
+
+            elif cmd == '/csv':
+                # Экспорт всех сделок в CSV для анализа
+                csv_data = export_trades_csv()
+                # Telegram лимит 4096 символов — отправляем частями
+                if len(csv_data) <= 4000:
+                    await tg(f'📊 <b>Все сделки (CSV):</b>\n<code>{csv_data}</code>')
+                else:
+                    # Первые 30 строк
+                    lines_csv = csv_data.split('\n')
+                    header = lines_csv[0]
+                    recent = '\n'.join([header] + lines_csv[1:31])
+                    await tg(
+                        f'📊 <b>Последние 30 сделок (CSV):</b>\n'
+                        f'<code>{recent}</code>\n'
+                        f'Всего строк: {len(lines_csv)-1}'
+                    )
+
+            elif cmd == '/stats':
+                stats_text = get_trades_stats()
+                await tg(stats_text)
 
             elif cmd == '/sync':
                 # Синхронизация локального списка позиций с реальными на BingX
