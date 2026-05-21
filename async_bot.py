@@ -8,7 +8,7 @@
 ║  [RSI]  Mean Reversion — RSI Extreme + Pattern + SMA/VWAP Magnet    ║
 ║                                                                      ║
 ║  ИСПРАВЛЕНИЯ vs RSI bot v8.30:                                       ║
-║  [R-FIX-1]  BASE_RISK 1% → 0.75% | MAX_SL 4.5% → 2.5%             ║
+║  [R-FIX-1]  BASE_RISK 2% → 0.75% | MAX_SL 4.5% → 2.5%             ║
 ║  [R-FIX-2]  MAX_POSITIONS 3 → 3 shared (SMC+RSI budget)            ║
 ║  [R-FIX-3]  SL = min(l) - ATR*3.0 → ATR*1.5 (tight + safe)        ║
 ║  [R-FIX-4]  RSI thresholds 28/72 → 25/75 (cleaner signals)         ║
@@ -107,8 +107,8 @@ SMC_PIVOT_ORDER = 5
 
 # ── RSI-параметры ───────────────────────────────────────
 RSI_TF          = '15m'
-RSI_LONG_MAX    = 27    # [P-5] чуть шире — 25 давал 0 сигналов в логах
-RSI_SHORT_MIN   = 73    # [P-5] симметрично
+RSI_LONG_MAX    = 30    # [FIX] 27→30: на 15m RSI<27 почти недостижимо в логах
+RSI_SHORT_MIN   = 70    # [FIX] 73→70: симметрично
 RSI_PERIOD      = 14
 
 # ── Исключения (части имён символов) ───────────────────
@@ -520,10 +520,11 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         'Evaluate this trade and respond ONLY with valid JSON: '
         '{"decision":"approve"|"reject","confidence":0-100,"comment":"brief reason"}. '
         'HARD RULES — proven losses when violated: '
-        'RULE 1 (SMC SHORT): RSI < 45 → REJECT. TIA(28)SL, XMR(30)SL, APE(32)SL, LINK(39)SL. '
-        'RULE 2 (SMC LONG): RSI > 55 → REJECT. Late entry into exhausted uptrend. '
-        'RULE 3 (RSI MR): volume > 3x → REJECT. NEAR(10.8x)SL, IMX(3.5x)SL, DASH(2.9x)SL. '
-        'RULE 4: Words oversold/overbought in SMC context = REJECT the trade. '
+        'RULE 1 (SMC SHORT): RSI < 32 → REJECT. TIA(28)SL, XMR(30)SL at absolute floor. '
+        'IMPORTANT: RSI 32-45 after CHoCH is NORMAL — the bearish candle pulls RSI down naturally. Do NOT reject RSI 32-45 for SMC. '
+        'RULE 2 (SMC LONG): RSI > 68 → REJECT. Overbought late entry. '
+        'RULE 3 (RSI MR): volume > 3.5x AND sma_dist < 3.5% → REJECT (trend impulse, not MR). '
+        'RULE 4: volume > 3.5x AND sma_dist > 3.5% → consider APPROVE (blow-off top exhaustion). '
         'High volume = momentum impulse, NOT mean reversion opportunity. '
         'NEAR Vol=10.8x MFE=0.60%, IMX Vol=3.5x MFE=0.53%, DASH Vol=2.9x MFE=0.07%. '
         'RULE 4 (RSI MR): If RSI > 88 → REJECT even if volume normal. '
@@ -990,10 +991,10 @@ async def smc_signal(sym: str):
     # Short при RSI < 42 = актив перепродан, ловим конец движения
     # RSI<42 блокирует: TIA(28) SL, APE(32) BE, XMR(30) SL, LINK(39) BE
     # Пропускает: сделки с RSI 42-70 — нормальный рабочий диапазон для CHoCH
-    if mode == 'Short' and rsi < 45:  # [FIX] 42→45: TIA/APE/XMR/LINK все RSI<45
+    if mode == 'Short' and rsi < 32:  # [FIX] 45→32: CHoCH само тянет RSI вниз
         return None, 'rsi'
     # Long при RSI > 55 = актив перекуплен, входим слишком поздно
-    if mode == 'Long'  and rsi > 55:  # [FIX] 58→55
+    if mode == 'Long'  and rsi > 68:  # [FIX] 55→68
         return None, 'rsi'
     # Крайние значения — однозначный запрет
     if mode == 'Long'  and rsi > 85:
@@ -1063,11 +1064,10 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     if vol_ratio < 2.0 or vol_ratio > 12.0:
         return None, 'vol'
     # Объём-фильтр для RSI Mean Reversion
-    # Vol>3.5x ВСЕГДА reject (до вычисления SMA — sma_dist не нужен)
-    # NEAR 10.8x SL, IMX 3.5x SL — памп, не MR возможность
-    if vol_ratio > 3.5:
-        return None, 'vol'
-    # Остальные vol-фильтры с sma_dist — перенесены ПОСЛЕ блока SMA200 (строка ~78)
+    # Vol>3.5x — предварительная проверка (sma_dist пока не вычислен)
+    # Если Vol очень высокий — ставим флаг, финальное решение после SMA
+    _high_vol = vol_ratio > 3.5  # флаг: финальная проверка с SMA ниже
+    # Остальные vol-фильтры с sma_dist — после блока SMA200
 
     # RSI текущий и предыдущий (только закрытые свечи)
     rsi_now  = calc_rsi(c[:-1],  RSI_PERIOD)
@@ -1100,7 +1100,12 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     sma_dist  = (price - sma200) / sma200 * 100
     vwap_dist = (price - vwap) / vwap * 100
 
-    # Vol-фильтры с sma_dist (перенесены сюда — после вычисления sma_dist)
+    # Vol-фильтры с sma_dist (после вычисления sma_dist)
+    # УМНЫЙ Vol>3.5x: блокируем только если цена НЕ оторвалась достаточно
+    # Vol>3.5 + SMA<3.5% = памп без растяжения → reject
+    # Vol>3.5 + SMA>3.5% = кульминация покупок (blow-off) → можно MR
+    if _high_vol and abs(sma_dist) < 3.5:
+        return None, 'vol'
     # Vol>3x + SMA<8%: умеренный памп без достаточного растяжения
     if vol_ratio > 3.0 and abs(sma_dist) < 8.0:
         return None, 'vol'
