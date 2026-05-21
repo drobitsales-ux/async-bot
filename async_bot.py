@@ -8,7 +8,7 @@
 ║  [RSI]  Mean Reversion — RSI Extreme + Pattern + SMA/VWAP Magnet    ║
 ║                                                                      ║
 ║  ИСПРАВЛЕНИЯ vs RSI bot v8.30:                                       ║
-║  [R-FIX-1]  BASE_RISK 2% → 0.75% | MAX_SL 4.5% → 2.5%             ║
+║  [R-FIX-1]  BASE_RISK 1% → 0.75% | MAX_SL 4.5% → 2.5%             ║
 ║  [R-FIX-2]  MAX_POSITIONS 3 → 3 shared (SMC+RSI budget)            ║
 ║  [R-FIX-3]  SL = min(l) - ATR*3.0 → ATR*1.5 (tight + safe)        ║
 ║  [R-FIX-4]  RSI thresholds 28/72 → 25/75 (cleaner signals)         ║
@@ -77,7 +77,7 @@ GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
-RISK_PER_TRADE   = 0.02     # [USER] 2% на сделку (тест; для проп → 0.0075)
+RISK_PER_TRADE   = 0.01     # [USER] 1% на сделку (тест; для проп → 0.0075)
 RISK_WEEKEND     = 0.01     # [USER] 1% в выходные (тест; для проп → 0.00375)
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
