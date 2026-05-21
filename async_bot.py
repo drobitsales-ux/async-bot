@@ -1061,16 +1061,11 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     if vol_ratio < 2.0 or vol_ratio > 12.0:
         return None, 'vol'
     # Объём-фильтр для RSI Mean Reversion
-    # Vol>3.5x ВСЕГДА reject: NEAR 10.8x SL, IMX 3.5x SL
+    # Vol>3.5x ВСЕГДА reject (до вычисления SMA — sma_dist не нужен)
+    # NEAR 10.8x SL, IMX 3.5x SL — памп, не MR возможность
     if vol_ratio > 3.5:
         return None, 'vol'
-    # Vol>3x + SMA<8%: умеренный памп
-    if vol_ratio > 3.0 and abs(sma_dist) < 8.0:
-        return None, 'vol'
-    # Уровень 2: Vol>2.5x при SMA<5% = умеренный импульс, но опасно
-    # Цена ещё не достаточно отклонилась для надёжного разворота
-    if vol_ratio > 2.5 and abs(sma_dist) < 5.0:
-        return None, 'vol'
+    # Остальные vol-фильтры с sma_dist — перенесены ПОСЛЕ блока SMA200 (строка ~78)
 
     # RSI текущий и предыдущий (только закрытые свечи)
     rsi_now  = calc_rsi(c[:-1],  RSI_PERIOD)
@@ -1102,6 +1097,14 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     vwap      = calc_vwap(h, l, c, v)
     sma_dist  = (price - sma200) / sma200 * 100
     vwap_dist = (price - vwap) / vwap * 100
+
+    # Vol-фильтры с sma_dist (перенесены сюда — после вычисления sma_dist)
+    # Vol>3x + SMA<8%: умеренный памп без достаточного растяжения
+    if vol_ratio > 3.0 and abs(sma_dist) < 8.0:
+        return None, 'vol'
+    # Vol>2.5x + SMA<5%: опасно, цена не отклонилась достаточно для разворота
+    if vol_ratio > 2.5 and abs(sma_dist) < 5.0:
+        return None, 'vol'
 
     # Свечной паттерн ([-2] — последняя закрытая)
     c3, o3 = float(c[-3]), float(o[-3])
