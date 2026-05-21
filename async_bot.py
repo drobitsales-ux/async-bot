@@ -981,9 +981,15 @@ async def smc_signal(sym: str):
 
     # VWAP
     vwap = calc_vwap(h, l, c, v)
-    if mode == 'Long'  and price < vwap * 0.995:
+    # VWAP — Premium/Discount зоны (логика SMC, не тренд-следование)
+    # SMC шортит из Premium зоны (выше VWAP) → цена возвращается к VWAP
+    # SMC лонгует из Discount зоны (ниже VWAP) → цена возвращается к VWAP
+    #
+    # ЗАПРЕЩАЕМ: Long если цена уже высоко над VWAP (перегрета, покупаем на хае)
+    if mode == 'Long'  and price > vwap * 1.005:
         return None, 'vwap'
-    if mode == 'Short' and price > vwap * 1.005:
+    # ЗАПРЕЩАЕМ: Short если цена уже глубоко под VWAP (перепродана, шортим на дне)
+    if mode == 'Short' and price < vwap * 0.995:
         return None, 'vwap'
 
     # RSI — защита от входа в конце тренда
