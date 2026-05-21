@@ -1706,8 +1706,9 @@ async def get_tickers_cached() -> dict:
 async def scan_smc():
     """Сканер SMC: запускается каждые 60 сек в торговые сессии."""
     if not is_session():
-        return
+        return  # вне торговой сессии — молчим
     if not check_circuit_breaker():
+        logging.debug('[SMC] Circuit breaker активен — скан пропущен')
         return
 
     markets = await get_markets()
@@ -1728,13 +1729,17 @@ async def scan_smc():
     async def check(sym):
         if sym in notified:
             return
-        async with sem:
-            sig, reason = await smc_signal(sym)
-        st[reason] = st.get(reason, 0) + 1
-        if sig:
-            notified[sym] = time.time()
-            await execute(sym, sig, 'SMC', smc_positions,
-                          f"RSI: {sig['rsi']:.1f}")
+        try:
+            async with sem:
+                sig, reason = await smc_signal(sym)
+            st[reason] = st.get(reason, 0) + 1
+            if sig:
+                notified[sym] = time.time()
+                await execute(sym, sig, 'SMC', smc_positions,
+                              f"RSI: {sig['rsi']:.1f}")
+        except Exception as _e:
+            logging.warning(f'[SMC] {sym} error: {_e}')
+            st['error'] = st.get('error', 0) + 1
 
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
@@ -1746,6 +1751,7 @@ async def scan_smc():
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
     if not check_circuit_breaker():
+        logging.debug('[RSI] Circuit breaker активен — скан пропущен')
         return
 
     markets   = await get_markets()
@@ -1766,19 +1772,23 @@ async def scan_rsi():
     async def check(sym):
         if sym in notified:
             return
-        # Быстрый pre-фильтр по тикеру (спред)
-        async with sem:
-            sig, reason = await rsi_signal(sym, btc_ctx)
-        st[reason] = st.get(reason, 0) + 1
-        if sig:
-            notified[sym] = time.time()
-            extra = (
-                f"RSI: {sig['rsi']:.1f}→{sig['rsi_prev']:.1f}  "
-                f"Vol: {sig['vol_ratio']:.1f}x  "
-                f"SMA-dist: {sig['sma_dist']:+.1f}%  "
-                f"TP-mult: {sig['tp_mult']}x"
-            )
-            await execute(sym, sig, 'RSI', rsi_positions, extra)
+        try:
+            # Быстрый pre-фильтр по тикеру (спред)
+            async with sem:
+                sig, reason = await rsi_signal(sym, btc_ctx)
+            st[reason] = st.get(reason, 0) + 1
+            if sig:
+                notified[sym] = time.time()
+                extra = (
+                    f"RSI: {sig['rsi']:.1f}→{sig['rsi_prev']:.1f}  "
+                    f"Vol: {sig['vol_ratio']:.1f}x  "
+                    f"SMA-dist: {sig['sma_dist']:+.1f}%  "
+                    f"TP-mult: {sig['tp_mult']}x"
+                )
+                await execute(sym, sig, 'RSI', rsi_positions, extra)
+        except Exception as _e:
+            logging.warning(f'[RSI] {sym} error: {_e}')
+            st['error'] = st.get('error', 0) + 1
 
     await asyncio.gather(*[check(s) for s in scan])
     total_r = sum(st.values())
@@ -2103,16 +2113,23 @@ async def main():
 
                 # Сканеры (параллельно)
                 scan_t0 = time.time()
-                await asyncio.gather(
+                results = await asyncio.gather(
                     scan_smc(),
                     scan_rsi(),
                     return_exceptions=True
                 )
+                # Логируем исключения из сканеров (ранее проглатывались молча)
+                for _i, _r in enumerate(results):
+                    if isinstance(_r, Exception):
+                        _name = ['scan_smc', 'scan_rsi'][_i]
+                        logging.error(f'❌ {_name} exception: {_r}', exc_info=_r)
                 scan_elapsed = time.time() - scan_t0
+                cb_status = '🔴CB' if circuit_open else ''
+                sess_status = '🟢сессия' if is_session() else '⏸вне'
                 logging.info(
                     f'⏱ Цикл #{cycle} завершён за {scan_elapsed:.1f}с | '
                     f'SMC:{len(smc_positions)} RSI:{len(rsi_positions)} поз | '
-                    f'Кэш Gemini: {len(_gemini_cache)} записей'
+                    f'{sess_status} {cb_status}'
                 )
 
             except Exception as e:
