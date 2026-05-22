@@ -52,6 +52,7 @@ PROP_BALANCE   = float(os.getenv('PROP_BALANCE', '100'))
 RISK_PER_TRADE = float(os.getenv('RISK_PCT', '0.02'))   # 2% для теста $100
 LEVERAGE       = int(os.getenv('LEVERAGE', '5'))
 MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
+MAX_TRADE_MIN  = int(os.getenv('MAX_TRADE_MIN', '160'))  # таймаут сделки (Render env)
 DAILY_DD_LIMIT = float(os.getenv('DAILY_DD', '0.025'))
 MIN_SL_PCT     = 1.0
 MAX_SL_PCT     = 2.5
@@ -394,6 +395,31 @@ async def monitor():
             pnl = ((curr_p - entry) / entry * 100 if is_long
                    else (entry - curr_p) / entry * 100)
 
+            secs = time.time() - pos['open_time']
+
+            # ── Таймаут живой позиции (синхронизация с BingX) ──
+            if secs > MAX_TRADE_MIN * 60:
+                logging.warning(
+                    f'⏰ [{pos.get("strategy","?")}] {sym}: '
+                    f'таймаут {secs/60:.0f}мин/{MAX_TRADE_MIN}мин '
+                    f'pnl={pnl:+.2f}% — принудительное закрытие'
+                )
+                try:
+                    order_s = 'sell' if is_long else 'buy'
+                    await exchange.create_order(
+                        sym, 'market', order_s, real_qty,
+                        params={'category':'linear','positionIdx':0,'reduceOnly':True}
+                    )
+                    await tg(
+                        f'⏰ <b>[{pos.get("strategy","?")}] {sym}</b>: '
+                        f'таймаут {secs/60:.0f}мин\n'
+                        f'Закрыта | PnL: {pnl:+.2f}%'
+                    )
+                except Exception as _te:
+                    logging.error(f'⏰ {sym} timeout-close: {_te}')
+                    await tg(f'❌ <b>{sym}</b>: ошибка таймаута! Закройте вручную.')
+                continue  # удалить из списка
+
             # Ghost position guard
             if real_qty * curr_p < 1.0 and real_qty > 0:
                 logging.warning(f"👻 {sym}: ghost position ${real_qty*curr_p:.4f} — force close")
@@ -426,9 +452,26 @@ async def monitor():
         else:
             # Позиция закрыта
             secs = time.time() - pos['open_time']
-            if secs < 180:   # grace 180с (запас на регистрацию в Bybit)
-                logging.info(f"⏳ {sym}: grace {secs:.0f}с/180с — позиция не найдена, ждём")
+            if secs < 180:
+                logging.info(f"⏳ {sym}: grace {secs:.0f}с/180с — ждём")
                 new_positions.append(pos)
+                continue
+
+            # Если не найдена И таймаут → принудительно закрыть
+            if secs > MAX_TRADE_MIN * 60:
+                logging.warning(f'⏰ {sym}: не найдена + таймаут {secs/60:.0f}мин — force close')
+                try:
+                    order_st = 'sell' if pos.get('direction')=='Long' else 'buy'
+                    qty_st = float(pos.get('qty', pos.get('initial_qty', 0)))
+                    if qty_st > 0:
+                        await exchange.create_order(
+                            sym, 'market', order_st, qty_st,
+                            params={'category':'linear','positionIdx':0,'reduceOnly':True}
+                        )
+                    await tg(f'⏰ <b>{sym}</b>: таймаут, позиция закрыта принудительно')
+                except Exception as _nte:
+                    logging.error(f'⏰ not-live timeout {sym}: {_nte}')
+                    await tg(f'❌ <b>{sym}</b>: не найдена + таймаут! Проверьте Bybit.')
                 continue
 
             # Пробуем ещё раз получить реальную цену выхода через trades
@@ -543,6 +586,7 @@ async def main():
     logging.info("🚀 Bybit Worker v2.0 UTA запущен")
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
+    logging.info(f"   Таймаут сделок: {MAX_TRADE_MIN}мин (env: MAX_TRADE_MIN)")
 
     await tg(
         f"🟢 <b>Bybit Worker v2.0 UTA</b> запущен\n"
