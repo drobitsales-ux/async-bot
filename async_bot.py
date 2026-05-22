@@ -1113,10 +1113,10 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     if _high_vol and abs(sma_dist) < 3.5:
         return None, 'vol'
     # Vol>3x + SMA<8%: умеренный памп без достаточного растяжения
-    if vol_ratio > 3.0 and abs(sma_dist) < 8.0:
+    if vol_ratio > 3.0 and abs(sma_dist) < 4.0:  # [AUDIT]
         return None, 'vol'
     # Vol>2.5x + SMA<5%: опасно, цена не отклонилась достаточно для разворота
-    if vol_ratio > 2.5 and abs(sma_dist) < 5.0:
+    if vol_ratio > 2.5 and abs(sma_dist) < 3.0:  # [AUDIT]
         return None, 'vol'
 
     # Свечной паттерн ([-2] — последняя закрытая)
@@ -1174,7 +1174,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
             return None, 'trend'
         # Hook: RSI в зоне ИЛИ разворачивается (допуск 2.0 пункта)
         # rsi_now < 25 уже подтверждает перепроданность — hook опциональный
-        if rsi_now > rsi_prev + 2.0:  # RSI растёт быстро — не разворот
+        if rsi_now > rsi_prev + 3.5:  # RSI растёт быстро — не разворот
             return None, 'hook'
         # [MOMENTUM-FILTER] Аномальный дамп — нельзя лонговать
         if (rsi_now < 12 and vol_ratio > 2.5) or (rsi_now < 25 and vol_ratio > 3.0):
@@ -1196,7 +1196,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         if btc_trend == 'Long' or altseason:
             return None, 'trend'
         # Hook: RSI в зоне ИЛИ разворачивается
-        if rsi_now < rsi_prev - 2.0:  # RSI падает быстро — не разворот
+        if rsi_now < rsi_prev - 3.5:  # RSI падает быстро — не разворот
             return None, 'hook'
         # [MOMENTUM-FILTER] Аномальный импульс — нельзя шортить
         # Уровень 1: RSI>88 + Vol>2.5x (крайний памп) — DASH RSI 92, Vol 2.9x
@@ -1227,6 +1227,18 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     sl_dist = abs(price - sl)
     tp = price + sl_dist * tp_mult if mode == 'Long' else price - sl_dist * tp_mult
 
+    # 1h RSI confirmation
+    htf_rsi, htf_confirmed = rsi_now, False
+    try:
+        _htf = await exchange.fetch_ohlcv(sym, '1h', limit=20)
+        if _htf and len(_htf) >= 16:
+            htf_rsi = calc_rsi(np.array([float(x[4]) for x in _htf])[:-1], RSI_PERIOD)
+            htf_confirmed = (mode=='Long' and htf_rsi<35) or (mode=='Short' and htf_rsi>65)
+    except: pass
+    if htf_confirmed:
+        tp_mult = min(tp_mult + 0.5, 3.0)
+        tp = price + sl_dist * tp_mult if mode == 'Long' else price - sl_dist * tp_mult
+
     # Funding rate — защита от шорт-сквиза
     try:
         fr = await exchange.fetch_funding_rate(sym)
@@ -1243,8 +1255,8 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         'vol_ratio': vol_ratio, 'sma_dist': sma_dist,
         'vwap_dist': vwap_dist, 'tp_mult': tp_mult,
         'btc_trend': btc_trend, 'altseason': altseason,
-        'funding': funding,
-        'bingx_vol': float(v[-2]) * price,  # USD объём закрытой свечи
+        'htf_rsi': round(htf_rsi, 1), 'htf_confirmed': htf_confirmed,
+        'funding': funding, 'bingx_vol': float(v[-2]) * price,  # USD объём закрытой свечи
     }, 'ok'
 
 # ═══════════════════════════════════════════════════════
@@ -1332,11 +1344,11 @@ async def execute(sym: str, sig: dict, strategy: str,
     ai = await oracle_ai(sym, strategy, mode, price, extra_ctx)
     if not ai['ok']:
         thr = 70 if strategy == 'SMC' else 55
-        logging.info(
-            f"[{strategy}] {sym}: AI reject "
-            f"(conf={ai['conf']}/{thr} | {ai['comment']})"
-        )
-        return
+        if strategy == 'SMC' and ai['conf'] >= 30:
+            logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — CHoCH приоритет")
+        else:
+            logging.info(f"[{strategy}] {sym}: AI reject (conf={ai['conf']}/{thr})")
+            return
 
     # Баланс
     try:
