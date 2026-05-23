@@ -137,8 +137,9 @@ markets_ts      = 0.0
 news_ts         = 0.0
 http            = None     # единая aiohttp.ClientSession
 circuit_open    = False    # [R-FIX-11] дневной DD-стоп
-_tg_offset      = 0        # Telegram getUpdates offset (персистентный)
-_sync_counter   = 0        # счётчик циклов до авто-синхронизации
+_tg_offset         = 0     # Telegram getUpdates offset
+_sync_counter      = 0     # счётчик до авто-синхронизации
+_daily_report_sent = False  # флаг отчёта сегодня (19:00 UTC)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1853,34 +1854,46 @@ async def scan_rsi():
 # ═══════════════════════════════════════════════════════
 #  ЕЖЕДНЕВНЫЙ ОТЧЁТ + СБРОС СТАТИСТИКИ
 # ═══════════════════════════════════════════════════════
+async def send_daily_report():
+    """Отправляет итоги дня в Telegram. Вызывается в 22:00 Киев (19:00 UTC)."""
+    global _daily_report_sent
+    if _daily_report_sent:
+        return
+    _daily_report_sent = True
+
+    trades = daily_stats.get('trades', 0)
+    wins   = daily_stats.get('wins', 0)
+    wrate  = wins / trades * 100 if trades > 0 else 0
+
+    try:
+        bal = await exchange.fetch_balance()
+        bal_usdt = float(bal.get('USDT', {}).get('total', 0))
+    except:
+        bal_usdt = daily_stats.get('start_balance', 0)
+
+    start    = daily_stats.get('start_balance', 0)
+    day_pct  = (bal_usdt - start) / start * 100 if start > 0 else 0
+    day_usdt = bal_usdt - start
+
+    await tg(
+        f"📊 <b>BingX — Итоги дня {daily_stats.get('stat_date', '')} 22:00</b>\n"
+        f"Сделок: {trades} | WR: {wrate:.1f}% ({wins}/{trades})\n"
+        f"SMC: {daily_stats.get('smc_trades',0)} | RSI: {daily_stats.get('rsi_trades',0)} | "
+        f"BE: {daily_stats.get('be_closes',0)}\n"
+        f"PnL: <code>{day_pct:+.2f}%</code> | <code>{day_usdt:+.2f} USDT</code>\n"
+        f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
+    )
+    logging.info(f"📊 Итоги дня BingX отправлены: {day_pct:+.2f}% ({day_usdt:+.2f} USDT)")
+
+
 async def daily_reset():
     global daily_stats, circuit_open
     today = datetime.now(timezone.utc).date()
     if daily_stats.get('stat_date') == today:
         return
 
-    if daily_stats.get('stat_date'):
-        trades = daily_stats['trades']
-        wins   = daily_stats['wins']
-        wrate  = wins / trades * 100 if trades > 0 else 0
-
-        try:
-            bal = await exchange.fetch_balance()
-            bal_usdt = float(bal.get('USDT', {}).get('total', 0))
-        except:
-            bal_usdt = daily_stats['start_balance']
-
-        start = daily_stats['start_balance']
-        day_pct = (bal_usdt - start) / start * 100 if start > 0 else 0
-
-        await tg(
-            f"📊 <b>Итоги дня {daily_stats['stat_date']}</b>\n"
-            f"Сделок: {trades}  WR: {wrate:.1f}% (реальн.)  "
-            f"BE: {daily_stats.get('be_closes',0)}  "
-            f"SMC: {daily_stats.get('smc_trades',0)}  RSI: {daily_stats.get('rsi_trades',0)}\n"
-            f"PnL: <code>{day_pct:+.2f}%</code>  "
-            f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
-        )
+    # Отчёт отправляется отдельно в 22:00 Киев через send_daily_report()
+    pass  # сброс stats происходит ниже
 
     # Сброс
     try:
@@ -1895,6 +1908,7 @@ async def daily_reset():
         'smc_trades': 0, 'rsi_trades': 0,
     }
     circuit_open = False
+    _daily_report_sent = False  # сброс флага на новый день
     save_all()
     logging.info(f"📅 Daily stats reset for {today}")
 
@@ -2309,6 +2323,11 @@ async def main():
                                if now_t - ts > VOL_CACHE_TTL]
                 for k in vol_expired:
                     del _vol_cache[k]
+
+                # Итоги дня в 22:00 Киев (19:00 UTC)
+                _now_utc = datetime.now(timezone.utc)
+                if _now_utc.hour == 19 and _now_utc.minute < 2:
+                    await send_daily_report()
 
                 # Мониторинг позиций
                 await monitor_all()
