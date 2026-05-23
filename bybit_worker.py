@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
@@ -52,7 +53,8 @@ PROP_BALANCE   = float(os.getenv('PROP_BALANCE', '100'))
 RISK_PER_TRADE = float(os.getenv('RISK_PCT', '0.02'))   # 2% для теста $100
 LEVERAGE       = int(os.getenv('LEVERAGE', '5'))
 MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
-MAX_TRADE_MIN  = int(os.getenv('MAX_TRADE_MIN', '160'))  # таймаут сделки (Render env)
+MAX_TRADE_MIN_SMC = int(os.getenv('MAX_TRADE_MIN_SMC', '120'))  # таймаут SMC
+MAX_TRADE_MIN_RSI = int(os.getenv('MAX_TRADE_MIN_RSI', '150'))  # таймаут RSI
 DAILY_DD_LIMIT = float(os.getenv('DAILY_DD', '0.025'))
 MIN_SL_PCT     = 1.0
 MAX_SL_PCT     = 2.5
@@ -75,8 +77,13 @@ exchange = ccxt_async.bybit({
 # ── Состояние ────────────────────────────────────────────
 active_positions = []
 daily_pnl_pct    = 0.0
+daily_pnl_usdt   = 0.0
+daily_trades     = 0
+daily_wins       = 0
+day_start_bal    = 0.0
 day_start_time   = time.time()
 circuit_open     = False
+_daily_report_sent = False
 http_session     = None
 _signal_queue: asyncio.Queue = None
 
@@ -100,11 +107,15 @@ async def tg(text: str):
 #  CIRCUIT BREAKER
 # ══════════════════════════════════════════════════════════
 def check_daily_reset():
-    global daily_pnl_pct, day_start_time, circuit_open
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, day_start_time, circuit_open, _daily_report_sent
     if time.time() - day_start_time > 86400:
         daily_pnl_pct  = 0.0
+        daily_pnl_usdt = 0.0
+        daily_trades   = 0
+        daily_wins     = 0
         day_start_time = time.time()
         circuit_open   = False
+        _daily_report_sent = False
         logging.info("📅 Daily stats reset")
 
 def is_trading_allowed() -> bool:
@@ -398,10 +409,11 @@ async def monitor():
             secs = time.time() - pos['open_time']
 
             # ── Таймаут живой позиции (синхронизация с BingX) ──
-            if secs > MAX_TRADE_MIN * 60:
+            _mx = MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC' else MAX_TRADE_MIN_RSI
+            if secs > _mx * 60:
                 logging.warning(
                     f'⏰ [{pos.get("strategy","?")}] {sym}: '
-                    f'таймаут {secs/60:.0f}мин/{MAX_TRADE_MIN}мин '
+                    f'таймаут {secs/60:.0f}мин/{_mx}мин '
                     f'pnl={pnl:+.2f}% — принудительное закрытие'
                 )
                 try:
@@ -458,8 +470,9 @@ async def monitor():
                 continue
 
             # Если не найдена И таймаут → принудительно закрыть
-            if secs > MAX_TRADE_MIN * 60:
-                logging.warning(f'⏰ {sym}: не найдена + таймаут {secs/60:.0f}мин — force close')
+            _mx2 = MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC' else MAX_TRADE_MIN_RSI
+            if secs > _mx2 * 60:
+                logging.warning(f'⏰ {sym}: не найдена + таймаут {secs/60:.0f}мин/{_mx2}мин')
                 try:
                     order_st = 'sell' if pos.get('direction')=='Long' else 'buy'
                     qty_st = float(pos.get('qty', pos.get('initial_qty', 0)))
@@ -496,15 +509,23 @@ async def monitor():
             daily_pnl_pct += pnl_pct / 100
             icon = '✅' if is_win else ('⚖️' if pnl_pct > 0 else '🛑')
 
+            # PnL в USDT (notional * leverage * pnl%)
+            pos_notional = float(pos.get('qty', 0)) * entry
+            pnl_usdt_pos = pos_notional * LEVERAGE * pnl_pct / 100 if pos_notional > 0 else 0
+            daily_pnl_usdt += pnl_usdt_pos
+            daily_trades   += 1
+            if pnl_pct > 0.1: daily_wins += 1
+
             logging.info(
                 f"{icon} {sym}: закрыта | entry={entry:.6f} exit={exit_p:.6f} "
-                f"pnl={pnl_pct:+.2f}% | {int(secs/60)}мин"
+                f"pnl={pnl_pct:+.2f}% ({pnl_usdt_pos:+.2f}$) | {int(secs/60)}мин"
             )
             await tg(
                 f"{icon} <b>[{pos['strategy']}] {sym}</b> закрыта\n"
-                f"PnL: <code>{pnl_pct:+.2f}%</code> | ⏱ {int(secs/60)}мин\n"
+                f"PnL: <code>{pnl_pct:+.2f}%</code> "
+                f"(<code>{pnl_usdt_pos:+.2f} USDT</code>) | ⏱ {int(secs/60)}мин\n"
                 f"Вход: {entry:.6f} | Выход: {exit_p:.6f}\n"
-                f"День: {daily_pnl_pct*100:+.2f}%"
+                f"День: {daily_pnl_pct*100:+.2f}% ({daily_pnl_usdt:+.2f} USDT)"
             )
 
     active_positions[:] = new_positions
@@ -586,7 +607,12 @@ async def main():
     logging.info("🚀 Bybit Worker v2.0 UTA запущен")
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
-    logging.info(f"   Таймаут сделок: {MAX_TRADE_MIN}мин (env: MAX_TRADE_MIN)")
+    logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин")
+    global day_start_bal
+    try:
+        _bal = await exchange.fetch_balance({'type': 'unified'})
+        day_start_bal = float(_bal.get('USDT', {}).get('total', 0))
+    except: pass
 
     await tg(
         f"🟢 <b>Bybit Worker v2.0 UTA</b> запущен\n"
@@ -615,6 +641,22 @@ async def main():
 
             if cycle % 4 == 0 and active_positions:
                 await monitor()
+
+            # Итоги дня в 22:00 Киев (19:00 UTC)
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.hour == 19 and now_utc.minute < 1 and not _daily_report_sent:
+                _daily_report_sent = True
+                wr = daily_wins / daily_trades * 100 if daily_trades > 0 else 0
+                await tg(
+                    f"📊 <b>Bybit Worker — Итоги дня</b> "
+                    f"{now_utc.strftime('%Y-%m-%d')}\n"
+                    f"Сделок: {daily_trades} | WR: {wr:.1f}% "
+                    f"({daily_wins}/{daily_trades})\n"
+                    f"PnL: <code>{daily_pnl_pct*100:+.2f}%</code> | "
+                    f"<code>{daily_pnl_usdt:+.2f} USDT</code>\n"
+                    f"Баланс: проверьте на Bybit"
+                )
+                logging.info("📊 Итоги дня Worker отправлены")
 
             await asyncio.sleep(15)
     finally:
