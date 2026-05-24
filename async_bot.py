@@ -85,8 +85,8 @@ LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
-MAX_TRADE_MIN_SMC = 120       # макс. длительность SMC сделки (мин), 15m × 8 свечей
-MAX_TRADE_MIN_RSI = 150       # макс. длительность RSI MR сделки (мин)
+MAX_TRADE_MIN_SMC = 180       # SMC: 12 свечей (3ч) — даём отработать структуре
+MAX_TRADE_MIN_RSI = 240       # RSI MR: 16 свечей (4ч) — возврат к среднему медленнее
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] стоп торговли при -2.5% за день
 SCAN_LIMIT       = 60       # [PERF-3] 100→60: топ-60 ликвидных, цель цикла <90с
@@ -1021,8 +1021,26 @@ async def smc_signal(sym: str):
             return None, 'fvg_test'
 
     atr = calc_atr(h, l, c)
-    sl  = price * (1 - MAX_SL_PCT / 100) if mode == 'Long' else price * (1 + MAX_SL_PCT / 100)
-    tp  = price * (1 + MAX_SL_PCT / 100 * 1.5) if mode == 'Long' else price * (1 - MAX_SL_PCT / 100 * 1.5)  # [FIX-TP] 2.0x→1.5x
+
+    # ── ДИНАМИЧЕСКИЙ SL по структуре + ATR ─────────────────
+    # SL = за минимум/максимум 3 последних свечей + 0.5*ATR (буфер от шума)
+    # При высокой волатильности SL расширяется, при низкой — сужается
+    if mode == 'Long':
+        struct_low = float(np.min(l[-4:-1]))
+        raw_sl     = min(struct_low - atr * 0.5, price - atr * 1.5)
+        sl         = max(raw_sl, price * (1 - MAX_SL_PCT / 100))   # capped at MAX_SL_PCT
+        sl         = min(sl, price * (1 - MIN_SL_PCT / 100))       # минимум MIN_SL_PCT
+    else:  # Short
+        struct_high = float(np.max(h[-4:-1]))
+        raw_sl      = max(struct_high + atr * 0.5, price + atr * 1.5)
+        sl          = min(raw_sl, price * (1 + MAX_SL_PCT / 100))  # capped
+        sl          = max(sl, price * (1 + MIN_SL_PCT / 100))      # минимум
+
+    # TP считается от РЕАЛЬНОЙ дистанции SL, а не от MAX_SL_PCT
+    sl_dist_actual = abs(price - sl)
+    tp_mult_smc    = 1.5  # RR 1:1.5
+    tp             = (price + sl_dist_actual * tp_mult_smc if mode == 'Long'
+                      else price - sl_dist_actual * tp_mult_smc)
 
     return {
         'sym': sym, 'mode': mode, 'price': price,
@@ -1409,6 +1427,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'tp50_hit':    False,
         'tp100_hit':   False,
         'atr':         atr,
+        'sl_dist_pct': abs(price - sl) / price * 100,  # для динамического BE/TP50
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
         'mae_price':   price,
@@ -1553,8 +1572,13 @@ async def monitor_all():
 
             # ── Breakeven ──────────────────────────────────────
             # BE после TP50: ждём 2.1% если TP50 ещё не сработал
-            be_thr = 2.1 if not pos.get('tp50_hit') else 1.5
-            if pnl >= be_thr and not pos.get('be_moved'):
+            # ── Динамический BE: после фиксации 0.5R (от реального SL) ──
+            # SL=1.2% → BE при +0.6% | SL=2.0% → BE при +1.0%
+            sl_dist_pct = pos.get('sl_dist_pct', 2.0)  # fallback на 2%
+            be_thr_dyn  = max(sl_dist_pct * 0.5, 0.5)  # минимум +0.5% (комиссии)
+            if pos.get('tp50_hit'):
+                be_thr_dyn = max(sl_dist_pct * 0.3, 0.4)  # после TP50 быстрее BE
+            if pnl >= be_thr_dyn and not pos.get('be_moved'):
                 new_sl = entry * 1.0015 if is_long else entry * 0.9985  # 0.15% > 2×fee
                 try:
                     if pos.get('sl_order_id'):
@@ -1575,7 +1599,9 @@ async def monitor_all():
                     logging.error(f"BE error {sym}: {e}")
 
             # ── TP 50% ─────────────────────────────────────────
-            if pnl >= 2.0 and not pos.get('tp50_hit'):  # [TP] 2.5→2.0%
+            # ── Динамический TP50: при +1.0R (равно SL дистанции) ──
+            tp50_thr_dyn = max(sl_dist_pct * 1.0, 1.0)  # минимум +1%
+            if pnl >= tp50_thr_dyn and not pos.get('tp50_hit'):
                 close_qty = round(real_qty * 0.5, 8)
                 remain    = round(real_qty - close_qty, 8)
                 try:
