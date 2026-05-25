@@ -1009,15 +1009,18 @@ async def smc_signal(sym: str):
 
     # VWAP
     vwap = calc_vwap(h, l, c, v)
-    # VWAP — Premium/Discount зоны (логика SMC, не тренд-следование)
-    # SMC шортит из Premium зоны (выше VWAP) → цена возвращается к VWAP
-    # SMC лонгует из Discount зоны (ниже VWAP) → цена возвращается к VWAP
+    # VWAP — Premium/Discount зоны (логика SMC)
+    # Оптимальная зона входа: 0.5-1.5% от VWAP
+    # < 0.5% = монета на средней (нет преимущества для MR к VWAP)
+    # 0.5-1.5% = идеальная зона Premium/Discount (CHoCH = смена тренда)
+    # > 1.5% = уже кульминация пампа/дампа (вход = ловушка, как TIA/APE)
     #
-    # ЗАПРЕЩАЕМ: Long если цена уже высоко над VWAP (перегрета, покупаем на хае)
-    if mode == 'Long'  and price > vwap * 1.005:
+    # ЗАПРЕЩАЕМ: Long если цена > 1.5% над VWAP (растянуто, покупка на хае)
+    # [AUDIT] 1.005 → 1.015: 0.5% слишком тесно для CHoCH импульса
+    if mode == 'Long'  and price > vwap * 1.015:
         return None, 'vwap'
-    # ЗАПРЕЩАЕМ: Short если цена уже глубоко под VWAP (перепродана, шортим на дне)
-    if mode == 'Short' and price < vwap * 0.995:
+    # ЗАПРЕЩАЕМ: Short если цена < 1.5% под VWAP
+    if mode == 'Short' and price < vwap * 0.985:
         return None, 'vwap'
 
     # RSI — защита от входа в конце тренда
@@ -1863,7 +1866,7 @@ async def scan_smc():
     ][:SCAN_LIMIT]
     sem  = asyncio.Semaphore(SCAN_SEM)
     st   = {k: 0 for k in ['session','news','vol','structure','choch',
-                            'vwap','rsi','fvg','fvg_test','ok']}
+                            'vwap','rsi','adx_flat','fvg','fvg_test','ok']}
 
     async def check(sym):
         if sym in notified:
@@ -1883,7 +1886,8 @@ async def scan_smc():
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
         f"[SMC SCAN] choch:{st['choch']} vwap:{st['vwap']} "
-        f"rsi:{st['rsi']} fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
+        f"rsi:{st['rsi']} adx:{st.get('adx_flat',0)} "
+        f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
         f"→ ВХОДЫ:{st['ok']}"
     )
 
