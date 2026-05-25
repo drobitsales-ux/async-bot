@@ -363,6 +363,33 @@ def calc_atr(h, l, c, w: int = 14) -> float:
                     np.abs(l[1:] - c[:-1])))
     return float(np.mean(tr[-w:]))
 
+def calc_adx(h, l, c, w: int = 14) -> float:
+    """
+    Average Directional Index — мера силы тренда (0-100).
+    ADX > 25: сильный тренд (хорошо для SMC)
+    ADX < 20: флэт (хорошо для RSI MR)
+    """
+    if len(h) < w + 2:
+        return 0.0
+    h, l, c = np.array(h), np.array(l), np.array(c)
+    # True Range
+    tr = np.maximum(h[1:] - l[1:],
+         np.maximum(np.abs(h[1:] - c[:-1]),
+                    np.abs(l[1:] - c[:-1])))
+    # Directional Movement
+    up_move   = h[1:] - h[:-1]
+    down_move = l[:-1] - l[1:]
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    # Smoothed
+    atr      = np.mean(tr[-w:]) if len(tr) >= w else np.mean(tr)
+    plus_di  = 100 * np.mean(plus_dm[-w:]) / atr if atr > 0 else 0
+    minus_di = 100 * np.mean(minus_dm[-w:]) / atr if atr > 0 else 0
+    # DX
+    di_sum = plus_di + minus_di
+    dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
+    return float(dx)
+
 def calc_ema(data, w: int) -> float:
     if len(data) < w:
         return float(data[-1])
@@ -1009,6 +1036,13 @@ async def smc_signal(sym: str):
     if mode == 'Short' and rsi < 15:
         return None, 'rsi'
 
+    # ── ADX фильтр для SMC: тренд должен быть выраженным ──
+    # ADX < 18 = слабый рынок, CHoCH = ложный сигнал
+    # ADX > 18 = направленное движение, CHoCH = реальный слом
+    adx = calc_adx(h, l, c, 14)
+    if adx < 18:
+        return None, 'adx_flat'
+
     # FVG
     fvg = find_fvg(h, l, mode)
     if not fvg:
@@ -1184,6 +1218,13 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     sl   = 0.0
 
     # RSI extreme bypass: RSI < 20 = enter without pattern
+    # ── ADX фильтр для RSI MR: только в флэте/слабом тренде ──
+    # ADX > 30 = сильный тренд, MR против тренда = риск
+    # ADX < 30 = подходит для возврата к среднему
+    adx = calc_adx(h, l, c, 14)
+    if adx > 30:
+        return None, 'adx_trend'
+
     rsi_extreme_long  = rsi_now <= 20
     rsi_extreme_short = rsi_now >= 80
 
@@ -1275,6 +1316,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         'vwap_dist': vwap_dist, 'tp_mult': tp_mult,
         'btc_trend': btc_trend, 'altseason': altseason,
         'htf_rsi': round(htf_rsi, 1), 'htf_confirmed': htf_confirmed,
+        'adx': round(adx, 1),
         'funding': funding, 'bingx_vol': float(v[-2]) * price,  # USD объём закрытой свечи
     }, 'ok'
 
@@ -1427,6 +1469,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'tp50_hit':    False,
         'tp100_hit':   False,
         'atr':         atr,
+        'adx':         round(adx, 1),
         'sl_dist_pct': abs(price - sl) / price * 100,  # для динамического BE/TP50
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
@@ -1572,12 +1615,13 @@ async def monitor_all():
 
             # ── Breakeven ──────────────────────────────────────
             # BE после TP50: ждём 2.1% если TP50 ещё не сработал
-            # ── Динамический BE: после фиксации 0.5R (от реального SL) ──
-            # SL=1.2% → BE при +0.6% | SL=2.0% → BE при +1.0%
-            sl_dist_pct = pos.get('sl_dist_pct', 2.0)  # fallback на 2%
-            be_thr_dyn  = max(sl_dist_pct * 0.5, 0.5)  # минимум +0.5% (комиссии)
+            # ── Динамический BE: 0.7R (не 0.5R — давал слишком ранний BE) ──
+            # SL=1.2% → BE при +0.84% | SL=2.0% → BE при +1.4%
+            # После TP50 → BE сразу (защита фиксированной прибыли)
+            sl_dist_pct = pos.get('sl_dist_pct', 2.0)
+            be_thr_dyn  = max(sl_dist_pct * 0.7, 0.6)  # [FIX] 0.5R→0.7R
             if pos.get('tp50_hit'):
-                be_thr_dyn = max(sl_dist_pct * 0.3, 0.4)  # после TP50 быстрее BE
+                be_thr_dyn = max(sl_dist_pct * 0.2, 0.3)  # после TP50 мгновенный BE
             if pnl >= be_thr_dyn and not pos.get('be_moved'):
                 new_sl = entry * 1.0015 if is_long else entry * 0.9985  # 0.15% > 2×fee
                 try:
@@ -1624,6 +1668,24 @@ async def monitor_all():
                              f"P&L: +{pnl:.2f}%")
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
+
+            # ── ATR Trailing Stop после TP50 ───────────────────
+            # На каждом цикле подтягиваем SL на ATR расстоянии от MFE
+            # Защищает прибыль на runner-части позиции
+            if pos.get('tp50_hit') and not pos.get('tp100_hit'):
+                atr_v = float(pos.get('atr', entry * 0.005))
+                mfe_p = float(pos['mfe_price'])
+                # Trailing SL: max(текущий SL, MFE - 1.2*ATR)
+                if is_long:
+                    new_trail = mfe_p - atr_v * 1.2
+                    if new_trail > pos.get('current_sl', 0):
+                        pos['current_sl'] = new_trail
+                        logging.debug(f'{sym} trail SL → {new_trail:.6f}')
+                else:
+                    new_trail = mfe_p + atr_v * 1.2
+                    if new_trail < pos.get('current_sl', float('inf')):
+                        pos['current_sl'] = new_trail
+                        logging.debug(f'{sym} trail SL → {new_trail:.6f}')
 
             # ── TP100 + trailing ───────────────────────────────
             tp100 = float(pos.get('tp1', entry))
