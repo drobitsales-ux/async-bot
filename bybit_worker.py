@@ -80,6 +80,9 @@ daily_pnl_pct    = 0.0
 daily_pnl_usdt   = 0.0
 daily_trades     = 0
 daily_wins       = 0
+daily_smc        = 0    # SMC сделок за день
+daily_rsi        = 0    # RSI сделок за день
+daily_be_closes  = 0    # BE-закрытий за день (0.1% < pnl < 0.5%)
 day_start_bal    = 0.0
 day_start_time   = time.time()
 circuit_open     = False
@@ -107,13 +110,16 @@ async def tg(text: str):
 #  CIRCUIT BREAKER
 # ══════════════════════════════════════════════════════════
 def check_daily_reset():
-    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, day_start_time, circuit_open, _daily_report_sent
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_be_closes, day_start_time, circuit_open, _daily_report_sent
     if time.time() - day_start_time > 86400:
-        daily_pnl_pct  = 0.0
-        daily_pnl_usdt = 0.0
-        daily_trades   = 0
-        daily_wins     = 0
-        day_start_time = time.time()
+        daily_pnl_pct   = 0.0
+        daily_pnl_usdt  = 0.0
+        daily_trades    = 0
+        daily_wins      = 0
+        daily_smc       = 0
+        daily_rsi       = 0
+        daily_be_closes = 0
+        day_start_time  = time.time()
         circuit_open   = False
         _daily_report_sent = False
         logging.info("📅 Daily stats reset")
@@ -514,7 +520,16 @@ async def monitor():
             pnl_usdt_pos = pos_notional * LEVERAGE * pnl_pct / 100 if pos_notional > 0 else 0
             daily_pnl_usdt += pnl_usdt_pos
             daily_trades   += 1
-            if pnl_pct > 0.1: daily_wins += 1
+            # Реальная победа = >0.5%, BE = 0.1-0.5%, loss = <0.1%
+            if pnl_pct >= 0.5:
+                daily_wins += 1
+            elif 0.1 < pnl_pct < 0.5:
+                daily_be_closes += 1
+            # SMC/RSI breakdown
+            if pos.get('strategy') == 'SMC':
+                daily_smc += 1
+            elif pos.get('strategy') == 'RSI':
+                daily_rsi += 1
 
             logging.info(
                 f"{icon} {sym}: закрыта | entry={entry:.6f} exit={exit_p:.6f} "
@@ -642,21 +657,38 @@ async def main():
             if cycle % 4 == 0 and active_positions:
                 await monitor()
 
-            # Итоги дня в 22:00 Киев (19:00 UTC)
+            # Итоги дня в 22:00 Киев (19:00 UTC) — формат идентичен BingX боту
             now_utc = datetime.now(timezone.utc)
-            if now_utc.hour == 19 and now_utc.minute < 1 and not _daily_report_sent:
+            if now_utc.hour == 19 and now_utc.minute < 2 and not _daily_report_sent:
                 _daily_report_sent = True
                 wr = daily_wins / daily_trades * 100 if daily_trades > 0 else 0
+                # Получить реальный баланс с Bybit
+                try:
+                    _bal = await exchange.fetch_balance({'type': 'unified'})
+                    bal_usdt = float(_bal.get('USDT', {}).get('total', 0))
+                except:
+                    bal_usdt = day_start_bal
+                # PnL от реального баланса (если есть)
+                if day_start_bal > 0:
+                    day_pct  = (bal_usdt - day_start_bal) / day_start_bal * 100
+                    day_usdt = bal_usdt - day_start_bal
+                else:
+                    day_pct  = daily_pnl_pct * 100
+                    day_usdt = daily_pnl_usdt
                 await tg(
-                    f"📊 <b>Bybit Worker — Итоги дня</b> "
-                    f"{now_utc.strftime('%Y-%m-%d')}\n"
+                    f"📊 <b>Bybit Worker — Итоги дня "
+                    f"{now_utc.strftime('%Y-%m-%d')} 22:00</b>\n"
                     f"Сделок: {daily_trades} | WR: {wr:.1f}% "
                     f"({daily_wins}/{daily_trades})\n"
-                    f"PnL: <code>{daily_pnl_pct*100:+.2f}%</code> | "
-                    f"<code>{daily_pnl_usdt:+.2f} USDT</code>\n"
-                    f"Баланс: проверьте на Bybit"
+                    f"SMC: {daily_smc} | RSI: {daily_rsi} | "
+                    f"BE: {daily_be_closes}\n"
+                    f"PnL: <code>{day_pct:+.2f}%</code> | "
+                    f"<code>{day_usdt:+.2f} USDT</code>\n"
+                    f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
                 )
-                logging.info("📊 Итоги дня Worker отправлены")
+                logging.info(
+                    f"📊 Итоги дня Worker: {day_pct:+.2f}% ({day_usdt:+.2f} USDT)"
+                )
 
             await asyncio.sleep(15)
     finally:
