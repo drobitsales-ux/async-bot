@@ -1885,8 +1885,9 @@ async def scan_smc():
 
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
-        f"[SMC SCAN] choch:{st['choch']} vwap:{st['vwap']} "
-        f"rsi:{st['rsi']} adx:{st.get('adx_flat',0)} "
+        f"[SMC SCAN] vol:{st['vol']} struct:{st['structure']} "
+        f"choch:{st['choch']} vwap:{st['vwap']} rsi:{st['rsi']} "
+        f"adx:{st.get('adx_flat',0)} "
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
         f"→ ВХОДЫ:{st['ok']}"
     )
