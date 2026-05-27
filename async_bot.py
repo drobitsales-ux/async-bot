@@ -89,8 +89,8 @@ MAX_TRADE_MIN_SMC = 180       # SMC: 12 свечей (3ч) — даём отра
 MAX_TRADE_MIN_RSI = 240       # RSI MR: 16 свечей (4ч) — возврат к среднему медленнее
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] стоп торговли при -2.5% за день
-SCAN_LIMIT       = 60       # [PERF-3] 100→60: топ-60 ликвидных, цель цикла <90с
-SCAN_SEM         = 50       # [PERF-3] 40→50 параллельных (60 символов)
+SCAN_LIMIT       = 80       # [EXPAND] 60→80: больше монет, +33% шансов на сетап
+SCAN_SEM         = 60       # [EXPAND] 50→60: больше параллелизма для 80 символов
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
 
 # ── Webhook для копи-трейдинга (Bybit Worker и другие) ──────────
@@ -1472,7 +1472,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'tp50_hit':    False,
         'tp100_hit':   False,
         'atr':         atr,
-        'adx':         round(adx, 1),
+        'adx':         round(float(sig.get('adx', 0)), 1),  # [FIX] sig.get вместо bare adx
         'sl_dist_pct': abs(price - sl) / price * 100,  # для динамического BE/TP50
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
