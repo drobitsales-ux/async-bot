@@ -1434,6 +1434,18 @@ async def execute(sym: str, sig: dict, strategy: str,
         logging.warning(f'[{strategy}] {sym}: qty={qty} <= 0, пропуск')
         return
 
+    # ── MIN/MAX notional guard ─────────────────────────────
+    notional_est = qty * price
+    if notional_est < 20:   # BingX мин. контракт ~$20
+        logging.info(f'[{strategy}] {sym}: notional ${notional_est:.1f}<$20 — пропуск')
+        return
+    if notional_est > free_usdt * 0.60:  # не больше 60% свободного баланса
+        logging.warning(
+            f'[{strategy}] {sym}: notional ${notional_est:.1f} > 60% '
+            f'баланса ${free_usdt:.0f} — позиция слишком большая, пропуск'
+        )
+        return
+
     pos_side   = 'LONG'  if mode == 'Long'  else 'SHORT'
     order_side = 'buy'   if mode == 'Long'  else 'sell'
     sl_side    = 'sell'  if mode == 'Long'  else 'buy'
