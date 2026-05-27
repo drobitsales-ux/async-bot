@@ -607,6 +607,11 @@ def run_http():
 # ══════════════════════════════════════════════════════════
 async def main():
     global http_session, _signal_queue
+    global day_start_bal
+    # [FIX] Эти переменные модифицируются в while-loop main() — нужны global
+    global _daily_report_sent
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins
+    global daily_smc, daily_rsi, daily_be_closes
 
     _signal_queue = asyncio.Queue()
     http_session  = aiohttp.ClientSession()
@@ -623,7 +628,6 @@ async def main():
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
     logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин")
-    global day_start_bal
     try:
         _bal = await exchange.fetch_balance({'type': 'unified'})
         day_start_bal = float(_bal.get('USDT', {}).get('total', 0))
