@@ -1938,7 +1938,7 @@ async def scan_rsi():
     total_r = sum(st.values())
     logging.info(
         f"[RSI SCAN] BTC:{btc_ctx['btc_trend']} Alt:{btc_ctx['altseason']} | "
-        f"total:{total_r} mid:{st['rsi_mid']} hook:{st['hook']} "
+        f"total:{total_r} vol:{st['vol']} mid:{st['rsi_mid']} hook:{st['hook']} "
         f"mom:{st['momentum']} sma:{st['sma_range']} vwap:{st['vwap']} "
         f"trend:{st['trend']} sl:{st['sl_wide']} sqz:{st['squeeze']} "
         f"pat:{st['no_pattern']} → ВХОДЫ:{st['ok']}"
