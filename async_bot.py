@@ -1892,8 +1892,9 @@ async def scan_smc():
                 await execute(sym, sig, 'SMC', smc_positions,
                               f"RSI: {sig['rsi']:.1f}")
         except Exception as _e:
-            logging.warning(f'[SMC] {sym} error: {_e}')
             st['error'] = st.get('error', 0) + 1
+            if st['error'] <= 2:  # логируем только первые 2 (не спамим)
+                logging.warning(f'[SMC] {sym} error: {type(_e).__name__}: {_e}')
 
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
@@ -1901,7 +1902,7 @@ async def scan_smc():
         f"choch:{st['choch']} vwap:{st['vwap']} rsi:{st['rsi']} "
         f"adx:{st.get('adx_flat',0)} "
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
-        f"→ ВХОДЫ:{st['ok']}"
+        f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
 
 async def scan_rsi():
@@ -1943,8 +1944,9 @@ async def scan_rsi():
                 )
                 await execute(sym, sig, 'RSI', rsi_positions, extra)
         except Exception as _e:
-            logging.warning(f'[RSI] {sym} error: {_e}')
             st['error'] = st.get('error', 0) + 1
+            if st['error'] <= 2:
+                logging.warning(f'[RSI] {sym} error: {type(_e).__name__}: {_e}')
 
     await asyncio.gather(*[check(s) for s in scan])
     total_r = sum(st.values())
@@ -1953,7 +1955,7 @@ async def scan_rsi():
         f"total:{total_r} vol:{st['vol']} mid:{st['rsi_mid']} hook:{st['hook']} "
         f"mom:{st['momentum']} sma:{st['sma_range']} vwap:{st['vwap']} "
         f"trend:{st['trend']} sl:{st['sl_wide']} sqz:{st['squeeze']} "
-        f"pat:{st['no_pattern']} → ВХОДЫ:{st['ok']}"
+        f"pat:{st['no_pattern']} err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
 
 # ═══════════════════════════════════════════════════════
