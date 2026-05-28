@@ -2108,7 +2108,7 @@ async def sync_positions_with_exchange() -> int:
 # ═══════════════════════════════════════════════════════
 #  TRADE LOGGER — SQLite + CSV экспорт
 # ═══════════════════════════════════════════════════════
-TRADES_DB = '/tmp/trades.db'  # /tmp не чистится при рестарте на Render
+TRADES_DB = '/data/trades.db' if os.path.exists('/data') else '/tmp/trades.db'  # [DISK] на /data переживает деплой
 
 def _init_trades_db():
     """Создаёт таблицу trades если не существует."""
