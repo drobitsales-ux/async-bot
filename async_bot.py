@@ -1634,7 +1634,7 @@ async def monitor_all():
             # SL=1.2% → BE при +0.84% | SL=2.0% → BE при +1.4%
             # После TP50 → BE сразу (защита фиксированной прибыли)
             sl_dist_pct = pos.get('sl_dist_pct', 2.0)
-            be_thr_dyn  = max(sl_dist_pct * 0.7, 0.6)  # [FIX] 0.5R→0.7R
+            be_thr_dyn  = max(sl_dist_pct * 0.9, 0.8)  # [PROP] 0.7R→0.9R: поздняя защита, больше шансов на TP
             if pos.get('tp50_hit'):
                 be_thr_dyn = max(sl_dist_pct * 0.2, 0.3)  # после TP50 мгновенный BE
             if pnl >= be_thr_dyn and not pos.get('be_moved'):
@@ -1659,7 +1659,7 @@ async def monitor_all():
 
             # ── TP 50% ─────────────────────────────────────────
             # ── Динамический TP50: при +1.0R (равно SL дистанции) ──
-            tp50_thr_dyn = max(sl_dist_pct * 1.0, 1.0)  # минимум +1%
+            tp50_thr_dyn = max(sl_dist_pct * 0.8, 0.8)  # [PROP] 1.0R→0.8R: ранняя фиксация, легче TP
             if pnl >= tp50_thr_dyn and not pos.get('tp50_hit'):
                 close_qty = round(real_qty * 0.5, 8)
                 remain    = round(real_qty - close_qty, 8)
@@ -1994,7 +1994,7 @@ async def send_daily_report():
 
 
 async def daily_reset():
-    global daily_stats, circuit_open
+    global daily_stats, circuit_open, _daily_report_sent
     today = datetime.now(timezone.utc).date()
     if daily_stats.get('stat_date') == today:
         return
