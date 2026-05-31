@@ -1129,15 +1129,15 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     # Vol>3.5x — предварительная проверка (sma_dist пока не вычислен)
     # Если Vol очень высокий — ставим флаг, финальное решение после SMA
     _high_vol = vol_ratio > 3.5  # флаг: финальная проверка с SMA ниже
-    # [V3] vol>5x + RSI не крайний = тренд-импульс, не MR
-    _rsi_not_extreme = 20 < rsi_now < 80
-    if vol_ratio > 5.0 and _rsi_not_extreme:
-        return None, 'vol'
     # Остальные vol-фильтры с sma_dist — после блока SMA200
 
     # RSI текущий и предыдущий (только закрытые свечи)
     rsi_now  = calc_rsi(c[:-1],  RSI_PERIOD)
     rsi_prev = calc_rsi(c[:-2], RSI_PERIOD)
+
+    # [V3] vol>5x + RSI не крайний (20-80) = тренд-импульс, не MR → пропуск
+    if vol_ratio > 5.0 and (20 < rsi_now < 80):
+        return None, 'vol'
 
     if RSI_LONG_MAX < rsi_now < RSI_SHORT_MIN:
         return None, 'rsi_mid'
