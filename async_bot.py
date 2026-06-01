@@ -1689,6 +1689,20 @@ async def monitor_all():
             if pnl >= tp50_thr_dyn and not pos.get('tp50_hit'):
                 close_qty = round(real_qty * 0.5, 8)
                 remain    = round(real_qty - close_qty, 8)
+                # [FIX] Если 50% округляется в 0 (мелкая позиция) — 
+                # двигаем SL в BE без частичного закрытия
+                if close_qty <= 0 or remain <= 0:
+                    pos['tp50_hit'] = True  # помечаем, чтобы сработал BE
+                    logging.info(f'{sym}: TP50 qty→0 (мелкая поз), только BE без фиксации')
+                    try:
+                        if pos.get('sl_order_id'):
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                        be_price = entry * (1 + sl_dist_pct/100 * 0.2) if is_long else entry * (1 - sl_dist_pct/100 * 0.2)
+                        pos['current_sl'] = be_price
+                    except Exception as _e:
+                        logging.warning(f'{sym}: BE move fail: {_e}')
+                    save_all()
+                    continue
                 try:
                     await exchange.create_order(
                         sym, 'market', sl_side, close_qty,
@@ -1737,6 +1751,13 @@ async def monitor_all():
                 remain    = round(float(pos['current_qty']) - close_qty, 8)
                 atr_v     = float(pos.get('atr', entry * 0.01))
                 trail_sl  = (tp100 - atr_v if is_long else tp100 + atr_v)
+                # [FIX] Если 50% округляется в 0 — только трейлим SL, без закрытия
+                if close_qty <= 0 or remain <= 0:
+                    pos['tp100_hit'] = True
+                    pos['current_sl'] = trail_sl
+                    logging.info(f'{sym}: TP100 qty→0 (мелкая поз), только трейл SL')
+                    save_all()
+                    continue
                 try:
                     await exchange.create_order(
                         sym, 'market', sl_side, close_qty,
