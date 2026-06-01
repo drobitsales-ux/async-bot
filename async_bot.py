@@ -1123,7 +1123,18 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         return None, 'vol'
     vol_ratio = float(v[-2]) / avg_v
     # Минимальный объём для подтверждения сигнала
-    if vol_ratio < 1.5 or vol_ratio > 8.0:  # [V3] 2.0-12.0 → 1.5-8.0
+    # [ADAPTIVE] Volume порог зависит от режима рынка (btc_ctx)
+    # Flat: объёмы низкие → ниже порог (больше MR реверсий)
+    # Trend: объёмы высокие → выше порог (фильтруем шум импульса)
+    _btc_tr = btc_ctx.get('btc_trend', 'Flat')
+    _alt    = btc_ctx.get('altseason', False)
+    if _btc_tr == 'Flat':
+        _vol_min = 1.3   # флэт: ловим больше реверсий
+    elif _alt:
+        _vol_min = 1.5   # альтсезон: средний
+    else:
+        _vol_min = 1.7   # тренд: только сильный объём
+    if vol_ratio < _vol_min or vol_ratio > 8.0:  # [ADAPTIVE]
         return None, 'vol'
     # Объём-фильтр для RSI Mean Reversion
     # Vol>3.5x — предварительная проверка (sma_dist пока не вычислен)
