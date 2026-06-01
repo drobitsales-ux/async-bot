@@ -1702,7 +1702,7 @@ async def monitor_all():
                     except Exception as _e:
                         logging.warning(f'{sym}: BE move fail: {_e}')
                     save_all()
-                    continue
+                    return True  # [FIX] continue→return (мы в функции, не в цикле)
                 try:
                     await exchange.create_order(
                         sym, 'market', sl_side, close_qty,
@@ -1757,7 +1757,7 @@ async def monitor_all():
                     pos['current_sl'] = trail_sl
                     logging.info(f'{sym}: TP100 qty→0 (мелкая поз), только трейл SL')
                     save_all()
-                    continue
+                    return True  # [FIX] continue→return
                 try:
                     await exchange.create_order(
                         sym, 'market', sl_side, close_qty,
