@@ -331,7 +331,8 @@ async def execute_signal(signal: dict):
 # ══════════════════════════════════════════════════════════
 async def monitor():
     """Мониторинг: BE при +1.5%, обнаружение закрытий."""
-    global active_positions, daily_pnl_pct
+    global active_positions, daily_pnl_pct, daily_pnl_usdt
+    global daily_trades, daily_wins, daily_smc, daily_rsi, daily_be_closes
 
     if not active_positions:
         return
