@@ -1129,11 +1129,10 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     _btc_tr = btc_ctx.get('btc_trend', 'Flat')
     _alt    = btc_ctx.get('altseason', False)
     if _btc_tr == 'Flat':
-        _vol_min = 1.3   # флэт: ловим больше реверсий
-    elif _alt:
-        _vol_min = 1.5   # альтсезон: средний
+        _vol_min = 1.3   # флэт/ranging: лучший режим для MR
     else:
-        _vol_min = 1.7   # тренд: только сильный объём
+        _vol_min = 1.5   # тренд/альт: базовый (НЕ строже — в тренде
+                         # объёмы равномерно высокие, ratio низкий)
     if vol_ratio < _vol_min or vol_ratio > 8.0:  # [ADAPTIVE]
         return None, 'vol'
     # Объём-фильтр для RSI Mean Reversion
