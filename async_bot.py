@@ -1117,23 +1117,33 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     v = np.array([float(x[5]) for x in ohlcv])
     price = float(c[-1])
 
-    # Volume: закрытая [-2]
-    avg_v = np.mean(v[-22:-2]) if len(v) >= 22 else float(np.mean(v[:-2]))
-    if avg_v <= 0:
+    # [STEP-A] Volume фильтр: ОКОННЫЙ (3 свечи) + абсолютная ликвидность
+    # Старый одиночный vol_ratio ловил всплеск, а не устойчивый объём.
+    # Новый: средний объём 3 закрытых свечей vs база, чтобы видеть
+    # РОВНЫЙ повышенный объём трендового движения, а не только спайки.
+    if len(v) < 25:
         return None, 'vol'
-    vol_ratio = float(v[-2]) / avg_v
-    # Минимальный объём для подтверждения сигнала
-    # [ADAPTIVE] Volume порог зависит от режима рынка (btc_ctx)
-    # Flat: объёмы низкие → ниже порог (больше MR реверсий)
-    # Trend: объёмы высокие → выше порог (фильтруем шум импульса)
+    base_v = float(np.mean(v[-23:-5]))   # база: 18 баров до последних 4
+    if base_v <= 0:
+        return None, 'vol'
+    recent_v = float(np.mean(v[-4:-1]))  # 3 закрытые свечи (без текущей)
+    vol_ratio = recent_v / base_v        # устойчивый объём окна
+    spike_v   = float(v[-2]) / base_v    # одиночный спайк (для верх. порога)
+
+    # Абсолютная ликвидность: объём в quote-валюте (цена×объём) за свечу
+    # Отсекаем неликвид где даже большой ratio = копейки оборота
+    quote_vol = float(v[-2]) * price     # примерный оборот свечи в USDT
+    _min_quote = 5000.0 if not False else 20000.0
+
+    # [ADAPTIVE] порог по режиму рынка
     _btc_tr = btc_ctx.get('btc_trend', 'Flat')
     _alt    = btc_ctx.get('altseason', False)
     if _btc_tr == 'Flat':
-        _vol_min = 1.3   # флэт/ranging: лучший режим для MR
+        _vol_min = 1.15   # флэт: устойчивый объём чуть выше базы
     else:
-        _vol_min = 1.5   # тренд/альт: базовый (НЕ строже — в тренде
-                         # объёмы равномерно высокие, ratio низкий)
-    if vol_ratio < _vol_min or vol_ratio > 8.0:  # [ADAPTIVE]
+        _vol_min = 1.25   # тренд/альт: ровный повышенный объём
+    # Reject: объём окна ниже порога ЛИБО спайк-аномалия ЛИБО неликвид
+    if vol_ratio < _vol_min or spike_v > 10.0 or quote_vol < _min_quote:
         return None, 'vol'
     # Объём-фильтр для RSI Mean Reversion
     # Vol>3.5x — предварительная проверка (sma_dist пока не вычислен)
