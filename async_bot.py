@@ -2104,7 +2104,7 @@ async def scan_smc():
 
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
-        f"[SMC SCAN] vol:{st['vol']} struct:{st['structure']} "
+        f"[SMC SCAN] news:{st['news']} vol:{st['vol']} struct:{st['structure']} "
         f"choch:{st['choch']} vwap:{st['vwap']} rsi:{st['rsi']} "
         f"adx:{st.get('adx_flat',0)} "
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
@@ -2179,7 +2179,7 @@ async def scan_rsi():
     total_r = sum(st.values())
     logging.info(
         f"[RSI SCAN] BTC:{btc_ctx['btc_trend']} Alt:{btc_ctx['altseason']} | "
-        f"total:{total_r} vol:{st['vol']} mid:{st['rsi_mid']} hook:{st['hook']} "
+        f"total:{total_r} news:{st['news']} vol:{st['vol']} mid:{st['rsi_mid']} hook:{st['hook']} "
         f"mom:{st['momentum']} sma:{st['sma_range']} vwap:{st['vwap']} "
         f"trend:{st['trend']} sl:{st['sl_wide']} sqz:{st['squeeze']} "
         f"pat:{st['no_pattern']} err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
