@@ -1464,6 +1464,7 @@ async def momentum_signal(sym: str, btc_ctx: dict):
         'ema20': ema20, 'ema50': ema50,
         'sma_dist': 0.0, 'vwap_dist': 0.0, 'tp_mult': 3.0,
         'rsi_prev': rsi, 'btc_trend': btc_ctx.get('btc_trend', ''),
+        'entry': price,
     }, 'ok'
 
 
@@ -1529,6 +1530,11 @@ async def execute(sym: str, sig: dict, strategy: str,
     if any(p['symbol'] == sym and p['direction'] != mode for p in all_pos):
         opp = 'Long' if mode == 'Short' else 'Short'
         logging.info(f'[{strategy}] {sym}: уже открыт {opp} — {mode} пропущен')
+        return
+    # [DUP-GUARD] Запрет дубля в ТОМ ЖЕ направлении (важно для MOM:
+    # momentum держит позицию дольше кулдауна notified → возможен 2й вход)
+    if any(p['symbol'] == sym and p['direction'] == mode for p in all_pos):
+        logging.info(f'[{strategy}] {sym}: уже открыт {mode} — дубль пропущен')
         return
 
     # [P-2] Передаём BingX-объём чтобы не блокировать BingX-эксклюзивы
@@ -2165,6 +2171,8 @@ async def scan_rsi():
                         f"EMA20{'>' if msig['ema20']>msig['ema50'] else '<'}EMA50 "
                         f"[{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
                     )
+                    # [SHADOW] записываем виртуальный сигнал для расчёта винрейта
+                    shadow_record(sym, msig['mode'], msig['entry'], msig, btc_ctx)
                     if MOMENTUM_LIVE:
                         notified[sym] = time.time()
                         mextra = (f"MOM ADX:{msig['adx']:.0f} "
@@ -2367,6 +2375,29 @@ def _init_trades_db():
             tp50_hit    INTEGER
         )
     """)
+    # [SHADOW] виртуальные momentum-сигналы (без риска) для расчёта винрейта
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS shadow_signals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            open_time   TEXT,
+            symbol      TEXT,
+            direction   TEXT,
+            entry_price REAL,
+            sl_price    REAL,
+            atr         REAL,
+            adx         REAL,
+            vol_ratio   REAL,
+            alt_score   INTEGER,
+            eth_btc     REAL,
+            mfe_price   REAL,
+            trail_sl    REAL,
+            status      TEXT,
+            close_time  TEXT,
+            exit_price  REAL,
+            pnl_pct     REAL,
+            bars_held   INTEGER
+        )
+    """)
     con.commit()
     con.close()
 
@@ -2418,6 +2449,129 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
         logging.info(f'📊 [LOG] {pos["symbol"]} {close_reason} {pnl_pct:+.2f}% записана')
     except Exception as e:
         logging.error(f'❌ [LOG] Ошибка записи сделки: {e}')
+
+
+# ═══════════════════════════════════════════════════════
+#  SHADOW TRACKING — виртуальные momentum-сигналы [нулевой риск]
+#  Записывает сигнал, симулирует чандельер-трейл как в live,
+#  считает виртуальный PnL → реальный винрейт без риска.
+# ═══════════════════════════════════════════════════════
+def shadow_record(sym, mode, price, msig, btc_ctx):
+    """Записывает новый shadow-сигнал, если по symbol+mode нет открытого."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? AND status='open' LIMIT 1",
+            (sym, mode))
+        if cur.fetchone():
+            con.close(); return  # уже отслеживается — дубль не пишем
+        con.execute(
+            "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
+            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+            (datetime.now(timezone.utc).isoformat(), sym, mode, price,
+             float(msig.get('sl', 0)), float(msig.get('atr', 0)),
+             float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
+             int(btc_ctx.get('alt_score', 50)), float(btc_ctx.get('eth_btc_spread', 0)),
+             price, float(msig.get('sl', 0))))
+        con.commit(); con.close()
+    except Exception as _e:
+        logging.warning(f'[SHADOW] record fail {sym}: {_e}')
+
+
+async def shadow_check():
+    """Симулирует чандельер-трейл по открытым shadow-сигналам, закрывает виртуально."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT id,symbol,direction,entry_price,atr,mfe_price,trail_sl,open_time "
+            "FROM shadow_signals WHERE status='open'").fetchall()
+        con.close()
+    except Exception as _e:
+        logging.warning(f'[SHADOW] read fail: {_e}')
+        return
+    if not rows:
+        return
+
+    MAX_HOLD_BARS = 100   # таймаут симуляции
+    for (sid, sym, mode, entry, atr, mfe_p, trail_sl, open_t) in rows:
+        try:
+            ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=3)
+            if not ohlcv:
+                continue
+            last = ohlcv[-1]
+            hi, lo, curr = float(last[2]), float(last[3]), float(last[4])
+            is_long = (mode == 'Long')
+            atr = atr if atr > 0 else entry * 0.01
+
+            # Обновляем MFE и чандельер-трейл (как в live process_pos)
+            if is_long:
+                mfe_p = max(mfe_p, hi)
+                new_trail = mfe_p - atr * MOM_TRAIL_ATR
+                trail_sl = max(trail_sl, new_trail)
+                hit = lo <= trail_sl
+            else:
+                mfe_p = min(mfe_p, lo)
+                new_trail = mfe_p + atr * MOM_TRAIL_ATR
+                trail_sl = min(trail_sl, new_trail)
+                hit = hi >= trail_sl
+
+            # Таймаут по числу баров
+            bars = 0
+            try:
+                _ot = datetime.fromisoformat(open_t)
+                tf_min = 60 if RSI_TF == '1h' else 15
+                bars = int((datetime.now(timezone.utc) - _ot).total_seconds() / 60 / tf_min)
+            except Exception:
+                pass
+            timeout = bars >= MAX_HOLD_BARS
+
+            con = sqlite3.connect(TRADES_DB)
+            if hit or timeout:
+                exit_p = trail_sl if hit else curr
+                pnl = ((exit_p - entry)/entry if is_long else (entry - exit_p)/entry) * 100
+                con.execute(
+                    "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
+                    "pnl_pct=?,bars_held=?,mfe_price=?,trail_sl=? WHERE id=?",
+                    (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl, 3),
+                     bars, mfe_p, trail_sl, sid))
+                logging.info(f"👁 [SHADOW CLOSE] {sym} {mode} → {'TRAIL' if hit else 'TIMEOUT'} "
+                             f"PnL: {pnl:+.2f}% ({bars} баров)")
+            else:
+                con.execute("UPDATE shadow_signals SET mfe_price=?,trail_sl=? WHERE id=?",
+                            (mfe_p, trail_sl, sid))
+            con.commit(); con.close()
+        except Exception as _e:
+            logging.debug(f'[SHADOW] check {sym}: {_e}')
+
+
+def shadow_stats() -> str:
+    """Сводка по закрытым shadow-сигналам: винрейт, средний PnL, PF."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        rows = con.execute(
+            "SELECT pnl_pct,alt_score,adx FROM shadow_signals WHERE status='closed'").fetchall()
+        n_open = con.execute(
+            "SELECT COUNT(*) FROM shadow_signals WHERE status='open'").fetchone()[0]
+        con.close()
+    except Exception as _e:
+        return f'[SHADOW] stats fail: {_e}'
+    if not rows:
+        return f'👁 Shadow: пока нет закрытых сигналов (открыто: {n_open})'
+    n = len(rows)
+    wins = sum(1 for r in rows if r[0] > 0)
+    wr = wins / n * 100
+    avg = sum(r[0] for r in rows) / n
+    gw = sum(r[0] for r in rows if r[0] > 0)
+    gl = abs(sum(r[0] for r in rows if r[0] < 0))
+    pf = (gw / gl) if gl > 0 else 0
+    return (f'👁 <b>Shadow Momentum</b> (виртуально, без риска)\n'
+            f'Сделок: {n} | Открыто: {n_open}\n'
+            f'Win Rate: {wr:.1f}% ({wins}W/{n-wins}L)\n'
+            f'Avg PnL: {avg:+.2f}% | PF: {pf:.2f}')
+
 
 def export_trades_csv() -> str:
     """Экспортирует все сделки из SQLite в CSV строку."""
@@ -2560,6 +2714,9 @@ async def check_tg_commands():
                 stats_text = get_trades_stats()
                 await tg(stats_text)
 
+            elif cmd == '/shadow':
+                await tg(shadow_stats())
+
             elif cmd == '/sync':
                 # Синхронизация локального списка позиций с реальными на BingX
                 # Используется когда позиция закрыта вручную на бирже
@@ -2665,6 +2822,10 @@ async def main():
 
                 # Мониторинг позиций
                 await monitor_all()
+
+                # [SHADOW] симуляция momentum-сигналов (виртуально)
+                if MOMENTUM_ENABLED:
+                    await shadow_check()
 
                 # Авто-синхронизация с BingX каждые 10 циклов (~10 мин)
                 global _sync_counter
