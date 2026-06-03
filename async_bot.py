@@ -81,6 +81,12 @@ RISK_PER_TRADE   = 0.01     # [USER] 1% на сделку (тест; для пр
 RISK_WEEKEND     = 0.01     # [USER] 1% в выходные (тест; для проп → 0.00375)
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
+# ── [MOMENTUM] режим тренд-следования (shadow по умолчанию) ──
+MOMENTUM_ENABLED = os.getenv('MOMENTUM_ENABLED', 'true').lower() == 'true'   # детект+лог
+MOMENTUM_LIVE    = os.getenv('MOMENTUM_LIVE', 'false').lower() == 'true'      # реальная торговля
+MOM_ADX_MIN      = 25      # тренд должен быть сильным
+MOM_TRAIL_ATR    = 3.0     # чандельер-трейлинг множитель ATR
+MOM_MIN_QUOTE    = 5000.0   # мин. оборот свечи USDT
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -1361,6 +1367,89 @@ async def rsi_signal(sym: str, btc_ctx: dict):
 # ═══════════════════════════════════════════════════════
 #  ИСПОЛНЕНИЕ ОРДЕРА (общий для обоих стратегий)
 # ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════
+#  MOMENTUM / TREND-FOLLOWING СИГНАЛ  [shadow по умолчанию]
+#  Логика ПРОТИВОПОЛОЖНА RSI MR: покупаем силу, а не фейдим.
+#  Вход: сильный тренд (ADX) + EMA выстроены + пробой + объём.
+#  Выход: чандельер-трейлинг (в process_pos, strategy='MOM').
+# ═══════════════════════════════════════════════════════
+async def momentum_signal(sym: str, btc_ctx: dict):
+    """Trend-following: EMA структура + пробой + устойчивый объём."""
+    if is_news_now():
+        return None, 'news'
+    try:
+        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)
+    except Exception:
+        return None, 'fetch_err'
+    if not ohlcv or len(ohlcv) < 55:
+        return None, 'no_data'
+
+    h = np.array([float(x[2]) for x in ohlcv])
+    l = np.array([float(x[3]) for x in ohlcv])
+    c = np.array([float(x[4]) for x in ohlcv])
+    v = np.array([float(x[5]) for x in ohlcv])
+    price = float(c[-1])
+
+    # 1. ADX: тренд должен быть СИЛЬНЫМ (momentum любит тренд)
+    adx = calc_adx(h, l, c)
+    if adx < MOM_ADX_MIN:
+        return None, 'adx_weak'
+
+    # 2. EMA структура
+    ema20 = calc_ema(c, 20)
+    ema50 = calc_ema(c, 50)
+
+    # 3. Объём: оконный устойчивый (как в шаге А)
+    if len(v) < 25:
+        return None, 'vol'
+    base_v = float(np.mean(v[-23:-5]))
+    if base_v <= 0:
+        return None, 'vol'
+    recent_v = float(np.mean(v[-4:-1]))
+    vol_ratio = recent_v / base_v
+    quote_vol = float(v[-2]) * price
+    _min_quote = MOM_MIN_QUOTE
+    if vol_ratio < 1.2 or quote_vol < _min_quote:
+        return None, 'vol'
+
+    # 4. Направление: EMA выстроены + пробой экстремума 20 баров
+    mode = None
+    recent_high = float(np.max(h[-21:-1]))
+    recent_low  = float(np.min(l[-21:-1]))
+    if ema20 > ema50 and price > ema20 and price >= recent_high * 0.998:
+        mode = 'Long'
+    elif ema20 < ema50 and price < ema20 and price <= recent_low * 1.002:
+        mode = 'Short'
+    if not mode:
+        return None, 'no_breakout'
+
+    # 5. RSI: не входить если уже перегрет (поздний вход)
+    rsi = calc_rsi(c, RSI_PERIOD)
+    if mode == 'Long' and rsi > 80:
+        return None, 'rsi_ext'
+    if mode == 'Short' and rsi < 20:
+        return None, 'rsi_ext'
+
+    # SL по ATR (трейлинг возьмёт прибыль). sl_dist в коридоре.
+    atr = calc_atr(h, l, c)
+    sl_pct = float(np.clip(atr / price * 1.5, MIN_SL_PCT/100, MAX_SL_PCT/100))
+    if mode == 'Long':
+        sl = price * (1 - sl_pct)
+        tp = price * (1 + sl_pct * 3.0)   # дальний ориентир; реально ведёт трейл
+    else:
+        sl = price * (1 + sl_pct)
+        tp = price * (1 - sl_pct * 3.0)
+
+    return {
+        'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
+        'adx': adx, 'rsi': rsi, 'vol_ratio': vol_ratio,
+        'ema20': ema20, 'ema50': ema50,
+        'sma_dist': 0.0, 'vwap_dist': 0.0, 'tp_mult': 3.0,
+        'rsi_prev': rsi, 'btc_trend': btc_ctx.get('btc_trend', ''),
+    }, 'ok'
+
+
 async def publish_to_workers(sym: str, mode: str, price: float,
                               sl: float, tp: float, strategy: str,
                               risk_usdt: float):
@@ -1608,6 +1697,50 @@ async def monitor_all():
         if live:
             real_qty = abs(float(live.get('contracts', 0)))
             pos['current_qty'] = real_qty
+
+            # ── [MOMENTUM] Чандельер-трейлинг (держим пока тренд жив) ──
+            if pos.get('strategy') == 'MOM':
+                atr_v = float(pos.get('atr', entry * 0.01))
+                mfe_p = float(pos['mfe_price'])
+                if is_long:
+                    new_trail = mfe_p - atr_v * MOM_TRAIL_ATR
+                    if new_trail > pos.get('current_sl', 0):
+                        pos['current_sl'] = new_trail
+                    hit = curr_p <= pos['current_sl']
+                else:
+                    new_trail = mfe_p + atr_v * MOM_TRAIL_ATR
+                    if new_trail < pos.get('current_sl', float('inf')):
+                        pos['current_sl'] = new_trail
+                    hit = curr_p >= pos['current_sl']
+                if hit:
+                    try:
+                        await exchange.create_order(
+                            sym, 'market', sl_side, real_qty,
+                            params={'positionSide': pos_side, 'reduceOnly': True})
+                        if pos.get('sl_order_id'):
+                            try:
+                                await exchange.cancel_order(pos['sl_order_id'], sym)
+                            except Exception:
+                                pass
+                        pnl_f = ((curr_p - entry) / entry if is_long
+                                 else (entry - curr_p) / entry) * 100
+                        mfe_t = (abs(float(pos['mfe_price']) - entry) / entry) * 100
+                        mae_t = (abs(float(pos['mae_price']) - entry) / entry) * 100
+                        try:
+                            _ot = datetime.fromisoformat(pos['open_time'])
+                            dur_m = int((datetime.now(timezone.utc) - _ot).total_seconds() / 60)
+                        except Exception:
+                            dur_m = 0
+                        net_u = pos.get('initial_qty', 0) * entry * (pnl_f/100) * LEVERAGE
+                        await tg(f"🚀 <b>[{pos.get('strategy')}] {sym}</b> трейл-выход "
+                                 f"<code>{curr_p:.6f}</code>  P&L: {pnl_f:+.2f}%")
+                        log_trade(pos, curr_p, pnl_f, net_u, mfe_t, -mae_t,
+                                  dur_m, 'TRAIL')
+                    except Exception as _e:
+                        logging.error(f'MOM exit {sym}: {_e}')
+                    return False
+                save_all()
+                return True
 
             # Ghost position guard: закрываем мизерные остатки принудительно
             pos_value_usdt = real_qty * curr_p
@@ -1999,6 +2132,24 @@ async def scan_rsi():
                     f"TP-mult: {sig['tp_mult']}x"
                 )
                 await execute(sym, sig, 'RSI', rsi_positions, extra)
+            # [MOMENTUM] Если MR не дал сигнал — пробуем momentum (тренд-режим)
+            elif MOMENTUM_ENABLED and sym not in notified:
+                async with sem:
+                    msig, mreason = await momentum_signal(sym, btc_ctx)
+                if msig:
+                    st['momentum'] = st.get('momentum', 0) + 1
+                    _alt = '🔥ALT' if btc_ctx.get('altseason') else 'no-alt'
+                    _live = 'LIVE' if MOMENTUM_LIVE else 'SHADOW'
+                    logging.info(
+                        f"🚀 [MOM {_live}] {sym} {msig['mode']} @ {msig['rsi']:.0f}rsi "
+                        f"ADX:{msig['adx']:.0f} Vol:{msig['vol_ratio']:.1f}x "
+                        f"EMA20{'>' if msig['ema20']>msig['ema50'] else '<'}EMA50 [{_alt}]"
+                    )
+                    if MOMENTUM_LIVE:
+                        notified[sym] = time.time()
+                        mextra = (f"MOM ADX:{msig['adx']:.0f} "
+                                  f"Vol:{msig['vol_ratio']:.1f}x trail:{MOM_TRAIL_ATR}xATR")
+                        await execute(sym, msig, 'MOM', rsi_positions, mextra)
         except Exception as _e:
             st['error'] = st.get('error', 0) + 1
             if st['error'] <= 2:
