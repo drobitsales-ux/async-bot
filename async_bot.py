@@ -545,9 +545,15 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         ctx_keys = ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')
         context.update({k: v for k, v in extra.items() if k in ctx_keys})
 
-    # Добавляем контекст BTC в промпт для лучшего решения
+    # Добавляем контекст BTC + числовые альт-метрики (факты из биржи, не выдумка AI)
     btc_ctx_str = context.get('btc_trend', 'Flat')
-    alt_ctx_str = 'altseason (altcoins outperform BTC)' if context.get('altseason') else 'no altseason'
+    _spread = context.get('eth_btc_spread', 0.0)
+    _ascore = context.get('alt_score', 50)
+    alt_ctx_str = (
+        f"altseason ACTIVE (ETH/BTC spread {_spread:+.1f}%, alt_score {_ascore}/100)"
+        if context.get('altseason')
+        else f"no altseason (ETH/BTC spread {_spread:+.1f}%, alt_score {_ascore}/100)"
+    )
 
     prompt = (
         'You are a crypto futures risk manager specializing in SMC and RSI mean reversion. '
@@ -940,27 +946,38 @@ async def get_btc_context() -> dict:
     try:
         btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
         if not btc_ohlcv or len(btc_ohlcv) < 200:
-            return {'btc_trend': 'Flat', 'altseason': False}
+            return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50}
         btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
         ema200 = calc_ema(btc_c, 200)
         dist = (btc_c[-1] - ema200) / ema200 * 100
         trend = 'Long' if dist > 0.5 else ('Short' if dist < -0.5 else 'Flat')
 
         altseason = False
+        eth_btc_spread = 0.0   # [ALT] спред доходности ETH vs BTC за 50 баров
         try:
             eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT:USDT', SMC_TF, limit=55)
             if eth_ohlcv and len(eth_ohlcv) >= 50:
                 eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
                 eth_ret = (eth_c[-1] - eth_c[-50]) / eth_c[-50] * 100
                 btc_ret = (btc_c[-1] - btc_c[-50]) / btc_c[-50] * 100
-                if eth_ret - btc_ret > 0.5 and eth_c[-1] > calc_ema(eth_c, 50):
+                eth_btc_spread = round(eth_ret - btc_ret, 2)
+                if eth_btc_spread > 0.5 and eth_c[-1] > calc_ema(eth_c, 50):
                     altseason = True
-        except:
+        except Exception:
             pass
 
-        return {'btc_trend': trend, 'altseason': altseason}
-    except:
-        return {'btc_trend': 'Flat', 'altseason': False}
+        # [ALT] alt_score 0-100: композит спреда ETH/BTC и тренда BTC вниз
+        # (капитал уходит из BTC в альты когда BTC слаб, а ETH/BTC растёт)
+        _score = 50.0
+        _score += max(min(eth_btc_spread * 8, 35), -35)   # спред: ±35
+        if trend == 'Short':  _score += 10   # BTC слаб → плюс альтам
+        elif trend == 'Long': _score -= 10
+        alt_score = int(max(0, min(100, _score)))
+
+        return {'btc_trend': trend, 'altseason': altseason,
+                'eth_btc_spread': eth_btc_spread, 'alt_score': alt_score}
+    except Exception:
+        return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50}
 
 # ═══════════════════════════════════════════════════════
 #  SMC СИГНАЛ
@@ -2140,10 +2157,13 @@ async def scan_rsi():
                     st['momentum'] = st.get('momentum', 0) + 1
                     _alt = '🔥ALT' if btc_ctx.get('altseason') else 'no-alt'
                     _live = 'LIVE' if MOMENTUM_LIVE else 'SHADOW'
+                    _ascore = btc_ctx.get('alt_score', 50)
+                    _spread = btc_ctx.get('eth_btc_spread', 0.0)
                     logging.info(
                         f"🚀 [MOM {_live}] {sym} {msig['mode']} @ {msig['rsi']:.0f}rsi "
                         f"ADX:{msig['adx']:.0f} Vol:{msig['vol_ratio']:.1f}x "
-                        f"EMA20{'>' if msig['ema20']>msig['ema50'] else '<'}EMA50 [{_alt}]"
+                        f"EMA20{'>' if msig['ema20']>msig['ema50'] else '<'}EMA50 "
+                        f"[{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
                     )
                     if MOMENTUM_LIVE:
                         notified[sym] = time.time()
