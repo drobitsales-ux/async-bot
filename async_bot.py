@@ -85,7 +85,7 @@ MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 MOMENTUM_ENABLED = os.getenv('MOMENTUM_ENABLED', 'true').lower() == 'true'   # детект+лог
 MOMENTUM_LIVE    = os.getenv('MOMENTUM_LIVE', 'false').lower() == 'true'      # реальная торговля
 MOM_ADX_MIN      = 25      # тренд должен быть сильным
-MOM_TRAIL_ATR    = 3.0     # чандельер-трейлинг множитель ATR
+MOM_TRAIL_ATR    = float(os.getenv('MOM_TRAIL_ATR', '1.5'))  # чандельер-трейл множитель ATR (env-настройка; 3.0 не фиксировал прибыль → 1.5)
 MOM_MIN_QUOTE    = 5000.0   # мин. оборот свечи USDT
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
