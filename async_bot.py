@@ -90,7 +90,12 @@ MOM_MIN_QUOTE    = 5000.0   # мин. оборот свечи USDT
 # [STEP-C] RSI-фильтр входа: не ловить истощённые движения
 # (не шортить уже перепроданное / не лонговать уже перекупленное)
 MOM_RSI_SHORT_MAX = float(os.getenv('MOM_RSI_SHORT_MAX', '35'))  # шорт только если RSI > этого
-MOM_RSI_LONG_MIN  = float(os.getenv('MOM_RSI_LONG_MIN', '65'))   # лонг только если RSI < этого
+MOM_RSI_LONG_MIN  = float(os.getenv('MOM_RSI_LONG_MIN', '65'))
+# [PULLBACK] вход по откату к EMA20 внутри тренда (НЕ пробой экстремума)
+PB_ENABLED   = os.getenv('PB_ENABLED', 'true').lower() == 'true'   # shadow-детект pullback
+PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к EMA20 (1.2%)
+PB_RSI_LO    = float(os.getenv('PB_RSI_LO', '40'))       # RSI reset зона: низ
+PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: верх   # лонг только если RSI < этого
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -1445,14 +1450,13 @@ async def momentum_signal(sym: str, btc_ctx: dict):
     if not mode:
         return None, 'no_breakout'
 
-    # 5. [STEP-C] RSI-фильтр входа: не входить в ИСТОЩЁННОЕ движение.
-    # Шорт только пока RSI не упал слишком низко (иначе ловим отскок),
-    # лонг только пока RSI не взлетел слишком высоко.
+    # 5. RSI: только защита от крайностей (откат фильтра STEP-C —
+    # он конфликтовал с пробойным входом и обнулял сигналы)
     rsi = calc_rsi(c, RSI_PERIOD)
-    if mode == 'Short' and rsi < MOM_RSI_SHORT_MAX:
-        return None, 'rsi_ext'   # уже перепродано — поздно шортить
-    if mode == 'Long' and rsi > MOM_RSI_LONG_MIN:
-        return None, 'rsi_ext'   # уже перекуплено — поздно лонговать
+    if mode == 'Long' and rsi > 80:
+        return None, 'rsi_ext'
+    if mode == 'Short' and rsi < 20:
+        return None, 'rsi_ext'
 
     # SL по ATR (трейлинг возьмёт прибыль). sl_dist в коридоре.
     atr = calc_atr(h, l, c)
@@ -1471,6 +1475,84 @@ async def momentum_signal(sym: str, btc_ctx: dict):
         'sma_dist': 0.0, 'vwap_dist': 0.0, 'tp_mult': 3.0,
         'rsi_prev': rsi, 'btc_trend': btc_ctx.get('btc_trend', ''),
         'entry': price,
+    }, 'ok'
+
+
+
+# ═══════════════════════════════════════════════════════
+#  PULLBACK СИГНАЛ  [shadow] — вход по ОТКАТУ к EMA20 в тренде
+#  Отличие от momentum: не пробой экстремума (истощённый вход),
+#  а откат к средней + возобновление тренда (свежий вход).
+#  RSI в нейтральной reset-зоне, НЕ перекуплен/перепродан.
+# ═══════════════════════════════════════════════════════
+async def pullback_signal(sym: str, btc_ctx: dict):
+    """Trend-following pullback: откат к EMA20 + RSI reset + возобновление."""
+    if is_news_now():
+        return None, 'news'
+    try:
+        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)
+    except Exception:
+        return None, 'fetch_err'
+    if not ohlcv or len(ohlcv) < 55:
+        return None, 'no_data'
+
+    h = np.array([float(x[2]) for x in ohlcv])
+    l = np.array([float(x[3]) for x in ohlcv])
+    c = np.array([float(x[4]) for x in ohlcv])
+    v = np.array([float(x[5]) for x in ohlcv])
+    price = float(c[-1])
+
+    # 1. Сильный тренд (как у momentum)
+    adx = calc_adx(h, l, c)
+    if adx < MOM_ADX_MIN:
+        return None, 'adx_weak'
+    ema20 = calc_ema(c, 20)
+    ema50 = calc_ema(c, 50)
+
+    # 2. Объём (оконный устойчивый)
+    if len(v) < 25:
+        return None, 'vol'
+    base_v = float(np.mean(v[-23:-5]))
+    if base_v <= 0:
+        return None, 'vol'
+    recent_v = float(np.mean(v[-4:-1]))
+    vol_ratio = recent_v / base_v
+    quote_vol = float(v[-2]) * price
+    if vol_ratio < 1.1 or quote_vol < MOM_MIN_QUOTE:
+        return None, 'vol'
+
+    # 3. RSI в reset-зоне (НЕ экстремум — ключевое отличие от пробоя)
+    rsi = calc_rsi(c, RSI_PERIOD)
+    if not (PB_RSI_LO < rsi < PB_RSI_HI):
+        return None, 'rsi_zone'
+
+    # 4. Откат к EMA20 + возобновление тренда
+    near_ema = abs(price - ema20) / ema20 <= PB_NEAR_PCT
+    mode = None
+    if ema20 > ema50 and near_ema and c[-1] > c[-2]:
+        # аптренд: цена откатилась к EMA20 и возобновляет рост
+        mode = 'Long'
+    elif ema20 < ema50 and near_ema and c[-1] < c[-2]:
+        # даунтренд: цена отскочила к EMA20 и возобновляет падение
+        mode = 'Short'
+    if not mode:
+        return None, 'no_pullback'
+
+    atr = calc_atr(h, l, c)
+    sl_pct = float(np.clip(atr / price * 1.5, MIN_SL_PCT/100, MAX_SL_PCT/100))
+    if mode == 'Long':
+        sl = price * (1 - sl_pct)
+        tp = price * (1 + sl_pct * 3.0)
+    else:
+        sl = price * (1 + sl_pct)
+        tp = price * (1 - sl_pct * 3.0)
+
+    return {
+        'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
+        'adx': adx, 'rsi': rsi, 'vol_ratio': vol_ratio,
+        'ema20': ema20, 'ema50': ema50, 'entry': price,
+        'sma_dist': 0.0, 'vwap_dist': 0.0, 'tp_mult': 3.0,
+        'rsi_prev': rsi, 'btc_trend': btc_ctx.get('btc_trend', ''),
     }, 'ok'
 
 
@@ -2178,12 +2260,26 @@ async def scan_rsi():
                         f"[{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
                     )
                     # [SHADOW] записываем виртуальный сигнал для расчёта винрейта
-                    shadow_record(sym, msig['mode'], msig['entry'], msig, btc_ctx)
+                    shadow_record(sym, msig['mode'], msig['entry'], msig, btc_ctx, 'MOM')
                     if MOMENTUM_LIVE:
                         notified[sym] = time.time()
                         mextra = (f"MOM ADX:{msig['adx']:.0f} "
                                   f"Vol:{msig['vol_ratio']:.1f}x trail:{MOM_TRAIL_ATR}xATR")
                         await execute(sym, msig, 'MOM', rsi_positions, mextra)
+            # [PULLBACK] независимый shadow-детект входа по откату (не торгует)
+            if PB_ENABLED:
+                async with sem:
+                    psig, preason = await pullback_signal(sym, btc_ctx)
+                if psig:
+                    _alt = '🔥ALT' if btc_ctx.get('altseason') else 'no-alt'
+                    _ascore = btc_ctx.get('alt_score', 50)
+                    _spread = btc_ctx.get('eth_btc_spread', 0.0)
+                    logging.info(
+                        f"🎯 [PB SHADOW] {sym} {psig['mode']} @ {psig['rsi']:.0f}rsi "
+                        f"ADX:{psig['adx']:.0f} Vol:{psig['vol_ratio']:.1f}x "
+                        f"near-EMA20 [{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
+                    )
+                    shadow_record(sym, psig['mode'], psig['entry'], psig, btc_ctx, 'PB')
         except Exception as _e:
             st['error'] = st.get('error', 0) + 1
             if st['error'] <= 2:
@@ -2404,6 +2500,11 @@ def _init_trades_db():
             bars_held   INTEGER
         )
     """)
+    # [PB] миграция: колонка strategy (MOM | PB) для раздельной статистики
+    try:
+        con.execute("ALTER TABLE shadow_signals ADD COLUMN strategy TEXT DEFAULT 'MOM'")
+    except Exception:
+        pass  # колонка уже существует
     con.commit()
     con.close()
 
@@ -2462,25 +2563,26 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
 #  Записывает сигнал, симулирует чандельер-трейл как в live,
 #  считает виртуальный PnL → реальный винрейт без риска.
 # ═══════════════════════════════════════════════════════
-def shadow_record(sym, mode, price, msig, btc_ctx):
-    """Записывает новый shadow-сигнал, если по symbol+mode нет открытого."""
+def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
+    """Записывает shadow-сигнал, если по symbol+mode+strategy нет открытого."""
     try:
         con = sqlite3.connect(TRADES_DB)
         cur = con.cursor()
         cur.execute(
-            "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? AND status='open' LIMIT 1",
-            (sym, mode))
+            "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? "
+            "AND strategy=? AND status='open' LIMIT 1",
+            (sym, mode, strategy))
         if cur.fetchone():
             con.close(); return  # уже отслеживается — дубль не пишем
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
-            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
              int(btc_ctx.get('alt_score', 50)), float(btc_ctx.get('eth_btc_spread', 0)),
-             price, float(msig.get('sl', 0))))
+             price, float(msig.get('sl', 0)), strategy))
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -2565,19 +2667,10 @@ def shadow_reset() -> str:
         return f'[SHADOW] reset fail: {_e}'
 
 
-def shadow_stats() -> str:
-    """Сводка по закрытым shadow-сигналам: винрейт, средний PnL, PF."""
-    try:
-        con = sqlite3.connect(TRADES_DB)
-        rows = con.execute(
-            "SELECT pnl_pct,alt_score,adx FROM shadow_signals WHERE status='closed'").fetchall()
-        n_open = con.execute(
-            "SELECT COUNT(*) FROM shadow_signals WHERE status='open'").fetchone()[0]
-        con.close()
-    except Exception as _e:
-        return f'[SHADOW] stats fail: {_e}'
+def _shadow_block(rows, label):
+    """Формирует строку статистики по списку закрытых сделок."""
     if not rows:
-        return f'👁 Shadow: пока нет закрытых сигналов (открыто: {n_open})'
+        return f'<b>{label}</b>: нет закрытых сделок'
     n = len(rows)
     wins = sum(1 for r in rows if r[0] > 0)
     wr = wins / n * 100
@@ -2585,10 +2678,28 @@ def shadow_stats() -> str:
     gw = sum(r[0] for r in rows if r[0] > 0)
     gl = abs(sum(r[0] for r in rows if r[0] < 0))
     pf = (gw / gl) if gl > 0 else 0
-    return (f'👁 <b>Shadow Momentum</b> (виртуально, без риска)\n'
-            f'Сделок: {n} | Открыто: {n_open}\n'
-            f'Win Rate: {wr:.1f}% ({wins}W/{n-wins}L)\n'
-            f'Avg PnL: {avg:+.2f}% | PF: {pf:.2f}')
+    return (f'<b>{label}</b>: {n} сделок | WR {wr:.1f}% ({wins}W/{n-wins}L) | '
+            f'Avg {avg:+.2f}% | PF {pf:.2f}')
+
+
+def shadow_stats() -> str:
+    """Сводка по закрытым shadow-сигналам, раздельно MOM и PB."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        mom = con.execute("SELECT pnl_pct FROM shadow_signals "
+                          "WHERE status='closed' AND strategy='MOM'").fetchall()
+        pb  = con.execute("SELECT pnl_pct FROM shadow_signals "
+                          "WHERE status='closed' AND strategy='PB'").fetchall()
+        o_mom = con.execute("SELECT COUNT(*) FROM shadow_signals "
+                            "WHERE status='open' AND strategy='MOM'").fetchone()[0]
+        o_pb = con.execute("SELECT COUNT(*) FROM shadow_signals "
+                           "WHERE status='open' AND strategy='PB'").fetchone()[0]
+        con.close()
+    except Exception as _e:
+        return f'[SHADOW] stats fail: {_e}'
+    return (f'👁 <b>Shadow (виртуально, без риска)</b>\n'
+            f'🚀 {_shadow_block(mom, "Momentum (пробой)")} | открыто: {o_mom}\n'
+            f'🎯 {_shadow_block(pb, "Pullback (откат)")} | открыто: {o_pb}')
 
 
 def export_trades_csv() -> str:
