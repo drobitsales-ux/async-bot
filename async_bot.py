@@ -87,6 +87,10 @@ MOMENTUM_LIVE    = os.getenv('MOMENTUM_LIVE', 'false').lower() == 'true'      # 
 MOM_ADX_MIN      = 25      # тренд должен быть сильным
 MOM_TRAIL_ATR    = float(os.getenv('MOM_TRAIL_ATR', '1.5'))  # чандельер-трейл множитель ATR (env-настройка; 3.0 не фиксировал прибыль → 1.5)
 MOM_MIN_QUOTE    = 5000.0   # мин. оборот свечи USDT
+# [STEP-C] RSI-фильтр входа: не ловить истощённые движения
+# (не шортить уже перепроданное / не лонговать уже перекупленное)
+MOM_RSI_SHORT_MAX = float(os.getenv('MOM_RSI_SHORT_MAX', '35'))  # шорт только если RSI > этого
+MOM_RSI_LONG_MIN  = float(os.getenv('MOM_RSI_LONG_MIN', '65'))   # лонг только если RSI < этого
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -1441,12 +1445,14 @@ async def momentum_signal(sym: str, btc_ctx: dict):
     if not mode:
         return None, 'no_breakout'
 
-    # 5. RSI: не входить если уже перегрет (поздний вход)
+    # 5. [STEP-C] RSI-фильтр входа: не входить в ИСТОЩЁННОЕ движение.
+    # Шорт только пока RSI не упал слишком низко (иначе ловим отскок),
+    # лонг только пока RSI не взлетел слишком высоко.
     rsi = calc_rsi(c, RSI_PERIOD)
-    if mode == 'Long' and rsi > 80:
-        return None, 'rsi_ext'
-    if mode == 'Short' and rsi < 20:
-        return None, 'rsi_ext'
+    if mode == 'Short' and rsi < MOM_RSI_SHORT_MAX:
+        return None, 'rsi_ext'   # уже перепродано — поздно шортить
+    if mode == 'Long' and rsi > MOM_RSI_LONG_MIN:
+        return None, 'rsi_ext'   # уже перекуплено — поздно лонговать
 
     # SL по ATR (трейлинг возьмёт прибыль). sl_dist в коридоре.
     atr = calc_atr(h, l, c)
@@ -2547,6 +2553,18 @@ async def shadow_check():
             logging.debug(f'[SHADOW] check {sym}: {_e}')
 
 
+def shadow_reset() -> str:
+    """Очищает таблицу shadow_signals для чистого замера."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        n = con.execute('SELECT COUNT(*) FROM shadow_signals').fetchone()[0]
+        con.execute('DELETE FROM shadow_signals')
+        con.commit(); con.close()
+        return f'🗑 Shadow-таблица очищена ({n} записей удалено). Замер с нуля.'
+    except Exception as _e:
+        return f'[SHADOW] reset fail: {_e}'
+
+
 def shadow_stats() -> str:
     """Сводка по закрытым shadow-сигналам: винрейт, средний PnL, PF."""
     try:
@@ -2716,6 +2734,9 @@ async def check_tg_commands():
 
             elif cmd == '/shadow':
                 await tg(shadow_stats())
+
+            elif cmd == '/shadow_reset':
+                await tg(shadow_reset())
 
             elif cmd == '/sync':
                 # Синхронизация локального списка позиций с реальными на BingX
