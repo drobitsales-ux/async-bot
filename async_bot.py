@@ -1813,15 +1813,20 @@ async def monitor_all():
             if pos.get('strategy') == 'MOM':
                 atr_v = float(pos.get('atr', entry * 0.01))
                 mfe_p = float(pos['mfe_price'])
+                # [BREATHING STOP] трейл активируется только после +1% профита
+                _mfe_pct = ((mfe_p - entry)/entry if is_long
+                            else (entry - mfe_p)/entry) * 100
                 if is_long:
-                    new_trail = mfe_p - atr_v * MOM_TRAIL_ATR
-                    if new_trail > pos.get('current_sl', 0):
-                        pos['current_sl'] = new_trail
+                    if _mfe_pct >= 1.0:
+                        new_trail = mfe_p - atr_v * MOM_TRAIL_ATR
+                        if new_trail > pos.get('current_sl', 0):
+                            pos['current_sl'] = new_trail
                     hit = curr_p <= pos['current_sl']
                 else:
-                    new_trail = mfe_p + atr_v * MOM_TRAIL_ATR
-                    if new_trail < pos.get('current_sl', float('inf')):
-                        pos['current_sl'] = new_trail
+                    if _mfe_pct >= 1.0:
+                        new_trail = mfe_p + atr_v * MOM_TRAIL_ATR
+                        if new_trail < pos.get('current_sl', float('inf')):
+                            pos['current_sl'] = new_trail
                     hit = curr_p >= pos['current_sl']
                 if hit:
                     try:
@@ -2505,10 +2510,64 @@ def _init_trades_db():
         con.execute("ALTER TABLE shadow_signals ADD COLUMN strategy TEXT DEFAULT 'MOM'")
     except Exception:
         pass  # колонка уже существует
+    # [EPOCH] таблица meta: время последнего деплоя (для статистики 'Последнее')
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     con.commit()
     con.close()
 
 _init_trades_db()
+
+
+# ═══════════════════════════════════════════════════════
+#  ВЕРСИЯ КОДА И ЖУРНАЛ ИЗМЕНЕНИЙ
+#  Бампай CODE_VERSION при КАЖДОМ деплое + добавляй строку в CHANGELOG.
+#  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
+#  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
+# ═══════════════════════════════════════════════════════
+CODE_VERSION = '2026-06-08-v12'
+CHANGELOG = [
+    ('2026-06-08-v12', "Split статистики Последнее/Всего (shadow + /stats) + журнал версий"),
+    ('2026-06-08-v11', "Дышащий стоп shadow+live MOM (трейл после +1%) + тег TF в /shadow"),
+    ('2026-06-07-v10', "Pullback shadow-стратегия + раздельная stats MOM/PB"),
+    ('2026-06-07-v9',  "RSI-фильтр входа momentum — ОТКАЧЕН (конфликт с пробоем, обнулял сигналы)"),
+    ('2026-06-06-v8',  "Трейл MOM_TRAIL_ATR 3.0 -> 1.5 (env-настройка)"),
+    ('2026-06-05-v7',  "Shadow-трекинг momentum: запись + симуляция + /shadow"),
+]
+# ⚠ НЕ ВОЗВРАЩАТЬ: RSI-фильтр входа momentum (>60/<40) — несовместим с пробоем экстремума.
+# ⚠ НЕ МЕНЯТЬ MR/SMC-логику на малой выборке (<30-50 сделок) — переобучение.
+
+
+def set_deploy_epoch():
+    """Сдвигает метку 'Последнее' ТОЛЬКО при смене CODE_VERSION (новый деплой),
+    а не на каждом рестарте. Пишет журнал изменений в лог."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        r = con.execute("SELECT value FROM meta WHERE key='code_version'").fetchone()
+        stored = r[0] if r else None
+        if stored != CODE_VERSION:
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('deploy_epoch',?)", (now,))
+            con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('code_version',?)", (CODE_VERSION,))
+            con.commit()
+            note = next((d for v, d in CHANGELOG if v == CODE_VERSION), '—')
+            logging.info(f"🆕 [DEPLOY] {CODE_VERSION}: {note}")
+            logging.info(f"📍 [EPOCH] метка 'Последнее' сброшена (предыдущая версия: {stored or 'нет'})")
+        else:
+            logging.info(f"♻️ [RESTART] {CODE_VERSION} без изменений кода — статистика 'Последнее' сохранена")
+        con.close()
+    except Exception as _e:
+        logging.warning(f'[EPOCH] set fail: {_e}')
+
+
+def get_deploy_epoch():
+    """Возвращает ISO-время последнего деплоя или None."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        r = con.execute("SELECT value FROM meta WHERE key='deploy_epoch'").fetchone()
+        con.close()
+        return r[0] if r else None
+    except Exception:
+        return None
 
 def log_trade(pos: dict, exit_p: float, pnl_pct: float,
               net_usdt: float, mfe_pct: float, mae_pct: float,
@@ -2614,16 +2673,23 @@ async def shadow_check():
             is_long = (mode == 'Long')
             atr = atr if atr > 0 else entry * 0.01
 
-            # Обновляем MFE и чандельер-трейл (как в live process_pos)
+            # [BREATHING STOP] Трейлинг включается ТОЛЬКО после +1% профита.
+            # До этого работает исходный широкий SL — сделка 'дышит',
+            # не выбивается шумом свечи входа (фикс '0 баров' закрытий).
+            mfe_pct = ((mfe_p - entry)/entry if is_long else (entry - mfe_p)/entry) * 100
             if is_long:
                 mfe_p = max(mfe_p, hi)
-                new_trail = mfe_p - atr * MOM_TRAIL_ATR
-                trail_sl = max(trail_sl, new_trail)
-                hit = lo <= trail_sl
+                mfe_pct = (mfe_p - entry)/entry * 100
+                if mfe_pct >= 1.0:   # профит дошёл до +1% → активируем трейл
+                    new_trail = mfe_p - atr * MOM_TRAIL_ATR
+                    trail_sl = max(trail_sl, new_trail)
+                hit = lo <= trail_sl   # до +1% trail_sl = исходный широкий SL
             else:
                 mfe_p = min(mfe_p, lo)
-                new_trail = mfe_p + atr * MOM_TRAIL_ATR
-                trail_sl = min(trail_sl, new_trail)
+                mfe_pct = (entry - mfe_p)/entry * 100
+                if mfe_pct >= 1.0:
+                    new_trail = mfe_p + atr * MOM_TRAIL_ATR
+                    trail_sl = min(trail_sl, new_trail)
                 hit = hi >= trail_sl
 
             # Таймаут по числу баров
@@ -2667,10 +2733,10 @@ def shadow_reset() -> str:
         return f'[SHADOW] reset fail: {_e}'
 
 
-def _shadow_block(rows, label):
+def _shadow_block(rows):
     """Формирует строку статистики по списку закрытых сделок."""
     if not rows:
-        return f'<b>{label}</b>: нет закрытых сделок'
+        return 'нет сделок'
     n = len(rows)
     wins = sum(1 for r in rows if r[0] > 0)
     wr = wins / n * 100
@@ -2678,28 +2744,45 @@ def _shadow_block(rows, label):
     gw = sum(r[0] for r in rows if r[0] > 0)
     gl = abs(sum(r[0] for r in rows if r[0] < 0))
     pf = (gw / gl) if gl > 0 else 0
-    return (f'<b>{label}</b>: {n} сделок | WR {wr:.1f}% ({wins}W/{n-wins}L) | '
+    return (f'{n} сделок | WR {wr:.1f}% ({wins}W/{n-wins}L) | '
             f'Avg {avg:+.2f}% | PF {pf:.2f}')
 
 
+def _shadow_strat(con, strat, epoch):
+    """Возвращает (rows_last, rows_all, n_open) по стратегии."""
+    rows_all = con.execute(
+        "SELECT pnl_pct FROM shadow_signals WHERE status='closed' AND strategy=?",
+        (strat,)).fetchall()
+    if epoch:
+        rows_last = con.execute(
+            "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+            "AND strategy=? AND close_time > ?", (strat, epoch)).fetchall()
+    else:
+        rows_last = []
+    n_open = con.execute(
+        "SELECT COUNT(*) FROM shadow_signals WHERE status='open' AND strategy=?",
+        (strat,)).fetchone()[0]
+    return rows_last, rows_all, n_open
+
+
 def shadow_stats() -> str:
-    """Сводка по закрытым shadow-сигналам, раздельно MOM и PB."""
+    """Сводка shadow: 'Последнее' (с деплоя) + 'Всего', раздельно MOM и PB."""
     try:
+        epoch = get_deploy_epoch()
         con = sqlite3.connect(TRADES_DB)
-        mom = con.execute("SELECT pnl_pct FROM shadow_signals "
-                          "WHERE status='closed' AND strategy='MOM'").fetchall()
-        pb  = con.execute("SELECT pnl_pct FROM shadow_signals "
-                          "WHERE status='closed' AND strategy='PB'").fetchall()
-        o_mom = con.execute("SELECT COUNT(*) FROM shadow_signals "
-                            "WHERE status='open' AND strategy='MOM'").fetchone()[0]
-        o_pb = con.execute("SELECT COUNT(*) FROM shadow_signals "
-                           "WHERE status='open' AND strategy='PB'").fetchone()[0]
+        m_last, m_all, m_open = _shadow_strat(con, 'MOM', epoch)
+        p_last, p_all, p_open = _shadow_strat(con, 'PB', epoch)
         con.close()
     except Exception as _e:
         return f'[SHADOW] stats fail: {_e}'
-    return (f'👁 <b>Shadow (виртуально, без риска)</b>\n'
-            f'🚀 {_shadow_block(mom, "Momentum (пробой)")} | открыто: {o_mom}\n'
-            f'🎯 {_shadow_block(pb, "Pullback (откат)")} | открыто: {o_pb}')
+    return (
+        f'👁 <b>Shadow 15м (виртуально, без риска)</b>\n'
+        f'\n🚀 <b>Momentum (пробой)</b> | открыто: {m_open}\n'
+        f'  Последнее: {_shadow_block(m_last)}\n'
+        f'  Всего: {_shadow_block(m_all)}\n'
+        f'\n🎯 <b>Pullback (откат)</b> | открыто: {p_open}\n'
+        f'  Последнее: {_shadow_block(p_last)}\n'
+        f'  Всего: {_shadow_block(p_all)}')
 
 
 def export_trades_csv() -> str:
@@ -2719,41 +2802,52 @@ def export_trades_csv() -> str:
     except Exception as e:
         return f'Ошибка: {e}'
 
+def _trades_row(con, since=None):
+    """Агрегаты по trades; since=ISO время → только сделки после него."""
+    where = "WHERE close_time > ?" if since else ""
+    args = (since,) if since else ()
+    return con.execute(f"""
+        SELECT
+            COUNT(*) total,
+            SUM(CASE WHEN pnl_pct >= 0.5 OR tp50_hit=1 THEN 1 ELSE 0 END) wins,
+            ROUND(AVG(pnl_pct),2) avg_pnl,
+            ROUND(AVG(mfe_pct),2) avg_mfe,
+            ROUND(AVG(mae_pct),2) avg_mae,
+            SUM(CASE WHEN strategy='SMC' THEN 1 ELSE 0 END) smc_cnt,
+            SUM(CASE WHEN strategy='RSI' THEN 1 ELSE 0 END) rsi_cnt,
+            SUM(CASE WHEN close_reason='Timeout' THEN 1 ELSE 0 END) timeout_cnt
+        FROM trades {where}
+    """, args).fetchone()
+
+
+def _trades_line(r):
+    """Форматирует строку из агрегата _trades_row."""
+    if not r or r[0] == 0:
+        return 'нет сделок'
+    total, wins = r[0], r[1]
+    wr = wins/total*100 if total else 0
+    return (f'{total} сделок | WR {wr:.1f}% ({wins}/{total}) | '
+            f'Avg {r[2]:+.2f}% | MFE {r[3]:.2f}% | '
+            f'SMC:{r[5]} RSI:{r[6]} TO:{r[7]}')
+
+
 def get_trades_stats() -> str:
-    """Быстрая статистика из БД для команды /stats."""
+    """Статистика /stats: 'Последнее' (с деплоя) + 'Всего'."""
     try:
+        epoch = get_deploy_epoch()
         con = sqlite3.connect(TRADES_DB)
-        cur = con.execute("""
-            SELECT
-                COUNT(*) total,
-                SUM(CASE WHEN pnl_pct >= 0.5 OR tp50_hit=1 THEN 1 ELSE 0 END) wins,
-                ROUND(AVG(pnl_pct),2) avg_pnl,
-                ROUND(AVG(mfe_pct),2) avg_mfe,
-                ROUND(AVG(mae_pct),2) avg_mae,
-                ROUND(AVG(rsi_val),1) avg_rsi,
-                ROUND(AVG(vol_ratio),2) avg_vol,
-                ROUND(AVG(dur_min),0) avg_dur,
-                SUM(CASE WHEN strategy='SMC' THEN 1 ELSE 0 END) smc_cnt,
-                SUM(CASE WHEN strategy='RSI' THEN 1 ELSE 0 END) rsi_cnt,
-                SUM(CASE WHEN close_reason='SL' THEN 1 ELSE 0 END) sl_cnt,
-                SUM(CASE WHEN close_reason='Timeout' THEN 1 ELSE 0 END) timeout_cnt
-            FROM trades
-        """)
-        r = cur.fetchone()
+        r_all = _trades_row(con)
+        r_last = _trades_row(con, epoch) if epoch else None
         con.close()
-        if not r or r[0] == 0:
-            return 'Нет данных'
-        total, wins = r[0], r[1]
-        wr = wins/total*100 if total else 0
-        return (
-            f'📊 <b>Статистика всех сделок</b>\n'
-            f'Всего: {total} | WR: {wr:.1f}% ({wins}/{total})\n'
-            f'Avg PnL: {r[2]:+.2f}% | MFE: {r[3]:.2f}% | MAE: {r[4]:.2f}%\n'
-            f'Avg RSI: {r[5]} | Vol: {r[6]}x | Dur: {r[7]:.0f}мин\n'
-            f'SMC: {r[8]} | RSI: {r[9]} | SL: {r[10]} | Timeout: {r[11]}'
-        )
     except Exception as e:
         return f'Ошибка: {e}'
+    if not r_all or r_all[0] == 0:
+        return '📊 Нет данных по реальным сделкам'
+    return (
+        f'📊 <b>Статистика реальных сделок (SMC/RSI)</b>\n'
+        f'Последнее: {_trades_line(r_last)}\n'
+        f'Всего: {_trades_line(r_all)}'
+    )
 
 
 async def check_tg_commands():
@@ -2873,6 +2967,7 @@ async def main():
 
     init_db()
     load_all()
+    set_deploy_epoch()   # [EPOCH] метка времени деплоя для статистики 'Последнее'
     http = aiohttp.ClientSession()
 
     Thread(target=run_health, daemon=True).start()
