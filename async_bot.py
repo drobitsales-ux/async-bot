@@ -39,7 +39,7 @@ import time
 import aiohttp
 import numpy as np
 import ccxt.async_support as ccxt_async
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -96,6 +96,8 @@ PB_ENABLED   = os.getenv('PB_ENABLED', 'true').lower() == 'true'   # shadow-де
 PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к EMA20 (1.2%)
 PB_RSI_LO    = float(os.getenv('PB_RSI_LO', '40'))       # RSI reset зона: низ
 PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: верх   # лонг только если RSI < этого
+# [SHADOW] кулдаун: не пересэмплировать тот же символ+стратегию+направление
+SHADOW_COOLDOWN_BARS = int(os.getenv('SHADOW_COOLDOWN_BARS', '6'))
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -2510,6 +2512,10 @@ def _init_trades_db():
         con.execute("ALTER TABLE shadow_signals ADD COLUMN strategy TEXT DEFAULT 'MOM'")
     except Exception:
         pass  # колонка уже существует
+    try:
+        con.execute("ALTER TABLE shadow_signals ADD COLUMN entry_rsi REAL DEFAULT 0")
+    except Exception:
+        pass  # колонка уже существует
     # [EPOCH] таблица meta: время последнего деплоя (для статистики 'Последнее')
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     con.commit()
@@ -2524,8 +2530,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-08-v12'
+CODE_VERSION = '2026-06-09-v13'
 CHANGELOG = [
+    ('2026-06-09-v13', "Кулдаун повторных сигналов (анти-овертрейд) + /shadow_analyze (мина данных по признакам) + entry_rsi"),
     ('2026-06-08-v12', "Split статистики Последнее/Всего (shadow + /stats) + журнал версий"),
     ('2026-06-08-v11', "Дышащий стоп shadow+live MOM (трейл после +1%) + тег TF в /shadow"),
     ('2026-06-07-v10', "Pullback shadow-стратегия + раздельная stats MOM/PB"),
@@ -2633,15 +2640,25 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
             (sym, mode, strategy))
         if cur.fetchone():
             con.close(); return  # уже отслеживается — дубль не пишем
+        # [COOLDOWN] не пересэмплировать тот же сетап сразу после закрытия
+        tf_min = 60 if RSI_TF == '1h' else 15
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(minutes=SHADOW_COOLDOWN_BARS * tf_min)).isoformat()
+        cur.execute(
+            "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? "
+            "AND strategy=? AND status='closed' AND close_time > ? LIMIT 1",
+            (sym, mode, strategy, cutoff))
+        if cur.fetchone():
+            con.close(); return  # недавно закрыт — ждём кулдаун
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
-            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?)",
+            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
              int(btc_ctx.get('alt_score', 50)), float(btc_ctx.get('eth_btc_spread', 0)),
-             price, float(msig.get('sl', 0)), strategy))
+             price, float(msig.get('sl', 0)), strategy, float(msig.get('rsi', 0))))
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -2719,6 +2736,82 @@ async def shadow_check():
             con.commit(); con.close()
         except Exception as _e:
             logging.debug(f'[SHADOW] check {sym}: {_e}')
+
+
+def _bucket_stats(rows):
+    """rows = [(pnl,)] → (n, wr, avg, pf)."""
+    n = len(rows)
+    if n == 0:
+        return (0, 0, 0, 0)
+    wins = sum(1 for r in rows if r[0] > 0)
+    wr = wins / n * 100
+    avg = sum(r[0] for r in rows) / n
+    gw = sum(r[0] for r in rows if r[0] > 0)
+    gl = abs(sum(r[0] for r in rows if r[0] < 0))
+    pf = (gw / gl) if gl > 0 else 0
+    return (n, wr, avg, pf)
+
+
+def _analyze_feature(con, strategy, col, buckets):
+    """Разбивка closed-сделок стратегии по диапазонам признака col.
+    buckets = [(label, lo, hi)]. Возвращает строки отчёта."""
+    out = []
+    for label, lo, hi in buckets:
+        rows = con.execute(
+            f"SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+            f"AND strategy=? AND {col} >= ? AND {col} < ?",
+            (strategy, lo, hi)).fetchall()
+        n, wr, avg, pf = _bucket_stats(rows)
+        if n == 0:
+            continue
+        flag = ' ⭐' if (pf > 1.0 and n >= 15) else ''
+        out.append(f"   {label}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}")
+    return out
+
+
+def shadow_analyze() -> str:
+    """Мина данных: ищет, какие условия отделяют победителей.
+    ⭐ = PF>1 при выборке >=15 (кандидат в фильтр; проверять форвардом)."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        parts = [f'🔬 <b>Анализ признаков {RSI_TF}</b> (closed shadow)']
+        for strat, emoji in [('MOM', '🚀'), ('PB', '🎯')]:
+            total = con.execute(
+                "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
+                (strat,)).fetchone()[0]
+            if total == 0:
+                continue
+            parts.append(f'\n{emoji} <b>{strat}</b> (всего {total})')
+            # по направлению
+            for d in ('Long', 'Short'):
+                rows = con.execute(
+                    "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+                    "AND strategy=? AND direction=?", (strat, d)).fetchall()
+                n, wr, avg, pf = _bucket_stats(rows)
+                if n:
+                    flag = ' ⭐' if (pf > 1.0 and n >= 15) else ''
+                    parts.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+            # по ADX
+            parts.append('  ADX:')
+            parts += _analyze_feature(con, strat, 'adx',
+                [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)])
+            # по объёму
+            parts.append('  Vol:')
+            parts += _analyze_feature(con, strat, 'vol_ratio',
+                [('1.0-1.5x', 1.0, 1.5), ('1.5-3x', 1.5, 3.0), ('3x+', 3.0, 99)])
+            # по alt_score
+            parts.append('  Alt-score:')
+            parts += _analyze_feature(con, strat, 'alt_score',
+                [('<40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)])
+            # по entry RSI (только новые записи где rsi>0)
+            parts.append('  Entry RSI:')
+            parts += _analyze_feature(con, strat, 'entry_rsi',
+                [('20-40', 20, 40), ('40-60', 40, 60), ('60-80', 60, 80)])
+        con.close()
+    except Exception as _e:
+        return f'[ANALYZE] fail: {_e}'
+    parts.append('\n⭐ = PF>1 при n>=15 (кандидат в фильтр, проверять форвардом)')
+    return '\n'.join(parts)
 
 
 def shadow_reset() -> str:
@@ -2942,6 +3035,9 @@ async def check_tg_commands():
 
             elif cmd == '/shadow_reset':
                 await tg(shadow_reset())
+
+            elif cmd == '/shadow_analyze':
+                await tg(shadow_analyze())
 
             elif cmd == '/sync':
                 # Синхронизация локального списка позиций с реальными на BingX
