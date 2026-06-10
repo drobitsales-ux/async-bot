@@ -2530,8 +2530,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-09-v13'
+CODE_VERSION = '2026-06-10-v14'
 CHANGELOG = [
+    ('2026-06-10-v14', 'Фикс /shadow_analyze (HTML 400 ошибка Telegram)'),
     ('2026-06-09-v13', "Кулдаун повторных сигналов (анти-овертрейд) + /shadow_analyze (мина данных по признакам) + entry_rsi"),
     ('2026-06-08-v12', "Split статистики Последнее/Всего (shadow + /stats) + журнал версий"),
     ('2026-06-08-v11', "Дышащий стоп shadow+live MOM (трейл после +1%) + тег TF в /shadow"),
@@ -2772,45 +2773,60 @@ def _analyze_feature(con, strategy, col, buckets):
 def shadow_analyze() -> str:
     """Мина данных: ищет, какие условия отделяют победителей.
     ⭐ = PF>1 при выборке >=15 (кандидат в фильтр; проверять форвардом)."""
+    def _fmt(label, rows):
+        n, wr, avg, pf = _bucket_stats(rows)
+        if n == 0:
+            return None
+        flag = ' ⭐' if (pf > 1.0 and n >= 15) else ''
+        # escape label для Telegram HTML — заменяем < на &lt; > на &gt;
+        safe = label.replace('<', '&lt;').replace('>', '&gt;')
+        return f"  {safe}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}"
+
+    def _feature(con, strat, col, buckets):
+        out = []
+        for label, lo, hi in buckets:
+            rows = con.execute(
+                f"SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+                f"AND strategy=? AND {col} >= ? AND {col} < ?",
+                (strat, lo, hi)).fetchall()
+            line = _fmt(label, rows)
+            if line:
+                out.append(line)
+        return out
+
     try:
         con = sqlite3.connect(TRADES_DB)
-        parts = [f'🔬 <b>Анализ признаков {RSI_TF}</b> (closed shadow)']
+        parts = [f'🔬 Анализ {RSI_TF} (closed shadow)']
         for strat, emoji in [('MOM', '🚀'), ('PB', '🎯')]:
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
                 (strat,)).fetchone()[0]
             if total == 0:
                 continue
-            parts.append(f'\n{emoji} <b>{strat}</b> (всего {total})')
-            # по направлению
+            parts.append(f'\n{emoji} {strat} (всего {total})')
             for d in ('Long', 'Short'):
                 rows = con.execute(
                     "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
                     "AND strategy=? AND direction=?", (strat, d)).fetchall()
-                n, wr, avg, pf = _bucket_stats(rows)
-                if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 15) else ''
-                    parts.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
-            # по ADX
+                line = _fmt(d, rows)
+                if line:
+                    parts.append(line)
             parts.append('  ADX:')
-            parts += _analyze_feature(con, strat, 'adx',
+            parts += _feature(con, strat, 'adx',
                 [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)])
-            # по объёму
             parts.append('  Vol:')
-            parts += _analyze_feature(con, strat, 'vol_ratio',
+            parts += _feature(con, strat, 'vol_ratio',
                 [('1.0-1.5x', 1.0, 1.5), ('1.5-3x', 1.5, 3.0), ('3x+', 3.0, 99)])
-            # по alt_score
             parts.append('  Alt-score:')
-            parts += _analyze_feature(con, strat, 'alt_score',
-                [('<40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)])
-            # по entry RSI (только новые записи где rsi>0)
+            parts += _feature(con, strat, 'alt_score',
+                [('lt40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)])
             parts.append('  Entry RSI:')
-            parts += _analyze_feature(con, strat, 'entry_rsi',
+            parts += _feature(con, strat, 'entry_rsi',
                 [('20-40', 20, 40), ('40-60', 40, 60), ('60-80', 60, 80)])
         con.close()
     except Exception as _e:
         return f'[ANALYZE] fail: {_e}'
-    parts.append('\n⭐ = PF>1 при n>=15 (кандидат в фильтр, проверять форвардом)')
+    parts.append('\n⭐ = PF&gt;1 при n&gt;=15 (кандидат в фильтр)')
     return '\n'.join(parts)
 
 
