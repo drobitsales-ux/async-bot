@@ -2182,6 +2182,9 @@ async def scan_smc():
         logging.debug('[SMC] Circuit breaker активен — скан пропущен')
         return
 
+    # [v16.1] btc-контекст один раз на скан (для alt_score в /stats_analyze)
+    smc_btc_ctx = await get_btc_context()
+
     markets = await get_markets()
     # Предфильтр: получаем объёмы всех монет ОДНИМ запросом
     # Это в 50x быстрее чем 250 отдельных fetch_ticker
@@ -2207,7 +2210,7 @@ async def scan_smc():
             if sig:
                 notified[sym] = time.time()
                 # [v16] передаём alt_score для /stats_analyze
-                sig['alt_score'] = btc_ctx.get('alt_score', 0)
+                sig['alt_score'] = smc_btc_ctx.get('alt_score', 0)
                 await execute(sym, sig, 'SMC', smc_positions,
                               f"RSI: {sig['rsi']:.1f}")
         except Exception as _e:
@@ -2551,8 +2554,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-10-v16'
+CODE_VERSION = '2026-06-10-v16.1'
 CHANGELOG = [
+    ('2026-06-10-v16.1', 'Фикс NameError btc_ctx в scan_smc (alt_score для реальных сделок)'),
     ('2026-06-10-v16', '/stats_analyze: анализ реальных сделок по ADX/RSI/alt_score/час/объём'),
     ('2026-06-10-v15', 'DATA-DRIVEN: PB vol>=1.5x + alt_score<55; 1h shadow отключён (MOM WR4%/PB WR18%)'),
     ('2026-06-10-v14', 'Фикс /shadow_analyze (HTML 400 ошибка Telegram)'),
