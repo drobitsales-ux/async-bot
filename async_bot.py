@@ -1520,13 +1520,18 @@ async def pullback_signal(sym: str, btc_ctx: dict):
     recent_v = float(np.mean(v[-4:-1]))
     vol_ratio = recent_v / base_v
     quote_vol = float(v[-2]) * price
-    if vol_ratio < 1.1 or quote_vol < MOM_MIN_QUOTE:
+    # [DATA v15] Vol>=1.5x: сегмент 1.5-3x даёт WR53%/PF1.06 vs 1.0-1.5x WR31%/PF0.56
+    if vol_ratio < 1.5 or quote_vol < MOM_MIN_QUOTE:
         return None, 'vol'
 
     # 3. RSI в reset-зоне (НЕ экстремум — ключевое отличие от пробоя)
     rsi = calc_rsi(c, RSI_PERIOD)
     if not (PB_RSI_LO < rsi < PB_RSI_HI):
         return None, 'rsi_zone'
+    # [DATA v15] Alt-score<55: при score>=55 PB теряет edge (WR47%/PF0.89)
+    #            при score<40 WR58%/PF1.65⭐ — работает в медвежьем/нейтральном
+    if btc_ctx.get('alt_score', 50) >= 55:
+        return None, 'alt_high'
 
     # 4. Откат к EMA20 + возобновление тренда
     near_ema = abs(price - ema20) / ema20 <= PB_NEAR_PCT
@@ -1732,6 +1737,11 @@ async def execute(sym: str, sig: dict, strategy: str,
         'sma_dist':    round(float(sig.get('sma_dist', 0)), 2),
         'vwap_dist':   round(float(sig.get('vwap_dist', 0)), 2),
         'btc_trend':   str(sig.get('btc_trend', '')),
+        # [v16] признаки для /stats_analyze
+        'adx_val':     round(float(sig.get('adx', 0)), 1),
+        'alt_score':   int(sig.get('alt_score', 0)),
+        'entry_hour':  datetime.now(timezone.utc).hour,
+        'open_time':   datetime.now(timezone.utc).isoformat(),
         'ai_conf':     int(ai.get('conf', 0)),
         'ai_comment':  str(ai.get('comment', '')).replace(',', ';')[:120],
         'tp_mult':     float(sig.get('tp_mult', 1.5)),
@@ -2196,6 +2206,8 @@ async def scan_smc():
             st[reason] = st.get(reason, 0) + 1
             if sig:
                 notified[sym] = time.time()
+                # [v16] передаём alt_score для /stats_analyze
+                sig['alt_score'] = btc_ctx.get('alt_score', 0)
                 await execute(sym, sig, 'SMC', smc_positions,
                               f"RSI: {sig['rsi']:.1f}")
         except Exception as _e:
@@ -2516,6 +2528,15 @@ def _init_trades_db():
         con.execute("ALTER TABLE shadow_signals ADD COLUMN entry_rsi REAL DEFAULT 0")
     except Exception:
         pass  # колонка уже существует
+    # [v16] дополнительные признаки входа для анализа реальных сделок
+    for _col in ['adx_val REAL DEFAULT 0',
+                 'alt_score INTEGER DEFAULT 0',
+                 'entry_hour INTEGER DEFAULT -1',
+                 'open_time TEXT DEFAULT ""']:
+        try:
+            con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
+        except Exception:
+            pass
     # [EPOCH] таблица meta: время последнего деплоя (для статистики 'Последнее')
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     con.commit()
@@ -2530,8 +2551,10 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-10-v14'
+CODE_VERSION = '2026-06-10-v16'
 CHANGELOG = [
+    ('2026-06-10-v16', '/stats_analyze: анализ реальных сделок по ADX/RSI/alt_score/час/объём'),
+    ('2026-06-10-v15', 'DATA-DRIVEN: PB vol>=1.5x + alt_score<55; 1h shadow отключён (MOM WR4%/PB WR18%)'),
     ('2026-06-10-v14', 'Фикс /shadow_analyze (HTML 400 ошибка Telegram)'),
     ('2026-06-09-v13', "Кулдаун повторных сигналов (анти-овертрейд) + /shadow_analyze (мина данных по признакам) + entry_rsi"),
     ('2026-06-08-v12', "Split статистики Последнее/Всего (shadow + /stats) + журнал версий"),
@@ -2592,8 +2615,9 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 entry_price, exit_price, pnl_pct, net_usdt,
                 mfe_pct, mae_pct, dur_min,
                 rsi_val, vol_ratio, sma_dist, vwap_dist, btc_trend,
-                ai_conf, ai_comment, tp_mult, be_moved, tp50_hit
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
+                adx_val, alt_score, entry_hour, open_time
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -2617,6 +2641,10 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('tp_mult', 1.5),
             int(pos.get('be_moved', False)),
             int(pos.get('tp50_hit', False)),
+            pos.get('adx_val', 0),
+            pos.get('alt_score', 0),
+            pos.get('entry_hour', -1),
+            pos.get('open_time', ''),
         ))
         con.commit()
         con.close()
@@ -2940,6 +2968,125 @@ def _trades_line(r):
             f'SMC:{r[5]} RSI:{r[6]} TO:{r[7]}')
 
 
+# ═══════════════════════════════════════════════════════
+#  АНАЛИЗАТОР РЕАЛЬНЫХ СДЕЛОК SMC/RSI
+#  Та же логика что /shadow_analyze, но по реальным trades.
+#  ⭐ = PF>1 при n>=10 — с реальными сделками порог ниже.
+#  ВАЖНО: выводы делать только при n>=30 по каждому сегменту.
+#  При n<30 — ориентировочно, не менять фильтры.
+# ═══════════════════════════════════════════════════════
+def _trades_bucket(con, col, lo, hi, strategy=None, since=None):
+    """Статистика по диапазону признака в реальных trades."""
+    where = f"WHERE {col} >= ? AND {col} < ?"
+    args = [lo, hi]
+    if strategy:
+        where += " AND strategy = ?"
+        args.append(strategy)
+    if since:
+        where += " AND close_time > ?"
+        args.append(since)
+    rows = con.execute(
+        f"SELECT pnl_pct FROM trades {where}", args).fetchall()
+    return _bucket_stats(rows)
+
+
+def stats_analyze() -> str:
+    """Анализ реальных сделок SMC/RSI по признакам входа.
+    Копит данные — при n<30 выводы ориентировочны."""
+    try:
+        epoch = get_deploy_epoch()
+        con = sqlite3.connect(TRADES_DB)
+        total = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        total_last = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE close_time > ?",
+            (epoch,)).fetchone()[0] if epoch else 0
+
+        lines = [f'🔬 <b>Анализ реальных сделок SMC/RSI</b>']
+        lines.append(f'Всего: {total} | С деплоя: {total_last}')
+        if total < 15:
+            lines.append('\n⚠️ Мало данных (нужно 30+ по сегменту).')
+            lines.append('Признаки уже копятся — анализ улучшится.')
+            con.close()
+            return '\n'.join(lines)
+
+        lines.append('')
+        # По стратегии
+        for strat in ('SMC', 'RSI'):
+            rows = con.execute(
+                "SELECT pnl_pct FROM trades WHERE strategy=?",
+                (strat,)).fetchall()
+            n, wr, avg, pf = _bucket_stats(rows)
+            if n == 0:
+                continue
+            flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+            lines.append(f'<b>{strat}</b>: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        lines.append('\n<b>Направление:</b>')
+        for d in ('Long', 'Short'):
+            rows = con.execute(
+                "SELECT pnl_pct FROM trades WHERE direction=?",
+                (d,)).fetchall()
+            n, wr, avg, pf = _bucket_stats(rows)
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        lines.append('\n<b>Причина закрытия:</b>')
+        for reason in ('SL', 'TP', 'BE', 'Timeout'):
+            rows = con.execute(
+                "SELECT pnl_pct FROM trades WHERE close_reason=?",
+                (reason,)).fetchall()
+            n, wr, avg, pf = _bucket_stats(rows)
+            if n:
+                lines.append(f'  {reason}: {n} сд | Avg {avg:+.2f}%')
+
+        lines.append('\n<b>ADX входа:</b>')
+        for lbl, lo, hi in [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)]:
+            n, wr, avg, pf = _trades_bucket(con, 'adx_val', lo, hi)
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        lines.append('\n<b>RSI входа:</b>')
+        for lbl, lo, hi in [('lt40', 0, 40), ('40-55', 40, 55), ('55-65', 55, 65), ('65+', 65, 100)]:
+            safe = lbl.replace('<', '&lt;')
+            n, wr, avg, pf = _trades_bucket(con, 'rsi_val', lo, hi)
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                lines.append(f'  {safe}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        lines.append('\n<b>Alt-score:</b>')
+        for lbl, lo, hi in [('lt40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)]:
+            safe = lbl.replace('<', '&lt;')
+            n, wr, avg, pf = _trades_bucket(con, 'alt_score', lo, hi)
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                lines.append(f'  {safe}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        lines.append('\n<b>Час входа (UTC):</b>')
+        for lbl, lo, hi in [('06-10', 6, 10), ('10-14', 10, 14),
+                             ('14-17', 14, 17), ('17-22', 17, 22)]:
+            n, wr, avg, pf = _trades_bucket(con, 'entry_hour', lo, hi)
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                lines.append(f'  {lbl}h: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        lines.append('\n<b>Объём:</b>')
+        for lbl, lo, hi in [('1-2x', 1.0, 2.0), ('2-4x', 2.0, 4.0), ('4x+', 4.0, 99)]:
+            n, wr, avg, pf = _trades_bucket(con, 'vol_ratio', lo, hi)
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+        con.close()
+    except Exception as _e:
+        return f'[STATS_ANALYZE] fail: {_e}'
+
+    lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
+    return '\n'.join(lines)
+
+
+
 def get_trades_stats() -> str:
     """Статистика /stats: 'Последнее' (с деплоя) + 'Всего'."""
     try:
@@ -3045,6 +3192,9 @@ async def check_tg_commands():
             elif cmd == '/stats':
                 stats_text = get_trades_stats()
                 await tg(stats_text)
+
+            elif cmd == '/stats_analyze':
+                await tg(stats_analyze())
 
             elif cmd == '/shadow':
                 await tg(shadow_stats())
