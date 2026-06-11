@@ -2321,11 +2321,28 @@ async def scan_rsi():
 #  ЕЖЕДНЕВНЫЙ ОТЧЁТ + СБРОС СТАТИСТИКИ
 # ═══════════════════════════════════════════════════════
 async def send_daily_report():
-    """Отправляет итоги дня в Telegram. Вызывается в 22:00 Киев (19:00 UTC)."""
+    """Отправляет итоги дня в Telegram. Триггер hour>=19 UTC (22:00 Киев).
+    Персистентный гард по дате — отправляет ровно один раз в день,
+    переживает рестарт Render."""
     global _daily_report_sent
-    if _daily_report_sent:
-        return
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        r = con.execute("SELECT value FROM meta WHERE key='last_report_date'").fetchone()
+        con.close()
+        if r and r[0] == today_str:
+            _daily_report_sent = True
+            return  # уже отправлен сегодня (переживает рестарт)
+    except Exception:
+        pass
     _daily_report_sent = True
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_report_date',?)",
+                    (today_str,))
+        con.commit(); con.close()
+    except Exception:
+        pass
 
     trades = daily_stats.get('trades', 0)
     wins   = daily_stats.get('wins', 0)
@@ -2554,8 +2571,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-10-v16.1'
+CODE_VERSION = '2026-06-11-v17'
 CHANGELOG = [
+    ('2026-06-11-v17', 'Фикс Итоги дня (триггер hour>=19, персист-гард) + /help + /report'),
     ('2026-06-10-v16.1', 'Фикс NameError btc_ctx в scan_smc (alt_score для реальных сделок)'),
     ('2026-06-10-v16', '/stats_analyze: анализ реальных сделок по ADX/RSI/alt_score/час/объём'),
     ('2026-06-10-v15', 'DATA-DRIVEN: PB vol>=1.5x + alt_score<55; 1h shadow отключён (MOM WR4%/PB WR18%)'),
@@ -3200,6 +3218,38 @@ async def check_tg_commands():
             elif cmd == '/stats_analyze':
                 await tg(stats_analyze())
 
+            elif cmd == '/report':
+                # ручной вызов итогов дня (сбрасываем гард чтобы отправить сейчас)
+                global _daily_report_sent
+                _daily_report_sent = False
+                try:
+                    _con = sqlite3.connect(TRADES_DB)
+                    _con.execute("DELETE FROM meta WHERE key='last_report_date'")
+                    _con.commit(); _con.close()
+                except Exception:
+                    pass
+                await send_daily_report()
+
+            elif cmd in ('/help', '/commands'):
+                await tg(
+                    '🤖 <b>Команды бота</b>\n\n'
+                    '<b>Статистика реальных сделок:</b>\n'
+                    '/stats — итоги SMC/RSI (Последнее/Всего)\n'
+                    '/stats_analyze — анализ по признакам (ADX/RSI/час/объём)\n'
+                    '/report — прислать Итоги дня сейчас\n'
+                    '/status — открытые позиции и состояние\n'
+                    '/csv — экспорт всех сделок\n\n'
+                    '<b>Shadow (виртуальные стратегии):</b>\n'
+                    '/shadow — статистика Momentum/Pullback\n'
+                    '/shadow_analyze — мина данных по признакам\n'
+                    '/shadow_reset — очистить shadow-статистику\n\n'
+                    '<b>Управление:</b>\n'
+                    '/sync — синхронизация позиций с биржей\n'
+                    '/reset — сброс дневной статистики\n'
+                    '/stop — остановка торговли\n'
+                    '/help — этот список'
+                )
+
             elif cmd == '/shadow':
                 await tg(shadow_stats())
 
@@ -3310,7 +3360,10 @@ async def main():
 
                 # Итоги дня в 22:00 Киев (19:00 UTC)
                 _now_utc = datetime.now(timezone.utc)
-                if _now_utc.hour == 19 and _now_utc.minute < 2:
+                # [v17] hour>=19 вместо узкого окна minute<2 — цикл ~5мин
+                # перепрыгивал 2-минутное окно и отчёт терялся. Персист-гард
+                # в send_daily_report не даёт продублировать.
+                if _now_utc.hour >= 19:
                     await send_daily_report()
 
                 # Мониторинг позиций
