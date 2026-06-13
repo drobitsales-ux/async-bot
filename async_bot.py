@@ -2671,8 +2671,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-12-v19'
+CODE_VERSION = '2026-06-13-v20'
 CHANGELOG = [
+    ('2026-06-13-v20', '/stats_analyze: разбивка причина-закрытия x направление (диагностика)'),
     ('2026-06-12-v19', 'Single-Asset алгоритм: BTC mean-reversion от VWAP (shadow, выход по TP=VWAP)'),
     ('2026-06-12-v18', 'REPORT_HOUR_UTC настраиваемый + стартовый лог расписания отчёта'),
     ('2026-06-11-v17', 'Фикс Итоги дня (триггер hour>=19, персист-гард) + /help + /report'),
@@ -3199,6 +3200,17 @@ def stats_analyze() -> str:
             n, wr, avg, pf = _bucket_stats(rows)
             if n:
                 lines.append(f'  {reason}: {n} сд | Avg {avg:+.2f}%')
+
+        # [v20] причина закрытия × направление — где именно теряются деньги
+        lines.append('\n<b>Причина × Направление:</b>')
+        for d in ('Long', 'Short'):
+            for reason in ('SL', 'TP', 'BE', 'Timeout'):
+                rows = con.execute(
+                    "SELECT pnl_pct FROM trades WHERE direction=? AND close_reason=?",
+                    (d, reason)).fetchall()
+                n, wr, avg, pf = _bucket_stats(rows)
+                if n:
+                    lines.append(f'  {d}+{reason}: {n} сд | Avg {avg:+.2f}%')
 
         lines.append('\n<b>ADX входа:</b>')
         for lbl, lo, hi in [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)]:
