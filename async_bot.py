@@ -1537,9 +1537,9 @@ async def pullback_signal(sym: str, btc_ctx: dict):
     rsi = calc_rsi(c, RSI_PERIOD)
     if not (PB_RSI_LO < rsi < PB_RSI_HI):
         return None, 'rsi_zone'
-    # [DATA v15] Alt-score<55: при score>=55 PB теряет edge (WR47%/PF0.89)
-    #            при score<40 WR58%/PF1.65⭐ — работает в медвежьем/нейтральном
-    if btc_ctx.get('alt_score', 50) >= 55:
+    # [DATA v21] Alt-score<40: 18 сд WR56%/PF1.00 (граница прибыли, устойчиво 3 замера).
+    # 40-55: WR39%/PF0.33 — убыточно. Ужесточаем с <55 до <40.
+    if btc_ctx.get('alt_score', 50) >= 40:
         return None, 'alt_high'
 
     # 4. Откат к EMA20 + возобновление тренда
@@ -2371,14 +2371,10 @@ async def scan_rsi():
                     _live = 'LIVE' if MOMENTUM_LIVE else 'SHADOW'
                     _ascore = btc_ctx.get('alt_score', 50)
                     _spread = btc_ctx.get('eth_btc_spread', 0.0)
-                    logging.info(
-                        f"🚀 [MOM {_live}] {sym} {msig['mode']} @ {msig['rsi']:.0f}rsi "
-                        f"ADX:{msig['adx']:.0f} Vol:{msig['vol_ratio']:.1f}x "
-                        f"EMA20{'>' if msig['ema20']>msig['ema50'] else '<'}EMA50 "
-                        f"[{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
-                    )
-                    # [SHADOW] записываем виртуальный сигнал для расчёта винрейта
-                    shadow_record(sym, msig['mode'], msig['entry'], msig, btc_ctx, 'MOM')
+                    # MOM лог отключён вместе с shadow (v21)
+                    # [DATA v21] MOM shadow ОТКЛЮЧЁН: 222 сделки, PF 0.28-0.35 везде,
+                    # ни одного сегмента с edge. Данных достаточно — edge отсутствует.
+                    # shadow_record(sym, msig['mode'], msig['entry'], msig, btc_ctx, 'MOM')
                     if MOMENTUM_LIVE:
                         notified[sym] = time.time()
                         mextra = (f"MOM ADX:{msig['adx']:.0f} "
@@ -2671,8 +2667,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-13-v20'
+CODE_VERSION = '2026-06-14-v21'
 CHANGELOG = [
+    ('2026-06-14-v21', 'MOM shadow отключён (222 сд, PF<0.4 везде) + PB alt_score<40 (данные v21)'),
     ('2026-06-13-v20', '/stats_analyze: разбивка причина-закрытия x направление (диагностика)'),
     ('2026-06-12-v19', 'Single-Asset алгоритм: BTC mean-reversion от VWAP (shadow, выход по TP=VWAP)'),
     ('2026-06-12-v18', 'REPORT_HOUR_UTC настраиваемый + стартовый лог расписания отчёта'),
