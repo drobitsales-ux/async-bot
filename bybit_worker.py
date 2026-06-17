@@ -109,9 +109,15 @@ async def tg(text: str):
 # ══════════════════════════════════════════════════════════
 #  CIRCUIT BREAKER
 # ══════════════════════════════════════════════════════════
+_last_reset_date = None
+
 def check_daily_reset():
-    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_be_closes, day_start_time, circuit_open, _daily_report_sent
-    if time.time() - day_start_time > 86400:
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
+    today = datetime.now(timezone.utc).date()
+    if _last_reset_date is None:
+        _last_reset_date = today
+    if today != _last_reset_date:
+        _last_reset_date = today
         daily_pnl_pct   = 0.0
         daily_pnl_usdt  = 0.0
         daily_trades    = 0
@@ -664,7 +670,8 @@ async def main():
 
             # Итоги дня в 22:00 Киев (19:00 UTC) — формат идентичен BingX боту
             now_utc = datetime.now(timezone.utc)
-            if now_utc.hour == 19 and now_utc.minute < 2 and not _daily_report_sent:
+            # [fix] hour>=19: узкое окно minute<2 пропускалось циклом Worker
+            if now_utc.hour >= 19 and not _daily_report_sent:
                 _daily_report_sent = True
                 wr = daily_wins / daily_trades * 100 if daily_trades > 0 else 0
                 # Получить реальный баланс с Bybit
