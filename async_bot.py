@@ -1461,13 +1461,16 @@ async def momentum_signal(sym: str, btc_ctx: dict):
     if not mode:
         return None, 'no_breakout'
 
-    # 5. RSI: только защита от крайностей (откат фильтра STEP-C —
-    # он конфликтовал с пробойным входом и обнулял сигналы)
+    # 5. [DATA v22] Hard-filters MOM: RSI 40-60 = единственный edge (PF 1.14)
     rsi = calc_rsi(c, RSI_PERIOD)
-    if mode == 'Long' and rsi > 80:
-        return None, 'rsi_ext'
-    if mode == 'Short' and rsi < 20:
-        return None, 'rsi_ext'
+    if not (40 <= rsi <= 60):
+        return None, 'rsi_zone'
+    # [DATA v22] vol<1.5 = ложные пробои (WR28%/PF0.27)
+    if vol_ratio < 1.5:
+        return None, 'vol'
+    # [DATA v22] alt_score>=55: WR6%/PF0.09 — 94% убыточных
+    if btc_ctx.get('alt_score', 50) >= 55:
+        return None, 'alt_high'
 
     # SL по ATR (трейлинг возьмёт прибыль). sl_dist в коридоре.
     atr = calc_atr(h, l, c)
@@ -1551,8 +1554,9 @@ async def pullback_signal(sym: str, btc_ctx: dict):
     elif ema20 < ema50 and near_ema and c[-1] < c[-2]:
         # даунтренд: цена отскочила к EMA20 и возобновляет падение
         mode = 'Short'
-    if not mode:
-        return None, 'no_pullback'
+    # [DATA v22] PB Short: WR35%/PF0.41 — убыточен, блокируем
+    if mode == 'Short':
+        return None, 'pb_short_blocked'
 
     atr = calc_atr(h, l, c)
     sl_pct = float(np.clip(atr / price * 1.5, MIN_SL_PCT/100, MAX_SL_PCT/100))
@@ -2667,9 +2671,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-14-v21'
+CODE_VERSION = '2026-06-18-v22'
 CHANGELOG = [
-    ('2026-06-14-v21', 'MOM shadow отключён (222 сд, PF<0.4 везде) + PB alt_score<40 (данные v21)'),
+    ('2026-06-18-v22', 'MOM hard-filters: RSI 40-60 + vol>=1.5 + alt<55; PB Short заблокирован (229 сд)'),
     ('2026-06-13-v20', '/stats_analyze: разбивка причина-закрытия x направление (диагностика)'),
     ('2026-06-12-v19', 'Single-Asset алгоритм: BTC mean-reversion от VWAP (shadow, выход по TP=VWAP)'),
     ('2026-06-12-v18', 'REPORT_HOUR_UTC настраиваемый + стартовый лог расписания отчёта'),
