@@ -1,0 +1,19 @@
+# Prop Firm Risk Management Rules & Bot Parameters
+
+**CRITICAL RULE:** Do not suggest any logic, filters, or position sizing algorithms that violate these Prop Firm constraints. Preservation of capital is the #1 priority.
+
+## 1. Account & Risk Limits
+- **Base Risk per Trade (`BASE_RISK`):** 0.75% of total capital.
+- **Max Stop Loss (`MAX_SL`):** 2.5% away from entry price. If calculated SL > 2.5%, the trade must be skipped.
+- **Daily Drawdown Limit (`DAILY_DD_LIMIT`):** 2.5% of the starting daily balance. If hit, the Circuit Breaker activates, halting all new entries until 00:00 UTC.
+- **Max Open Positions (`MAX_POSITIONS`):** 3 maximum concurrent positions (shared budget across SMC and RSI strategies).
+
+## 2. Trading Operations
+- **Smart Money Sessions (Killzones):** SMC strategy is strictly limited to 06:30 - 17:00 UTC. 
+- **Minimum Profit Factor:** Trailing stops should secure at least 1:1.5 RR (Risk:Reward) before turning into "Smart Trailing" (HTF tracking).
+- **Timeout Rule:** Trades must be closed if they are stagnant for more than 450 minutes (30 bars on 15m TF) to free up margin.
+
+## 3. Indicator Thresholds (Current Baseline)
+- RSI Extreme Thresholds: 25 (Oversold) / 75 (Overbought).
+- VWAP SMC Limit: `price > vwap * 1.015` blocks Longs, `price < vwap * 0.985` blocks Shorts.
+- Volume Momentum Filter: `vol_ratio > 3.0` requires `sma_dist >= 4.0%` to pass.
