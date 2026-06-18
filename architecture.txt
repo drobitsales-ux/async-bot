@@ -1,0 +1,24 @@
+# Bot Architecture Overview: Unified SMC + RSI Bot v10.0
+**Target Exchange:** BingX Perpetual Futures (via CCXT)
+**Architecture Type:** Asynchronous Python (asyncio)
+
+## 1. Core Modules & Data Flow
+The bot operates in a continuous asynchronous loop, fetching OHLCV data, scanning for setups, and managing open positions.
+- **Data Caching:** Uses `aiocache` (TTL 50s) to minimize exchange API calls. OHLCV data is fetched across 3 timeframes (15m, 1h, 4h).
+- **Scanners:**
+  - `scan_smc()`: Looks for Smart Money Concepts setups (CHoCH, FVG, VWAP limits). Active only during strict Killzone sessions.
+  - `scan_rsi()`: Looks for Mean Reversion setups (Extreme RSI, 1h HTF Confirmation, VWAP/SMA divergence, Hook patterns). Active 24/7.
+  - `scan_shadow()`: Virtual paper-trading scanner tracking experimental Momentum and Pullback strategies.
+- **LLM Advisor:** Integrates with Groq/Gemini API to perform sentiment/context analysis before entry. Acts strictly as an advisor (blocks only if confidence < 30).
+- **Position Monitor (`monitor_all`):** Handles trade lifecycle (Stop Loss, Take Profit, Timeout, and Smart Trailing based on 1h timeframe).
+- **Web Server:** Uses `aiohttp` on port 10000 to keep the Render cloud instance alive.
+
+## 2. Technical Stack
+- `ccxt.async_support`: Unified exchange API interaction.
+- `pandas` & `numpy`: Fast vector calculations for technical indicators.
+- `asyncio`: Concurrency for API calls and background tasks.
+
+## 3. Strict Development Rules
+- **No Blocking Code:** Never use `time.sleep()`, `requests`, or synchronous pandas operations that block the event loop. Always use `await asyncio.sleep()` and async HTTP clients.
+- **Data Integrity:** OHLCV structures are strictly `[timestamp, open, high, low, close, volume]`.
+- **API Limits:** Minimize CCXT calls. Always use cached OHLCV for indicators unless an order execution is required.
