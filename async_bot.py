@@ -1002,7 +1002,7 @@ async def get_btc_context() -> dict:
 # ═══════════════════════════════════════════════════════
 #  SMC СИГНАЛ
 # ═══════════════════════════════════════════════════════
-async def smc_signal(sym: str):
+async def smc_signal(sym: str, btc_ctx: dict = None):
     """
     Полный SMC пайплайн:
     1. Killzone + News
@@ -1012,6 +1012,8 @@ async def smc_signal(sym: str):
     5. RSI 85/15
     6. FVG — тест зоны
     """
+    if btc_ctx is None:
+        btc_ctx = {}
     if not is_session():
         return None, 'session'
     if is_news_now():
@@ -1068,20 +1070,18 @@ async def smc_signal(sym: str):
 
     # RSI — защита от входа в конце тренда
     rsi = calc_rsi(c[:-1])
-    # Short при RSI < 42 = актив перепродан, ловим конец движения
-    # RSI<42 блокирует: TIA(28) SL, APE(32) BE, XMR(30) SL, LINK(39) BE
-    # Пропускает: сделки с RSI 42-70 — нормальный рабочий диапазон для CHoCH
-    if mode == 'Short' and rsi < 32:  # [FIX] 45→32: CHoCH само тянет RSI вниз
-        return None, 'rsi'
-    # Long при RSI > 55 = актив перекуплен, входим слишком поздно
-    if mode == 'Long'  and rsi > 68:  # [FIX] 55→68
-        return None, 'rsi'
-    # Крайние значения — однозначный запрет
-    if mode == 'Long'  and rsi > 85:
-        return None, 'rsi'
-    if mode == 'Short' and rsi < 15:
-        return None, 'rsi'
+    # [DATA v22] RSI exhaustion filter: убыточны RSI<40 (PF 0.00) и RSI>65 (PF 0.06)
+    # Идеальная зона SMC: 40-65 (WR43%, Avg+4.05%, PF 5.01 на 7 сд)
+    if rsi < 40:
+        return None, 'rsi_exhaustion'
+    if rsi > 65:
+        return None, 'rsi_exhaustion'
 
+    # [DATA v22] Short убыточен при alt_score>=40 (рынок не холодный)
+    # Long фильтровать не нужно: PF 3.40 при lt40 (14 сд)
+    if mode == 'Short' and btc_ctx.get('alt_score', 50) >= 40:
+        return None, 'alt_score_short'
+    
     # ── ADX фильтр для SMC: тренд должен быть выраженным ──
     # ADX < 18 = слабый рынок, CHoCH = ложный сигнал
     # ADX > 18 = направленное движение, CHoCH = реальный слом
@@ -2305,7 +2305,7 @@ async def scan_smc():
             return
         try:
             async with sem:
-                sig, reason = await smc_signal(sym)
+                sig, reason = await smc_signal(sym, smc_btc_ctx)
             st[reason] = st.get(reason, 0) + 1
             if sig:
                 notified[sym] = time.time()
@@ -2323,6 +2323,7 @@ async def scan_smc():
         f"[SMC SCAN] news:{st['news']} vol:{st['vol']} struct:{st['structure']} "
         f"choch:{st['choch']} vwap:{st['vwap']} rsi:{st['rsi']} "
         f"adx:{st.get('adx_flat',0)} "
+        f"rsi_exh:{st.get('rsi_exhaustion',0)} alt_sh:{st.get('alt_score_short',0)} "
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
         f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
@@ -2671,9 +2672,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-18-v22'
+CODE_VERSION = '2026-06-19-v23'
 CHANGELOG = [
-    ('2026-06-18-v22', 'MOM hard-filters: RSI 40-60 + vol>=1.5 + alt<55; PB Short заблокирован (229 сд)'),
+    ('2026-06-19-v23', 'SMC hard-filters: RSI 40-65 exhaustion + Short блок при alt_score>=40 (18 сд, PF 2.22)'),
     ('2026-06-13-v20', '/stats_analyze: разбивка причина-закрытия x направление (диагностика)'),
     ('2026-06-12-v19', 'Single-Asset алгоритм: BTC mean-reversion от VWAP (shadow, выход по TP=VWAP)'),
     ('2026-06-12-v18', 'REPORT_HOUR_UTC настраиваемый + стартовый лог расписания отчёта'),
