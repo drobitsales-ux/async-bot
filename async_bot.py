@@ -107,6 +107,7 @@ SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение 
 SA_RSI_LO    = float(os.getenv('SA_RSI_LO', '30'))       # лонг: RSI ниже этого (перепродан)
 SA_RSI_HI    = float(os.getenv('SA_RSI_HI', '70'))       # шорт: RSI выше этого (перекуплен)
 SA_WINDOW    = os.getenv('SA_WINDOW', '')                # окно UTC 'HH-HH' или '' = весь день
+SA_LIVE      = os.getenv('SA_LIVE', 'false').lower() == 'true'  # [v23] реальная торговля SA
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -1052,6 +1053,10 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     if not mode:
         return None, 'choch'
 
+    # [DATA v23] SMC Short: WR25%/PF0.66 — убыточен, оставляем только Long
+    if mode == 'Short':
+        return None, 'short_blocked'
+
     # VWAP
     vwap = calc_vwap(h, l, c, v)
     # VWAP — Premium/Discount зоны (логика SMC)
@@ -1518,7 +1523,8 @@ async def pullback_signal(sym: str, btc_ctx: dict):
 
     # 1. Сильный тренд (как у momentum)
     adx = calc_adx(h, l, c)
-    if adx < MOM_ADX_MIN:
+    # [DATA v23] ADX>=40: PF 1.11-6.96 | ADX<40: PF 0.81 — слабый тренд даёт ложные откаты
+    if adx < 40:
         return None, 'adx_weak'
     ema20 = calc_ema(c, 20)
     ema50 = calc_ema(c, 50)
@@ -1532,8 +1538,8 @@ async def pullback_signal(sym: str, btc_ctx: dict):
     recent_v = float(np.mean(v[-4:-1]))
     vol_ratio = recent_v / base_v
     quote_vol = float(v[-2]) * price
-    # [DATA v15] Vol>=1.5x: сегмент 1.5-3x даёт WR53%/PF1.06 vs 1.0-1.5x WR31%/PF0.56
-    if vol_ratio < 1.5 or quote_vol < MOM_MIN_QUOTE:
+    # [DATA v23] золотая зона 1.5-3x: PF 1.34 | >3x: PF 0.68 (истощение объёма)
+    if not (1.5 <= vol_ratio <= 3.0) or quote_vol < MOM_MIN_QUOTE:
         return None, 'vol'
 
     # 3. RSI в reset-зоне (НЕ экстремум — ключевое отличие от пробоя)
@@ -2297,7 +2303,7 @@ async def scan_smc():
         and float((all_tickers.get(s) or {}).get('quoteVolume', 0) or 0) >= vol_pre
     ][:SCAN_LIMIT]
     sem  = asyncio.Semaphore(SCAN_SEM)
-    st   = {k: 0 for k in ['session','news','vol','structure','choch',
+    st   = {k: 0 for k in ['session','news','vol','structure','choch','short_blocked',
                             'vwap','rsi','adx_flat','fvg','fvg_test','ok']}
 
     async def check(sym):
@@ -2321,7 +2327,8 @@ async def scan_smc():
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
         f"[SMC SCAN] news:{st['news']} vol:{st['vol']} struct:{st['structure']} "
-        f"choch:{st['choch']} vwap:{st['vwap']} rsi:{st['rsi']} "
+        f"choch:{st['choch']} short_blk:{st.get('short_blocked',0)} "
+        f"vwap:{st['vwap']} rsi:{st['rsi']} "
         f"adx:{st.get('adx_flat',0)} "
         f"rsi_exh:{st.get('rsi_exhaustion',0)} alt_sh:{st.get('alt_score_short',0)} "
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
@@ -2672,8 +2679,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-19-v23'
+CODE_VERSION = '2026-06-22-v24'
 CHANGELOG = [
+    ('2026-06-22-v24', 'SMC: только Long (Short blocked); PB: ADX>=40 + vol 1.5-3x; SA LIVE активирован; Worker SA-статистика + self-ping'),
     ('2026-06-19-v23', 'SMC hard-filters: RSI 40-65 exhaustion + Short блок при alt_score>=40 (18 сд, PF 2.22)'),
     ('2026-06-13-v20', '/stats_analyze: разбивка причина-закрытия x направление (диагностика)'),
     ('2026-06-12-v19', 'Single-Asset алгоритм: BTC mean-reversion от VWAP (shadow, выход по TP=VWAP)'),
@@ -3532,13 +3540,19 @@ async def main():
                         _sa_ctx = await get_btc_context()
                         _sasig, _ = await single_asset_signal(_sa_ctx)
                         if _sasig:
+                            _sa_live_str = 'LIVE' if SA_LIVE else 'SHADOW'
                             logging.info(
-                                f"📈 [SA SHADOW] {SA_SYMBOL.split('/')[0]} {_sasig['mode']} "
+                                f"📈 [SA {_sa_live_str}] {SA_SYMBOL.split('/')[0]} {_sasig['mode']} "
                                 f"@ {_sasig['rsi']:.0f}rsi VWAP-dist:{_sasig['vwap_dist']:+.1f}ATR "
                                 f"→ TP:VWAP"
                             )
                             shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
                                           _sasig, _sa_ctx, 'SA')
+                            # [v23] SA LIVE: реальное исполнение на BingX
+                            if SA_LIVE and SA_SYMBOL not in notified:
+                                notified[SA_SYMBOL] = time.time()
+                                await execute(SA_SYMBOL, _sasig, 'SA', rsi_positions,
+                                              f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}")
                     except Exception as _e:
                         logging.debug(f'[SA] {_e}')
 
