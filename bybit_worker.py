@@ -82,6 +82,7 @@ daily_trades     = 0
 daily_wins       = 0
 daily_smc        = 0    # SMC сделок за день
 daily_rsi        = 0    # RSI сделок за день
+daily_sa         = 0    # [v24] SA сделок за день
 daily_be_closes  = 0    # BE-закрытий за день (0.1% < pnl < 0.5%)
 day_start_bal    = 0.0
 day_start_time   = time.time()
@@ -112,7 +113,7 @@ async def tg(text: str):
 _last_reset_date = None
 
 def check_daily_reset():
-    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
     today = datetime.now(timezone.utc).date()
     if _last_reset_date is None:
         _last_reset_date = today
@@ -124,6 +125,7 @@ def check_daily_reset():
         daily_wins      = 0
         daily_smc       = 0
         daily_rsi       = 0
+        daily_sa        = 0
         daily_be_closes = 0
         day_start_time  = time.time()
         circuit_open   = False
@@ -338,7 +340,7 @@ async def execute_signal(signal: dict):
 async def monitor():
     """Мониторинг: BE при +1.5%, обнаружение закрытий."""
     global active_positions, daily_pnl_pct, daily_pnl_usdt
-    global daily_trades, daily_wins, daily_smc, daily_rsi, daily_be_closes
+    global daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes
 
     if not active_positions:
         return
@@ -532,11 +534,13 @@ async def monitor():
                 daily_wins += 1
             elif 0.1 < pnl_pct < 0.5:
                 daily_be_closes += 1
-            # SMC/RSI breakdown
+            # SMC/RSI/SA breakdown
             if pos.get('strategy') == 'SMC':
                 daily_smc += 1
             elif pos.get('strategy') == 'RSI':
                 daily_rsi += 1
+            elif pos.get('strategy') == 'SA':
+                daily_sa += 1   # [v24]
 
             logging.info(
                 f"{icon} {sym}: закрыта | entry={entry:.6f} exit={exit_p:.6f} "
@@ -618,11 +622,28 @@ async def main():
     # [FIX] Эти переменные модифицируются в while-loop main() — нужны global
     global _daily_report_sent
     global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins
-    global daily_smc, daily_rsi, daily_be_closes
+    global daily_smc, daily_rsi, daily_sa, daily_be_closes
 
     _signal_queue = asyncio.Queue()
     http_session  = aiohttp.ClientSession()
     Thread(target=run_http, daemon=True).start()
+
+    # [v24] Self-ping: не даёт Render усыплять Worker (каждые 10 мин)
+    # Без этого Render Free tier засыпает и пропускает 19:00 UTC отчёт
+    async def self_ping():
+        await asyncio.sleep(60)  # даём время стартовать HTTP-серверу
+        while True:
+            try:
+                async with http_session.get(
+                    "https://bybit-worker-qgpj.onrender.com/health",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    logging.debug(f"[PING] self-ping {r.status}")
+            except Exception as _pe:
+                logging.debug(f"[PING] {_pe}")
+            await asyncio.sleep(600)  # каждые 10 мин
+
+    asyncio.ensure_future(self_ping())
 
     # Диагностика при старте
     logging.info("=" * 55)
@@ -692,7 +713,7 @@ async def main():
                     f"{now_utc.strftime('%Y-%m-%d')} 22:00</b>\n"
                     f"Сделок: {daily_trades} | WR: {wr:.1f}% "
                     f"({daily_wins}/{daily_trades})\n"
-                    f"SMC: {daily_smc} | RSI: {daily_rsi} | "
+                    f"SMC: {daily_smc} | RSI: {daily_rsi} | SA: {daily_sa} | "
                     f"BE: {daily_be_closes}\n"
                     f"PnL: <code>{day_pct:+.2f}%</code> | "
                     f"<code>{day_usdt:+.2f} USDT</code>\n"
