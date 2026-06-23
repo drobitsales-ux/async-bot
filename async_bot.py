@@ -152,6 +152,8 @@ EXCLUDED_PARTS = [
 # ── Состояние ────────────────────────────────────────────
 smc_positions   = []   # [R-FIX-12] отдельные списки
 rsi_positions   = []
+sa_positions    = []   # [v24] SA отдельный список позиций
+_sa_last_entry  = 0.0  # [v24] cooldown: timestamp последнего SA входа (не через notified)
 daily_stats     = {
     'pnl_pct': 0.0, 'trades': 0, 'wins': 0,
     'start_balance': 0.0, 'stat_date': None,
@@ -233,6 +235,7 @@ def _load(table: str) -> list:
 def save_all():
     _save('smc_pos', smc_positions)
     _save('rsi_pos', rsi_positions)
+    _save('sa_pos',  sa_positions)   # [v24]
     try:
         conn = get_db()
         conn.execute(
@@ -247,9 +250,10 @@ def save_all():
         logging.error(f"DB save stats: {e}")
 
 def load_all():
-    global smc_positions, rsi_positions, daily_stats
+    global smc_positions, rsi_positions, sa_positions, daily_stats
     smc_positions = _load('smc_pos')
     rsi_positions = _load('rsi_pos')
+    sa_positions  = _load('sa_pos')   # [v24]
     try:
         conn = get_db()
         row = conn.execute("SELECT * FROM stats WHERE id=1").fetchone()
@@ -368,7 +372,7 @@ def current_risk() -> float:
     return RISK_WEEKEND if is_weekend() else RISK_PER_TRADE
 
 def all_positions() -> list:
-    return smc_positions + rsi_positions
+    return smc_positions + rsi_positions + sa_positions  # [v24] SA включён
 
 def calc_vwap(h, l, c, v) -> float:
     denom = np.sum(v)
@@ -2250,8 +2254,8 @@ async def monitor_all():
             notified[sym] = time.time()   # cooldown после закрытия
             return False   # удалить из списка
 
-    # Обработка SMC и RSI позиций
-    new_smc, new_rsi = [], []
+    # Обработка SMC, RSI и SA позиций
+    new_smc, new_rsi, new_sa = [], [], []
     for p in smc_positions:
         keep = await process_pos(p, smc_positions)
         if keep:
@@ -2260,8 +2264,13 @@ async def monitor_all():
         keep = await process_pos(p, rsi_positions)
         if keep:
             new_rsi.append(p)
+    for p in sa_positions:   # [v24]
+        keep = await process_pos(p, sa_positions)
+        if keep:
+            new_sa.append(p)
     smc_positions[:] = new_smc
     rsi_positions[:] = new_rsi
+    sa_positions[:]  = new_sa   # [v24]
 
 # ═══════════════════════════════════════════════════════
 #  СКАНЕРЫ
@@ -2563,7 +2572,7 @@ async def sync_positions_with_exchange() -> int:
                 return True
             return False
 
-        new_smc, new_rsi = [], []
+        new_smc, new_rsi, new_sa = [], [], []
         for p in smc_positions:
             if _is_real(p): new_smc.append(p)
             else:
@@ -2574,9 +2583,15 @@ async def sync_positions_with_exchange() -> int:
             else:
                 logging.warning(f'👻 [SYNC] RSI ghost: {p["symbol"]} {p["direction"]}')
                 removed += 1
+        for p in sa_positions:   # [v24]
+            if _is_real(p): new_sa.append(p)
+            else:
+                logging.warning(f'👻 [SYNC] SA ghost: {p["symbol"]} {p["direction"]}')
+                removed += 1
 
         smc_positions[:] = new_smc
         rsi_positions[:] = new_rsi
+        sa_positions[:]  = new_sa   # [v24]
         save_all()
         logging.info(f'✅ [SYNC] Удалено ghost: {removed} | '
                      f'Осталось: SMC={len(smc_positions)} RSI={len(rsi_positions)}')
@@ -2679,8 +2694,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-22-v24'
+CODE_VERSION = '2026-06-23-v25'
 CHANGELOG = [
+    ('2026-06-23-v25', 'SA LIVE bugfix: sa_positions отдельный список + cooldown вместо notified (BTC всегда в notified)'),
     ('2026-06-22-v24', 'SMC: только Long (Short blocked); PB: ADX>=40 + vol 1.5-3x; SA LIVE активирован; Worker SA-статистика + self-ping'),
     ('2026-06-19-v23', 'SMC hard-filters: RSI 40-65 exhaustion + Short блок при alt_score>=40 (18 сд, PF 2.22)'),
     ('2026-06-13-v20', '/stats_analyze: разбивка причина-закрытия x направление (диагностика)'),
@@ -3534,7 +3550,7 @@ async def main():
                 if MOMENTUM_ENABLED:
                     await shadow_check()
 
-                # [SA] single-asset BTC mean-reversion детект (shadow, раз в цикл)
+                # [SA] single-asset BTC mean-reversion (SA_LIVE = реальная торговля)
                 if SA_ENABLED:
                     try:
                         _sa_ctx = await get_btc_context()
@@ -3548,11 +3564,19 @@ async def main():
                             )
                             shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
                                           _sasig, _sa_ctx, 'SA')
-                            # [v23] SA LIVE: реальное исполнение на BingX
-                            if SA_LIVE and SA_SYMBOL not in notified:
-                                notified[SA_SYMBOL] = time.time()
-                                await execute(SA_SYMBOL, _sasig, 'SA', rsi_positions,
-                                              f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}")
+                            # [v24 FIX] SA LIVE: используем sa_positions + свой cooldown.
+                            # НЕ используем notified — BTC всегда есть в notified от SMC/RSI скана.
+                            if SA_LIVE:
+                                global _sa_last_entry
+                                _sa_open = any(
+                                    p.get('mode') == _sasig['mode']
+                                    for p in sa_positions
+                                )
+                                _sa_cooldown_ok = (time.time() - _sa_last_entry) > 3600  # 1ч cooldown
+                                if not _sa_open and _sa_cooldown_ok:
+                                    _sa_last_entry = time.time()
+                                    await execute(SA_SYMBOL, _sasig, 'SA', sa_positions,
+                                                  f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}")
                     except Exception as _e:
                         logging.debug(f'[SA] {_e}')
 
