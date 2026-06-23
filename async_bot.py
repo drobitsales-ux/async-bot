@@ -1643,6 +1643,14 @@ async def single_asset_signal(btc_ctx: dict):
         return None, 'atr'
     rsi = calc_rsi(c_full, RSI_PERIOD)
 
+    # [v25] Volume Climax filter: защита от "падающего ножа" без кульминации
+    # Используем полную историю (ohlcv) для устойчивого среднего объёма
+    v_full = np.array([float(x[5]) for x in ohlcv])
+    avg_vol = float(np.mean(v_full[-21:-1])) if len(v_full) > 21 else float(np.mean(v_full[:-1]))
+    vol_ratio = float(v_full[-2]) / avg_vol if avg_vol > 0 else 0.0
+    if vol_ratio < 2.0:
+        return None, 'vol_climax'
+
     dist_atr = (price - vwap) / atr   # >0 цена выше VWAP, <0 ниже
     mode = None
     # Лонг: цена сильно НИЖЕ VWAP + перепродан → возврат вверх к VWAP
@@ -1665,7 +1673,7 @@ async def single_asset_signal(btc_ctx: dict):
 
     return {
         'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
-        'adx': 0.0, 'rsi': rsi, 'vol_ratio': 0.0,
+        'adx': 0.0, 'rsi': rsi, 'vol_ratio': round(vol_ratio, 2),
         'ema20': vwap, 'ema50': vwap, 'entry': price,
         'sma_dist': round(dist_atr, 2), 'vwap_dist': round(dist_atr, 2),
         'tp_mult': 0.0, 'rsi_prev': rsi,
@@ -2694,8 +2702,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-23-v25'
+CODE_VERSION = '2026-06-23-v26'
 CHANGELOG = [
+    ('2026-06-23-v26', 'SA Volume Climax filter: vol_ratio>=2.0 (защита от падающего ножа без кульминации)'),
     ('2026-06-23-v25', 'SA LIVE bugfix: sa_positions отдельный список + cooldown вместо notified (BTC всегда в notified)'),
     ('2026-06-22-v24', 'SMC: только Long (Short blocked); PB: ADX>=40 + vol 1.5-3x; SA LIVE активирован; Worker SA-статистика + self-ping'),
     ('2026-06-19-v23', 'SMC hard-filters: RSI 40-65 exhaustion + Short блок при alt_score>=40 (18 сд, PF 2.22)'),
@@ -3560,7 +3569,7 @@ async def main():
                             logging.info(
                                 f"📈 [SA {_sa_live_str}] {SA_SYMBOL.split('/')[0]} {_sasig['mode']} "
                                 f"@ {_sasig['rsi']:.0f}rsi VWAP-dist:{_sasig['vwap_dist']:+.1f}ATR "
-                                f"→ TP:VWAP"
+                                f"Vol:{_sasig['vol_ratio']:.1f}x → TP:VWAP"
                             )
                             shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
                                           _sasig, _sa_ctx, 'SA')
