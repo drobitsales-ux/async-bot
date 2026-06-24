@@ -684,6 +684,38 @@ def score_setup_local(strategy: str, mode: str, extra: dict) -> dict:
     sma_dist = float(extra.get('sma_dist', 0))
     vwap_dist = float(extra.get('vwap_dist', 0))
 
+    # [v26] SA — mean-reversion: логика ПРОТИВОПОЛОЖНА трендовой.
+    # Вход ПРОТИВ тренда — это и есть суть стратегии, штрафовать нельзя.
+    if strategy == 'SA':
+        # RSI экстремум = основной сигнал
+        if mode == 'Long' and rsi <= 30:
+            score += 20; reasons.append('RSI deeply oversold')
+        elif mode == 'Long' and rsi <= 35:
+            score += 12; reasons.append('RSI oversold')
+        elif mode == 'Short' and rsi >= 70:
+            score += 20; reasons.append('RSI deeply overbought')
+        elif mode == 'Short' and rsi >= 65:
+            score += 12; reasons.append('RSI overbought')
+        # Volume climax уже отфильтрован в single_asset_signal (>=2.0)
+        # Здесь дополнительно поощряем экстремальный объём
+        if vol_ratio >= 3.0:
+            score += 10; reasons.append('volume climax')
+        elif vol_ratio >= 2.0:
+            score += 5; reasons.append('volume spike')
+        # VWAP отклонение = мера растянутости (чем дальше — тем лучше для MR)
+        if mode == 'Long' and vwap_dist <= -2.0:
+            score += 10; reasons.append('deep below VWAP')
+        elif mode == 'Short' and vwap_dist >= 2.0:
+            score += 10; reasons.append('deep above VWAP')
+        score = max(0, min(100, score))
+        ok = score >= 55
+        comment = ', '.join(reasons) if reasons else 'neutral'
+        logging.info(
+            f'📊 [LOCAL] {strategy} {mode} → {"APPROVE" if ok else "REJECT"} '
+            f'({score}/100) | {comment}'
+        )
+        return {'ok': ok, 'conf': score, 'comment': f'local:{comment}'}
+
     # RSI alignment
     if mode == 'Long' and rsi < 35:
         score += 15; reasons.append('RSI oversold')
@@ -2702,8 +2734,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-23-v26'
+CODE_VERSION = '2026-06-24-v27'
 CHANGELOG = [
+    ('2026-06-24-v27', 'SA: score_setup_local MR-логика (не штрафуем контртренд); shadow_record убран из LIVE пути; debug лог причины фильтра'),
     ('2026-06-23-v26', 'SA Volume Climax filter: vol_ratio>=2.0 (защита от падающего ножа без кульминации)'),
     ('2026-06-23-v25', 'SA LIVE bugfix: sa_positions отдельный список + cooldown вместо notified (BTC всегда в notified)'),
     ('2026-06-22-v24', 'SMC: только Long (Short blocked); PB: ADX>=40 + vol 1.5-3x; SA LIVE активирован; Worker SA-статистика + self-ping'),
@@ -3563,7 +3596,7 @@ async def main():
                 if SA_ENABLED:
                     try:
                         _sa_ctx = await get_btc_context()
-                        _sasig, _ = await single_asset_signal(_sa_ctx)
+                        _sasig, _sa_reason = await single_asset_signal(_sa_ctx)
                         if _sasig:
                             _sa_live_str = 'LIVE' if SA_LIVE else 'SHADOW'
                             logging.info(
@@ -3571,21 +3604,31 @@ async def main():
                                 f"@ {_sasig['rsi']:.0f}rsi VWAP-dist:{_sasig['vwap_dist']:+.1f}ATR "
                                 f"Vol:{_sasig['vol_ratio']:.1f}x → TP:VWAP"
                             )
-                            shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
-                                          _sasig, _sa_ctx, 'SA')
-                            # [v24 FIX] SA LIVE: используем sa_positions + свой cooldown.
-                            # НЕ используем notified — BTC всегда есть в notified от SMC/RSI скана.
                             if SA_LIVE:
+                                # [v26 FIX] LIVE: execute напрямую, shadow_record НЕ вызываем.
+                                # shadow_record писал в shadow_signals до execute — сигнал
+                                # попадал в shadow статистику вместо реальной.
                                 global _sa_last_entry
                                 _sa_open = any(
                                     p.get('mode') == _sasig['mode']
                                     for p in sa_positions
                                 )
-                                _sa_cooldown_ok = (time.time() - _sa_last_entry) > 3600  # 1ч cooldown
+                                _sa_cooldown_ok = (time.time() - _sa_last_entry) > 3600
                                 if not _sa_open and _sa_cooldown_ok:
                                     _sa_last_entry = time.time()
                                     await execute(SA_SYMBOL, _sasig, 'SA', sa_positions,
                                                   f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}")
+                                else:
+                                    logging.info(
+                                        f"[SA] пропуск: open={_sa_open} "
+                                        f"cooldown={'OK' if _sa_cooldown_ok else f'{int((3600-(time.time()-_sa_last_entry))/60)}мин'}"
+                                    )
+                            else:
+                                # SHADOW режим: пишем виртуальную сделку
+                                shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
+                                              _sasig, _sa_ctx, 'SA')
+                        else:
+                            logging.debug(f'[SA] фильтр: {_sa_reason}')
                     except Exception as _e:
                         logging.debug(f'[SA] {_e}')
 
