@@ -2734,10 +2734,10 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-24-v27'
+CODE_VERSION = '2026-06-25-v28'
 CHANGELOG = [
-    ('2026-06-24-v27', 'SA: score_setup_local MR-логика (не штрафуем контртренд); shadow_record убран из LIVE пути; debug лог причины фильтра'),
-    ('2026-06-23-v26', 'SA Volume Climax filter: vol_ratio>=2.0 (защита от падающего ножа без кульминации)'),
+    ('2026-06-25-v28', 'SA cooldown bugfix: _sa_last_entry обновляется только после реального открытия (len check)'),
+    ('2026-06-24-v27', 'SA: score_setup_local MR-логика; shadow_record убран из LIVE пути'),
     ('2026-06-23-v25', 'SA LIVE bugfix: sa_positions отдельный список + cooldown вместо notified (BTC всегда в notified)'),
     ('2026-06-22-v24', 'SMC: только Long (Short blocked); PB: ADX>=40 + vol 1.5-3x; SA LIVE активирован; Worker SA-статистика + self-ping'),
     ('2026-06-19-v23', 'SMC hard-filters: RSI 40-65 exhaustion + Short блок при alt_score>=40 (18 сд, PF 2.22)'),
@@ -3605,9 +3605,10 @@ async def main():
                                 f"Vol:{_sasig['vol_ratio']:.1f}x → TP:VWAP"
                             )
                             if SA_LIVE:
-                                # [v26 FIX] LIVE: execute напрямую, shadow_record НЕ вызываем.
-                                # shadow_record писал в shadow_signals до execute — сигнал
-                                # попадал в shadow статистику вместо реальной.
+                                # [v28 FIX] cooldown обновляется ТОЛЬКО если execute
+                                # реально открыл позицию (проверка по длине sa_positions).
+                                # Раньше _sa_last_entry = time.time() стояло ДО execute —
+                                # любой внутренний reject (AI, volume, риск) вешал 1ч блок.
                                 global _sa_last_entry
                                 _sa_open = any(
                                     p.get('mode') == _sasig['mode']
@@ -3615,9 +3616,15 @@ async def main():
                                 )
                                 _sa_cooldown_ok = (time.time() - _sa_last_entry) > 3600
                                 if not _sa_open and _sa_cooldown_ok:
-                                    _sa_last_entry = time.time()
+                                    _sa_len_before = len(sa_positions)
                                     await execute(SA_SYMBOL, _sasig, 'SA', sa_positions,
                                                   f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}")
+                                    # cooldown только если позиция реально добавлена
+                                    if len(sa_positions) > _sa_len_before:
+                                        _sa_last_entry = time.time()
+                                        logging.info(f"[SA] позиция открыта → cooldown запущен")
+                                    else:
+                                        logging.info(f"[SA] execute отклонил сигнал → cooldown НЕ запускается")
                                 else:
                                     logging.info(
                                         f"[SA] пропуск: open={_sa_open} "
