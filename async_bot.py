@@ -1680,7 +1680,10 @@ async def single_asset_signal(btc_ctx: dict):
     v_full = np.array([float(x[5]) for x in ohlcv])
     avg_vol = float(np.mean(v_full[-21:-1])) if len(v_full) > 21 else float(np.mean(v_full[:-1]))
     vol_ratio = float(v_full[-2]) / avg_vol if avg_vol > 0 else 0.0
-    if vol_ratio < 2.0:
+    # [v29 FIX] vol_climax порог снижен 2.0→1.3:
+    # При медленном снижении без паники vol_ratio редко достигает 2x.
+    # 1.3x = есть повышенный интерес, но не требуем кульминации.
+    if vol_ratio < 1.3:
         return None, 'vol_climax'
 
     dist_atr = (price - vwap) / atr   # >0 цена выше VWAP, <0 ниже
@@ -1705,6 +1708,7 @@ async def single_asset_signal(btc_ctx: dict):
 
     return {
         'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
+        'price': price,          # [v29 FIX] execute() требует sig['price'] — отсутствовал → KeyError
         'adx': 0.0, 'rsi': rsi, 'vol_ratio': round(vol_ratio, 2),
         'ema20': vwap, 'ema50': vwap, 'entry': price,
         'sma_dist': round(dist_atr, 2), 'vwap_dist': round(dist_atr, 2),
@@ -2734,8 +2738,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-25-v28'
+CODE_VERSION = '2026-06-27-v29'
 CHANGELOG = [
+    ('2026-06-27-v29', "SA критический bugfix: добавлен 'price' в sig dict (KeyError в execute); vol_climax 2.0→1.3; SA exception → WARNING"),
     ('2026-06-25-v28', 'SA cooldown bugfix: _sa_last_entry обновляется только после реального открытия (len check)'),
     ('2026-06-24-v27', 'SA: score_setup_local MR-логика; shadow_record убран из LIVE пути'),
     ('2026-06-23-v25', 'SA LIVE bugfix: sa_positions отдельный список + cooldown вместо notified (BTC всегда в notified)'),
@@ -3637,7 +3642,7 @@ async def main():
                         else:
                             logging.debug(f'[SA] фильтр: {_sa_reason}')
                     except Exception as _e:
-                        logging.debug(f'[SA] {_e}')
+                        logging.warning(f'[SA] exception: {_e}')
 
                 # Авто-синхронизация с BingX каждые 10 циклов (~10 мин)
                 global _sync_counter
