@@ -1844,10 +1844,14 @@ async def execute(sym: str, sig: dict, strategy: str,
     if notional_est < 20:   # BingX мин. контракт ~$20
         logging.info(f'[{strategy}] {sym}: notional ${notional_est:.1f}<$20 — пропуск')
         return
-    if notional_est > free_usdt * 0.95:  # [v29] 0.60→0.95: с плечом 5x, 60% слишком жёстко для депозита <$100
+    # [v31] Лимит учитывает плечо: проверяем маржу (notional / LEVERAGE), а не notional.
+    # SA: до 20% депозита маржой | SMC/RSI/MOM/PB: до 15% депозита маржой.
+    _margin_pct  = 0.20 if strategy == 'SA' else 0.15
+    max_notional = free_usdt * LEVERAGE * _margin_pct
+    if notional_est > max_notional:
         logging.warning(
-            f'[{strategy}] {sym}: notional ${notional_est:.1f} > 95% '
-            f'баланса ${free_usdt:.0f} — позиция слишком большая, пропуск'
+            f'[{strategy}] {sym}: notional ${notional_est:.1f} > max ${max_notional:.1f} '
+            f'({int(_margin_pct*100)}% маржи × {LEVERAGE}x плечо от ${free_usdt:.0f}) — пропуск'
         )
         return
 
@@ -2747,8 +2751,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-28-v30'
+CODE_VERSION = '2026-06-28-v31'
 CHANGELOG = [
+    ('2026-06-28-v31', 'execute: notional guard учитывает LEVERAGE; SA=20% маржи, SMC/RSI=15% маржи'),
     ('2026-06-28-v30', 'init_db: sa_pos таблица; AI prompt: SA/SMC правила разделены; notional лимит 60%→95%'),
     ('2026-06-27-v29', "SA bugfix: 'price' в sig dict + vol_climax 2.0→1.3 + exception WARNING"),
     ('2026-06-24-v27', 'SA: score_setup_local MR-логика; shadow_record убран из LIVE пути'),
