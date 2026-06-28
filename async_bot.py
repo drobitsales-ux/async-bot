@@ -206,6 +206,7 @@ def init_db():
     # [R-FIX-12] раздельные таблицы стратегий
     c.execute("CREATE TABLE IF NOT EXISTS smc_pos  (id INTEGER PRIMARY KEY, data TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS rsi_pos  (id INTEGER PRIMARY KEY, data TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS sa_pos   (id INTEGER PRIMARY KEY, data TEXT)")  # [v29]
     c.execute("""CREATE TABLE IF NOT EXISTS stats
                  (id INTEGER PRIMARY KEY, pnl_pct REAL, trades INTEGER,
                   wins INTEGER, start_balance REAL, stat_date TEXT,
@@ -585,14 +586,18 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         'Evaluate this trade and respond ONLY with valid JSON: '
         '{"decision":"approve"|"reject","confidence":0-100,"comment":"brief reason"}. '
         'HARD RULES — proven losses when violated: '
-        'RULE 1 (SMC SHORT): RSI < 32 → REJECT. TIA(28)SL, XMR(30)SL at absolute floor. '
+        # [v29] Разделяем правила по стратегиям — LLM путал SMC Short с SA Long
+        'RULE 1 (SMC ONLY — Short): RSI < 32 → REJECT. TIA(28)SL, XMR(30)SL at absolute floor. '
         'IMPORTANT: RSI 32-45 after CHoCH is NORMAL — the bearish candle pulls RSI down naturally. Do NOT reject RSI 32-45 for SMC. '
-        'RULE 2 (SMC LONG): RSI > 68 → REJECT. Overbought late entry. '
-        'RULE 3 (RSI MR): volume > 3.5x AND sma_dist < 3.5% → REJECT (trend impulse, not MR). '
-        'RULE 4: volume > 3.5x AND sma_dist > 3.5% → consider APPROVE (blow-off top exhaustion). '
+        'RULE 2 (SMC ONLY — Long): RSI > 68 → REJECT. Overbought late entry. '
+        'RULE 3 (SA STRATEGY — Mean Reversion): SA Long REQUIRES low RSI (oversold, typically RSI < 35). '
+        'SA Short REQUIRES high RSI (overbought, typically RSI > 65). '
+        'NEVER apply SMC RSI rules to SA. SA is the OPPOSITE logic — it fades extremes. '
+        'RULE 4 (RSI MR): volume > 3.5x AND sma_dist < 3.5% → REJECT (trend impulse, not MR). '
+        'RULE 5: volume > 3.5x AND sma_dist > 3.5% → consider APPROVE (blow-off top exhaustion). '
         'High volume = momentum impulse, NOT mean reversion opportunity. '
         'NEAR Vol=10.8x MFE=0.60%, IMX Vol=3.5x MFE=0.53%, DASH Vol=2.9x MFE=0.07%. '
-        'RULE 4 (RSI MR): If RSI > 88 → REJECT even if volume normal. '
+        'RULE 6 (RSI MR): If RSI > 88 → REJECT even if volume normal. '
         'Extreme RSI values with any volume = strong momentum, not reversion. '
         'SOFT RULES (use judgement): '
         'BTC:Flat does NOT invalidate altcoin setups. '
@@ -867,7 +872,11 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
         "Ты риск-менеджер крипто-хедж-фонда. Анализируй сетап и верни ТОЛЬКО "
         'валидный JSON: {"decision": "approve"|"reject", "confidence": 0-100, '
         '"comment": "краткий вывод на русском"}. '
-        "SMC: ищем CHoCH+FVG в сессию. RSI MR: перепроданность/перекупленность+паттерн."
+        "SMC: ищем CHoCH+FVG в сессию. RSI MR: перепроданность/перекупленность+паттерн. "
+        "ВАЖНО: стратегии имеют РАЗНЫЕ правила RSI. "
+        "SMC Short: RSI < 32 → REJECT. SMC Long: RSI > 68 → REJECT. "
+        "SA (Mean Reversion): ПРОТИВОПОЛОЖНАЯ логика — SA Long требует RSI < 35 (перепродан), "
+        "SA Short требует RSI > 65 (перекуплен). НЕ применяй правила SMC к стратегии SA."
     )
     prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
 
@@ -1835,9 +1844,9 @@ async def execute(sym: str, sig: dict, strategy: str,
     if notional_est < 20:   # BingX мин. контракт ~$20
         logging.info(f'[{strategy}] {sym}: notional ${notional_est:.1f}<$20 — пропуск')
         return
-    if notional_est > free_usdt * 0.60:  # не больше 60% свободного баланса
+    if notional_est > free_usdt * 0.95:  # [v29] 0.60→0.95: с плечом 5x, 60% слишком жёстко для депозита <$100
         logging.warning(
-            f'[{strategy}] {sym}: notional ${notional_est:.1f} > 60% '
+            f'[{strategy}] {sym}: notional ${notional_est:.1f} > 95% '
             f'баланса ${free_usdt:.0f} — позиция слишком большая, пропуск'
         )
         return
@@ -2738,10 +2747,10 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-27-v29'
+CODE_VERSION = '2026-06-28-v30'
 CHANGELOG = [
-    ('2026-06-27-v29', "SA критический bugfix: добавлен 'price' в sig dict (KeyError в execute); vol_climax 2.0→1.3; SA exception → WARNING"),
-    ('2026-06-25-v28', 'SA cooldown bugfix: _sa_last_entry обновляется только после реального открытия (len check)'),
+    ('2026-06-28-v30', 'init_db: sa_pos таблица; AI prompt: SA/SMC правила разделены; notional лимит 60%→95%'),
+    ('2026-06-27-v29', "SA bugfix: 'price' в sig dict + vol_climax 2.0→1.3 + exception WARNING"),
     ('2026-06-24-v27', 'SA: score_setup_local MR-логика; shadow_record убран из LIVE пути'),
     ('2026-06-23-v25', 'SA LIVE bugfix: sa_positions отдельный список + cooldown вместо notified (BTC всегда в notified)'),
     ('2026-06-22-v24', 'SMC: только Long (Short blocked); PB: ADX>=40 + vol 1.5-3x; SA LIVE активирован; Worker SA-статистика + self-ping'),
