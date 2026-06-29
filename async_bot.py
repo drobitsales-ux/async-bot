@@ -590,9 +590,10 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         'RULE 1 (SMC ONLY — Short): RSI < 32 → REJECT. TIA(28)SL, XMR(30)SL at absolute floor. '
         'IMPORTANT: RSI 32-45 after CHoCH is NORMAL — the bearish candle pulls RSI down naturally. Do NOT reject RSI 32-45 for SMC. '
         'RULE 2 (SMC ONLY — Long): RSI > 68 → REJECT. Overbought late entry. '
-        'RULE 3 (SA STRATEGY — Mean Reversion): SA Long REQUIRES low RSI (oversold, typically RSI < 35). '
-        'SA Short REQUIRES high RSI (overbought, typically RSI > 65). '
-        'NEVER apply SMC RSI rules to SA. SA is the OPPOSITE logic — it fades extremes. '
+        'RULE 3 (SA STRATEGY — Mean Reversion / Counter-trend): '
+        'If direction is SHORT: High RSI (> 65) means the asset is OVERBOUGHT. This is EXCELLENT for a Short. You MUST APPROVE. NEVER reject a Short because RSI is high. '
+        'If direction is LONG: Low RSI (< 35) means the asset is OVERSOLD. This is EXCELLENT for a Long. You MUST APPROVE. NEVER reject a Long because RSI is low. '
+        'SMC trend rules DO NOT APPLY to SA. SA explicitly trades against the local trend. '
         'RULE 4 (RSI MR): volume > 3.5x AND sma_dist < 3.5% → REJECT (trend impulse, not MR). '
         'RULE 5: volume > 3.5x AND sma_dist > 3.5% → consider APPROVE (blow-off top exhaustion). '
         'High volume = momentum impulse, NOT mean reversion opportunity. '
@@ -876,7 +877,10 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
         "ВАЖНО: стратегии имеют РАЗНЫЕ правила RSI. "
         "SMC Short: RSI < 32 → REJECT. SMC Long: RSI > 68 → REJECT. "
         "SA (Mean Reversion): ПРОТИВОПОЛОЖНАЯ логика — SA Long требует RSI < 35 (перепродан), "
-        "SA Short требует RSI > 65 (перекуплен). НЕ применяй правила SMC к стратегии SA."
+        "FOR SA STRATEGY (Mean Reversion / Counter-trend): "
+        "If direction is SHORT: High RSI (> 65) means OVERBOUGHT — EXCELLENT for Short, you MUST APPROVE, NEVER reject because RSI is high. "
+        "If direction is LONG: Low RSI (< 35) means OVERSOLD — EXCELLENT for Long, you MUST APPROVE, NEVER reject because RSI is low. "
+        "SMC trend rules DO NOT APPLY to SA. SA explicitly trades against the local trend."
     )
     prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
 
@@ -2751,8 +2755,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-28-v31'
+CODE_VERSION = '2026-06-29-v32'
 CHANGELOG = [
+    ('2026-06-29-v32', 'AI oracle: SA правила директивные — MUST APPROVE для RSI экстремумов, бинарная логика без двоякой трактовки'),
     ('2026-06-28-v31', 'execute: notional guard учитывает LEVERAGE; SA=20% маржи, SMC/RSI=15% маржи'),
     ('2026-06-28-v30', 'init_db: sa_pos таблица; AI prompt: SA/SMC правила разделены; notional лимит 60%→95%'),
     ('2026-06-27-v29', "SA bugfix: 'price' в sig dict + vol_climax 2.0→1.3 + exception WARNING"),
