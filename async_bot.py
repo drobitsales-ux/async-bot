@@ -1850,7 +1850,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         return
     # [v31] Лимит учитывает плечо: проверяем маржу (notional / LEVERAGE), а не notional.
     # SA: до 20% депозита маржой | SMC/RSI/MOM/PB: до 15% депозита маржой.
-    _margin_pct  = 0.20 if strategy == 'SA' else 0.15
+    _margin_pct  = 0.30 if strategy == 'SA' else 0.15  # [v33] SA 20%→30%
     max_notional = free_usdt * LEVERAGE * _margin_pct
     if notional_est > max_notional:
         logging.warning(
@@ -2755,9 +2755,10 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-29-v32'
+CODE_VERSION = '2026-06-29-v33'
 CHANGELOG = [
-    ('2026-06-29-v32', 'AI oracle: SA правила директивные — MUST APPROVE для RSI экстремумов, бинарная логика без двоякой трактовки'),
+    ('2026-06-29-v33', 'execute: SA margin лимит 20%→30% (84-100$ позиции при депозите 73-82$ проходят)'),
+    ('2026-06-29-v32', 'AI oracle: SA правила директивные — MUST APPROVE для RSI экстремумов'),
     ('2026-06-28-v31', 'execute: notional guard учитывает LEVERAGE; SA=20% маржи, SMC/RSI=15% маржи'),
     ('2026-06-28-v30', 'init_db: sa_pos таблица; AI prompt: SA/SMC правила разделены; notional лимит 60%→95%'),
     ('2026-06-27-v29', "SA bugfix: 'price' в sig dict + vol_climax 2.0→1.3 + exception WARNING"),
