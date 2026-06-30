@@ -232,6 +232,29 @@ async def execute_signal(signal: dict):
         logging.warning(f"⚠️ {sym}: qty={qty} <= 0")
         return
 
+    # [v2] Margin guard: risk-based qty может требовать больше маржи, чем есть
+    # на счету (типично при узком SL у mean-reversion стратегий типа SA).
+    # Ограничиваем notional сверху через leverage, иначе Bybit вернёт 110007.
+    _margin_pct       = 0.30 if strategy == 'SA' else 0.15
+    max_notional_usdt = free_usdt * LEVERAGE * _margin_pct
+    notional_pre      = qty * entry
+    if notional_pre > max_notional_usdt:
+        qty_capped = round(max_notional_usdt / entry, 4)
+        if qty_capped < 0.01:
+            logging.warning(
+                f"⚠️ Insufficient margin for requested risk: {sym} "
+                f"notional=${notional_pre:.2f} > max=${max_notional_usdt:.2f} "
+                f"({int(_margin_pct*100)}% маржи × {LEVERAGE}x от ${free_usdt:.2f}), "
+                f"qty_capped={qty_capped} < мин. precision — пропуск"
+            )
+            return
+        logging.warning(
+            f"⚠️ {sym}: notional ${notional_pre:.2f} > max ${max_notional_usdt:.2f} "
+            f"({int(_margin_pct*100)}% маржи × {LEVERAGE}x от ${free_usdt:.2f}) — "
+            f"qty уменьшен {qty}→{qty_capped}"
+        )
+        qty = qty_capped
+
     # Минимальный notional Bybit ~$5
     notional = qty * entry
     if notional < 5.0:
