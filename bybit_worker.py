@@ -225,8 +225,31 @@ async def execute_signal(signal: dict):
 
     risk_amount = free_usdt * RISK_PER_TRADE
     sl_dist     = abs(entry - sl)
-    qty         = round(risk_amount / sl_dist, 4)
-    qty         = max(round(qty, 2), 0.01)  # Bybit min precision
+    qty_raw     = risk_amount / sl_dist
+
+    # [v3] Динамическая precision/min-lot с биржи вместо жёсткого round(qty,2)/0.01.
+    # Жёсткое округление до 0.01 ломало активы с min-lot 0.001 (BTC) — урезанный
+    # qty_capped=0.0022 валиден на бирже, но отбраковывался кодом раньше биржи.
+    try:
+        if sym not in exchange.markets:
+            await exchange.load_markets()
+        market = exchange.market(sym)
+        min_qty = float(market.get('limits', {}).get('amount', {}).get('min') or 0.0)
+    except Exception as e:
+        logging.warning(f"⚠️ {sym}: не удалось загрузить market info ({e}), min_qty=0")
+        market  = None
+        min_qty = 0.0
+
+    def _to_precision(q: float) -> float:
+        """Округление по precision биржи; fallback на 4 знака если market недоступен."""
+        if market is not None:
+            try:
+                return float(exchange.amount_to_precision(sym, q))
+            except Exception:
+                pass
+        return round(q, 4)
+
+    qty = _to_precision(qty_raw)
 
     if qty <= 0:
         logging.warning(f"⚠️ {sym}: qty={qty} <= 0")
@@ -239,13 +262,14 @@ async def execute_signal(signal: dict):
     max_notional_usdt = free_usdt * LEVERAGE * _margin_pct
     notional_pre      = qty * entry
     if notional_pre > max_notional_usdt:
-        qty_capped = round(max_notional_usdt / entry, 4)
-        if qty_capped < 0.01:
+        qty_capped = _to_precision(max_notional_usdt / entry)
+        # [v3] Сравниваем с реальным min_qty биржи, а не с хардкодом 0.01
+        if qty_capped < min_qty or qty_capped <= 0:
             logging.warning(
                 f"⚠️ Insufficient margin for requested risk: {sym} "
                 f"notional=${notional_pre:.2f} > max=${max_notional_usdt:.2f} "
                 f"({int(_margin_pct*100)}% маржи × {LEVERAGE}x от ${free_usdt:.2f}), "
-                f"qty_capped={qty_capped} < мин. precision — пропуск"
+                f"qty_capped={qty_capped} < min_lot={min_qty} — пропуск"
             )
             return
         logging.warning(
@@ -254,6 +278,10 @@ async def execute_signal(signal: dict):
             f"qty уменьшен {qty}→{qty_capped}"
         )
         qty = qty_capped
+    elif qty < min_qty:
+        # risk-based qty оказался меньше биржевого минимума — отдельная причина отказа
+        logging.warning(f"⚠️ {sym}: qty={qty} < min_lot={min_qty} биржи — пропуск")
+        return
 
     # Минимальный notional Bybit ~$5
     notional = qty * entry
