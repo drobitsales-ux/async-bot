@@ -116,6 +116,7 @@ MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
 MAX_TRADE_MIN_SMC = 180       # SMC: 12 свечей (3ч) — даём отработать структуре
 MAX_TRADE_MIN_RSI = 240       # RSI MR: 16 свечей (4ч) — возврат к среднему медленнее
+MAX_TRADE_MIN_SA  = 150       # [v36] SA: возврат к дневному VWAP; нет за 2.5ч → сетап мёртв
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] стоп торговли при -2.5% за день
 SCAN_LIMIT       = 80       # [EXPAND] 60→80: больше монет, +33% шансов на сетап
@@ -1734,7 +1735,7 @@ async def single_asset_signal(btc_ctx: dict):
 
 async def publish_to_workers(sym: str, mode: str, price: float,
                               sl: float, tp: float, strategy: str,
-                              risk_usdt: float):
+                              risk_usdt: float, atr: float = 0.0):
     """
     Отправляет сигнал всем зарегистрированным Worker-сервисам.
     BingX-бот продолжает работать независимо от результата.
@@ -1750,6 +1751,7 @@ async def publish_to_workers(sym: str, mode: str, price: float,
         'sl':        round(sl, 8),
         'tp':        round(tp, 8),
         'strategy':  strategy,
+        'atr':       round(atr, 8),   # [v36] реальный ATR для трейлинга воркера
         'timestamp': time.time(),
     }
 
@@ -1904,6 +1906,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
         'mae_price':   price,
+        'realized_pnl_usdt': 0.0,  # [v36] USDT от частичных закрытий (TP50)
         # Контекст рынка для аналитики
         'rsi_val':     round(float(sig.get('rsi', 0)), 1),
         'vol_ratio':   round(float(sig.get('vol_ratio', 0)), 2),
@@ -1937,7 +1940,8 @@ async def execute(sym: str, sig: dict, strategy: str,
     await tg(msg)
     logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
     # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
-    asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt))
+    asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt,
+                                           atr=float(sig.get('atr', 0.0))))
 
 # ═══════════════════════════════════════════════════════
 #  МОНИТОРИНГ ПОЗИЦИЙ (общий)
@@ -2072,7 +2076,40 @@ async def monitor_all():
             dur_s   = (datetime.now(timezone.utc)
                        - datetime.fromisoformat(pos['open_time'])).total_seconds()
             dur_min = dur_s / 60
-            max_dur = MAX_TRADE_MIN_SMC if strategy == 'SMC' else MAX_TRADE_MIN_RSI
+            max_dur = (MAX_TRADE_MIN_SMC if strategy == 'SMC'
+                       else MAX_TRADE_MIN_SA if strategy == 'SA'
+                       else MAX_TRADE_MIN_RSI)
+
+            # ── [v36] Smart Timeout (SMC): раннее закрытие мёртвых сделок ──
+            # Данные: 9/21 сд закрыты Timeout с Avg -0.95% — съедают TP-профит.
+            # Если 90+ мин, pnl слегка отрицательный (но не у SL) и TP50 не было —
+            # CHoCH не отработал, выходим раньше вместо ожидания полных 180 мин.
+            sl_dist_pct_st = float(pos.get('sl_dist_pct', 1.5))
+            if (strategy == 'SMC' and dur_min > 90 and not pos.get('tp50_hit')
+                    and -0.5 * sl_dist_pct_st < pnl < 0):
+                logging.warning(
+                    f'⏰ [SMC-SMART] {sym}: {dur_min:.0f}мин, pnl={pnl:+.2f}% '
+                    f'(зона -{0.5*sl_dist_pct_st:.2f}%..0) — сделка мертва, ранний выход'
+                )
+                try:
+                    if pos.get('sl_order_id'):
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                    await exchange.create_order(
+                        sym, 'market', sl_side, real_qty,
+                        params={'positionSide': pos_side, 'reduceOnly': True}
+                    )
+                    mfe_t = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+                    mae_t = abs(float(pos.get('mae_price', entry)) - entry) / entry * 100
+                    log_trade(pos, curr_p, pnl, 0.0, mfe_t, mae_t,
+                              int(dur_min), 'Timeout')
+                    await tg(
+                        f'⏰ <b>[SMC] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
+                        f'Сделка не отработала | PnL: {pnl:+.2f}%'
+                    )
+                except Exception as _te:
+                    logging.error(f'Smart timeout close error {sym}: {_te}')
+                return False
+
             if dur_min > max_dur and not pos.get('tp50_hit'):
                 logging.warning(
                     f'⏰ [{strategy}] {sym}: таймаут {dur_min:.0f}мин>={max_dur}мин '
@@ -2159,11 +2196,15 @@ async def monitor_all():
                                 'stopPrice': round(entry, 8),
                                 'reduceOnly': True}
                     )
+                    # [v36] фиксируем USDT-профит от закрытых 50%
+                    tp50_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
+                    tp50_fee = close_qty * curr_p * FEE_RATE
+                    pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw - tp50_fee
                     pos.update({'tp50_hit': True, 'current_qty': remain,
                                 'sl_order_id': sl_ord['id']})
                     save_all()
                     await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
-                             f"P&L: +{pnl:.2f}%")
+                             f"P&L: +{pnl:.2f}% | +{tp50_raw - tp50_fee:+.2f} USDT")
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
 
@@ -2273,15 +2314,20 @@ async def monitor_all():
                    else (entry - exit_p) * float(pos['current_qty']))
             fee_in  = float(pos['initial_qty']) * entry * FEE_RATE
             fee_out = float(pos['current_qty']) * exit_p * FEE_RATE
-            net_pnl = raw - (fee_in + fee_out)
+            # [v36] runner-часть + зафиксированный USDT от TP50 (v34-фикс восстановлен)
+            runner_pnl = raw - fee_out
+            net_pnl = runner_pnl + pos.get('realized_pnl_usdt', 0.0) - fee_in
 
-            pnl_pct = (exit_p - entry) / entry * 100 if is_long else (entry - exit_p) / entry * 100
+            # [v36] pnl_pct = ROE (движение цены × LEVERAGE) — совпадает с биржей
+            price_move_pct = ((exit_p - entry) / entry * 100 if is_long
+                              else (entry - exit_p) / entry * 100)
+            pnl_pct = price_move_pct * LEVERAGE
             daily_stats['trades'] += 1
-            daily_stats['pnl_pct'] += pnl_pct / 100  # в долях
+            daily_stats['pnl_pct'] += price_move_pct / 100  # DD-расчёт без плеча
 
             # Реальная победа = ощутимая прибыль (не BE)
-            # pnl < 0.5% = BE-close (LINK+0.21%, APE+0.21%) — НЕ победа
-            min_win_pct = 0.5
+            # пороги масштабированы под ROE: 0.5% цены × LEVERAGE
+            min_win_pct = 0.5 * LEVERAGE
             is_win = pos.get('tp50_hit', False) or pnl_pct >= min_win_pct
             is_be  = 0 < pnl_pct < min_win_pct
             if is_win:
@@ -2305,7 +2351,7 @@ async def monitor_all():
                 f"{daily_stats['wins']} побед | WR {winrate_d:.0f}%"
             )
             # Determine close reason
-            _close_reason = ('TP' if pos.get('tp50_hit') and pnl_pct >= 0.5
+            _close_reason = ('TP' if pos.get('tp50_hit') and pnl_pct >= 0.5 * LEVERAGE
                              else 'BE' if is_be
                              else 'SL' if pnl_pct < 0
                              else 'WIN')
@@ -2757,8 +2803,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-02-v35'
+CODE_VERSION = '2026-07-02-v36'
 CHANGELOG = [
+    ('2026-07-02-v36', 'v34 PNL-фиксы восстановлены (realized_pnl+ROE); MAX_TRADE_MIN_SA=150; Smart Timeout SMC 90мин; ATR→worker payload'),
     ('2026-07-02-v35', 'stats: SA выделена в отдельный блок с SA_HIST_OFFSET=37; SA убрана из shadow; шапка v10→v10+SA'),
     ('2026-06-29-v33', 'execute: SA margin лимит 20%→30%'),
     ('2026-06-29-v32', 'AI oracle: SA правила директивные — MUST APPROVE для RSI экстремумов'),
@@ -3201,7 +3248,9 @@ def _trades_row(con, since=None):
     return con.execute(f"""
         SELECT
             COUNT(*) total,
-            SUM(CASE WHEN pnl_pct >= 0.5 OR tp50_hit=1 THEN 1 ELSE 0 END) wins,
+            -- [v36] порог {0.5 * LEVERAGE}: pnl_pct теперь ROE. Старые записи (до v36)
+            -- хранят % без плеча — их wins могут занижаться, форвард-данные корректны.
+            SUM(CASE WHEN pnl_pct >= {0.5 * LEVERAGE} OR tp50_hit=1 THEN 1 ELSE 0 END) wins,
             ROUND(AVG(pnl_pct),2) avg_pnl,
             ROUND(AVG(mfe_pct),2) avg_mfe,
             ROUND(AVG(mae_pct),2) avg_mae,
