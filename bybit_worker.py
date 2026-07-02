@@ -329,11 +329,13 @@ async def execute_signal(signal: dict):
         logging.info(f"✅ {sym}: market order открыт | id={entry_ord.get('id', '?')}")
         await asyncio.sleep(2.0)  # ждём регистрации позиции
         try:
+            # [FIX-TP50] Устанавливаем ТОЛЬКО SL при открытии.
+            # TP убран из trading_stop — он блокировал частичное закрытие (tpslMode:Full
+            # закрывал 100% позиции при касании TP). Трейлинг и TP50 теперь в monitor().
             sl_p = {'category':'linear','symbol':sym,'positionIdx':position_idx,
                     'stopLoss':str(round(sl,8)),'slTriggerBy':'LastPrice','tpslMode':'Full'}
-            if tp: sl_p.update({'takeProfit':str(round(tp,8)),'tpTriggerBy':'LastPrice'})
             await exchange.private_post_v5_position_trading_stop(sl_p)
-            logging.info(f"✅ {sym}: SL={sl:.6f} (trading_stop)")
+            logging.info(f"✅ {sym}: SL={sl:.6f} (trading_stop, без TP — трейлинг в monitor)")
         except Exception as _sle:
             logging.warning(f"⚠️ trading_stop: {_sle} — STOP_MARKET fallback")
             try:
@@ -347,16 +349,23 @@ async def execute_signal(signal: dict):
                 await tg(f"🚨 <b>{sym}</b>: ПОЗИЦИЯ БЕЗ SL! Закройте вручную!")
 
         rec = {
-            'symbol':       sym,
-            'direction':    mode,
-            'entry_price':  entry,
-            'qty':          qty,
-            'sl_price':     sl,
-            'tp_price':     tp,
-            'order_id':     entry_ord.get('id', ''),
-            'strategy':     strategy,
-            'open_time':    time.time(),
-            'be_moved':     False,
+            'symbol':            sym,
+            'direction':         mode,
+            'entry_price':       entry,
+            'qty':               qty,
+            'initial_qty':       qty,
+            'current_qty':       qty,
+            'sl_price':          sl,
+            'current_sl':        sl,
+            'tp_price':          tp,
+            'order_id':          entry_ord.get('id', ''),
+            'strategy':          strategy,
+            'open_time':         time.time(),
+            'be_moved':          False,
+            'tp50_hit':          False,           # [TP50] флаг частичного закрытия
+            'realized_pnl_usdt': 0.0,             # [TP50] накопленный USDT от TP50
+            'mfe_price':         entry,            # [TRAIL] для трейлинга
+            'sl_dist_pct':       sl_pct,           # [TP50] для динамического порога
         }
         active_positions.append(rec)
 
@@ -474,7 +483,14 @@ async def monitor():
 
             secs = time.time() - pos['open_time']
 
-            # ── Таймаут живой позиции (синхронизация с BingX) ──
+            # Обновляем MFE для трейлинга
+            mfe_p = float(pos.get('mfe_price', entry))
+            if is_long and curr_p > mfe_p:
+                pos['mfe_price'] = curr_p
+            elif not is_long and curr_p < mfe_p:
+                pos['mfe_price'] = curr_p
+
+            # ── Таймаут живой позиции ──
             _mx = MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC' else MAX_TRADE_MIN_RSI
             if secs > _mx * 60:
                 logging.warning(
@@ -496,7 +512,7 @@ async def monitor():
                 except Exception as _te:
                     logging.error(f'⏰ {sym} timeout-close: {_te}')
                     await tg(f'❌ <b>{sym}</b>: ошибка таймаута! Закройте вручную.')
-                continue  # удалить из списка
+                continue
 
             # Ghost position guard
             if real_qty * curr_p < 1.0 and real_qty > 0:
@@ -510,7 +526,7 @@ async def monitor():
                     logging.error(f"Ghost close error: {ge}")
                 continue
 
-            # Breakeven при +1.5% (покрывает комиссию Bybit 0.06% × 2 = +0.12%)
+            # ── Breakeven после TP50 (или при +1.5% если TP50 ещё не сработал) ──
             if pnl >= 1.5 and not pos.get('be_moved'):
                 new_sl = entry * 1.002 if is_long else entry * 0.998
                 logging.info(f"🛡 {sym}: SL → BE {new_sl:.6f} (P&L +{pnl:.2f}%)")
@@ -519,11 +535,89 @@ async def monitor():
                         'category':'linear','symbol':sym,'positionIdx':0,
                         'stopLoss':str(round(new_sl,8)),
                         'slTriggerBy':'LastPrice','tpslMode':'Full'})
-                    pos['sl_price'] = new_sl
-                    pos['be_moved'] = True
+                    pos['sl_price']  = new_sl
+                    pos['current_sl'] = new_sl
+                    pos['be_moved']  = True
                     await tg(f"🛡 <b>{sym}</b>: SL → БУ <code>{new_sl:.6f}</code> | +{pnl:.2f}%")
                 except Exception as e:
                     logging.error(f"BE error {sym}: {e}")
+
+            # ── TP50: закрываем 50% при +0.8R ──
+            sl_dist_pct = float(pos.get('sl_dist_pct', 1.5))
+            tp50_thr    = max(sl_dist_pct * 0.8, 0.8)
+            if pnl >= tp50_thr and not pos.get('tp50_hit'):
+                close_qty  = float(pos.get('current_qty', real_qty)) * 0.5
+                try:
+                    # округляем через market precision
+                    if sym not in exchange.markets:
+                        await exchange.load_markets()
+                    close_qty = float(exchange.amount_to_precision(sym, close_qty))
+                except Exception:
+                    close_qty = round(close_qty, 3)
+                remain = round(float(pos.get('current_qty', real_qty)) - close_qty, 6)
+                if close_qty <= 0 or remain <= 0:
+                    pos['tp50_hit'] = True
+                    logging.info(f"{sym}: TP50 qty→0 (мелкая поз), только BE")
+                else:
+                    try:
+                        cl_side = 'sell' if is_long else 'buy'
+                        await exchange.create_order(
+                            sym, 'market', cl_side, close_qty,
+                            params={'category':'linear','positionIdx':0,'reduceOnly':True}
+                        )
+                        # [FIX-PNL] накапливаем зафиксированный USDT от 50%
+                        tp50_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
+                        pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw
+                        pos['tp50_hit']   = True
+                        pos['current_qty'] = remain
+                        logging.info(f"💰 {sym}: TP50 {close_qty} закрыто +{pnl:.2f}% | +{tp50_raw:+.2f}$")
+                        await tg(
+                            f"💰 <b>[{pos['strategy']}] {sym}</b>: TP50% зафиксирован\n"
+                            f"P&L: +{pnl:.2f}% | +{tp50_raw:+.2f} USDT\n"
+                            f"Остаток runner: {remain} | SL → БУ"
+                        )
+                        # Двигаем SL в BE на runner-часть
+                        be_sl = entry * 1.001 if is_long else entry * 0.999
+                        try:
+                            await exchange.private_post_v5_position_trading_stop({
+                                'category':'linear','symbol':sym,'positionIdx':0,
+                                'stopLoss':str(round(be_sl,8)),
+                                'slTriggerBy':'LastPrice','tpslMode':'Full'})
+                            pos['current_sl'] = be_sl
+                            pos['be_moved']   = True
+                        except Exception as _be:
+                            logging.warning(f"BE after TP50 fail {sym}: {_be}")
+                    except Exception as e:
+                        logging.error(f"TP50 error {sym}: {e}")
+
+            # ── ATR Trailing SL после TP50 ──
+            if pos.get('tp50_hit') and pos.get('be_moved'):
+                atr_v  = entry * 0.012  # ~1.2% ATR estimate (нет ATR в сигнале воркера)
+                mfe_now = float(pos.get('mfe_price', entry))
+                if is_long:
+                    new_trail = mfe_now - atr_v * 1.2
+                    if new_trail > float(pos.get('current_sl', 0)):
+                        try:
+                            await exchange.private_post_v5_position_trading_stop({
+                                'category':'linear','symbol':sym,'positionIdx':0,
+                                'stopLoss':str(round(new_trail,6)),
+                                'slTriggerBy':'LastPrice','tpslMode':'Full'})
+                            pos['current_sl'] = new_trail
+                            logging.debug(f"{sym} trail SL → {new_trail:.6f}")
+                        except Exception as _tr:
+                            logging.debug(f"Trail SL fail {sym}: {_tr}")
+                else:
+                    new_trail = mfe_now + atr_v * 1.2
+                    if new_trail < float(pos.get('current_sl', 999999)):
+                        try:
+                            await exchange.private_post_v5_position_trading_stop({
+                                'category':'linear','symbol':sym,'positionIdx':0,
+                                'stopLoss':str(round(new_trail,6)),
+                                'slTriggerBy':'LastPrice','tpslMode':'Full'})
+                            pos['current_sl'] = new_trail
+                            logging.debug(f"{sym} trail SL → {new_trail:.6f}")
+                        except Exception as _tr:
+                            logging.debug(f"Trail SL fail {sym}: {_tr}")
 
             new_positions.append(pos)
 
@@ -573,11 +667,16 @@ async def monitor():
                        else (entry - exit_p) / entry * 100)
             is_win  = pnl_pct > 0.5  # реальная победа > 0.5%
             daily_pnl_pct += pnl_pct / 100
-            icon = '✅' if is_win else ('⚖️' if pnl_pct > 0 else '🛑')
 
-            # PnL в USDT (notional * leverage * pnl%)
-            pos_notional = float(pos.get('qty', 0)) * entry
-            pnl_usdt_pos = pos_notional * LEVERAGE * pnl_pct / 100 if pos_notional > 0 else 0
+            # [FIX-PNL] Корректный расчёт USDT:
+            # runner-часть (current_qty) + зафиксированный USDT от TP50
+            # pos_notional * LEVERAGE было неверно — LEVERAGE уже в notional
+            _cur_qty     = float(pos.get('current_qty', pos.get('qty', 0)))
+            runner_usdt  = (_cur_qty * (exit_p - entry) if is_long
+                            else _cur_qty * (entry - exit_p))
+            realized_tp50 = float(pos.get('realized_pnl_usdt', 0.0))
+            pnl_usdt_pos  = runner_usdt + realized_tp50
+            icon = '✅' if is_win else ('⚖️' if pnl_pct > 0 else '🛑')
             daily_pnl_usdt += pnl_usdt_pos
             daily_trades   += 1
             # Реальная победа = >0.5%, BE = 0.1-0.5%, loss = <0.1%
