@@ -55,6 +55,7 @@ LEVERAGE       = int(os.getenv('LEVERAGE', '5'))
 MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
 MAX_TRADE_MIN_SMC = int(os.getenv('MAX_TRADE_MIN_SMC', '180'))  # SMC: 12 свечей (3ч)
 MAX_TRADE_MIN_RSI = int(os.getenv('MAX_TRADE_MIN_RSI', '240'))  # RSI: 16 свечей (4ч)
+MAX_TRADE_MIN_SA  = int(os.getenv('MAX_TRADE_MIN_SA', '150'))   # [v4] SA: 2.5ч (синхр. с ботом)
 DAILY_DD_LIMIT = float(os.getenv('DAILY_DD', '0.025'))
 MIN_SL_PCT     = 1.0
 MAX_SL_PCT     = 2.5
@@ -161,6 +162,7 @@ async def execute_signal(signal: dict):
     sl       = float(signal.get('sl', 0))
     tp       = float(signal.get('tp', 0))
     strategy = signal.get('strategy', '?')
+    sig_atr  = float(signal.get('atr', 0) or 0)  # [v4] реальный ATR от бота для трейлинга
 
     logging.info(f"📥 Получен сигнал: [{strategy}] {sym} {mode} | entry={entry} sl={sl}")
 
@@ -366,6 +368,7 @@ async def execute_signal(signal: dict):
             'realized_pnl_usdt': 0.0,             # [TP50] накопленный USDT от TP50
             'mfe_price':         entry,            # [TRAIL] для трейлинга
             'sl_dist_pct':       sl_pct,           # [TP50] для динамического порога
+            'atr':               sig_atr,           # [v4] реальный ATR от бота (0 = fallback)
         }
         active_positions.append(rec)
 
@@ -491,7 +494,9 @@ async def monitor():
                 pos['mfe_price'] = curr_p
 
             # ── Таймаут живой позиции ──
-            _mx = MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC' else MAX_TRADE_MIN_RSI
+            _mx = (MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC'
+                   else MAX_TRADE_MIN_SA if pos.get('strategy')=='SA'
+                   else MAX_TRADE_MIN_RSI)
             if secs > _mx * 60:
                 logging.warning(
                     f'⏰ [{pos.get("strategy","?")}] {sym}: '
@@ -526,8 +531,10 @@ async def monitor():
                     logging.error(f"Ghost close error: {ge}")
                 continue
 
-            # ── Breakeven после TP50 (или при +1.5% если TP50 ещё не сработал) ──
-            if pnl >= 1.5 and not pos.get('be_moved'):
+            # ── Breakeven: динамический 0.7R (синхронизировано с async_bot) ──
+            # [v4] Было хардкод +1.5% — рассинхрон с ботом при узком/широком SL
+            _be_thr = max(float(pos.get('sl_dist_pct', 1.5)) * 0.7, 0.5)
+            if pnl >= _be_thr and not pos.get('be_moved'):
                 new_sl = entry * 1.002 if is_long else entry * 0.998
                 logging.info(f"🛡 {sym}: SL → BE {new_sl:.6f} (P&L +{pnl:.2f}%)")
                 try:
@@ -592,7 +599,10 @@ async def monitor():
 
             # ── ATR Trailing SL после TP50 ──
             if pos.get('tp50_hit') and pos.get('be_moved'):
-                atr_v  = entry * 0.012  # ~1.2% ATR estimate (нет ATR в сигнале воркера)
+                # [v4] Реальный ATR из сигнала бота; fallback 1.2% если не передан
+                atr_v = float(pos.get('atr', 0) or 0)
+                if atr_v <= 0:
+                    atr_v = entry * 0.012
                 mfe_now = float(pos.get('mfe_price', entry))
                 if is_long:
                     new_trail = mfe_now - atr_v * 1.2
@@ -630,7 +640,9 @@ async def monitor():
                 continue
 
             # Если не найдена И таймаут → принудительно закрыть
-            _mx2 = MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC' else MAX_TRADE_MIN_RSI
+            _mx2 = (MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC'
+                    else MAX_TRADE_MIN_SA if pos.get('strategy')=='SA'
+                    else MAX_TRADE_MIN_RSI)
             if secs > _mx2 * 60:
                 logging.warning(f'⏰ {sym}: не найдена + таймаут {secs/60:.0f}мин/{_mx2}мин')
                 try:
@@ -805,7 +817,7 @@ async def main():
     logging.info("🚀 Bybit Worker v2.0 UTA запущен")
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
-    logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин")
+    logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин SA={MAX_TRADE_MIN_SA}мин")
     try:
         _bal = await exchange.fetch_balance({'type': 'unified'})
         day_start_bal = float(_bal.get('USDT', {}).get('total', 0))
