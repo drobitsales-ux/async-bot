@@ -1902,6 +1902,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
         'mae_price':   price,
+        'realized_pnl_usdt': 0.0,  # [FIX-PNL] накапливаем USDT от частичных закрытий (TP50)
         # Контекст рынка для аналитики
         'rsi_val':     round(float(sig.get('rsi', 0)), 1),
         'vol_ratio':   round(float(sig.get('vol_ratio', 0)), 2),
@@ -2157,11 +2158,15 @@ async def monitor_all():
                                 'stopPrice': round(entry, 8),
                                 'reduceOnly': True}
                     )
+                    # [FIX-PNL] Фиксируем USDT-профит от закрытых 50%
+                    tp50_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
+                    tp50_fee = close_qty * curr_p * FEE_RATE
+                    pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw - tp50_fee
                     pos.update({'tp50_hit': True, 'current_qty': remain,
                                 'sl_order_id': sl_ord['id']})
                     save_all()
                     await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
-                             f"P&L: +{pnl:.2f}%")
+                             f"P&L: +{pnl:.2f}% | +{tp50_raw - tp50_fee:+.2f} USDT")
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
 
@@ -2271,15 +2276,21 @@ async def monitor_all():
                    else (entry - exit_p) * float(pos['current_qty']))
             fee_in  = float(pos['initial_qty']) * entry * FEE_RATE
             fee_out = float(pos['current_qty']) * exit_p * FEE_RATE
-            net_pnl = raw - (fee_in + fee_out)
+            # [FIX-PNL] runner-часть + уже зафиксированный USDT от TP50
+            runner_pnl = raw - fee_out
+            net_pnl = runner_pnl + pos.get('realized_pnl_usdt', 0.0) - fee_in
 
-            pnl_pct = (exit_p - entry) / entry * 100 if is_long else (entry - exit_p) / entry * 100
+            # [FIX-PNL] pnl_pct = ROE (движение цены × LEVERAGE) — совпадает с биржей
+            price_move_pct = ((exit_p - entry) / entry * 100 if is_long
+                              else (entry - exit_p) / entry * 100)
+            pnl_pct = price_move_pct * LEVERAGE  # ROE для отображения
             daily_stats['trades'] += 1
-            daily_stats['pnl_pct'] += pnl_pct / 100  # в долях
+            daily_stats['pnl_pct'] += price_move_pct / 100  # в долях без плеча для DD-расчёта
 
             # Реальная победа = ощутимая прибыль (не BE)
-            # pnl < 0.5% = BE-close (LINK+0.21%, APE+0.21%) — НЕ победа
-            min_win_pct = 0.5
+            # pnl_pct теперь ROE (×LEVERAGE), пороги масштабированы соответственно
+            # 0.5% цены × 5x = 2.5% ROE — минимальная победа
+            min_win_pct = 0.5 * LEVERAGE
             is_win = pos.get('tp50_hit', False) or pnl_pct >= min_win_pct
             is_be  = 0 < pnl_pct < min_win_pct
             if is_win:
@@ -2755,9 +2766,10 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-06-29-v33'
+CODE_VERSION = '2026-07-02-v34'
 CHANGELOG = [
-    ('2026-06-29-v33', 'execute: SA margin лимит 20%→30% (84-100$ позиции при депозите 73-82$ проходят)'),
+    ('2026-07-02-v34', 'PNL fix: realized_pnl_usdt накапливается при TP50; net_pnl = runner+realized-fees; pnl_pct→ROE×LEVERAGE'),
+    ('2026-06-29-v33', 'execute: SA margin лимит 20%→30%'),
     ('2026-06-29-v32', 'AI oracle: SA правила директивные — MUST APPROVE для RSI экстремумов'),
     ('2026-06-28-v31', 'execute: notional guard учитывает LEVERAGE; SA=20% маржи, SMC/RSI=15% маржи'),
     ('2026-06-28-v30', 'init_db: sa_pos таблица; AI prompt: SA/SMC правила разделены; notional лимит 60%→95%'),
