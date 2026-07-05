@@ -1127,18 +1127,17 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
 
     # RSI — защита от входа в конце тренда
     rsi = calc_rsi(c[:-1])
-    # [DATA v22] RSI exhaustion filter: убыточны RSI<40 (PF 0.00) и RSI>65 (PF 0.06)
-    # Идеальная зона SMC: 40-65 (WR43%, Avg+4.05%, PF 5.01 на 7 сд)
-    if rsi < 40:
-        return None, 'rsi_exhaustion'
-    if rsi > 65:
+    # [v37 EARLY] RSI строго 55-65 — зона продолжения тенденции.
+    # Данные: 55-65 PF 3.87 (n=10) | 40-55 PF 0.83 (n=7, мало!) | 65+ PF 0.06 (n=2)
+    # ⚠️ n<15 в зонах отсечения — первый кандидат на откат если частота упадёт до 0.
+    if not (55 <= rsi <= 65):
         return None, 'rsi_exhaustion'
 
-    # [DATA v22] Short убыточен при alt_score>=40 (рынок не холодный)
-    # Long фильтровать не нужно: PF 3.40 при lt40 (14 сд)
-    if mode == 'Short' and btc_ctx.get('alt_score', 50) >= 40:
-        return None, 'alt_score_short'
-    
+    # [v37 EARLY] alt_score<45 для ВСЕХ входов (было только Short<40):
+    # lt40 PF 2.63 (n=14) | 40-55 PF 0.00 (n=5, мало!) — SMC собирает стопы
+    # в разогретом альтсезоне. Порог 45 — с запасом от 40.
+    if btc_ctx.get('alt_score', 50) >= 45:
+        return None, 'alt_high'
     # ── ADX фильтр для SMC: тренд должен быть выраженным ──
     # ADX < 18 = слабый рынок, CHoCH = ложный сигнал
     # ADX > 18 = направленное движение, CHoCH = реальный слом
@@ -1575,8 +1574,9 @@ async def pullback_signal(sym: str, btc_ctx: dict):
 
     # 1. Сильный тренд (как у momentum)
     adx = calc_adx(h, l, c)
-    # [DATA v23] ADX>=40: PF 1.11-6.96 | ADX<40: PF 0.81 — слабый тренд даёт ложные откаты
-    if adx < 40:
+    # [v37] ADX>60: PF 4.17 WR83% (n=12) | 40-60: PF 0.83 — только экстремальный тренд.
+    # PB остаётся в shadow до форвард-подтверждения на этом фильтре.
+    if adx <= 60:
         return None, 'adx_weak'
     ema20 = calc_ema(c, 20)
     ema50 = calc_ema(c, 50)
@@ -1696,10 +1696,10 @@ async def single_asset_signal(btc_ctx: dict):
     v_full = np.array([float(x[5]) for x in ohlcv])
     avg_vol = float(np.mean(v_full[-21:-1])) if len(v_full) > 21 else float(np.mean(v_full[:-1]))
     vol_ratio = float(v_full[-2]) / avg_vol if avg_vol > 0 else 0.0
-    # [v29 FIX] vol_climax порог снижен 2.0→1.3:
-    # При медленном снижении без паники vol_ratio редко достигает 2x.
-    # 1.3x = есть повышенный интерес, но не требуем кульминации.
-    if vol_ratio < 1.3:
+    # [v37] Volume window 1.3-2.0x (данные n=16):
+    # 1.3-2x: WR 83% PF 9.55 | 2-4x: WR 10% PF 0.02 — выше 2x это кульминация
+    # импульса, MR против него уходит во флэт/таймаут.
+    if not (1.3 <= vol_ratio <= 2.0):
         return None, 'vol_climax'
 
     dist_atr = (price - vwap) / atr   # >0 цена выше VWAP, <0 ниже
@@ -2448,7 +2448,7 @@ async def scan_smc():
         f"choch:{st['choch']} short_blk:{st.get('short_blocked',0)} "
         f"vwap:{st['vwap']} rsi:{st['rsi']} "
         f"adx:{st.get('adx_flat',0)} "
-        f"rsi_exh:{st.get('rsi_exhaustion',0)} alt_sh:{st.get('alt_score_short',0)} "
+        f"rsi_exh:{st.get('rsi_exhaustion',0)} alt_hi:{st.get('alt_high',0)} "
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
         f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
@@ -2491,25 +2491,15 @@ async def scan_rsi():
                     f"TP-mult: {sig['tp_mult']}x"
                 )
                 await execute(sym, sig, 'RSI', rsi_positions, extra)
-            # [MOMENTUM] Если MR не дал сигнал — пробуем momentum (тренд-режим)
-            elif MOMENTUM_ENABLED and sym not in notified:
-                async with sem:
-                    msig, mreason = await momentum_signal(sym, btc_ctx)
-                if msig:
-                    st['momentum'] = st.get('momentum', 0) + 1
-                    _alt = '🔥ALT' if btc_ctx.get('altseason') else 'no-alt'
-                    _live = 'LIVE' if MOMENTUM_LIVE else 'SHADOW'
-                    _ascore = btc_ctx.get('alt_score', 50)
-                    _spread = btc_ctx.get('eth_btc_spread', 0.0)
-                    # MOM лог отключён вместе с shadow (v21)
-                    # [DATA v21] MOM shadow ОТКЛЮЧЁН: 222 сделки, PF 0.28-0.35 везде,
-                    # ни одного сегмента с edge. Данных достаточно — edge отсутствует.
-                    # shadow_record(sym, msig['mode'], msig['entry'], msig, btc_ctx, 'MOM')
-                    if MOMENTUM_LIVE:
-                        notified[sym] = time.time()
-                        mextra = (f"MOM ADX:{msig['adx']:.0f} "
-                                  f"Vol:{msig['vol_ratio']:.1f}x trail:{MOM_TRAIL_ATR}xATR")
-                        await execute(sym, msig, 'MOM', rsi_positions, mextra)
+            # [v37] MOMENTUM ПОЛНОСТЬЮ ОТКЛЮЧЁН: 229 сд, PF 0.27-0.74 во всех
+            # сегментах кроме RSI 40-60 (n=18, PF 1.14 — недостаточно для edge
+            # на фоне тотальной убыточности). Сканер выключен для экономии
+            # API-лимитов и CPU. Код momentum_signal сохранён для истории.
+            # elif MOMENTUM_ENABLED and sym not in notified:
+            #     async with sem:
+            #         msig, mreason = await momentum_signal(sym, btc_ctx)
+            #     if msig:
+            #         ... (см. git-историю / v36)
             # [PULLBACK] независимый shadow-детект входа по откату (не торгует)
             if PB_ENABLED:
                 async with sem:
@@ -2803,8 +2793,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-02-v36'
+CODE_VERSION = '2026-07-04-v37'
 CHANGELOG = [
+    ('2026-07-04-v37', 'SA vol 1.3-2.0 (n=16); SMC RSI 55-65 + alt<45 [EARLY n<15!]; PB ADX>60 shadow; MOM сканер отключён'),
     ('2026-07-02-v36', 'v34 PNL-фиксы восстановлены (realized_pnl+ROE); MAX_TRADE_MIN_SA=150; Smart Timeout SMC 90мин; ATR→worker payload'),
     ('2026-07-02-v35', 'stats: SA выделена в отдельный блок с SA_HIST_OFFSET=37; SA убрана из shadow; шапка v10→v10+SA'),
     ('2026-06-29-v33', 'execute: SA margin лимит 20%→30%'),
@@ -3125,8 +3116,8 @@ def shadow_analyze() -> str:
     try:
         con = sqlite3.connect(TRADES_DB)
         parts = [f'🔬 Анализ {RSI_TF} (closed shadow)']
-        # [v34] SA переведена в live — убрана из shadow-анализа
-        for strat, emoji in [('MOM', '🚀'), ('PB', '🎯')]:
+        # [v37] MOM отключён; SA в live — в shadow остался только PB
+        for strat, emoji in [('PB', '🎯')]:
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
                 (strat,)).fetchone()[0]
@@ -3204,21 +3195,17 @@ def _shadow_strat(con, strat, epoch):
 
 
 def shadow_stats() -> str:
-    """Сводка shadow: 'Последнее' (с деплоя) + 'Всего', раздельно MOM и PB.
-    [v34] SA переведена в live — исключена из shadow-статистики."""
+    """Сводка shadow: 'Последнее' (с деплоя) + 'Всего'.
+    [v37] MOM отключён, SA в live — в shadow остался только PB."""
     try:
         epoch = get_deploy_epoch()
         con = sqlite3.connect(TRADES_DB)
-        m_last, m_all, m_open = _shadow_strat(con, 'MOM', epoch)
         p_last, p_all, p_open = _shadow_strat(con, 'PB', epoch)
         con.close()
     except Exception as _e:
         return f'[SHADOW] stats fail: {_e}'
     return (
         f'👁 <b>Shadow 15м (виртуально, без риска)</b>\n'
-        f'\n🚀 <b>Momentum (пробой)</b> | открыто: {m_open}\n'
-        f'  Последнее: {_shadow_block(m_last)}\n'
-        f'  Всего: {_shadow_block(m_all)}\n'
         f'\n🎯 <b>Pullback (откат)</b> | открыто: {p_open}\n'
         f'  Последнее: {_shadow_block(p_last)}\n'
         f'  Всего: {_shadow_block(p_all)}')
