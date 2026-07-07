@@ -215,6 +215,7 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS smc_pos  (id INTEGER PRIMARY KEY, data TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS rsi_pos  (id INTEGER PRIMARY KEY, data TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS sa_pos   (id INTEGER PRIMARY KEY, data TEXT)")  # [v29]
+    c.execute("CREATE TABLE IF NOT EXISTS pb_pos   (id INTEGER PRIMARY KEY, data TEXT)")  # [PB]
     c.execute("""CREATE TABLE IF NOT EXISTS stats
                  (id INTEGER PRIMARY KEY, pnl_pct REAL, trades INTEGER,
                   wins INTEGER, start_balance REAL, stat_date TEXT,
@@ -225,6 +226,10 @@ def init_db():
 def _save(table: str, data: list):
     try:
         conn = get_db()
+        # [SELF-HEAL] гарантируем существование таблицы перед записью —
+        # защита от "no such table" при частичном патче / персистентном диске /
+        # порядке запуска. IF NOT EXISTS не трогает уже существующие таблицы.
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, data TEXT)")
         conn.execute(f"INSERT OR REPLACE INTO {table} (id, data) VALUES (1, ?)",
                      (json.dumps(data),))
         conn.commit()
@@ -2225,24 +2230,37 @@ async def monitor_all():
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
 
-            # ── ATR Trailing Stop после TP50 ───────────────────
-            # На каждом цикле подтягиваем SL на ATR расстоянии от MFE
-            # Защищает прибыль на runner-части позиции
+            # ── ATR Trailing Stop после TP50 (ФИЗИЧЕСКИЙ) ──────
+            # [SYMMETRY] Перевыпускаем реальный STOP_MARKET на бирже (как воркер),
+            # а не только pos['current_sl'] в памяти. Защищает runner при краше/
+            # рестарте бота: стоп уже стоит на BingX независимо от процесса.
+            # Ордер переставляем ТОЛЬКО когда трейл реально сдвинулся — экономим API.
             if pos.get('tp50_hit') and not pos.get('tp100_hit'):
                 atr_v = float(pos.get('atr', entry * 0.005))
                 mfe_p = float(pos['mfe_price'])
                 trail_mult = SA_TRAIL_ATR if strategy == 'SA' else 1.2  # [SA-EXIT] узкий трейл для MR
-                # Trailing SL: max(текущий SL, MFE - trail_mult*ATR)
-                if is_long:
-                    new_trail = mfe_p - atr_v * trail_mult
-                    if new_trail > pos.get('current_sl', 0):
-                        pos['current_sl'] = new_trail
-                        logging.debug(f'{sym} trail SL → {new_trail:.6f}')
-                else:
-                    new_trail = mfe_p + atr_v * trail_mult
-                    if new_trail < pos.get('current_sl', float('inf')):
-                        pos['current_sl'] = new_trail
-                        logging.debug(f'{sym} trail SL → {new_trail:.6f}')
+                run_qty = float(pos.get('current_qty', real_qty))
+                cur_sl  = float(pos.get('current_sl', 0 if is_long else float('inf')))
+                new_trail = (mfe_p - atr_v * trail_mult if is_long
+                             else mfe_p + atr_v * trail_mult)
+                moved = new_trail > cur_sl if is_long else new_trail < cur_sl
+                if moved and run_qty > 0:
+                    try:
+                        if pos.get('sl_order_id'):
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                        sl_ord = await exchange.create_order(
+                            sym, 'STOP_MARKET', sl_side, run_qty,
+                            params={'positionSide': pos_side,
+                                    'stopPrice': round(new_trail, 8),
+                                    'reduceOnly': True}
+                        )
+                        pos['current_sl']  = new_trail
+                        pos['sl_order_id'] = sl_ord['id']
+                        logging.debug(f'{sym} trail SL (биржа) → {new_trail:.6f}')
+                    except Exception as _tr:
+                        # Не удалось переставить — оставляем прежний биржевой стоп,
+                        # current_sl НЕ трогаем, чтобы память не разошлась с биржей.
+                        logging.warning(f'{sym} trail re-issue fail: {_tr}')
 
             # ── TP100 + trailing ───────────────────────────────
             tp100 = float(pos.get('tp1', entry))
