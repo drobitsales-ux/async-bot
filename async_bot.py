@@ -94,6 +94,8 @@ MOM_RSI_SHORT_MAX = float(os.getenv('MOM_RSI_SHORT_MAX', '35'))  # шорт то
 MOM_RSI_LONG_MIN  = float(os.getenv('MOM_RSI_LONG_MIN', '65'))
 # [PULLBACK] вход по откату к EMA20 внутри тренда (НЕ пробой экстремума)
 PB_ENABLED   = os.getenv('PB_ENABLED', 'true').lower() == 'true'   # shadow-детект pullback
+PB_LIVE      = os.getenv('PB_LIVE', 'false').lower() == 'true'      # [PB] gated live (микро-размер)
+PB_RISK_MULT = float(os.getenv('PB_RISK_MULT', '0.25'))            # [PB] 25% риска до накопления n>=30
 PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к EMA20 (1.2%)
 PB_RSI_LO    = float(os.getenv('PB_RSI_LO', '40'))       # RSI reset зона: низ
 PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: верх   # лонг только если RSI < этого
@@ -110,6 +112,8 @@ SA_RSI_HI    = float(os.getenv('SA_RSI_HI', '70'))       # шорт: RSI выш�
 SA_WINDOW    = os.getenv('SA_WINDOW', '')                # окно UTC 'HH-HH' или '' = весь день
 SA_LIVE      = os.getenv('SA_LIVE', 'false').lower() == 'true'  # [v23] реальная торговля SA
 SA_HIST_OFFSET = 37  # сделок SA до перевода в live (включены в общий счётчик)
+SA_PARTIAL_PCT = float(os.getenv('SA_PARTIAL_PCT', '0.8'))  # [SA-EXIT] фикс 50% при +0.8% (MFE гаснет ~1%)
+SA_TRAIL_ATR   = float(os.getenv('SA_TRAIL_ATR',  '0.8'))   # [SA-EXIT] чувствительный трейл хвоста (MR-ход короткий)
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -156,6 +160,7 @@ EXCLUDED_PARTS = [
 smc_positions   = []   # [R-FIX-12] отдельные списки
 rsi_positions   = []
 sa_positions    = []   # [v24] SA отдельный список позиций
+pb_positions    = []   # [PB] отдельный список live-позиций pullback (gated)
 _sa_last_entry  = 0.0  # [v24] cooldown: timestamp последнего SA входа (не через notified)
 daily_stats     = {
     'pnl_pct': 0.0, 'trades': 0, 'wins': 0,
@@ -240,6 +245,7 @@ def save_all():
     _save('smc_pos', smc_positions)
     _save('rsi_pos', rsi_positions)
     _save('sa_pos',  sa_positions)   # [v24]
+    _save('pb_pos',  pb_positions)   # [PB]
     try:
         conn = get_db()
         conn.execute(
@@ -254,10 +260,11 @@ def save_all():
         logging.error(f"DB save stats: {e}")
 
 def load_all():
-    global smc_positions, rsi_positions, sa_positions, daily_stats
+    global smc_positions, rsi_positions, sa_positions, pb_positions, daily_stats
     smc_positions = _load('smc_pos')
     rsi_positions = _load('rsi_pos')
     sa_positions  = _load('sa_pos')   # [v24]
+    pb_positions  = _load('pb_pos')   # [PB]
     try:
         conn = get_db()
         row = conn.execute("SELECT * FROM stats WHERE id=1").fetchone()
@@ -376,7 +383,7 @@ def current_risk() -> float:
     return RISK_WEEKEND if is_weekend() else RISK_PER_TRADE
 
 def all_positions() -> list:
-    return smc_positions + rsi_positions + sa_positions  # [v24] SA включён
+    return smc_positions + rsi_positions + sa_positions + pb_positions  # [v24] SA + [PB]
 
 def calc_vwap(h, l, c, v) -> float:
     denom = np.sum(v)
@@ -1130,7 +1137,9 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # [v37 EARLY] RSI строго 55-65 — зона продолжения тенденции.
     # Данные: 55-65 PF 3.87 (n=10) | 40-55 PF 0.83 (n=7, мало!) | 65+ PF 0.06 (n=2)
     # ⚠️ n<15 в зонах отсечения — первый кандидат на откат если частота упадёт до 0.
-    if not (55 <= rsi <= 65):
+    # [SMC-FREQ] нижняя граница 55→50 для возврата частоты. Верх 65 держим (65+ = PF 0.06).
+    # Гипотеза: под-зона 50-55 ближе к прибыльной 55-65. КОНТРОЛЬ: PF под-зоны 50-55 через ~15 сд.
+    if not (50 <= rsi <= 65):
         return None, 'rsi_exhaustion'
 
     # [v37 EARLY] alt_score<45 для ВСЕХ входов (было только Short<40):
@@ -1772,7 +1781,7 @@ async def publish_to_workers(sym: str, mode: str, price: float,
 
 
 async def execute(sym: str, sig: dict, strategy: str,
-                  pos_list: list, extra_tg: str = ""):
+                  pos_list: list, extra_tg: str = "", risk_mult: float = 1.0):
     """
     Общий исполнитель. strategy = 'SMC' | 'RSI'.
     sig может содержать 'bingx_vol' для oracle_volume.
@@ -1837,7 +1846,7 @@ async def execute(sym: str, sig: dict, strategy: str,
     if free_usdt < 50:
         return
 
-    risk_usdt = free_usdt * current_risk()
+    risk_usdt = free_usdt * current_risk() * risk_mult  # [PB] risk_mult<1 для gated-live
     sl_dist   = abs(price - sl)
     if sl_dist <= 0:
         return
@@ -1940,8 +1949,10 @@ async def execute(sym: str, sig: dict, strategy: str,
     await tg(msg)
     logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
     # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
-    asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt,
-                                           atr=float(sig.get('atr', 0.0))))
+    # [PB] экспериментальный PB НЕ копируем на воркер до валидации (n>=30)
+    if strategy != 'PB':
+        asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt,
+                                               atr=float(sig.get('atr', 0.0))))
 
 # ═══════════════════════════════════════════════════════
 #  МОНИТОРИНГ ПОЗИЦИЙ (общий)
@@ -2165,7 +2176,10 @@ async def monitor_all():
 
             # ── TP 50% ─────────────────────────────────────────
             # ── Динамический TP50: при +1.0R (равно SL дистанции) ──
-            tp50_thr_dyn = max(sl_dist_pct * 0.8, 0.8)  # [PROP] 1.0R→0.8R: ранняя фиксация, легче TP
+            if strategy == 'SA':
+                tp50_thr_dyn = SA_PARTIAL_PCT            # [SA] MFE-данные: пик ~1%, фикс на 0.8%
+            else:
+                tp50_thr_dyn = max(sl_dist_pct * 0.8, 0.8)  # [PROP] 1.0R→0.8R: ранняя фиксация, легче TP
             if pnl >= tp50_thr_dyn and not pos.get('tp50_hit'):
                 close_qty = round(real_qty * 0.5, 8)
                 remain    = round(real_qty - close_qty, 8)
@@ -2190,10 +2204,12 @@ async def monitor_all():
                     )
                     if pos.get('sl_order_id'):
                         await exchange.cancel_order(pos['sl_order_id'], sym)
+                    # [SA-EXIT] БУ хвоста с учётом 2×комиссии (голый entry = минус на фи)
+                    be_after_tp50 = entry * 1.0015 if is_long else entry * 0.9985
                     sl_ord = await exchange.create_order(
                         sym, 'STOP_MARKET', sl_side, remain,
                         params={'positionSide': pos_side,
-                                'stopPrice': round(entry, 8),
+                                'stopPrice': round(be_after_tp50, 8),
                                 'reduceOnly': True}
                     )
                     # [v36] фиксируем USDT-профит от закрытых 50%
@@ -2201,7 +2217,8 @@ async def monitor_all():
                     tp50_fee = close_qty * curr_p * FEE_RATE
                     pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw - tp50_fee
                     pos.update({'tp50_hit': True, 'current_qty': remain,
-                                'sl_order_id': sl_ord['id']})
+                                'sl_order_id': sl_ord['id'],
+                                'current_sl': be_after_tp50})  # [SA-EXIT] базовый уровень для трейла
                     save_all()
                     await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
                              f"P&L: +{pnl:.2f}% | +{tp50_raw - tp50_fee:+.2f} USDT")
@@ -2214,14 +2231,15 @@ async def monitor_all():
             if pos.get('tp50_hit') and not pos.get('tp100_hit'):
                 atr_v = float(pos.get('atr', entry * 0.005))
                 mfe_p = float(pos['mfe_price'])
-                # Trailing SL: max(текущий SL, MFE - 1.2*ATR)
+                trail_mult = SA_TRAIL_ATR if strategy == 'SA' else 1.2  # [SA-EXIT] узкий трейл для MR
+                # Trailing SL: max(текущий SL, MFE - trail_mult*ATR)
                 if is_long:
-                    new_trail = mfe_p - atr_v * 1.2
+                    new_trail = mfe_p - atr_v * trail_mult
                     if new_trail > pos.get('current_sl', 0):
                         pos['current_sl'] = new_trail
                         logging.debug(f'{sym} trail SL → {new_trail:.6f}')
                 else:
-                    new_trail = mfe_p + atr_v * 1.2
+                    new_trail = mfe_p + atr_v * trail_mult
                     if new_trail < pos.get('current_sl', float('inf')):
                         pos['current_sl'] = new_trail
                         logging.debug(f'{sym} trail SL → {new_trail:.6f}')
@@ -2363,8 +2381,8 @@ async def monitor_all():
             notified[sym] = time.time()   # cooldown после закрытия
             return False   # удалить из списка
 
-    # Обработка SMC, RSI и SA позиций
-    new_smc, new_rsi, new_sa = [], [], []
+    # Обработка SMC, RSI, SA и PB позиций
+    new_smc, new_rsi, new_sa, new_pb = [], [], [], []
     for p in smc_positions:
         keep = await process_pos(p, smc_positions)
         if keep:
@@ -2377,9 +2395,14 @@ async def monitor_all():
         keep = await process_pos(p, sa_positions)
         if keep:
             new_sa.append(p)
+    for p in pb_positions:   # [PB]
+        keep = await process_pos(p, pb_positions)
+        if keep:
+            new_pb.append(p)
     smc_positions[:] = new_smc
     rsi_positions[:] = new_rsi
     sa_positions[:]  = new_sa   # [v24]
+    pb_positions[:]  = new_pb   # [PB]
 
 # ═══════════════════════════════════════════════════════
 #  СКАНЕРЫ
@@ -2514,6 +2537,14 @@ async def scan_rsi():
                         f"near-EMA20 [{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
                     )
                     shadow_record(sym, psig['mode'], psig['entry'], psig, btc_ctx, 'PB')
+
+                    # [PB GATED LIVE] микро-размер, только пока набираем n>=30.
+                    # Фильтры уже жёсткие в pullback_signal: ADX>60, Vol 1.5-3x, alt<40, Long-only.
+                    if PB_LIVE and sym not in notified:
+                        psig['price'] = psig['entry']       # execute() требует sig['price']
+                        await execute(sym, psig, 'PB', pb_positions,
+                                      risk_mult=PB_RISK_MULT)
+                        notified[sym] = time.time()
         except Exception as _e:
             st['error'] = st.get('error', 0) + 1
             if st['error'] <= 2:
@@ -2671,7 +2702,7 @@ async def sync_positions_with_exchange() -> int:
                 return True
             return False
 
-        new_smc, new_rsi, new_sa = [], [], []
+        new_smc, new_rsi, new_sa, new_pb = [], [], [], []
         for p in smc_positions:
             if _is_real(p): new_smc.append(p)
             else:
@@ -2687,10 +2718,16 @@ async def sync_positions_with_exchange() -> int:
             else:
                 logging.warning(f'👻 [SYNC] SA ghost: {p["symbol"]} {p["direction"]}')
                 removed += 1
+        for p in pb_positions:   # [PB]
+            if _is_real(p): new_pb.append(p)
+            else:
+                logging.warning(f'👻 [SYNC] PB ghost: {p["symbol"]} {p["direction"]}')
+                removed += 1
 
         smc_positions[:] = new_smc
         rsi_positions[:] = new_rsi
         sa_positions[:]  = new_sa   # [v24]
+        pb_positions[:]  = new_pb   # [PB]
         save_all()
         logging.info(f'✅ [SYNC] Удалено ghost: {removed} | '
                      f'Осталось: SMC={len(smc_positions)} RSI={len(rsi_positions)}')
