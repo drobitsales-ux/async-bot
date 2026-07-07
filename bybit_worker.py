@@ -640,7 +640,9 @@ async def monitor():
                             pos['current_sl'] = new_trail
                             logging.debug(f"{sym} trail SL → {new_trail:.6f}")
                         except Exception as _tr:
-                            logging.debug(f"Trail SL fail {sym}: {_tr}")
+                            # [SYMMETRY] при сбое current_sl НЕ трогаем (уже так);
+                            # логируем warning как в боте — чтобы видеть проблему в проде
+                            logging.warning(f"{sym} trail re-issue fail: {_tr}")
                 else:
                     new_trail = mfe_now + atr_v * trail_mult
                     if new_trail < float(pos.get('current_sl', 999999)):
@@ -652,7 +654,9 @@ async def monitor():
                             pos['current_sl'] = new_trail
                             logging.debug(f"{sym} trail SL → {new_trail:.6f}")
                         except Exception as _tr:
-                            logging.debug(f"Trail SL fail {sym}: {_tr}")
+                            # [SYMMETRY] при сбое current_sl НЕ трогаем (уже так);
+                            # логируем warning как в боте — чтобы видеть проблему в проде
+                            logging.warning(f"{sym} trail re-issue fail: {_tr}")
 
             new_positions.append(pos)
 
