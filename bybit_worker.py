@@ -1,6 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     BYBIT WORKER  v2.0  —  UTA (Unified Trading Account)    ║
+║     BYBIT WORKER  v2.1  —  UTA (Unified Trading Account)    ║
+║                                                              ║
+║  Изменения v2.1 (синхронизация SA-выходов с async_bot):     ║
+║  [SA-EXIT] SA_PARTIAL_PCT=0.8: фикс 50% при +0.8% (не 1.6%) ║
+║  [SA-EXIT] SA_TRAIL_ATR=0.8: чувствительный трейл для SA     ║
+║  [SA-EXIT] БУ после TP50 с учётом 2×комиссии (0.15%)         ║
+║  [BUGFIX]  monitor(): live определяется ДО использования     ║
 ║                                                              ║
 ║  Исправления v2.0:                                          ║
 ║  [FIX-1] UTA: positionIdx=0 (one-way), не hedge mode       ║
@@ -20,6 +26,8 @@
 ║    RISK_PCT          = 0.02 (2% для теста $100)             ║
 ║    LEVERAGE          = 5                                     ║
 ║    MAX_POS           = 2                                     ║
+║    SA_PARTIAL_PCT    = 0.8  (порог частичной фиксации SA)   ║
+║    SA_TRAIL_ATR      = 0.8  (множитель ATR трейла SA)        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -59,6 +67,10 @@ MAX_TRADE_MIN_SA  = int(os.getenv('MAX_TRADE_MIN_SA', '150'))   # [v4] SA: 2.5ч
 DAILY_DD_LIMIT = float(os.getenv('DAILY_DD', '0.025'))
 MIN_SL_PCT     = 1.0
 MAX_SL_PCT     = 2.5
+# [SA-EXIT] Синхронизация выходов SA с async_bot.py:
+# данные MFE показывают пик хода ~1%, старый порог 1.6% его не достигал.
+SA_PARTIAL_PCT = float(os.getenv('SA_PARTIAL_PCT', '0.8'))  # SA: фикс 50% при +0.8%
+SA_TRAIL_ATR   = float(os.getenv('SA_TRAIL_ATR',  '0.8'))   # SA: чувствительный трейл хвоста
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | [BYBIT] %(message)s')
 
@@ -401,7 +413,7 @@ async def execute_signal(signal: dict):
 #  МОНИТОРИНГ ПОЗИЦИЙ
 # ══════════════════════════════════════════════════════════
 async def monitor():
-    """Мониторинг: BE при +1.5%, обнаружение закрытий."""
+    """Мониторинг: BE, TP50 (SA=+0.8%), трейлинг, обнаружение закрытий."""
     global active_positions, daily_pnl_pct, daily_pnl_usdt
     global daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes
 
@@ -437,23 +449,10 @@ async def monitor():
         entry   = float(pos['entry_price'])
 
         ticker_d = tickers.get(sym) or {}
-        curr_p = float(ticker_d.get('last', 0) or 0)
-        if curr_p <= 0:
-            curr_p = float(ticker_d.get('close', 0) or 0)
-        # Fallback: берём markPrice из самой позиции (если есть)
-        if curr_p <= 0 and live:
-            info = live.get('info') or {}
-            curr_p = float(info.get('markPrice', 0) or
-                           info.get('unrealisedPnl', 0) or 0)
-            # unrealisedPnl не цена — вычислим из него если есть qty
-            if curr_p != 0 and 'markPrice' not in info:
-                curr_p = 0  # не подходит
-            if 'markPrice' in info:
-                curr_p = float(info.get('markPrice', 0) or 0)
-        if curr_p <= 0:
-            curr_p = entry
-            logging.debug(f"⚠️ {sym}: curr_p=entry (ticker недоступен)")
 
+        # [BUGFIX v2.1] live ДОЛЖНА быть определена ДО использования в curr_p-fallback.
+        # Раньше 'live' читалась в блоке markPrice-fallback выше своего определения →
+        # NameError и краш цикла мониторинга, когда тикер не отдавал цену.
         bybit_side = 'Buy' if is_long else 'Sell'
         # Нормализуем символ: Bybit может хранить как 'STORJUSDT' или 'STORJ/USDT'
         sym_base = sym.replace('USDT', '').replace('/', '')
@@ -478,6 +477,24 @@ async def monitor():
         else:
             live_syms = [r.get('symbol') for r in pos_raw if abs(float(r.get('contracts',0)))>0]
             logging.info(f"[MONITOR] {sym}: НЕ найдена | Bybit видит: {live_syms}")
+
+        # Цена: last → close → markPrice из позиции → entry
+        curr_p = float(ticker_d.get('last', 0) or 0)
+        if curr_p <= 0:
+            curr_p = float(ticker_d.get('close', 0) or 0)
+        # Fallback: берём markPrice из самой позиции (если есть)
+        if curr_p <= 0 and live:
+            info = live.get('info') or {}
+            curr_p = float(info.get('markPrice', 0) or
+                           info.get('unrealisedPnl', 0) or 0)
+            # unrealisedPnl не цена — вычислим из него если есть qty
+            if curr_p != 0 and 'markPrice' not in info:
+                curr_p = 0  # не подходит
+            if 'markPrice' in info:
+                curr_p = float(info.get('markPrice', 0) or 0)
+        if curr_p <= 0:
+            curr_p = entry
+            logging.debug(f"⚠️ {sym}: curr_p=entry (ticker недоступен)")
 
         if live:
             real_qty = abs(float(live.get('contracts', 0)))
@@ -549,9 +566,14 @@ async def monitor():
                 except Exception as e:
                     logging.error(f"BE error {sym}: {e}")
 
-            # ── TP50: закрываем 50% при +0.8R ──
+            # ── TP50: закрываем 50% ──
+            # [SA-EXIT] SA фиксирует рано (+0.8%), т.к. MFE гаснет ~1%.
+            # Остальные стратегии — прежний динамический порог 0.8R.
             sl_dist_pct = float(pos.get('sl_dist_pct', 1.5))
-            tp50_thr    = max(sl_dist_pct * 0.8, 0.8)
+            if pos.get('strategy') == 'SA':
+                tp50_thr = SA_PARTIAL_PCT
+            else:
+                tp50_thr = max(sl_dist_pct * 0.8, 0.8)
             if pnl >= tp50_thr and not pos.get('tp50_hit'):
                 close_qty  = float(pos.get('current_qty', real_qty)) * 0.5
                 try:
@@ -583,8 +605,9 @@ async def monitor():
                             f"P&L: +{pnl:.2f}% | +{tp50_raw:+.2f} USDT\n"
                             f"Остаток runner: {remain} | SL → БУ"
                         )
-                        # Двигаем SL в BE на runner-часть
-                        be_sl = entry * 1.001 if is_long else entry * 0.999
+                        # [SA-EXIT] Двигаем SL в БУ на runner-часть с учётом 2×комиссии
+                        # (было 0.1% — на грани фи; 0.15% синхронно с async_bot)
+                        be_sl = entry * 1.0015 if is_long else entry * 0.9985
                         try:
                             await exchange.private_post_v5_position_trading_stop({
                                 'category':'linear','symbol':sym,'positionIdx':0,
@@ -603,9 +626,11 @@ async def monitor():
                 atr_v = float(pos.get('atr', 0) or 0)
                 if atr_v <= 0:
                     atr_v = entry * 0.012
+                # [SA-EXIT] SA ведём чувствительнее (0.8·ATR) — MR-ход короткий
+                trail_mult = SA_TRAIL_ATR if pos.get('strategy') == 'SA' else 1.2
                 mfe_now = float(pos.get('mfe_price', entry))
                 if is_long:
-                    new_trail = mfe_now - atr_v * 1.2
+                    new_trail = mfe_now - atr_v * trail_mult
                     if new_trail > float(pos.get('current_sl', 0)):
                         try:
                             await exchange.private_post_v5_position_trading_stop({
@@ -617,7 +642,7 @@ async def monitor():
                         except Exception as _tr:
                             logging.debug(f"Trail SL fail {sym}: {_tr}")
                 else:
-                    new_trail = mfe_now + atr_v * 1.2
+                    new_trail = mfe_now + atr_v * trail_mult
                     if new_trail < float(pos.get('current_sl', 999999)):
                         try:
                             await exchange.private_post_v5_position_trading_stop({
@@ -724,7 +749,7 @@ async def monitor():
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = (
-            f"Bybit Worker v2.0 UTA | "
+            f"Bybit Worker v2.1 UTA | "
             f"Positions: {len(active_positions)} | "
             f"DD: {daily_pnl_pct*100:+.2f}% | "
             f"Circuit: {'OPEN' if circuit_open else 'OK'}"
@@ -814,9 +839,10 @@ async def main():
     logging.info(f"🔑 WORKER_SECRET:  {WORKER_SECRET[:8]}...")
     logging.info(f"🔑 TELEGRAM:       {'✅' if TOKEN else '❌'} | CHAT: {CHAT_ID}")
     logging.info("=" * 55)
-    logging.info("🚀 Bybit Worker v2.0 UTA запущен")
+    logging.info("🚀 Bybit Worker v2.1 UTA запущен")
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
+    logging.info(f"   SA-выход: частичник +{SA_PARTIAL_PCT}% | трейл {SA_TRAIL_ATR}·ATR")
     logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин SA={MAX_TRADE_MIN_SA}мин")
     try:
         _bal = await exchange.fetch_balance({'type': 'unified'})
@@ -824,9 +850,10 @@ async def main():
     except: pass
 
     await tg(
-        f"🟢 <b>Bybit Worker v2.0 UTA</b> запущен\n"
+        f"🟢 <b>Bybit Worker v2.1 UTA</b> запущен\n"
         f"Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%/сделку\n"
         f"Leverage: {LEVERAGE}x | DD-лимит: {DAILY_DD_LIMIT*100:.1f}%\n"
+        f"SA-выход: +{SA_PARTIAL_PCT}% частичник\n"
         f"Ожидаю сигналы от BingX..."
     )
 
