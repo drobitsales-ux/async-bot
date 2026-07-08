@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -103,6 +104,69 @@ circuit_open     = False
 _daily_report_sent = False
 http_session     = None
 _signal_queue: asyncio.Queue = None
+
+# ══════════════════════════════════════════════════════════
+#  ПЕРСИСТЕНТНОСТЬ (SQLite) — переживаем рестарты Render
+# ══════════════════════════════════════════════════════════
+# ВАЖНО: SQLite спасает от потери позиций ТОЛЬКО если файл лежит на
+# постоянном диске Render (Disk mounted at /data). Без примонтированного
+# диска деплой всё равно стирает файл. См. заметку в конце ответа.
+_DB_DIR  = os.getenv('WORKER_DB_DIR', '/data')
+try:
+    os.makedirs(_DB_DIR, exist_ok=True)
+    # Проверяем возможность записи в каталог
+    _probe = os.path.join(_DB_DIR, '.write_test')
+    with open(_probe, 'w') as _f:
+        _f.write('ok')
+    os.remove(_probe)
+except Exception as _dbe:
+    # Нет постоянного диска — падать нельзя, но предупреждаем громко
+    logging.warning(f"⚠️ {_DB_DIR} недоступен для записи ({_dbe}) — "
+                    f"использую локальный файл. ПЕРСИСТЕНТНОСТЬ МЕЖДУ ДЕПЛОЯМИ НЕ ГАРАНТИРОВАНА!")
+    _DB_DIR = '.'
+DB_PATH = os.path.join(_DB_DIR, 'worker_data.db')
+
+
+def init_worker_db():
+    """Создаёт таблицу активных позиций, если её нет."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS active_pos (id INTEGER PRIMARY KEY, data TEXT)")
+        conn.commit()
+        conn.close()
+        logging.info(f"🗄  Worker DB: {DB_PATH}")
+    except Exception as e:
+        logging.error(f"init_worker_db: {e}")
+
+
+def save_positions():
+    """Сохраняет весь список active_positions одной строкой JSON (как в боте).
+    Вызывается после ЛЮБОГО изменения: открытие, BE, TP50, трейл, закрытие."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # self-heal: гарантируем таблицу даже при частичном деплое
+        conn.execute("CREATE TABLE IF NOT EXISTS active_pos (id INTEGER PRIMARY KEY, data TEXT)")
+        conn.execute("INSERT OR REPLACE INTO active_pos (id, data) VALUES (1, ?)",
+                     (json.dumps(active_positions),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"save_positions: {e}")
+
+
+def load_positions() -> list:
+    """Загружает active_positions из БД при старте. Возвращает [] если пусто/ошибка."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS active_pos (id INTEGER PRIMARY KEY, data TEXT)")
+        row = conn.execute("SELECT data FROM active_pos WHERE id=1").fetchone()
+        conn.close()
+        if row and row[0]:
+            data = json.loads(row[0])
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logging.error(f"load_positions: {e}")
+    return []
 
 # ══════════════════════════════════════════════════════════
 #  TELEGRAM
@@ -383,6 +447,7 @@ async def execute_signal(signal: dict):
             'atr':               sig_atr,           # [v4] реальный ATR от бота (0 = fallback)
         }
         active_positions.append(rec)
+        save_positions()  # [PERSIST] сразу фиксируем открытие — переживёт рестарт
 
         await tg(
             f"{'🟢' if mode=='Long' else '🔴'} <b>[{strategy}] {sym}</b> — {mode}\n"
@@ -777,6 +842,7 @@ async def monitor():
             )
 
     active_positions[:] = new_positions
+    save_positions()  # [PERSIST] фиксируем итог цикла: трейл, закрытия, BE, TP50
 
 # ══════════════════════════════════════════════════════════
 #  HTTP WEBHOOK SERVER
@@ -848,6 +914,7 @@ async def main():
 
     _signal_queue = asyncio.Queue()
     http_session  = aiohttp.ClientSession()
+    init_worker_db()  # [PERSIST] создаём БД/таблицу до приёма сигналов
     Thread(target=run_http, daemon=True).start()
 
     # [v24] Self-ping: не даёт Render усыплять Worker (каждые 10 мин)
@@ -901,6 +968,29 @@ async def main():
     except Exception as e:
         logging.error(f"❌ Ошибка подключения к Bybit: {e}")
         await tg(f"❌ <b>Ошибка подключения к Bybit:</b>\n<code>{str(e)[:200]}</code>")
+
+    # ── [PERSIST] Восстановление позиций после рестарта ──────────
+    # Подтягиваем из БД, затем СРАЗУ сверяем с биржей через monitor()
+    # (там уже есть логика: найдена ли на бирже, таймаут по open_time и т.д.).
+    recovered = load_positions()
+    if recovered:
+        active_positions[:] = recovered
+        # open_time хранится как epoch-число → таймауты считаются корректно
+        _lines = []
+        for _p in recovered:
+            _age = (time.time() - float(_p.get('open_time', time.time()))) / 60
+            _lines.append(f"• [{_p.get('strategy','?')}] {_p.get('symbol','?')} "
+                          f"{_p.get('direction','?')} | возраст {_age:.0f}мин")
+        logging.warning(f"♻️ Восстановлено позиций из БД: {len(recovered)}")
+        for _l in _lines:
+            logging.info(f"   {_l}")
+        await tg(f"♻️ <b>Восстановлено после рестарта: {len(recovered)}</b>\n"
+                 + "\n".join(_lines) + "\n<i>Сверяю с биржей…</i>")
+        # Немедленная сверка с биржей + обработка таймаутов, не ждём 4 цикла
+        try:
+            await monitor()
+        except Exception as _me:
+            logging.error(f"reconcile monitor on start: {_me}")
 
     try:
         cycle = 0
