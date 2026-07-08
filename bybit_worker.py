@@ -567,11 +567,16 @@ async def monitor():
                     logging.error(f"BE error {sym}: {e}")
 
             # ── TP50: закрываем 50% ──
-            # [SA-EXIT] SA фиксирует рано (+0.8%), т.к. MFE гаснет ~1%.
-            # Остальные стратегии — прежний динамический порог 0.8R.
+            # [SA-DYN v38] SA: частичка на ПОЛПУТИ к VWAP (tp_price), а не жёсткие 0.8%.
+            # Баг v37: константа могла быть дальше самого TP → частичка не срабатывала.
             sl_dist_pct = float(pos.get('sl_dist_pct', 1.5))
             if pos.get('strategy') == 'SA':
-                tp50_thr = SA_PARTIAL_PCT
+                _tp_tgt = float(pos.get('tp_price', 0) or 0)
+                if _tp_tgt > 0:
+                    _tp_dist_pct = abs(_tp_tgt - entry) / entry * 100
+                    tp50_thr = max(_tp_dist_pct * 0.5, 0.2)  # пол 0.2% — выше комиссий/шума
+                else:
+                    tp50_thr = SA_PARTIAL_PCT                 # fallback если TP не задан
             else:
                 tp50_thr = max(sl_dist_pct * 0.8, 0.8)
             if pnl >= tp50_thr and not pos.get('tp50_hit'):
@@ -619,6 +624,32 @@ async def monitor():
                             logging.warning(f"BE after TP50 fail {sym}: {_be}")
                     except Exception as e:
                         logging.error(f"TP50 error {sym}: {e}")
+
+            # ── [SA-FRONTRUN v38] Защитный БУ при недоходе до VWAP ──
+            # Прошли >=80% пути к TP, но не коснулись его → остаток в БУ.
+            # Защита от разворота у самой цели (симметрично async_bot).
+            if pos.get('strategy') == 'SA' and not pos.get('be_moved'):
+                _tp_tgt = float(pos.get('tp_price', 0) or 0)
+                _denom  = (_tp_tgt - entry) if is_long else (entry - _tp_tgt)
+                if _tp_tgt > 0 and _denom > 0:
+                    _mfe = float(pos.get('mfe_price', entry))
+                    _peak = ((_mfe - entry) if is_long else (entry - _mfe)) / _denom
+                    if 0.8 <= _peak < 1.0:
+                        _be = entry * 1.0015 if is_long else entry * 0.9985
+                        _cur = float(pos.get('current_sl', 0 if is_long else 1e18))
+                        _better = _be > _cur if is_long else _be < _cur
+                        if _better:
+                            try:
+                                await exchange.private_post_v5_position_trading_stop({
+                                    'category':'linear','symbol':sym,'positionIdx':0,
+                                    'stopLoss':str(round(_be,8)),
+                                    'slTriggerBy':'LastPrice','tpslMode':'Full'})
+                                pos['current_sl'] = _be
+                                pos['be_moved']   = True
+                                await tg(f"🛡 <b>[SA] {sym}</b>: фронтран "
+                                         f"{_peak*100:.0f}% пути к VWAP — SL→БУ")
+                            except Exception as _fe:
+                                logging.warning(f"{sym} frontrun BE fail: {_fe}")
 
             # ── ATR Trailing SL после TP50 ──
             if pos.get('tp50_hit') and pos.get('be_moved'):
