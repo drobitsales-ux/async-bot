@@ -2180,9 +2180,16 @@ async def monitor_all():
                     logging.error(f"BE error {sym}: {e}")
 
             # ── TP 50% ─────────────────────────────────────────
-            # ── Динамический TP50: при +1.0R (равно SL дистанции) ──
             if strategy == 'SA':
-                tp50_thr_dyn = SA_PARTIAL_PCT            # [SA] MFE-данные: пик ~1%, фикс на 0.8%
+                # [SA-DYN v38] Частичка на ПОЛПУТИ к VWAP, а не жёсткие 0.8%.
+                # Баг v37: константа 0.8% могла быть ДАЛЬШЕ самого TP (VWAP близко),
+                # и частичка/БУ не срабатывали — сделка уходила в SL.
+                tp_tgt = float(pos.get('tp1', 0) or 0)
+                if tp_tgt > 0:
+                    tp_dist_pct  = abs(tp_tgt - entry) / entry * 100
+                    tp50_thr_dyn = max(tp_dist_pct * 0.5, 0.2)  # пол 0.2% — выше комиссий/шума
+                else:
+                    tp50_thr_dyn = SA_PARTIAL_PCT               # fallback если TP не задан
             else:
                 tp50_thr_dyn = max(sl_dist_pct * 0.8, 0.8)  # [PROP] 1.0R→0.8R: ранняя фиксация, легче TP
             if pnl >= tp50_thr_dyn and not pos.get('tp50_hit'):
@@ -2222,13 +2229,47 @@ async def monitor_all():
                     tp50_fee = close_qty * curr_p * FEE_RATE
                     pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw - tp50_fee
                     pos.update({'tp50_hit': True, 'current_qty': remain,
-                                'sl_order_id': sl_ord['id'],
-                                'current_sl': be_after_tp50})  # [SA-EXIT] базовый уровень для трейла
+                                'sl_order_id': sl_ord['id'], 'be_moved': True,
+                                'current_sl': be_after_tp50})  # [SA-EXIT] БУ ровно в момент TP50
                     save_all()
                     await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
                              f"P&L: +{pnl:.2f}% | +{tp50_raw - tp50_fee:+.2f} USDT")
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
+
+            # ── [SA-FRONTRUN v38] Защитный БУ при недоходе до VWAP ──
+            # Если цена прошла >=80% пути к TP, но не коснулась его — переводим
+            # ОСТАТОК в БУ. Защита от разворота у самой цели (в баг-сделке цена
+            # дошла до 62911 при цели 62948 и рухнула в SL).
+            if strategy == 'SA' and not pos.get('be_moved'):
+                tp_tgt = float(pos.get('tp1', 0) or 0)
+                denom  = (tp_tgt - entry) if is_long else (entry - tp_tgt)
+                if tp_tgt > 0 and denom > 0:
+                    mfe_p = float(pos.get('mfe_price', entry))
+                    peak  = ((mfe_p - entry) if is_long else (entry - mfe_p)) / denom
+                    if 0.8 <= peak < 1.0:   # прошли 80%+, но TP (100%) не коснулись
+                        be_price = entry * 1.0015 if is_long else entry * 0.9985
+                        cur_sl   = float(pos.get('current_sl', 0 if is_long else 1e18))
+                        better   = be_price > cur_sl if is_long else be_price < cur_sl
+                        if better:
+                            try:
+                                if pos.get('sl_order_id'):
+                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                _q = float(pos.get('current_qty', real_qty))
+                                sl_ord = await exchange.create_order(
+                                    sym, 'STOP_MARKET', sl_side, _q,
+                                    params={'positionSide': pos_side,
+                                            'stopPrice': round(be_price, 8),
+                                            'reduceOnly': True})
+                                pos.update({'current_sl': be_price,
+                                            'sl_order_id': sl_ord['id'],
+                                            'be_moved': True})
+                                save_all()
+                                await tg(f"🛡 <b>[SA] {sym}</b>: фронтран "
+                                         f"{peak*100:.0f}% пути к VWAP — SL→БУ "
+                                         f"<code>{be_price:.6f}</code>")
+                            except Exception as _fe:
+                                logging.warning(f"{sym} frontrun BE fail: {_fe}")
 
             # ── ATR Trailing Stop после TP50 (ФИЗИЧЕСКИЙ) ──────
             # [SYMMETRY] Перевыпускаем реальный STOP_MARKET на бирже (как воркер),
