@@ -1139,17 +1139,18 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
 
     # RSI — защита от входа в конце тренда
     rsi = calc_rsi(c[:-1])
-    # [v37 EARLY] RSI строго 55-65 — зона продолжения тенденции.
-    # Данные: 55-65 PF 3.87 (n=10) | 40-55 PF 0.83 (n=7, мало!) | 65+ PF 0.06 (n=2)
-    # ⚠️ n<15 в зонах отсечения — первый кандидат на откат если частота упадёт до 0.
-    # [SMC-FREQ] нижняя граница 55→50 для возврата частоты. Верх 65 держим (65+ = PF 0.06).
-    # Гипотеза: под-зона 50-55 ближе к прибыльной 55-65. КОНТРОЛЬ: PF под-зоны 50-55 через ~15 сд.
-    if not (50 <= rsi <= 65):
+    # [SMC-REVIVE v39] Частота упала до ~1 сд/день → расширяем RSI 50-65 → 45-68.
+    # Низ 45: под-зона 45-55 маргинальна (40-55 PF 0.83, n=7), но не катастрофа —
+    #   принимаем ради частоты, КОНТРОЛЬ PF под-зоны через ~15 сд.
+    # Верх 68 (НЕ 70): bucket 65+ = PF 0.06, и LLM (RULE 2) всё равно жёстко
+    #   режет RSI>68 — зона 68-70 впустую жгла бы LLM-вызовы.
+    if not (45 <= rsi <= 68):
         return None, 'rsi_exhaustion'
 
-    # [v37 EARLY] alt_score<45 для ВСЕХ входов (было только Short<40):
-    # lt40 PF 2.63 (n=14) | 40-55 PF 0.00 (n=5, мало!) — SMC собирает стопы
-    # в разогретом альтсезоне. Порог 45 — с запасом от 40.
+    # [SMC-REVIVE v39] alt_score: порог 45 СОХРАНЁН (запрошенное <50 ОТКЛОНЕНО
+    # данными): bucket 40-55 = WR 0%, PF 0.00 (0 из 5) — расширение до 50 впускает
+    # ровно проигрышную зону. Частоту возвращает RSI-расширение выше (низ 45
+    # исторически почти удваивает воронку: 7 сд было в 40-55 против 11 в 55-65).
     if btc_ctx.get('alt_score', 50) >= 45:
         return None, 'alt_high'
     # ── ADX фильтр для SMC: тренд должен быть выраженным ──
@@ -2233,7 +2234,7 @@ async def monitor_all():
                                 'current_sl': be_after_tp50})  # [SA-EXIT] БУ ровно в момент TP50
                     save_all()
                     await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
-                             f"P&L: +{pnl:.2f}% | +{tp50_raw - tp50_fee:+.2f} USDT")
+                             f"P&L: +{pnl:.2f}% | {tp50_raw - tp50_fee:+.2f} USDT")
                 except Exception as e:
                     logging.error(f"TP50 error {sym}: {e}")
 
@@ -2332,12 +2333,18 @@ async def monitor_all():
                                 'stopPrice': round(trail_sl, 8),
                                 'reduceOnly': True}
                     )
+                    # [v39] Фиксируем USDT от закрытых на TP100 25% — раньше эта
+                    # частичка НЕ попадала в realized_pnl_usdt и занижала итог позиции
+                    tp100_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
+                    tp100_fee = close_qty * curr_p * FEE_RATE
+                    tp100_net = tp100_raw - tp100_fee
+                    pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp100_net
                     pos.update({'tp100_hit': True, 'current_qty': remain,
                                 'sl_order_id': sl_ord['id'],
                                 'current_sl': trail_sl})
                     save_all()
                     await tg(f"🏆 <b>[{strategy}] {sym}</b>: TP100 взят! "
-                             f"Трейлинг включён P&L: +{pnl:.2f}%")
+                             f"Трейлинг включён P&L: +{pnl:.2f}% | {tp100_net:+.2f} USDT")
                 except Exception as e:
                     logging.error(f"TP100 error {sym}: {e}")
 
