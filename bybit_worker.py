@@ -189,6 +189,34 @@ async def tg(text: str):
 # ══════════════════════════════════════════════════════════
 _last_reset_date = None
 
+def _register_close(pos: dict, pnl_pct: float, pnl_usdt: float):
+    """
+    [v39 FIX-COUNTERS] ЕДИНАЯ точка учёта закрытой позиции в счётчиках дня.
+    БАГ: таймаут-ветки (принудительное закрытие живой позиции и «не найдена +
+    таймаут») делали `continue` МИМО блока учёта — daily_trades/wins/pnl не
+    росли. По статистике таймаут — самая частая причина закрытия (10 из 22 у
+    SMC), поэтому отчёт дня показывал «Сделок: 0» при реальных сделках.
+    Теперь ВСЕ пути закрытия обязаны звать эту функцию.
+    """
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins
+    global daily_smc, daily_rsi, daily_sa, daily_be_closes
+    daily_pnl_pct  += pnl_pct / 100
+    daily_pnl_usdt += pnl_usdt
+    daily_trades   += 1
+    # Реальная победа = >0.5%, BE = 0.1-0.5%
+    if pnl_pct >= 0.5:
+        daily_wins += 1
+    elif 0.1 < pnl_pct < 0.5:
+        daily_be_closes += 1
+    strat = pos.get('strategy')
+    if strat == 'SMC':
+        daily_smc += 1
+    elif strat == 'RSI':
+        daily_rsi += 1
+    elif strat == 'SA':
+        daily_sa += 1
+
+
 def check_daily_reset():
     global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
     today = datetime.now(timezone.utc).date()
@@ -591,10 +619,16 @@ async def monitor():
                         sym, 'market', order_s, real_qty,
                         params={'category':'linear','positionIdx':0,'reduceOnly':True}
                     )
+                    # [v39 FIX-COUNTERS] таймаут = закрытая сделка, обязана попасть
+                    # в итоги дня (раньше continue пропускал учёт → «Сделок: 0»)
+                    _to_usdt = ((curr_p - entry) * real_qty if is_long
+                                else (entry - curr_p) * real_qty)
+                    _to_usdt += float(pos.get('realized_pnl_usdt', 0.0))
+                    _register_close(pos, pnl, _to_usdt)
                     await tg(
                         f'⏰ <b>[{pos.get("strategy","?")}] {sym}</b>: '
                         f'таймаут {secs/60:.0f}мин\n'
-                        f'Закрыта | PnL: {pnl:+.2f}%'
+                        f'Закрыта | PnL: {pnl:+.2f}% ({_to_usdt:+.2f} USDT)'
                     )
                 except Exception as _te:
                     logging.error(f'⏰ {sym} timeout-close: {_te}')
@@ -670,9 +704,11 @@ async def monitor():
                         pos['tp50_hit']   = True
                         pos['current_qty'] = remain
                         logging.info(f"💰 {sym}: TP50 {close_qty} закрыто +{pnl:.2f}% | +{tp50_raw:+.2f}$")
+                        # [v39 LOG-STD] формат идентичен BingX + пометка фронтрана
+                        _fr_note = " | ⚡ после фронтран-БУ" if pos.get('frontrun_hit') else ""
                         await tg(
-                            f"💰 <b>[{pos['strategy']}] {sym}</b>: TP50% зафиксирован\n"
-                            f"P&L: +{pnl:.2f}% | +{tp50_raw:+.2f} USDT\n"
+                            f"💰 <b>[{pos['strategy']}] {sym}</b>: TP50% зафиксирован "
+                            f"P&L: +{pnl:.2f}% | {tp50_raw:+.2f} USDT{_fr_note}\n"
                             f"Остаток runner: {remain} | SL → БУ"
                         )
                         # [SA-EXIT] Двигаем SL в БУ на runner-часть с учётом 2×комиссии
@@ -711,10 +747,29 @@ async def monitor():
                                     'slTriggerBy':'LastPrice','tpslMode':'Full'})
                                 pos['current_sl'] = _be
                                 pos['be_moved']   = True
+                                pos['frontrun_hit'] = True  # [v39] пометка для TP50-лога
+                                # [v39 LOG-STD] P&L в сообщении (был голый технический лог)
                                 await tg(f"🛡 <b>[SA] {sym}</b>: фронтран "
-                                         f"{_peak*100:.0f}% пути к VWAP — SL→БУ")
+                                         f"{_peak*100:.0f}% пути к VWAP — SL→БУ "
+                                         f"| P&L: {pnl:+.2f}%")
                             except Exception as _fe:
                                 logging.warning(f"{sym} frontrun BE fail: {_fe}")
+
+            # ── [v39 LOG-STD] TP100 взят — уведомление (раньше воркер молчал) ──
+            # Только нотификация, торговая логика не меняется: трейлинг и так
+            # уже ведёт runner после TP50 (блок ниже).
+            _tp_price = float(pos.get('tp_price', 0) or 0)
+            if (_tp_price > 0 and not pos.get('tp100_notified')
+                    and ((is_long and curr_p >= _tp_price)
+                         or (not is_long and curr_p <= _tp_price))):
+                pos['tp100_notified'] = True
+                _rq = float(pos.get('current_qty', real_qty))
+                _run_usdt = ((curr_p - entry) * _rq if is_long
+                             else (entry - curr_p) * _rq)
+                _tot_usdt = _run_usdt + float(pos.get('realized_pnl_usdt', 0.0))
+                await tg(f"🏆 <b>[{pos.get('strategy','?')}] {sym}</b>: "
+                         f"TP100 взят! Трейлинг включён "
+                         f"P&L: +{pnl:.2f}% | {_tot_usdt:+.2f} USDT")
 
             # ── ATR Trailing SL после TP50 ──
             if pos.get('tp50_hit') and pos.get('be_moved'):
@@ -778,7 +833,15 @@ async def monitor():
                             sym, 'market', order_st, qty_st,
                             params={'category':'linear','positionIdx':0,'reduceOnly':True}
                         )
-                    await tg(f'⏰ <b>{sym}</b>: таймаут, позиция закрыта принудительно')
+                    # [v39 FIX-COUNTERS] и эта ветка обязана попасть в итоги дня
+                    _pnl_nf = ((curr_p - entry) / entry * 100 if is_long
+                               else (entry - curr_p) / entry * 100)
+                    _usdt_nf = ((curr_p - entry) * qty_st if is_long
+                                else (entry - curr_p) * qty_st)
+                    _usdt_nf += float(pos.get('realized_pnl_usdt', 0.0))
+                    _register_close(pos, _pnl_nf, _usdt_nf)
+                    await tg(f'⏰ <b>{sym}</b>: таймаут, позиция закрыта принудительно '
+                             f'| PnL: {_pnl_nf:+.2f}% ({_usdt_nf:+.2f} USDT)')
                 except Exception as _nte:
                     logging.error(f'⏰ not-live timeout {sym}: {_nte}')
                     await tg(f'❌ <b>{sym}</b>: не найдена + таймаут! Проверьте Bybit.')
@@ -803,7 +866,6 @@ async def monitor():
             pnl_pct = ((exit_p - entry) / entry * 100 if is_long
                        else (entry - exit_p) / entry * 100)
             is_win  = pnl_pct > 0.5  # реальная победа > 0.5%
-            daily_pnl_pct += pnl_pct / 100
 
             # [FIX-PNL] Корректный расчёт USDT:
             # runner-часть (current_qty) + зафиксированный USDT от TP50
@@ -814,20 +876,8 @@ async def monitor():
             realized_tp50 = float(pos.get('realized_pnl_usdt', 0.0))
             pnl_usdt_pos  = runner_usdt + realized_tp50
             icon = '✅' if is_win else ('⚖️' if pnl_pct > 0 else '🛑')
-            daily_pnl_usdt += pnl_usdt_pos
-            daily_trades   += 1
-            # Реальная победа = >0.5%, BE = 0.1-0.5%, loss = <0.1%
-            if pnl_pct >= 0.5:
-                daily_wins += 1
-            elif 0.1 < pnl_pct < 0.5:
-                daily_be_closes += 1
-            # SMC/RSI/SA breakdown
-            if pos.get('strategy') == 'SMC':
-                daily_smc += 1
-            elif pos.get('strategy') == 'RSI':
-                daily_rsi += 1
-            elif pos.get('strategy') == 'SA':
-                daily_sa += 1   # [v24]
+            # [v39 FIX-COUNTERS] единый учёт через _register_close
+            _register_close(pos, pnl_pct, pnl_usdt_pos)
 
             logging.info(
                 f"{icon} {sym}: закрыта | entry={entry:.6f} exit={exit_p:.6f} "
