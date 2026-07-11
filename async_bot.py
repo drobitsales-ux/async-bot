@@ -1031,11 +1031,21 @@ async def get_btc_context() -> dict:
     try:
         btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
         if not btc_ohlcv or len(btc_ohlcv) < 200:
-            return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50}
+            return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50, 'htf_slope': 'Flat'}
         btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
         ema200 = calc_ema(btc_c, 200)
         dist = (btc_c[-1] - ema200) / ema200 * 100
         trend = 'Long' if dist > 0.5 else ('Short' if dist < -0.5 else 'Flat')
+
+        # [v38] HTF-наклон: куда движется САМА EMA200(15m) за последние 2ч (8 баров).
+        # btc_trend = сторона цены от средней; htf_slope = направление средней.
+        # Гипотеза для проверки: SA-шорты против htf_slope='Up' вязнут (таймауты).
+        try:
+            _ema_prev = calc_ema(btc_c[:-8], 200)
+            _sl_pct = (ema200 - _ema_prev) / _ema_prev * 100
+            htf_slope = 'Up' if _sl_pct > 0.15 else ('Down' if _sl_pct < -0.15 else 'Flat')
+        except Exception:
+            htf_slope = 'Flat'
 
         altseason = False
         eth_btc_spread = 0.0   # [ALT] спред доходности ETH vs BTC за 50 баров
@@ -1060,9 +1070,10 @@ async def get_btc_context() -> dict:
         alt_score = int(max(0, min(100, _score)))
 
         return {'btc_trend': trend, 'altseason': altseason,
-                'eth_btc_spread': eth_btc_spread, 'alt_score': alt_score}
+                'eth_btc_spread': eth_btc_spread, 'alt_score': alt_score,
+                'htf_slope': htf_slope}   # [v38]
     except Exception:
-        return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50}
+        return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50, 'htf_slope': 'Flat'}
 
 # ═══════════════════════════════════════════════════════
 #  SMC СИГНАЛ
@@ -1745,6 +1756,7 @@ async def single_asset_signal(btc_ctx: dict):
         'sma_dist': round(dist_atr, 2), 'vwap_dist': round(dist_atr, 2),
         'tp_mult': 0.0, 'rsi_prev': rsi,
         'btc_trend': btc_ctx.get('btc_trend', ''),
+        'htf_trend': btc_ctx.get('htf_slope', 'Flat'),  # [v38] наклон EMA200 → лог
     }, 'ok'
 
 
@@ -1921,6 +1933,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'open_time':   datetime.now(timezone.utc).isoformat(),
         'mfe_price':   price,
         'mae_price':   price,
+        'mfe_time_min': 0,         # [v38] минута пика MFE (калибровка smart-timeout)
         'realized_pnl_usdt': 0.0,  # [v36] USDT от частичных закрытий (TP50)
         # Контекст рынка для аналитики
         'rsi_val':     round(float(sig.get('rsi', 0)), 1),
@@ -1928,6 +1941,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'sma_dist':    round(float(sig.get('sma_dist', 0)), 2),
         'vwap_dist':   round(float(sig.get('vwap_dist', 0)), 2),
         'btc_trend':   str(sig.get('btc_trend', '')),
+        'htf_trend':   str(sig.get('htf_trend', '')),  # [v38] Up/Down/Flat (пока только SA)
         # [v16] признаки для /stats_analyze
         'adx_val':     round(float(sig.get('adx', 0)), 1),
         'alt_score':   int(sig.get('alt_score', 0)),
@@ -2003,12 +2017,19 @@ async def monitor_all():
         pos_side = 'LONG' if is_long else 'SHORT'
         sl_side  = 'sell' if is_long else 'buy'
 
-        # Обновить MFE/MAE
+        # Обновить MFE/MAE ([v38] + минута пика MFE — калибровка smart-timeout)
+        _prev_mfe = float(pos.get('mfe_price', entry))
+        _mfe_improved = (curr_p > _prev_mfe) if is_long else (curr_p < _prev_mfe)
+        if _mfe_improved:
+            pos['mfe_price'] = curr_p
+            try:
+                pos['mfe_time_min'] = int((datetime.now(timezone.utc)
+                    - datetime.fromisoformat(pos['open_time'])).total_seconds() / 60)
+            except Exception:
+                pass
         if is_long:
-            pos['mfe_price'] = max(float(pos.get('mfe_price', entry)), curr_p)
             pos['mae_price'] = min(float(pos.get('mae_price', entry)), curr_p)
         else:
-            pos['mfe_price'] = min(float(pos.get('mfe_price', entry)), curr_p)
             pos['mae_price'] = max(float(pos.get('mae_price', entry)), curr_p)
 
         if live:
@@ -2131,7 +2152,42 @@ async def monitor_all():
                 except Exception as _te:
                     logging.error(f'Smart timeout close error {sym}: {_te}')
                 return False
-
+                        
+            # ── [v38] SA Smart Timeout: ранний выход из мёртвых MR-сетапов ──
+            # Таймауты SA держат слот до 150 мин и в среднем закрываются в минус.
+            # Если за половину лимита (75 мин) цена НИ РАЗУ не прошла +0.35%
+            # к VWAP, TP50 не было и сейчас ноль/минус — возврат не состоялся.
+            # Пороги 75мин/0.35% ВРЕМЕННЫЕ — калибровать по mfe_time_min при n>=30.
+            _sa_mfe_pct = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+            if (strategy == 'SA' and dur_min > 75 and not pos.get('tp50_hit')
+                    and pnl <= 0 and _sa_mfe_pct < 0.35):
+                logging.warning(
+                    f'⏰ [SA-SMART] {sym}: {dur_min:.0f}мин, pnl={pnl:+.2f}%, '
+                    f'MFE={_sa_mfe_pct:.2f}%<0.35% — сетап мёртв, ранний выход'
+                )
+                try:
+                    if pos.get('sl_order_id'):
+                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                    await exchange.create_order(
+                        sym, 'market', sl_side, real_qty,
+                        params={'positionSide': pos_side, 'reduceOnly': True}
+                    )
+                    mae_t = abs(float(pos.get('mae_price', entry)) - entry) / entry * 100
+                    _q     = float(pos.get('current_qty', 0))
+                    _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
+                    _fee   = _q * (entry + curr_p) * FEE_RATE
+                    _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    log_trade(pos, curr_p, pnl, _to_net, _sa_mfe_pct, mae_t,
+                              int(dur_min), 'Timeout')
+                    await tg(
+                        f'⏰ <b>[SA] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
+                        f'MFE {_sa_mfe_pct:.2f}% — возврата к VWAP нет | '
+                        f'PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
+                    )
+                except Exception as _te:
+                    logging.error(f'SA smart timeout close error {sym}: {_te}')
+                return False
+            
             if dur_min > max_dur and not pos.get('tp50_hit'):
                 logging.warning(
                     f'⏰ [{strategy}] {sym}: таймаут {dur_min:.0f}мин>={max_dur}мин '
@@ -2893,7 +2949,9 @@ def _init_trades_db():
     for _col in ['adx_val REAL DEFAULT 0',
                  'alt_score INTEGER DEFAULT 0',
                  'entry_hour INTEGER DEFAULT -1',
-                 'open_time TEXT DEFAULT ""']:
+                 'open_time TEXT DEFAULT ""',
+                 'htf_trend TEXT DEFAULT ""',         # [v38] наклон EMA200(15m) на входе
+                 'mfe_time_min INTEGER DEFAULT -1']:  # [v38] минута пика MFE
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
@@ -2912,8 +2970,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-04-v37'
+CODE_VERSION = '2026-07-11-v38'
 CHANGELOG = [
+    ('2026-07-11-v38', 'SA Smart Timeout 75мин/MFE<0.35% (времен., калибр. по mfe_time_min); лог htf_trend+mfe_time_min; SA-отчёт: причина закрытия/час/VWAP-дист/HTF'),
     ('2026-07-04-v37', 'SA vol 1.3-2.0 (n=16); SMC RSI 55-65 + alt<45 [EARLY n<15!]; PB ADX>60 shadow; MOM сканер отключён'),
     ('2026-07-02-v36', 'v34 PNL-фиксы восстановлены (realized_pnl+ROE); MAX_TRADE_MIN_SA=150; Smart Timeout SMC 90мин; ATR→worker payload'),
     ('2026-07-02-v35', 'stats: SA выделена в отдельный блок с SA_HIST_OFFSET=37; SA убрана из shadow; шапка v10→v10+SA'),
@@ -2994,8 +3053,9 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 mfe_pct, mae_pct, dur_min,
                 rsi_val, vol_ratio, sma_dist, vwap_dist, btc_trend,
                 ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
-                adx_val, alt_score, entry_hour, open_time
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                adx_val, alt_score, entry_hour, open_time,
+                htf_trend, mfe_time_min
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -3023,6 +3083,8 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('alt_score', 0),
             pos.get('entry_hour', -1),
             pos.get('open_time', ''),
+            pos.get('htf_trend', ''),       # [v38]
+            pos.get('mfe_time_min', -1),    # [v38]
         ))
         con.commit()
         con.close()
@@ -3517,7 +3579,9 @@ def stats_analyze() -> str:
 
         # ── БЛОК 2: SA (live-сделки + SA_HIST_OFFSET) ────────────────
         sa_new = con.execute(
-            "SELECT pnl_pct, direction, rsi_val, alt_score, vol_ratio FROM trades "
+            "SELECT pnl_pct, direction, rsi_val, alt_score, vol_ratio, "
+            "close_reason, entry_hour, vwap_dist, mfe_pct, dur_min, "
+            "htf_trend, mfe_time_min FROM trades "
             "WHERE strategy='SA'"
         ).fetchall()
         sa_deploy = con.execute(
@@ -3565,6 +3629,62 @@ def stats_analyze() -> str:
                 if n:
                     flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
                     lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+            # [v38] Причина закрытия: avg MFE + длительность = диагностика висяков.
+            # MFE таймаутов >=0.5% → проблема выхода; ~0.1-0.2% → проблема входа.
+            lines.append('\n<b>Причина закрытия (avg MFE | мин):</b>')
+            for reas in ('TP', 'WIN', 'BE', 'SL', 'Timeout', 'Manual'):
+                rows_c = [r for r in sa_new if r[5] == reas]
+                if rows_c:
+                    _n = len(rows_c)
+                    _avg = sum(x[0] for x in rows_c) / _n
+                    _mfe = sum((x[8] or 0) for x in rows_c) / _n
+                    _dur = sum((x[9] or 0) for x in rows_c) / _n
+                    lines.append(f'  {reas}: {_n} сд | Avg {_avg:+.2f}% | '
+                                 f'MFE {_mfe:.2f}% | {_dur:.0f}мин')
+
+            # [v38] Причина × Направление — где именно вязнут шорты
+            lines.append('\n<b>Причина × Направление:</b>')
+            for d in ('Long', 'Short'):
+                for reas in ('TP', 'WIN', 'BE', 'SL', 'Timeout'):
+                    rows_cd = [r for r in sa_new if r[5] == reas and r[1] == d]
+                    if rows_cd:
+                        _n = len(rows_cd)
+                        _avg = sum(x[0] for x in rows_cd) / _n
+                        _mfe = sum((x[8] or 0) for x in rows_cd) / _n
+                        lines.append(f'  {d}+{reas}: {_n} сд | Avg {_avg:+.2f}% | MFE {_mfe:.2f}%')
+
+            # [v38] Час входа UTC (сессии: Азия / EU / US / вечер)
+            lines.append('\n<b>Час входа (UTC):</b>')
+            for lbl, lo, hi in [('00-06h', 0, 6), ('06-12h', 6, 12),
+                                 ('12-18h', 12, 18), ('18-24h', 18, 24)]:
+                rows_h = [(r[0],) for r in sa_new
+                          if r[6] is not None and lo <= r[6] < hi]
+                n, wr, avg, pf = _bucket_stats(rows_h)
+                if n:
+                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+            # [v38] |VWAP-дист| в ATR на входе: не слишком ли близко заходим
+            lines.append('\n<b>VWAP-дист (ATR):</b>')
+            for lbl, lo, hi in [('1.5-1.8', 1.5, 1.8), ('1.8-2.2', 1.8, 2.2), ('2.2+', 2.2, 99)]:
+                rows_vd = [(r[0],) for r in sa_new if lo <= abs(r[7] or 0) < hi]
+                n, wr, avg, pf = _bucket_stats(rows_vd)
+                if n:
+                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+            # [v38] HTF-наклон EMA200 (копится с v38, старые сделки = пусто)
+            _htf_rows = [r for r in sa_new if r[10]]
+            if _htf_rows:
+                lines.append('\n<b>HTF-наклон × Направление:</b>')
+                for d in ('Long', 'Short'):
+                    for hs in ('Up', 'Flat', 'Down'):
+                        rows_hd = [(r[0],) for r in _htf_rows if r[1] == d and r[10] == hs]
+                        n, wr, avg, pf = _bucket_stats(rows_hd)
+                        if n:
+                            lines.append(f'  {d}+{hs}: {n} сд | WR {wr:.0f}% | '
+                                         f'Avg {avg:+.2f}% | PF {pf:.2f}')
         else:
             lines.append(f'⚠️ Мало live-данных ({len(sa_new)} сд). Нужно 5+ для анализа.')
 
