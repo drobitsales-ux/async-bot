@@ -203,10 +203,11 @@ def _register_close(pos: dict, pnl_pct: float, pnl_usdt: float):
     daily_pnl_pct  += pnl_pct / 100
     daily_pnl_usdt += pnl_usdt
     daily_trades   += 1
-    # Реальная победа = >0.5%, BE = 0.1-0.5%
-    if pnl_pct >= 0.5:
+    # [WIN-FIX] Победа ТОЛЬКО если итоговый USDT строго > 0 (раньше порог >=0.5%
+    # засчитывал победой сделки, ушедшие в минус после комиссии).
+    if pnl_usdt > 0:
         daily_wins += 1
-    elif 0.1 < pnl_pct < 0.5:
+    elif pnl_usdt == 0:
         daily_be_closes += 1
     strat = pos.get('strategy')
     if strat == 'SMC':
@@ -215,7 +216,6 @@ def _register_close(pos: dict, pnl_pct: float, pnl_usdt: float):
         daily_rsi += 1
     elif strat == 'SA':
         daily_sa += 1
-
 
 def check_daily_reset():
     global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
