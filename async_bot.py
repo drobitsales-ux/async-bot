@@ -2117,11 +2117,16 @@ async def monitor_all():
                     )
                     mfe_t = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
                     mae_t = abs(float(pos.get('mae_price', entry)) - entry) / entry * 100
-                    log_trade(pos, curr_p, pnl, 0.0, mfe_t, mae_t,
+                    # [TIMEOUT-USDT] чистый USDT: движение цены − комиссия round-trip + фикс TP50
+                    _q     = float(pos.get('current_qty', 0))
+                    _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
+                    _fee   = _q * (entry + curr_p) * FEE_RATE
+                    _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    log_trade(pos, curr_p, pnl, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ <b>[SMC] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
-                        f'Сделка не отработала | PnL: {pnl:+.2f}%'
+                        f'Сделка не отработала | PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
                     )
                 except Exception as _te:
                     logging.error(f'Smart timeout close error {sym}: {_te}')
@@ -2141,11 +2146,16 @@ async def monitor_all():
                     )
                     mfe_t = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
                     mae_t = abs(float(pos.get('mae_price', entry)) - entry) / entry * 100
-                    log_trade(pos, curr_p, pnl, 0.0, mfe_t, mae_t,
+                    # [TIMEOUT-USDT] чистый USDT: движение цены − комиссия round-trip + фикс TP50
+                    _q     = float(pos.get('current_qty', 0))
+                    _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
+                    _fee   = _q * (entry + curr_p) * FEE_RATE
+                    _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    log_trade(pos, curr_p, pnl, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ <b>[{strategy}] {sym}</b>: таймаут {dur_min:.0f}мин\n'
-                        f'Закрыто рыночным | PnL: {pnl:+.2f}%'
+                        f'Закрыто рыночным | PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
                     )
                 except Exception as _te:
                     logging.error(f'Timeout close error {sym}: {_te}')
@@ -2409,11 +2419,13 @@ async def monitor_all():
             daily_stats['trades'] += 1
             daily_stats['pnl_pct'] += price_move_pct / 100  # DD-расчёт без плеча
 
-            # Реальная победа = ощутимая прибыль (не BE)
-            # пороги масштабированы под ROE: 0.5% цены × LEVERAGE
-            min_win_pct = 0.5 * LEVERAGE
-            is_win = pos.get('tp50_hit', False) or pnl_pct >= min_win_pct
-            is_be  = 0 < pnl_pct < min_win_pct
+            # Реальная победа = чистые деньги в плюсе после комиссий.
+            # [WIN-FIX] Раньше tp50_hit форсил победу даже если раннер ушёл в SL
+            # и net_pnl < 0 → отчёт показывал WR 100% при минусе по дню.
+            # Теперь победа ТОЛЬКО если итоговый net_pnl строго > 0.
+            is_win = net_pnl > 0
+            # BE = цена не падала, но комиссия/проскальзывание съели профит в ноль/микро-минус
+            is_be  = (not is_win) and pnl_pct >= 0
             if is_win:
                 daily_stats['wins'] += 1
             elif is_be:
@@ -2425,7 +2437,11 @@ async def monitor_all():
 
             winrate_d = (daily_stats['wins'] / daily_stats['trades'] * 100
                          if daily_stats['trades'] > 0 else 0)
-            result_tag = ' (TP✓)' if pos.get('tp50_hit') else (' (BE)' if is_be else (' (WIN)' if is_win else ' (SL)'))
+            # [WIN-FIX] тег согласован с is_win — убран конфликт «(TP✓) + 🛑»
+            _tp_mark = ' TP✓' if pos.get('tp50_hit') else ''
+            result_tag = (f' (WIN{_tp_mark})' if is_win
+                          else ' (BE)' if is_be
+                          else f' (SL{_tp_mark})')
             await tg(
                 f"{'✅' if is_win else ('⚖️' if is_be else '🛑')} <b>[{strategy}] {sym}</b> закрыта{result_tag}\n"
                 f"PnL: <code>{pnl_pct:+.2f}%</code> | Net: <code>{net_pnl:+.2f} USDT</code>\n"
