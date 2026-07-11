@@ -217,6 +217,7 @@ def _register_close(pos: dict, pnl_pct: float, pnl_usdt: float):
     elif strat == 'SA':
         daily_sa += 1
 
+
 def check_daily_reset():
     global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
     today = datetime.now(timezone.utc).date()
@@ -602,6 +603,37 @@ async def monitor():
                 pos['mfe_price'] = curr_p
             elif not is_long and curr_p < mfe_p:
                 pos['mfe_price'] = curr_p
+
+            # ── [v38-SYNC] SA Smart Timeout — зеркало основного бота ──
+            # BingX закрывает мёртвый SA-сетап на 75-й мин; без зеркала
+            # позиция Bybit висела бы до полных 150 мин в рассинхроне.
+            _sa_mfe_pct = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+            if (pos.get('strategy') == 'SA' and secs > 75 * 60
+                    and not pos.get('tp50_hit')
+                    and pnl <= 0 and _sa_mfe_pct < 0.35):
+                logging.warning(
+                    f'⏰ [SA-SMART] {sym}: {secs/60:.0f}мин, pnl={pnl:+.2f}%, '
+                    f'MFE={_sa_mfe_pct:.2f}%<0.35% — ранний выход (зеркало BingX)'
+                )
+                try:
+                    order_s = 'sell' if is_long else 'buy'
+                    await exchange.create_order(
+                        sym, 'market', order_s, real_qty,
+                        params={'category':'linear','positionIdx':0,'reduceOnly':True}
+                    )
+                    _sm_usdt = ((curr_p - entry) * real_qty if is_long
+                                else (entry - curr_p) * real_qty)
+                    _sm_usdt += float(pos.get('realized_pnl_usdt', 0.0))
+                    _register_close(pos, pnl, _sm_usdt)
+                    await tg(
+                        f'⏰ <b>[SA] {sym}</b>: smart-timeout {secs/60:.0f}мин\n'
+                        f'MFE {_sa_mfe_pct:.2f}% — возврата к VWAP нет | '
+                        f'PnL: {pnl:+.2f}% ({_sm_usdt:+.2f} USDT)'
+                    )
+                except Exception as _te:
+                    logging.error(f'⏰ {sym} SA-smart close: {_te}')
+                    await tg(f'❌ <b>{sym}</b>: ошибка SA smart-timeout! Закройте вручную.')
+                continue
 
             # ── Таймаут живой позиции ──
             _mx = (MAX_TRADE_MIN_SMC if pos.get('strategy')=='SMC'
