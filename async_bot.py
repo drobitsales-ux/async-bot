@@ -1868,11 +1868,48 @@ async def execute(sym: str, sig: dict, strategy: str,
     sl_dist   = abs(price - sl)
     if sl_dist <= 0:
         return
-    qty = risk_usdt / sl_dist
-    qty = round(qty, 4)
-    if qty <= 0:
-        logging.warning(f'[{strategy}] {sym}: qty={qty} <= 0, пропуск')
+
+    # ── [v39] Объём: округление к БЛИЖАЙШЕМУ шагу лота биржи ──────────────
+    # Было: qty = round(qty, 4) — хардкод 4 знака, игнорировал реальный шаг лота.
+    # Стало: ccxt.ROUND по precision рынка. Важно: ccxt.amount_to_precision по
+    # умолчанию TRUNCATE (обрезал бы 0.0018 → 0.001 при шаге 0.001 = −44% позиции).
+    qty_ideal = risk_usdt / sl_dist
+    try:
+        if not exchange.markets or sym not in exchange.markets:
+            await exchange.load_markets()
+        _mkt     = exchange.market(sym)
+        _min_qty = float((_mkt.get('limits', {}).get('amount', {}) or {}).get('min') or 0)
+        qty = float(exchange.decimal_to_precision(
+            qty_ideal, ccxt_async.ROUND, _mkt['precision']['amount'],
+            exchange.precisionMode, exchange.paddingMode))
+    except Exception as _me:
+        logging.warning(f'[{strategy}] {sym}: market info недоступен ({_me}) — fallback round(,4)')
+        _min_qty = 0.0
+        qty = round(qty_ideal, 4)
+
+    if qty <= 0 or (_min_qty and qty < _min_qty):
+        logging.warning(f'[{strategy}] {sym}: qty={qty} < min_lot={_min_qty} — пропуск')
         return
+
+    # [v39] ФАКТИЧЕСКИЙ риск от округлённого qty. Округление ВВЕРХ повышает риск,
+    # поэтому для пропа обязателен потолок: грубый шаг лота на малом депо может
+    # раздуть риск в разы → отказ от сделки вместо превышения дневного DD.
+    risk_real = qty * sl_dist
+    _risk_dev = risk_real / risk_usdt if risk_usdt > 0 else 1.0
+    if _risk_dev > 1.30:
+        logging.warning(
+            f'[{strategy}] {sym}: шаг лота грубый — реальный риск ${risk_real:.2f} = '
+            f'{_risk_dev:.2f}× целевого ${risk_usdt:.2f} (qty {qty_ideal:.6f}→{qty}) — '
+            f'пропуск (проп-защита DD)'
+        )
+        return
+    if _risk_dev > 1.05 or _risk_dev < 0.95:
+        logging.info(
+            f'[{strategy}] {sym}: qty {qty_ideal:.6f}→{qty} (шаг лота) | '
+            f'риск ${risk_usdt:.2f}→${risk_real:.2f}'
+        )
+    # Всё ниже (TG, лог, воркер) использует РЕАЛЬНЫЙ риск округлённой позиции
+    risk_usdt = risk_real
 
     # ── MIN/MAX notional guard ─────────────────────────────
     notional_est = qty * price
