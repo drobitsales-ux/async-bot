@@ -65,6 +65,10 @@ MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
 MAX_TRADE_MIN_SMC = int(os.getenv('MAX_TRADE_MIN_SMC', '180'))  # SMC: 12 свечей (3ч)
 MAX_TRADE_MIN_RSI = int(os.getenv('MAX_TRADE_MIN_RSI', '240'))  # RSI: 16 свечей (4ч)
 MAX_TRADE_MIN_SA  = int(os.getenv('MAX_TRADE_MIN_SA', '150'))   # [v4] SA: 2.5ч (синхр. с ботом)
+# [v40] SA-ONLY: боевой проп-счёт Bybit торгует ТОЛЬКО SA (лучший edge: PF 2.10, n=37).
+# SMC/RSI продолжают работать на BingX для форвард-статистики, сюда не зеркалятся.
+# Расширение списка — осознанное решение после валидации n>=30, не через env.
+ALLOWED_STRATEGIES = ('SA',)
 DAILY_DD_LIMIT = float(os.getenv('DAILY_DD', '0.025'))
 MIN_SL_PCT     = 1.0
 MAX_SL_PCT     = 2.5
@@ -270,6 +274,11 @@ async def execute_signal(signal: dict):
     sig_atr  = float(signal.get('atr', 0) or 0)  # [v4] реальный ATR от бота для трейлинга
 
     logging.info(f"📥 Получен сигнал: [{strategy}] {sym} {mode} | entry={entry} sl={sl}")
+
+    # ── [v40] SA-ONLY фильтр: игнорируем все стратегии кроме разрешённых ──
+    if strategy not in ALLOWED_STRATEGIES:
+        logging.info(f"[BYBIT] Сигнал {strategy} пропущен: Воркер работает только с SA")
+        return
 
     if not sym or mode not in ('Long', 'Short') or not entry or not sl:
         logging.warning(f"⚠️ Некорректный сигнал: {signal}")
@@ -957,7 +966,7 @@ async def monitor():
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = (
-            f"Bybit Worker v2.1 UTA | "
+            f"Bybit Worker v2.1 UTA [SA-only] | "
             f"Positions: {len(active_positions)} | "
             f"DD: {daily_pnl_pct*100:+.2f}% | "
             f"Circuit: {'OPEN' if circuit_open else 'OK'}"
