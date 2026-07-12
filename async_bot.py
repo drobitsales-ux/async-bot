@@ -1998,13 +1998,16 @@ async def execute(sym: str, sig: dict, strategy: str,
         f"{'🟢' if mode=='Long' else '🔴'} <b>[{strategy}] {sym}</b> — {mode}{wknd}\n"
         f"Цена: <code>{price:.6f}</code>\n"
         f"SL: <code>{sl:.6f}</code>  TP: <code>{tp:.6f}</code>\n"
+        # [v39] Qty/Notional/Риск — от РЕАЛЬНОГО округлённого объёма (= биржа)
+        f"Qty: <code>{qty}</code>  Notional: <b>${qty * price:.2f}</b>\n"
         f"RR: <b>1:{rr:.2f}</b>  Риск: <b>${risk_usdt:.2f}</b>\n"
         + (f"🤖 AI: bypass\n" if 'bypass' in ai['comment']
            else f"🧠 AI({provider}): {ai['conf']}/100 | {ai['comment']}\n")
         + extra_tg
     )
     await tg(msg)
-    logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | Risk:${risk_usdt:.2f}")
+    logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | "
+                 f"Qty:{qty} | Notional:${qty*price:.2f} | Risk:${risk_usdt:.2f}")
     # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
     # [PB] экспериментальный PB НЕ копируем на воркер до валидации (n>=30)
     if strategy != 'PB':
