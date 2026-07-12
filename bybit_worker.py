@@ -348,12 +348,21 @@ async def execute_signal(signal: dict):
         min_qty = 0.0
 
     def _to_precision(q: float) -> float:
-        """Округление по precision биржи; fallback на 4 знака если market недоступен."""
+        """[v39] Округление к БЛИЖАЙШЕМУ шагу лота (ccxt.ROUND).
+        Было: exchange.amount_to_precision() — у ccxt дефолт TRUNCATE, он
+        обрезал вниз: при шаге 0.001 (BTC на Bybit) 0.0018 → 0.001, т.е.
+        реальная позиция была до 44% меньше расчётной. Теперь 0.0018 → 0.002.
+        """
         if market is not None:
             try:
-                return float(exchange.amount_to_precision(sym, q))
+                return float(exchange.decimal_to_precision(
+                    q, ccxt_async.ROUND, market['precision']['amount'],
+                    exchange.precisionMode, exchange.paddingMode))
             except Exception:
-                pass
+                try:
+                    return float(exchange.amount_to_precision(sym, q))
+                except Exception:
+                    pass
         return round(q, 4)
 
     qty = _to_precision(qty_raw)
@@ -399,6 +408,22 @@ async def execute_signal(signal: dict):
             f"Баланс ${free_usdt:.2f}. Нужно ~${min_bal_needed:.0f} USDT."
         )
         return
+
+    # ── [v39] ФАКТИЧЕСКИЙ риск от округлённого qty (лог = биржа) ──────────
+    # Округление вверх повышает риск → проп-потолок, иначе грубый шаг лота
+    # на малом депо раздувает дневной DD.
+    risk_real = qty * sl_dist
+    _risk_dev = risk_real / risk_amount if risk_amount > 0 else 1.0
+    if _risk_dev > 1.30 and qty > min_qty:
+        logging.warning(
+            f"⚠️ {sym}: шаг лота грубый — риск ${risk_real:.2f} = {_risk_dev:.2f}× "
+            f"целевого ${risk_amount:.2f} (qty {qty_raw:.6f}→{qty}) — пропуск (проп-защита DD)"
+        )
+        return
+    if abs(_risk_dev - 1.0) > 0.05:
+        logging.info(f"📐 {sym}: qty {qty_raw:.6f}→{qty} (шаг лота) | "
+                     f"риск ${risk_amount:.2f}→${risk_real:.2f}")
+    risk_amount = risk_real   # лог/TG ниже используют реальный риск
 
     order_side = 'buy'  if mode == 'Long'  else 'sell'
     sl_side    = 'sell' if mode == 'Long'  else 'buy'
@@ -483,7 +508,7 @@ async def execute_signal(signal: dict):
             f"Вход: <code>{entry:.6f}</code>\n"
             f"SL: <code>{sl:.6f}</code> ({sl_pct:.2f}%)\n"
             f"TP: <code>{tp:.6f}</code>\n"
-            f"Риск: <b>${risk_amount:.2f}</b> ({RISK_PER_TRADE*100:.1f}% × ${free_usdt:.0f})\n"
+            f"Риск: <b>${risk_amount:.2f}</b> (факт. по qty | цель {RISK_PER_TRADE*100:.1f}% × ${free_usdt:.0f})\n"
             f"Notional: ${notional:.2f} | Qty: {qty}\n"
             f"📋 Сигнал от BingX"
         )
