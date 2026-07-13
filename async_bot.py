@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  UNIFIED SMC + RSI MEAN REVERSION BOT  v10.0  PROP FIRM EDITION     ║
+║  UNIFIED SMC + RSI MEAN REVERSION BOT  v41  PROP FIRM EDITION       ║
 ║  BingX Perpetual Futures | Render-Ready | $10k → $100k Path         ║
 ║                                                                      ║
 ║  СТРАТЕГИИ:                                                          ║
@@ -2823,7 +2823,7 @@ async def daily_reset():
 class HealthCheck(BaseHTTPRequestHandler):
     def do_GET(self):
         body = (
-            f"Unified SMC+RSI Bot v10.0 | "
+            f"Unified SMC+RSI Bot {BOT_VERSION} | "
             f"SMC:{len(smc_positions)} RSI:{len(rsi_positions)} | "
             f"PnL:{daily_stats['pnl_pct']*100:+.2f}%"
         ).encode()
@@ -4125,7 +4125,7 @@ async def main():
 
     finally:
         logging.info("Shutting down...")
-        await tg("🔴 <b>Bot v10.0</b> остановлен")
+        await tg(f"🔴 <b>Bot {BOT_VERSION}</b> остановлен")
         if http:
             await http.close()
         await exchange.close()
