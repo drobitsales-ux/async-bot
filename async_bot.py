@@ -3010,8 +3010,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-11-v38'
+CODE_VERSION = '2026-07-13-v41'
 CHANGELOG = [
+    ('2026-07-13-v41', 'SA-отчёт: ретро-сегмент BTC-тренд × Направление (n/WR/Avg/PF/Timeout/MFE, ⚠️контртренд) + свод Контртренд vs По тренду BTC'),
     ('2026-07-11-v38', 'SA Smart Timeout 75мин/MFE<0.35% (времен., калибр. по mfe_time_min); лог htf_trend+mfe_time_min; SA-отчёт: причина закрытия/час/VWAP-дист/HTF'),
     ('2026-07-04-v37', 'SA vol 1.3-2.0 (n=16); SMC RSI 55-65 + alt<45 [EARLY n<15!]; PB ADX>60 shadow; MOM сканер отключён'),
     ('2026-07-02-v36', 'v34 PNL-фиксы восстановлены (realized_pnl+ROE); MAX_TRADE_MIN_SA=150; Smart Timeout SMC 90мин; ATR→worker payload'),
@@ -3621,7 +3622,7 @@ def stats_analyze() -> str:
         sa_new = con.execute(
             "SELECT pnl_pct, direction, rsi_val, alt_score, vol_ratio, "
             "close_reason, entry_hour, vwap_dist, mfe_pct, dur_min, "
-            "htf_trend, mfe_time_min FROM trades "
+            "htf_trend, mfe_time_min, btc_trend FROM trades "
             "WHERE strategy='SA'"
         ).fetchall()
         sa_deploy = con.execute(
@@ -3725,6 +3726,38 @@ def stats_analyze() -> str:
                         if n:
                             lines.append(f'  {d}+{hs}: {n} сд | WR {wr:.0f}% | '
                                          f'Avg {avg:+.2f}% | PF {pf:.2f}')
+
+            # [v41] BTC-тренд × Направление: контртренд-вход = вязнет?
+            # btc_trend ∈ {Long,Short,Flat} (совпадает со словарём direction).
+            # Контртренд = direction != btc_trend при btc_trend != Flat.
+            _bt_rows = [r for r in sa_new if r[12]]
+            if _bt_rows:
+                lines.append('\n<b>BTC-тренд × Направление (Timeout | MFE):</b>')
+                for d in ('Long', 'Short'):
+                    for bt in ('Long', 'Short', 'Flat'):
+                        rows_bt = [r for r in _bt_rows if r[1] == d and r[12] == bt]
+                        n, wr, avg, pf = _bucket_stats([(r[0],) for r in rows_bt])
+                        if n:
+                            _to = sum(1 for r in rows_bt if r[5] == 'Timeout')
+                            _mfe = sum((r[8] or 0) for r in rows_bt) / n
+                            _ct = ' ⚠️контртренд' if (d != bt and bt != 'Flat') else ''
+                            lines.append(f'  {d}/BTC-{bt}: {n} сд | WR {wr:.0f}% | '
+                                         f'Avg {avg:+.2f}% | PF {pf:.2f} | '
+                                         f'TO {_to} | MFE {_mfe:.2f}%{_ct}')
+
+                # Свод: контртренд vs по тренду BTC (Flat исключён как нейтраль)
+                _counter = [r for r in _bt_rows if r[1] != r[12] and r[12] != 'Flat']
+                _aligned = [r for r in _bt_rows if r[1] == r[12]]
+                lines.append('\n<b>Свод BTC-тренд:</b>')
+                for lbl, grp in [('Контртренд', _counter), ('По тренду BTC', _aligned)]:
+                    if grp:
+                        _n = len(grp)
+                        _, _wr, _avg, _pf = _bucket_stats([(r[0],) for r in grp])
+                        _to_pct = sum(1 for r in grp if r[5] == 'Timeout') / _n * 100
+                        _mfe = sum((r[8] or 0) for r in grp) / _n
+                        lines.append(f'  {lbl}: {_n} сд | WR {_wr:.0f}% | '
+                                     f'Avg {_avg:+.2f}% | PF {_pf:.2f} | '
+                                     f'Timeout {_to_pct:.0f}% | MFE {_mfe:.2f}%')
         else:
             lines.append(f'⚠️ Мало live-данных ({len(sa_new)} сд). Нужно 5+ для анализа.')
 
