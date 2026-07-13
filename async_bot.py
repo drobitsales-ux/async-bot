@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
+BOT_VERSION   = 'v41'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -3979,14 +3980,14 @@ async def main():
         pass
 
     await tg(
-        f"🟢 <b>Unified SMC+RSI+SA Bot v10.0 PROP</b> запущен\n"
+        f"🟢 <b>Unified SMC+RSI+SA Bot {BOT_VERSION} PROP</b> запущен\n"
         f"[SMC] Smart Money Concepts | [RSI] Mean Reversion | [SA] BTC VWAP MR\n"
         f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  "
         f"Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
         f"Сессия: 06:30–17:00 UTC (Киев 09:30–20:00)\n"
         f"Circuit breaker: при DD >{DAILY_DD_LIMIT*100:.1f}%/день"
     )
-    logging.info("🚀 Unified SMC+RSI+SA Bot v10.0 started")
+    logging.info(f"🚀 Unified SMC+RSI+SA Bot {BOT_VERSION} started")
 
     cycle = 0
     try:
