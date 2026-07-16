@@ -76,6 +76,7 @@ MAX_SL_PCT     = 2.5
 # данные MFE показывают пик хода ~1%, старый порог 1.6% его не достигал.
 SA_PARTIAL_PCT = float(os.getenv('SA_PARTIAL_PCT', '0.8'))  # SA: фикс 50% при +0.8%
 SA_TRAIL_ATR   = float(os.getenv('SA_TRAIL_ATR',  '0.8'))   # SA: чувствительный трейл хвоста
+SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeout MFE-порог (было 0.35, строгое <)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | [BYBIT] %(message)s')
 
@@ -642,12 +643,13 @@ async def monitor():
             # BingX закрывает мёртвый SA-сетап на 75-й мин; без зеркала
             # позиция Bybit висела бы до полных 150 мин в рассинхроне.
             _sa_mfe_pct = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+            # [v42] <=0.40 (было <0.35): 0.35 на границе не закрывался → досиживал до SL.
             if (pos.get('strategy') == 'SA' and secs > 75 * 60
                     and not pos.get('tp50_hit')
-                    and pnl <= 0 and _sa_mfe_pct < 0.35):
+                    and pnl <= 0 and _sa_mfe_pct <= SA_TIMEOUT_MFE):
                 logging.warning(
                     f'⏰ [SA-SMART] {sym}: {secs/60:.0f}мин, pnl={pnl:+.2f}%, '
-                    f'MFE={_sa_mfe_pct:.2f}%<0.35% — ранний выход (зеркало BingX)'
+                    f'MFE={_sa_mfe_pct:.2f}%<={SA_TIMEOUT_MFE:.2f}% — ранний выход (зеркало BingX)'
                 )
                 try:
                     order_s = 'sell' if is_long else 'buy'

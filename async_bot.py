@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v41'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v42'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -108,6 +108,7 @@ REPORT_HOUR_UTC = int(os.getenv('REPORT_HOUR_UTC', '19'))
 SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
 SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение от VWAP в ATR для входа
+SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '2.2'))  # [v42] потолок: дальше — импульсная нога, не растяжение
 SA_RSI_LO    = float(os.getenv('SA_RSI_LO', '30'))       # лонг: RSI ниже этого (перепродан)
 SA_RSI_HI    = float(os.getenv('SA_RSI_HI', '70'))       # шорт: RSI выше этого (перекуплен)
 SA_WINDOW    = os.getenv('SA_WINDOW', '')                # окно UTC 'HH-HH' или '' = весь день
@@ -115,6 +116,7 @@ SA_LIVE      = os.getenv('SA_LIVE', 'false').lower() == 'true'  # [v23] реал
 SA_HIST_OFFSET = 37  # сделок SA до перевода в live (включены в общий счётчик)
 SA_PARTIAL_PCT = float(os.getenv('SA_PARTIAL_PCT', '0.8'))  # [SA-EXIT] фикс 50% при +0.8% (MFE гаснет ~1%)
 SA_TRAIL_ATR   = float(os.getenv('SA_TRAIL_ATR',  '0.8'))   # [SA-EXIT] чувствительный трейл хвоста (MR-ход короткий)
+SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeout MFE-порог (было 0.35, строгое <)
 LEVERAGE         = 5
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
@@ -1730,6 +1732,11 @@ async def single_asset_signal(btc_ctx: dict):
         return None, 'vol_climax'
 
     dist_atr = (price - vwap) / atr   # >0 цена выше VWAP, <0 ниже
+
+    # [v42] За ~2.2 ATR от VWAP — импульсная нога, не растяжение. Возврата нет.
+    if abs(dist_atr) > SA_ATR_DIST_MAX:
+        return None, 'vwap_far'
+
     mode = None
     # Лонг: цена сильно НИЖЕ VWAP + перепродан → возврат вверх к VWAP
     if dist_atr <= -SA_ATR_DIST and rsi <= SA_RSI_LO:
@@ -2200,11 +2207,12 @@ async def monitor_all():
             # к VWAP, TP50 не было и сейчас ноль/минус — возврат не состоялся.
             # Пороги 75мин/0.35% ВРЕМЕННЫЕ — калибровать по mfe_time_min при n>=30.
             _sa_mfe_pct = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+            # [v42] <=0.40 (было <0.35): 0.35 на границе не закрывался → досиживал до SL.
             if (strategy == 'SA' and dur_min > 75 and not pos.get('tp50_hit')
-                    and pnl <= 0 and _sa_mfe_pct < 0.35):
+                    and pnl <= 0 and _sa_mfe_pct <= SA_TIMEOUT_MFE):
                 logging.warning(
                     f'⏰ [SA-SMART] {sym}: {dur_min:.0f}мин, pnl={pnl:+.2f}%, '
-                    f'MFE={_sa_mfe_pct:.2f}%<0.35% — сетап мёртв, ранний выход'
+                    f'MFE={_sa_mfe_pct:.2f}%<={SA_TIMEOUT_MFE:.2f}% — сетап мёртв, ранний выход'
                 )
                 try:
                     if pos.get('sl_order_id'):
@@ -3011,8 +3019,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-13-v41'
+CODE_VERSION = '2026-07-16-v42'
 CHANGELOG = [
+    ('2026-07-16-v42', 'SA потолок vwap_dist<=2.2 ATR (n=32,p=0.007); smart-timeout MFE<=0.40 fix рассинхрона границы; фикс vol-бакета отчёта'),
     ('2026-07-13-v41', 'SA-отчёт: ретро-сегмент BTC-тренд × Направление (n/WR/Avg/PF/Timeout/MFE, ⚠️контртренд) + свод Контртренд vs По тренду BTC'),
     ('2026-07-11-v38', 'SA Smart Timeout 75мин/MFE<0.35% (времен., калибр. по mfe_time_min); лог htf_trend+mfe_time_min; SA-отчёт: причина закрытия/час/VWAP-дист/HTF'),
     ('2026-07-04-v37', 'SA vol 1.3-2.0 (n=16); SMC RSI 55-65 + alt<45 [EARLY n<15!]; PB ADX>60 shadow; MOM сканер отключён'),
@@ -3665,7 +3674,7 @@ def stats_analyze() -> str:
                     lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
 
             lines.append('\n<b>Объём:</b>')
-            for lbl, lo, hi in [('1.3-2x', 1.3, 2.0), ('2-4x', 2.0, 4.0), ('4x+', 4.0, 99)]:
+            for lbl, lo, hi in [('1.3-2.0x', 1.3, 2.0001), ('2-4x', 2.0001, 4.0), ('4x+', 4.0, 99)]:
                 rows_v = [(r[0],) for r in sa_new if lo <= (r[4] or 0) < hi]
                 n, wr, avg, pf = _bucket_stats(rows_v)
                 if n:
