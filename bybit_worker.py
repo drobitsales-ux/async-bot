@@ -1,6 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     BYBIT WORKER  v2.1  —  UTA (Unified Trading Account)    ║
+║     BYBIT WORKER  v43  —  UTA (Unified Trading Account)     ║
+║                                                              ║
+║  Изменения v43:                                              ║
+║  [FIX] TP50 при неделимом лоте (qty=0.001, close_qty→0):     ║
+║        раньше только флаг tp50_hit, SL оставался на -1% —    ║
+║        защита не срабатывала (баг проп-счёта, лог 2026-07-17)║
+║        Теперь: весь объём остаётся, SL сразу переводится в БУ║
 ║                                                              ║
 ║  Изменения v2.1 (синхронизация SA-выходов с async_bot):     ║
 ║  [SA-EXIT] SA_PARTIAL_PCT=0.8: фикс 50% при +0.8% (не 1.6%) ║
@@ -47,6 +53,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
+BOT_VERSION   = 'v43'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -757,8 +764,25 @@ async def monitor():
                     close_qty = round(close_qty, 3)
                 remain = round(float(pos.get('current_qty', real_qty)) - close_qty, 6)
                 if close_qty <= 0 or remain <= 0:
+                    # [v43] Неделимый лот (qty=0.001): partial невозможен физически.
+                    # Раньше ставился только флаг, а SL оставался на -1% → защита не работала.
+                    # Теперь: полный объём остаётся, но SL сразу переводится в БУ на бирже.
                     pos['tp50_hit'] = True
-                    logging.info(f"{sym}: TP50 qty→0 (мелкая поз), только BE")
+                    be_sl = entry * 1.0015 if is_long else entry * 0.9985
+                    try:
+                        await exchange.private_post_v5_position_trading_stop({
+                            'category':'linear','symbol':sym,'positionIdx':0,
+                            'stopLoss':str(round(be_sl,8)),
+                            'slTriggerBy':'LastPrice','tpslMode':'Full'})
+                        pos['current_sl'] = be_sl
+                        pos['be_moved']   = True
+                        logging.info(f"{sym}: TP50 qty→0 (мелкий лот 0.001) — весь объём, SL→БУ {be_sl:.2f}")
+                        await tg(
+                            f"🛡 <b>[SA] {sym}</b>: лот неделим (0.001) — TP50 пропущен, "
+                            f"весь объём под БУ | P&L: +{pnl:.2f}%"
+                        )
+                    except Exception as _be0:
+                        logging.warning(f"BE (indivisible lot) fail {sym}: {_be0}")
                 else:
                     try:
                         cl_side = 'sell' if is_long else 'buy'
@@ -968,7 +992,7 @@ async def monitor():
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = (
-            f"Bybit Worker v2.1 UTA [SA-only] | "
+            f"Bybit Worker {BOT_VERSION} UTA [SA-only] | "
             f"Positions: {len(active_positions)} | "
             f"DD: {daily_pnl_pct*100:+.2f}% | "
             f"Circuit: {'OPEN' if circuit_open else 'OK'}"
@@ -1059,7 +1083,7 @@ async def main():
     logging.info(f"🔑 WORKER_SECRET:  {WORKER_SECRET[:8]}...")
     logging.info(f"🔑 TELEGRAM:       {'✅' if TOKEN else '❌'} | CHAT: {CHAT_ID}")
     logging.info("=" * 55)
-    logging.info("🚀 Bybit Worker v2.1 UTA запущен")
+    logging.info(f"🚀 Bybit Worker {BOT_VERSION} UTA запущен")
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
     logging.info(f"   SA-выход: частичник +{SA_PARTIAL_PCT}% | трейл {SA_TRAIL_ATR}·ATR")
@@ -1070,7 +1094,7 @@ async def main():
     except: pass
 
     await tg(
-        f"🟢 <b>Bybit Worker v2.1 UTA</b> запущен\n"
+        f"🟢 <b>Bybit Worker {BOT_VERSION} UTA</b> запущен\n"
         f"Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%/сделку\n"
         f"Leverage: {LEVERAGE}x | DD-лимит: {DAILY_DD_LIMIT*100:.1f}%\n"
         f"SA-выход: +{SA_PARTIAL_PCT}% частичник\n"
