@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v42'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v44'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -109,6 +109,9 @@ SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
 SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение от VWAP в ATR для входа
 SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '2.2'))  # [v42] потолок: дальше — импульсная нога, не растяжение
+SA_MIN_RR = float(os.getenv('SA_MIN_RR', '0.7'))
+# Порог 0.7 = требуется WR>59%. Зона 1.5-2.2 ATR даёт WR 74-80% (n=23) — запас есть.
+# RR<0.7 требует WR>67% — такого запаса нет, отсекаем.
 SA_RSI_LO    = float(os.getenv('SA_RSI_LO', '30'))       # лонг: RSI ниже этого (перепродан)
 SA_RSI_HI    = float(os.getenv('SA_RSI_HI', '70'))       # шорт: RSI выше этого (перекуплен)
 SA_WINDOW    = os.getenv('SA_WINDOW', '')                # окно UTC 'HH-HH' или '' = весь день
@@ -622,6 +625,10 @@ async def oracle_groq(sym: str, strategy: str, mode: str,
         'BTC:Flat does NOT invalidate altcoin setups. '
         'During altseason, long setups on altcoins are more valid. '
         'RSI 40-60 neutral zone for SMC = valid structural trade. '
+        # [v44] Оракул выдал "RSI > 68 for SMC Long" при факт. RSI 66.1 — выдуманная цифра.
+        'ANTI-HALLUCINATION: your comment must cite ONLY numbers present in this request. '
+        'Do not assert numeric facts (thresholds, values) absent from the input data. '
+        'If the data is insufficient to judge, return confidence<50 with comment "insufficient data". '
         f'Market context: BTC={btc_ctx_str}, {alt_ctx_str}. '
         f'Setup: {json.dumps(context)}'
     )
@@ -898,7 +905,11 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
         "FOR SA STRATEGY (Mean Reversion / Counter-trend): "
         "If direction is SHORT: High RSI (> 65) means OVERBOUGHT — EXCELLENT for Short, you MUST APPROVE, NEVER reject because RSI is high. "
         "If direction is LONG: Low RSI (< 35) means OVERSOLD — EXCELLENT for Long, you MUST APPROVE, NEVER reject because RSI is low. "
-        "SMC trend rules DO NOT APPLY to SA. SA explicitly trades against the local trend."
+        "SMC trend rules DO NOT APPLY to SA. SA explicitly trades against the local trend. "
+        # [v44] Оракул выдал "RSI > 68 for SMC Long" при факт. RSI 66.1 — выдуманная цифра.
+        "ANTI-HALLUCINATION: обоснование должно ссылаться ТОЛЬКО на числа, переданные в этом запросе. "
+        "Не утверждай числовых фактов, которых нет во входных данных. "
+        "Если данных недостаточно — верни confidence<50 с комментарием 'insufficient data'."
     )
     prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
 
@@ -1756,6 +1767,13 @@ async def single_asset_signal(btc_ctx: dict):
         sl = price * (1 + sl_pct)
         tp = vwap
 
+    # [v44] Гейт минимального RR: TP=VWAP во флэте бывает близко к цене —
+    # риск 1% ради <0.7% при WR~51% математически убыточен по построению.
+    _sl_d = abs(price - sl); _tp_d = abs(tp - price)
+    _rr = (_tp_d / _sl_d) if _sl_d > 0 else 0
+    if _rr < SA_MIN_RR:
+        return None, 'low_rr'
+
     return {
         'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
         'price': price,          # [v29 FIX] execute() требует sig['price'] — отсутствовал → KeyError
@@ -1765,6 +1783,7 @@ async def single_asset_signal(btc_ctx: dict):
         'tp_mult': 0.0, 'rsi_prev': rsi,
         'btc_trend': btc_ctx.get('btc_trend', ''),
         'htf_trend': btc_ctx.get('htf_slope', 'Flat'),  # [v38] наклон EMA200 → лог
+        'entry_rr': round(_rr, 2),
     }, 'ok'
 
 
@@ -1987,6 +2006,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'vwap_dist':   round(float(sig.get('vwap_dist', 0)), 2),
         'btc_trend':   str(sig.get('btc_trend', '')),
         'htf_trend':   str(sig.get('htf_trend', '')),  # [v38] Up/Down/Flat (пока только SA)
+        'entry_rr':    float(sig.get('entry_rr', 0)),  # [v44] RR входа (пока только SA)
         # [v16] признаки для /stats_analyze
         'adx_val':     round(float(sig.get('adx', 0)), 1),
         'alt_score':   int(sig.get('alt_score', 0)),
@@ -3000,7 +3020,8 @@ def _init_trades_db():
                  'entry_hour INTEGER DEFAULT -1',
                  'open_time TEXT DEFAULT ""',
                  'htf_trend TEXT DEFAULT ""',         # [v38] наклон EMA200(15m) на входе
-                 'mfe_time_min INTEGER DEFAULT -1']:  # [v38] минута пика MFE
+                 'mfe_time_min INTEGER DEFAULT -1',   # [v38] минута пика MFE
+                 'entry_rr REAL DEFAULT 0']:          # [v44] RR входа (SA)
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
@@ -3019,8 +3040,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-16-v42'
+CODE_VERSION = '2026-07-20-v44'
 CHANGELOG = [
+    ('2026-07-20-v44', 'SA гейт MIN_RR=0.7 (RR<1 при WR51% = убыток по построению); лог entry_rr + сегмент RR в отчёте; ужесточён промпт оракула; диагностика SMC RSI-зоны'),
     ('2026-07-16-v42', 'SA потолок vwap_dist<=2.2 ATR (n=32,p=0.007); smart-timeout MFE<=0.40 fix рассинхрона границы; фикс vol-бакета отчёта'),
     ('2026-07-13-v41', 'SA-отчёт: ретро-сегмент BTC-тренд × Направление (n/WR/Avg/PF/Timeout/MFE, ⚠️контртренд) + свод Контртренд vs По тренду BTC'),
     ('2026-07-11-v38', 'SA Smart Timeout 75мин/MFE<0.35% (времен., калибр. по mfe_time_min); лог htf_trend+mfe_time_min; SA-отчёт: причина закрытия/час/VWAP-дист/HTF'),
@@ -3105,8 +3127,8 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 rsi_val, vol_ratio, sma_dist, vwap_dist, btc_trend,
                 ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
                 adx_val, alt_score, entry_hour, open_time,
-                htf_trend, mfe_time_min
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                htf_trend, mfe_time_min, entry_rr
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -3136,6 +3158,7 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('open_time', ''),
             pos.get('htf_trend', ''),       # [v38]
             pos.get('mfe_time_min', -1),    # [v38]
+            pos.get('entry_rr', 0),         # [v44]
         ))
         con.commit()
         con.close()
@@ -3632,7 +3655,7 @@ def stats_analyze() -> str:
         sa_new = con.execute(
             "SELECT pnl_pct, direction, rsi_val, alt_score, vol_ratio, "
             "close_reason, entry_hour, vwap_dist, mfe_pct, dur_min, "
-            "htf_trend, mfe_time_min, btc_trend FROM trades "
+            "htf_trend, mfe_time_min, btc_trend, entry_rr FROM trades "
             "WHERE strategy='SA'"
         ).fetchall()
         sa_deploy = con.execute(
@@ -3768,6 +3791,19 @@ def stats_analyze() -> str:
                         lines.append(f'  {lbl}: {_n} сд | WR {_wr:.0f}% | '
                                      f'Avg {_avg:+.2f}% | PF {_pf:.2f} | '
                                      f'Timeout {_to_pct:.0f}% | MFE {_mfe:.2f}%')
+
+            # [v44] RR входа: гейт SA_MIN_RR введён в v44, старые сделки = 0 (нет данных) —
+            # исключаем их же способом, что и HTF-наклон (r[10]) в v41.
+            _rr_rows = [r for r in sa_new if r[13]]
+            if _rr_rows:
+                lines.append('\n<b>RR входа:</b>')
+                for lbl, lo, hi in [('<0.7', 0, 0.7), ('0.7-1.0', 0.7, 1.0),
+                                     ('1.0-1.5', 1.0, 1.5), ('1.5+', 1.5, 99)]:
+                    rows_rr = [(r[0],) for r in _rr_rows if lo <= r[13] < hi]
+                    n, wr, avg, pf = _bucket_stats(rows_rr)
+                    if n:
+                        flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                        lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
         else:
             lines.append(f'⚠️ Мало live-данных ({len(sa_new)} сд). Нужно 5+ для анализа.')
 
