@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v44'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v45'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -121,6 +121,10 @@ SA_PARTIAL_PCT = float(os.getenv('SA_PARTIAL_PCT', '0.8'))  # [SA-EXIT] фикс
 SA_TRAIL_ATR   = float(os.getenv('SA_TRAIL_ATR',  '0.8'))   # [SA-EXIT] чувствительный трейл хвоста (MR-ход короткий)
 SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeout MFE-порог (было 0.35, строгое <)
 LEVERAGE         = 5
+# [v45] Лимит маржи на сделку, доля депозита. Потолок notional = bal × LEVERAGE × pct.
+# Не влияет на расчёт риска (qty = risk/sl_dist) — только ограничивает сверху.
+MARGIN_PCT_SA  = float(os.getenv('MARGIN_PCT_SA',  '0.30'))
+MARGIN_PCT_ALT = float(os.getenv('MARGIN_PCT_ALT', '0.15'))
 MIN_VOL_USDT     = 500_000    # [TEST] снижен для проверки (было 3_000_000)
 MAX_SL_PCT       = 2.5        # [R-FIX-1] жёсткий лимит SL %
 MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спредом
@@ -1945,7 +1949,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         return
     # [v31] Лимит учитывает плечо: проверяем маржу (notional / LEVERAGE), а не notional.
     # SA: до 20% депозита маржой | SMC/RSI/MOM/PB: до 15% депозита маржой.
-    _margin_pct  = 0.30 if strategy == 'SA' else 0.15  # [v33] SA 20%→30%
+    _margin_pct  = MARGIN_PCT_SA if strategy == 'SA' else MARGIN_PCT_ALT  # [v45] ENV-настраиваемый
     max_notional = free_usdt * LEVERAGE * _margin_pct
     if notional_est > max_notional:
         logging.warning(
@@ -3040,8 +3044,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-20-v44'
+CODE_VERSION = '2026-07-21-v45'
 CHANGELOG = [
+    ('2026-07-21-v45', 'лимит маржи на сделку вынесен в ENV MARGIN_PCT_SA/MARGIN_PCT_ALT (было хардкод 0.30/0.15); лимит 15% блокировал валидные SMC-сетапы с SL>1.3%'),
     ('2026-07-20-v44', 'SA гейт MIN_RR=0.7 (RR<1 при WR51% = убыток по построению); лог entry_rr + сегмент RR в отчёте; ужесточён промпт оракула; диагностика SMC RSI-зоны'),
     ('2026-07-16-v42', 'SA потолок vwap_dist<=2.2 ATR (n=32,p=0.007); smart-timeout MFE<=0.40 fix рассинхрона границы; фикс vol-бакета отчёта'),
     ('2026-07-13-v41', 'SA-отчёт: ретро-сегмент BTC-тренд × Направление (n/WR/Avg/PF/Timeout/MFE, ⚠️контртренд) + свод Контртренд vs По тренду BTC'),
@@ -4014,6 +4019,7 @@ async def main():
     logging.info(f"🔑 BINGX_API_KEY:   {'✅ задан' if BINGX_KEY else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 BINGX_SECRET:    {'✅ задан' if BINGX_SECRET else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 GEMINI_API_KEY:  {'✅ задан' if GEMINI_KEY else '⚠️ не задан (AI oracle выключен)'}")
+    logging.info(f"⚙️ [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info("=" * 60)
 
     # Инициализация баланса

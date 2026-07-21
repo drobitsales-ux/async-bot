@@ -1,6 +1,10 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     BYBIT WORKER  v43  —  UTA (Unified Trading Account)     ║
+║     BYBIT WORKER  v45  —  UTA (Unified Trading Account)     ║
+║                                                              ║
+║  Изменения v45:                                              ║
+║  [ENV] MARGIN_PCT_SA/MARGIN_PCT_ALT — лимит маржи на сделку  ║
+║        вынесен из хардкода (был 0.30/0.15), дефолты те же    ║
 ║                                                              ║
 ║  Изменения v43:                                              ║
 ║  [FIX] TP50 при неделимом лоте (qty=0.001, close_qty→0):     ║
@@ -53,7 +57,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v43'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v45'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -68,6 +72,10 @@ except ValueError:
 PROP_BALANCE   = float(os.getenv('PROP_BALANCE', '100'))
 RISK_PER_TRADE = float(os.getenv('RISK_PCT', '0.02'))   # 2% для теста $100
 LEVERAGE       = int(os.getenv('LEVERAGE', '5'))
+# [v45] Лимит маржи на сделку, доля депозита. Потолок notional = bal × LEVERAGE × pct.
+# Имена ENV ОБЯЗАНЫ совпадать с async_bot.py — иначе настройки расходятся между ботами.
+MARGIN_PCT_SA  = float(os.getenv('MARGIN_PCT_SA',  '0.30'))
+MARGIN_PCT_ALT = float(os.getenv('MARGIN_PCT_ALT', '0.15'))
 MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
 MAX_TRADE_MIN_SMC = int(os.getenv('MAX_TRADE_MIN_SMC', '180'))  # SMC: 12 свечей (3ч)
 MAX_TRADE_MIN_RSI = int(os.getenv('MAX_TRADE_MIN_RSI', '240'))  # RSI: 16 свечей (4ч)
@@ -391,7 +399,7 @@ async def execute_signal(signal: dict):
     # [v2] Margin guard: risk-based qty может требовать больше маржи, чем есть
     # на счету (типично при узком SL у mean-reversion стратегий типа SA).
     # Ограничиваем notional сверху через leverage, иначе Bybit вернёт 110007.
-    _margin_pct       = 0.30 if strategy == 'SA' else 0.15
+    _margin_pct       = MARGIN_PCT_SA if strategy == 'SA' else MARGIN_PCT_ALT  # [v45] ENV-настраиваемый
     max_notional_usdt = free_usdt * LEVERAGE * _margin_pct
     notional_pre      = qty * entry
     if notional_pre > max_notional_usdt:
@@ -1086,6 +1094,7 @@ async def main():
     logging.info(f"🚀 Bybit Worker {BOT_VERSION} UTA запущен")
     logging.info(f"   Депозит: ${PROP_BALANCE:,.0f} | Риск: {RISK_PER_TRADE*100:.1f}%")
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
+    logging.info(f"   [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info(f"   SA-выход: частичник +{SA_PARTIAL_PCT}% | трейл {SA_TRAIL_ATR}·ATR")
     logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин SA={MAX_TRADE_MIN_SA}мин")
     try:
