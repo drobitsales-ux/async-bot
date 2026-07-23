@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v45'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v46'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -109,9 +109,11 @@ SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
 SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение от VWAP в ATR для входа
 SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '2.2'))  # [v42] потолок: дальше — импульсная нога, не растяжение
-SA_MIN_RR = float(os.getenv('SA_MIN_RR', '0.7'))
-# Порог 0.7 = требуется WR>59%. Зона 1.5-2.2 ATR даёт WR 74-80% (n=23) — запас есть.
-# RR<0.7 требует WR>67% — такого запаса нет, отсекаем.
+SA_MIN_RR = float(os.getenv('SA_MIN_RR', '0.5'))
+# [v46] 0.5 (было 0.7): порог 0.7 калиброван на WR 51% всей популяции, включая
+# бакет 2.2+ (WR 34%), заблокированный фильтром v42. Торгуемая зона 1.5-2.2 ATR
+# даёт WR 74-80% (n=23), безубыточный RR там 0.25-0.35. При RR 0.5 безубыток = WR 67%,
+# запас к наблюдаемому WR сохраняется. ПЕРЕСМОТРЕТЬ по сегменту "RR входа" при n>=30.
 SA_RSI_LO    = float(os.getenv('SA_RSI_LO', '30'))       # лонг: RSI ниже этого (перепродан)
 SA_RSI_HI    = float(os.getenv('SA_RSI_HI', '70'))       # шорт: RSI выше этого (перекуплен)
 SA_WINDOW    = os.getenv('SA_WINDOW', '')                # окно UTC 'HH-HH' или '' = весь день
@@ -1699,18 +1701,20 @@ def _sa_in_window() -> bool:
 
 
 async def single_asset_signal(btc_ctx: dict):
-    """Mean reversion BTC от дневного VWAP. Возвращает (sig, reason)."""
+    """Mean reversion BTC от дневного VWAP. Возвращает (sig, reason, diag).
+    diag — снимок рабочих чисел цикла для [SA SCAN]-лога (v46); {} пока
+    цена/ATR ещё не вычислены (window/news/fetch_err/no_data/atr)."""
     if not _sa_in_window():
-        return None, 'window'
+        return None, 'window', {}
     if is_news_now():
-        return None, 'news'
+        return None, 'news', {}
     try:
         # дневной VWAP: берём бары с начала суток UTC. На 15m это <=96 баров.
         ohlcv = await exchange.fetch_ohlcv(SA_SYMBOL, RSI_TF, limit=120)
     except Exception:
-        return None, 'fetch_err'
+        return None, 'fetch_err', {}
     if not ohlcv or len(ohlcv) < 30:
-        return None, 'no_data'
+        return None, 'no_data', {}
 
     # отфильтровываем бары текущих суток UTC для дневного VWAP
     today = datetime.now(timezone.utc).date()
@@ -1732,25 +1736,36 @@ async def single_asset_signal(btc_ctx: dict):
     vwap = calc_vwap(h, l, c, v)
     atr = calc_atr(h_full, l_full, c_full)
     if atr <= 0:
-        return None, 'atr'
+        return None, 'atr', {}
     rsi = calc_rsi(c_full, RSI_PERIOD)
+
+    # [v46] dist_atr/atr_pct/rr не зависят от mode (TP всегда VWAP, SL —
+    # симметричный clip от atr/price) → считаем один раз здесь и переиспользуем
+    # и в диагностике всех веток отсева, и в самом гейте SA_MIN_RR ниже —
+    # без повторного вычисления.
+    dist_atr = (price - vwap) / atr   # >0 цена выше VWAP, <0 ниже
+    atr_pct  = atr / price * 100 if price > 0 else 0.0
+    sl_pct   = float(np.clip(atr / price * 2.0, MIN_SL_PCT/100, MAX_SL_PCT/100))
+    _rr      = (abs(dist_atr) * atr) / (sl_pct * price) if (sl_pct * price) > 0 else 0.0
 
     # [v25] Volume Climax filter: защита от "падающего ножа" без кульминации
     # Используем полную историю (ohlcv) для устойчивого среднего объёма
     v_full = np.array([float(x[5]) for x in ohlcv])
     avg_vol = float(np.mean(v_full[-21:-1])) if len(v_full) > 21 else float(np.mean(v_full[:-1]))
     vol_ratio = float(v_full[-2]) / avg_vol if avg_vol > 0 else 0.0
+
+    diag = {'dist_atr': round(dist_atr, 2), 'vol_ratio': round(vol_ratio, 2),
+            'rsi': round(rsi, 1), 'atr_pct': round(atr_pct, 3), 'rr': round(_rr, 2)}
+
     # [v37] Volume window 1.3-2.0x (данные n=16):
     # 1.3-2x: WR 83% PF 9.55 | 2-4x: WR 10% PF 0.02 — выше 2x это кульминация
     # импульса, MR против него уходит во флэт/таймаут.
     if not (1.3 <= vol_ratio <= 2.0):
-        return None, 'vol_climax'
-
-    dist_atr = (price - vwap) / atr   # >0 цена выше VWAP, <0 ниже
+        return None, 'vol_climax', diag
 
     # [v42] За ~2.2 ATR от VWAP — импульсная нога, не растяжение. Возврата нет.
     if abs(dist_atr) > SA_ATR_DIST_MAX:
-        return None, 'vwap_far'
+        return None, 'vwap_far', diag
 
     mode = None
     # Лонг: цена сильно НИЖЕ VWAP + перепродан → возврат вверх к VWAP
@@ -1760,10 +1775,9 @@ async def single_asset_signal(btc_ctx: dict):
     elif dist_atr >= SA_ATR_DIST and rsi >= SA_RSI_HI:
         mode = 'Short'
     if not mode:
-        return None, 'no_setup'
+        return None, 'no_setup', diag
 
     # SL за экстремум (шире отклонения), TP = VWAP (естественная цель)
-    sl_pct = float(np.clip(atr / price * 2.0, MIN_SL_PCT/100, MAX_SL_PCT/100))
     if mode == 'Long':
         sl = price * (1 - sl_pct)
         tp = vwap
@@ -1773,10 +1787,9 @@ async def single_asset_signal(btc_ctx: dict):
 
     # [v44] Гейт минимального RR: TP=VWAP во флэте бывает близко к цене —
     # риск 1% ради <0.7% при WR~51% математически убыточен по построению.
-    _sl_d = abs(price - sl); _tp_d = abs(tp - price)
-    _rr = (_tp_d / _sl_d) if _sl_d > 0 else 0
+    # _rr — та же величина, что в diag выше (симметрична для Long/Short).
     if _rr < SA_MIN_RR:
-        return None, 'low_rr'
+        return None, 'low_rr', diag
 
     return {
         'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
@@ -1788,7 +1801,7 @@ async def single_asset_signal(btc_ctx: dict):
         'btc_trend': btc_ctx.get('btc_trend', ''),
         'htf_trend': btc_ctx.get('htf_slope', 'Flat'),  # [v38] наклон EMA200 → лог
         'entry_rr': round(_rr, 2),
-    }, 'ok'
+    }, 'ok', diag
 
 
 async def publish_to_workers(sym: str, mode: str, price: float,
@@ -3044,8 +3057,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-21-v45'
+CODE_VERSION = '2026-07-23-v46'
 CHANGELOG = [
+    ('2026-07-23-v46', '[SA SCAN] диагностика отсева в INFO-логи (была слепая зона на DEBUG); SA_MIN_RR 0.7→0.5 — порог был калиброван на популяции до фильтра v42, вместе они давали пустое окно при ATR<0.318% цены'),
     ('2026-07-21-v45', 'лимит маржи на сделку вынесен в ENV MARGIN_PCT_SA/MARGIN_PCT_ALT (было хардкод 0.30/0.15); лимит 15% блокировал валидные SMC-сетапы с SL>1.3%'),
     ('2026-07-20-v44', 'SA гейт MIN_RR=0.7 (RR<1 при WR51% = убыток по построению); лог entry_rr + сегмент RR в отчёте; ужесточён промпт оракула; диагностика SMC RSI-зоны'),
     ('2026-07-16-v42', 'SA потолок vwap_dist<=2.2 ATR (n=32,p=0.007); smart-timeout MFE<=0.40 fix рассинхрона границы; фикс vol-бакета отчёта'),
@@ -4092,7 +4106,23 @@ async def main():
                 if SA_ENABLED:
                     try:
                         _sa_ctx = await get_btc_context()
-                        _sasig, _sa_reason = await single_asset_signal(_sa_ctx)
+                        _sasig, _sa_reason, _sa_diag = await single_asset_signal(_sa_ctx)
+                        # [v46] Счётчик причин отсева SA за цикл — раньше только на
+                        # DEBUG (слепая зона в проде). Диагностика самодостаточна:
+                        # текущие dist/vol/rsi/atr%/rr прямо из single_asset_signal.
+                        _sa_st = {k: 0 for k in
+                                  ('atr', 'vol_climax', 'vwap_far', 'no_setup', 'low_rr', 'ok')}
+                        _sa_st[_sa_reason] = _sa_st.get(_sa_reason, 0) + 1
+                        logging.info(
+                            f"[SA SCAN] BTC | atr:{_sa_st['atr']} vol_climax:{_sa_st['vol_climax']} "
+                            f"vwap_far:{_sa_st['vwap_far']} no_setup:{_sa_st['no_setup']} "
+                            f"low_rr:{_sa_st['low_rr']} → ВХОДЫ:{_sa_st['ok']} | "
+                            f"dist:{_sa_diag.get('dist_atr', 0):+.2f}ATR "
+                            f"vol:{_sa_diag.get('vol_ratio', 0):.2f} "
+                            f"rsi:{_sa_diag.get('rsi', 0):.0f} "
+                            f"atr:{_sa_diag.get('atr_pct', 0):.2f}% "
+                            f"rr:{_sa_diag.get('rr', 0):.2f}"
+                        )
                         if _sasig:
                             _sa_live_str = 'LIVE' if SA_LIVE else 'SHADOW'
                             logging.info(
@@ -4130,8 +4160,6 @@ async def main():
                                 # SHADOW режим: пишем виртуальную сделку
                                 shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
                                               _sasig, _sa_ctx, 'SA')
-                        else:
-                            logging.debug(f'[SA] фильтр: {_sa_reason}')
                     except Exception as _e:
                         logging.warning(f'[SA] exception: {_e}')
 
