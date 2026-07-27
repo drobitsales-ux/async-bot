@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v46'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v47'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -100,6 +100,16 @@ PB_RISK_MULT = float(os.getenv('PB_RISK_MULT', '0.25'))            # [PB] 25% р
 PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к EMA20 (1.2%)
 PB_RSI_LO    = float(os.getenv('PB_RSI_LO', '40'))       # RSI reset зона: низ
 PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: верх   # лонг только если RSI < этого
+# [v47] RANGE BOUNCE — свип границы флэт-диапазона + reclaim + объём. Только shadow.
+RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
+RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
+RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '5.0')) # гейт флэта: ширина диапазона в ATR
+RB_SWEEP_MIN_ATR = float(os.getenv('RB_SWEEP_MIN_ATR', '0.15'))
+RB_SWEEP_MAX_ATR = float(os.getenv('RB_SWEEP_MAX_ATR', '1.0'))
+RB_VOL_MIN       = float(os.getenv('RB_VOL_MIN', '1.5'))
+RB_MIN_QUOTE     = float(os.getenv('RB_MIN_QUOTE', '5000'))
+RB_MIN_RR        = float(os.getenv('RB_MIN_RR', '1.0'))        # RR до TP1 (середина диапазона)
+RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
 # [SHADOW] кулдаун: не пересэмплировать тот же символ+стратегию+направление
 SHADOW_COOLDOWN_BARS = int(os.getenv('SHADOW_COOLDOWN_BARS', '6'))
 # [v18] час отправки 'Итоги дня' (UTC). 19 UTC = 22:00 Киев. Настраивается.
@@ -181,6 +191,7 @@ daily_stats     = {
 }
 news_events     = []       # [float timestamp, ...]
 notified        = {}       # {sym: timestamp}  cooldown 4h
+_rb_last_range  = {}       # [v47] {(sym,mode): (range_low, range_high)} — дедуп по диапазону
 markets_cache   = None
 markets_ts      = 0.0
 news_ts         = 0.0
@@ -1680,6 +1691,89 @@ async def pullback_signal(sym: str, btc_ctx: dict):
     }, 'ok'
 
 
+# ═══════════════════════════════════════════════════════
+#  RANGE BOUNCE / LIQUIDITY SWEEP СИГНАЛ [shadow, v47]
+#  Гипотеза: во флэте цена периодически "выносит" ликвидность за
+#  границу диапазона (сбор стопов) и возвращается внутрь — вход
+#  против выноса, цель — середина/противоположная граница диапазона.
+#  Только виртуальный трекинг, БЕЗ реальной торговли и публикации воркеру.
+# ═══════════════════════════════════════════════════════
+async def rb_signal(sym: str, btc_ctx: dict):
+    """Range Bounce: свип границы N-барного диапазона + reclaim + объём."""
+    try:
+        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=RB_RANGE_BARS + 5)
+    except Exception:
+        return None, 'fetch_err'
+    if not ohlcv or len(ohlcv) < RB_RANGE_BARS + 3:
+        return None, 'no_data'
+
+    h = np.array([float(x[2]) for x in ohlcv])
+    l = np.array([float(x[3]) for x in ohlcv])
+    c = np.array([float(x[4]) for x in ohlcv])
+    v = np.array([float(x[5]) for x in ohlcv])
+    price = float(c[-1])
+
+    atr = calc_atr(h, l, c)
+    if atr <= 0:
+        return None, 'atr'
+
+    # Диапазон по RB_RANGE_BARS ЗАКРЫТЫМ барам, без свип-свечи [-2] и текущей [-1]
+    range_high = float(np.max(h[-(RB_RANGE_BARS + 1):-1]))
+    range_low  = float(np.min(l[-(RB_RANGE_BARS + 1):-1]))
+    range_w_atr = (range_high - range_low) / atr
+
+    # Гейт флэта: широкий диапазон = трендовый режим, свип-логика не работает
+    if range_w_atr > RB_MAX_RANGE_ATR:
+        return None, 'trend_regime'
+
+    # Последняя ЗАКРЫТАЯ свеча — индекс -2 (не текущая формирующаяся [-1])
+    lo2, hi2, cl2 = float(l[-2]), float(h[-2]), float(c[-2])
+
+    mode = None
+    sweep_depth_atr = 0.0
+    if lo2 < range_low:
+        _depth = (range_low - lo2) / atr
+        if RB_SWEEP_MIN_ATR <= _depth <= RB_SWEEP_MAX_ATR and cl2 > range_low:
+            mode = 'Long'
+            sweep_depth_atr = _depth
+    if mode is None and hi2 > range_high:
+        _depth = (hi2 - range_high) / atr
+        if RB_SWEEP_MIN_ATR <= _depth <= RB_SWEEP_MAX_ATR and cl2 < range_high:
+            mode = 'Short'
+            sweep_depth_atr = _depth
+    if not mode:
+        return None, 'no_sweep'
+
+    # Выкуп объёмом + ликвидность (та же закрытая свеча свипа)
+    avg_v = float(np.mean(v[-22:-2])) if len(v) > 22 else 0.0
+    vol_ratio = float(v[-2]) / avg_v if avg_v > 0 else 0.0
+    quote_vol = float(v[-2]) * price
+    if vol_ratio < RB_VOL_MIN or quote_vol < RB_MIN_QUOTE:
+        return None, 'vol'
+
+    rsi = calc_rsi(c, RSI_PERIOD)
+
+    sl  = lo2 - atr * 0.5 if mode == 'Long' else hi2 + atr * 0.5
+    tp1 = (range_high + range_low) / 2       # середина диапазона
+    tp2 = range_high if mode == 'Long' else range_low  # противоположная граница
+
+    sl_d  = abs(price - sl)
+    tp1_d = abs(tp1 - price)
+    rr = (tp1_d / sl_d) if sl_d > 0 else 0
+    if rr < RB_MIN_RR:
+        return None, 'low_rr'
+
+    return {
+        'mode': mode, 'sl': sl, 'tp': tp1, 'tp2': tp2, 'atr': atr,
+        'adx': 0.0, 'rsi': rsi, 'vol_ratio': round(vol_ratio, 2),
+        'entry': price,
+        'range_high': range_high, 'range_low': range_low,
+        'range_w_atr': round(range_w_atr, 2),
+        'sweep_depth_atr': round(sweep_depth_atr, 2),
+        'entry_rr': round(rr, 2),
+        'btc_trend': btc_ctx.get('btc_trend', ''),
+    }, 'ok'
+
 
 # ═══════════════════════════════════════════════════════
 #  SINGLE-ASSET СИГНАЛ [shadow] — mean reversion BTC от VWAP
@@ -2670,8 +2764,12 @@ async def scan_smc():
     sem  = asyncio.Semaphore(SCAN_SEM)
     st   = {k: 0 for k in ['session','news','vol','structure','choch','short_blocked',
                             'vwap','rsi','adx_flat','fvg','fvg_test','ok']}
+    # [v47] RB (Range Bounce) — shadow-only, тот же скан-список ~80 монет что SMC
+    st_rb = {k: 0 for k in ['trend_regime', 'no_sweep', 'vol', 'low_rr', 'ok']}
+    rb_shadow_n = 0   # фактически записанных shadow-сделок за цикл (после дедупа по диапазону)
 
     async def check(sym):
+        nonlocal rb_shadow_n
         if sym in notified:
             return
         try:
@@ -2689,6 +2787,36 @@ async def scan_smc():
             if st['error'] <= 2:  # логируем только первые 2 (не спамим)
                 logging.warning(f'[SMC] {sym} error: {type(_e).__name__}: {_e}')
 
+        # [v47] RB shadow-детект: независимо от исхода SMC-сигнала выше.
+        # Только виртуальный трекинг — БЕЗ реальной торговли и публикации воркеру.
+        if RB_ENABLED:
+            try:
+                async with sem:
+                    rsig, rreason = await rb_signal(sym, smc_btc_ctx)
+                st_rb[rreason] = st_rb.get(rreason, 0) + 1
+                if rsig:
+                    _rb_key = (sym, rsig['mode'])
+                    _rb_rng = (round(rsig['range_low'], 8), round(rsig['range_high'], 8))
+                    _prev = _rb_last_range.get(_rb_key)
+                    # Дедуп: тот же диапазон (допуск 0.05%) — уже отслежен, не дублируем
+                    _same_range = (
+                        _prev is not None
+                        and abs(_rb_rng[0] - _prev[0]) < abs(_prev[0]) * 0.0005
+                        and abs(_rb_rng[1] - _prev[1]) < abs(_prev[1]) * 0.0005
+                    )
+                    if not _same_range:
+                        _rb_last_range[_rb_key] = _rb_rng
+                        rsig['alt_score'] = smc_btc_ctx.get('alt_score', 0)
+                        logging.info(
+                            f"🎯 [RB SHADOW] {sym} {rsig['mode']} @ {rsig['rsi']:.0f}rsi "
+                            f"sweep:{rsig['sweep_depth_atr']:.2f}ATR range:{rsig['range_w_atr']:.1f}ATR "
+                            f"Vol:{rsig['vol_ratio']:.1f}x RR:{rsig['entry_rr']:.2f}"
+                        )
+                        shadow_record(sym, rsig['mode'], rsig['entry'], rsig, smc_btc_ctx, 'RB')
+                        rb_shadow_n += 1
+            except Exception as _re:
+                logging.debug(f'[RB] {sym} error: {type(_re).__name__}: {_re}')
+
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
         f"[SMC SCAN] news:{st['news']} vol:{st['vol']} struct:{st['structure']} "
@@ -2699,6 +2827,12 @@ async def scan_smc():
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
         f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
+    if RB_ENABLED:
+        logging.info(
+            f"[RB SCAN] total:{len(scan)} no_range:{st_rb['trend_regime']} "
+            f"no_sweep:{st_rb['no_sweep']} vol:{st_rb['vol']} low_rr:{st_rb['low_rr']} "
+            f"→ SHADOW:{rb_shadow_n}"
+        )
 
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
@@ -3031,6 +3165,14 @@ def _init_trades_db():
         con.execute("ALTER TABLE shadow_signals ADD COLUMN tp_price REAL DEFAULT 0")
     except Exception:
         pass  # [v19] TP для SA mean-reversion (выход по VWAP)
+    # [v47] RB (Range Bounce): доп. признаки + вторая цель (TP2)
+    for _scol in ['entry_hour INTEGER DEFAULT -1', 'btc_trend TEXT DEFAULT \'\'',
+                  'entry_rr REAL DEFAULT 0', 'range_w_atr REAL DEFAULT 0',
+                  'sweep_depth_atr REAL DEFAULT 0', 'tp2_price REAL DEFAULT 0']:
+        try:
+            con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
+        except Exception:
+            pass  # колонка уже существует
     # [v16] дополнительные признаки входа для анализа реальных сделок
     for _col in ['adx_val REAL DEFAULT 0',
                  'alt_score INTEGER DEFAULT 0',
@@ -3057,8 +3199,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-23-v46'
+CODE_VERSION = '2026-07-27-v47'
 CHANGELOG = [
+    ('2026-07-27-v47', 'fix регрессии v40 в воркере (check_daily_reset в главный цикл — отчёты молчали при днях без сигналов); новая SHADOW-стратегия RB Range-Bounce/Liquidity-Sweep под флэт (свип границы диапазона + reclaim + объём 1.5x), только виртуальные сделки'),
     ('2026-07-23-v46', '[SA SCAN] диагностика отсева в INFO-логи (была слепая зона на DEBUG); SA_MIN_RR 0.7→0.5 — порог был калиброван на популяции до фильтра v42, вместе они давали пустое окно при ATR<0.318% цены'),
     ('2026-07-21-v45', 'лимит маржи на сделку вынесен в ENV MARGIN_PCT_SA/MARGIN_PCT_ALT (было хардкод 0.30/0.15); лимит 15% блокировал валидные SMC-сетапы с SL>1.3%'),
     ('2026-07-20-v44', 'SA гейт MIN_RR=0.7 (RR<1 при WR51% = убыток по построению); лог entry_rr + сегмент RR в отчёте; ужесточён промпт оракула; диагностика SMC RSI-зоны'),
@@ -3214,14 +3357,20 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
             con.close(); return  # недавно закрыт — ждём кулдаун
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
-            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)",
+            "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
+            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
              int(btc_ctx.get('alt_score', 50)), float(btc_ctx.get('eth_btc_spread', 0)),
              price, float(msig.get('sl', 0)), strategy, float(msig.get('rsi', 0)),
-             float(msig.get('tp', 0))))
+             float(msig.get('tp', 0)),
+             # [v47] RB: доп. признаки для сегментации + вторая цель (TP2).
+             # Для PB/MOM/SA не заданы в msig → дефолты 0/'' безвредны.
+             datetime.now(timezone.utc).hour, str(btc_ctx.get('btc_trend', '')),
+             float(msig.get('entry_rr', 0)), float(msig.get('range_w_atr', 0)),
+             float(msig.get('sweep_depth_atr', 0)), float(msig.get('tp2', 0))))
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -3234,7 +3383,7 @@ async def shadow_check():
         cur = con.cursor()
         rows = cur.execute(
             "SELECT id,symbol,direction,entry_price,atr,mfe_price,trail_sl,open_time,"
-            "strategy,tp_price,sl_price FROM shadow_signals WHERE status='open'").fetchall()
+            "strategy,tp_price,sl_price,tp2_price FROM shadow_signals WHERE status='open'").fetchall()
         con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] read fail: {_e}')
@@ -3243,7 +3392,7 @@ async def shadow_check():
         return
 
     MAX_HOLD_BARS = 100   # таймаут симуляции
-    for (sid, sym, mode, entry, atr, mfe_p, trail_sl, open_t, strat, tp_p, sl_p) in rows:
+    for (sid, sym, mode, entry, atr, mfe_p, trail_sl, open_t, strat, tp_p, sl_p, tp2_p) in rows:
         try:
             ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=3)
             if not ohlcv:
@@ -3281,6 +3430,47 @@ async def shadow_check():
                          bars_sa, sid))
                     logging.info(f"👁 [SA CLOSE] {sym} {mode} → {rsn} "
                                  f"PnL: {pnl:+.2f}% ({bars_sa} баров)")
+                con.commit(); con.close()
+                continue
+
+            # [RB v47] Range Bounce: TP1(середина диапазона)/TP2(противоположная
+            # граница)/SL/таймаут 240мин. Приоритет при пересечении в одном баре:
+            # SL (консервативно) > TP2 > TP1.
+            elif strat == 'RB':
+                bars_rb = 0
+                tf_m = 60 if RSI_TF == '1h' else 15
+                try:
+                    _ot = datetime.fromisoformat(open_t)
+                    bars_rb = int((datetime.now(timezone.utc) - _ot).total_seconds()/60/tf_m)
+                except Exception:
+                    pass
+                if is_long:
+                    sl_hit  = lo <= sl_p
+                    tp2_hit = hi >= tp2_p
+                    tp1_hit = hi >= tp_p
+                else:
+                    sl_hit  = hi >= sl_p
+                    tp2_hit = lo <= tp2_p
+                    tp1_hit = lo <= tp_p
+                rb_timeout = bars_rb >= (RB_TIMEOUT_MIN / tf_m)
+                con = sqlite3.connect(TRADES_DB)
+                if sl_hit or tp2_hit or tp1_hit or rb_timeout:
+                    if sl_hit:
+                        exit_p, rsn = sl_p, 'SL'
+                    elif tp2_hit:
+                        exit_p, rsn = tp2_p, 'TP2'
+                    elif tp1_hit:
+                        exit_p, rsn = tp_p, 'TP1'
+                    else:
+                        exit_p, rsn = curr, 'TIMEOUT'
+                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
+                    con.execute(
+                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
+                        "pnl_pct=?,bars_held=? WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl,3),
+                         bars_rb, sid))
+                    logging.info(f"👁 [RB CLOSE] {sym} {mode} → {rsn} "
+                                 f"PnL: {pnl:+.2f}% ({bars_rb} баров)")
                 con.commit(); con.close()
                 continue
 
@@ -3390,8 +3580,8 @@ def shadow_analyze() -> str:
     try:
         con = sqlite3.connect(TRADES_DB)
         parts = [f'🔬 Анализ {RSI_TF} (closed shadow)']
-        # [v37] MOM отключён; SA в live — в shadow остался только PB
-        for strat, emoji in [('PB', '🎯')]:
+        # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce)
+        for strat, emoji in [('PB', '🎯'), ('RB', '🎯')]:
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
                 (strat,)).fetchone()[0]
@@ -3405,18 +3595,34 @@ def shadow_analyze() -> str:
                 line = _fmt(d, rows)
                 if line:
                     parts.append(line)
-            parts.append('  ADX:')
-            parts += _feature(con, strat, 'adx',
-                [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)])
-            parts.append('  Vol:')
-            parts += _feature(con, strat, 'vol_ratio',
-                [('1.0-1.5x', 1.0, 1.5), ('1.5-3x', 1.5, 3.0), ('3x+', 3.0, 99)])
-            parts.append('  Alt-score:')
-            parts += _feature(con, strat, 'alt_score',
-                [('lt40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)])
-            parts.append('  Entry RSI:')
-            parts += _feature(con, strat, 'entry_rsi',
-                [('20-40', 20, 40), ('40-60', 40, 60), ('60-80', 60, 80)])
+            if strat == 'PB':
+                parts.append('  ADX:')
+                parts += _feature(con, strat, 'adx',
+                    [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)])
+                parts.append('  Vol:')
+                parts += _feature(con, strat, 'vol_ratio',
+                    [('1.0-1.5x', 1.0, 1.5), ('1.5-3x', 1.5, 3.0), ('3x+', 3.0, 99)])
+                parts.append('  Alt-score:')
+                parts += _feature(con, strat, 'alt_score',
+                    [('lt40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)])
+                parts.append('  Entry RSI:')
+                parts += _feature(con, strat, 'entry_rsi',
+                    [('20-40', 20, 40), ('40-60', 40, 60), ('60-80', 60, 80)])
+            elif strat == 'RB':
+                # [v47] Пороги кандидата — как везде: PF>1 при n>=15, доверие n>=30
+                parts.append('  Sweep-глубина (ATR):')
+                parts += _feature(con, strat, 'sweep_depth_atr',
+                    [('0.15-0.4', 0.15, 0.4), ('0.4-1.0', 0.4, 1.0)])
+                parts.append('  Объём:')
+                parts += _feature(con, strat, 'vol_ratio',
+                    [('1.5-2.5x', 1.5, 2.5), ('2.5x+', 2.5, 99)])
+                parts.append('  Ширина диапазона (ATR):')
+                parts += _feature(con, strat, 'range_w_atr',
+                    [('<=3', 0, 3), ('3-5', 3, 5)])
+                parts.append('  Час входа (UTC):')
+                parts += _feature(con, strat, 'entry_hour',
+                    [('00-06h', 0, 6), ('06-12h', 6, 12),
+                     ('12-18h', 12, 18), ('18-24h', 18, 24)])
         con.close()
     except Exception as _e:
         return f'[ANALYZE] fail: {_e}'

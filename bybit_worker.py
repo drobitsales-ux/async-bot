@@ -1,6 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     BYBIT WORKER  v45  —  UTA (Unified Trading Account)     ║
+║     BYBIT WORKER  v47  —  UTA (Unified Trading Account)     ║
+║                                                              ║
+║  Изменения v47:                                              ║
+║  [FIX] Регрессия v40: check_daily_reset() вызывался только   ║
+║        из execute_signal → при днях без сигналов (SA-only)   ║
+║        _daily_report_sent не сбрасывался, «Итоги дня» молчали║
+║        Теперь вызывается и в главном цикле, не завися от     ║
+║        сигналов; day_start_bal обновляется при смене дня.    ║
 ║                                                              ║
 ║  Изменения v45:                                              ║
 ║  [ENV] MARGIN_PCT_SA/MARGIN_PCT_ALT — лимит маржи на сделку  ║
@@ -57,7 +64,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v45'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v47'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -238,7 +245,8 @@ def _register_close(pos: dict, pnl_pct: float, pnl_usdt: float):
         daily_sa += 1
 
 
-def check_daily_reset():
+def check_daily_reset() -> bool:
+    """True — только в цикле, где произошла смена суток (вызвавшая сброс)."""
     global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
     today = datetime.now(timezone.utc).date()
     if _last_reset_date is None:
@@ -257,6 +265,8 @@ def check_daily_reset():
         circuit_open   = False
         _daily_report_sent = False
         logging.info("📅 Daily stats reset")
+        return True
+    return False
 
 def is_trading_allowed() -> bool:
     global circuit_open
@@ -1147,6 +1157,20 @@ async def main():
         cycle = 0
         while True:
             cycle += 1
+
+            # [v47] Ежесуточный сброс в ГЛАВНОМ цикле — не зависит от сигналов.
+            # Регрессия v40: вызов только из execute_signal → при днях без сигналов
+            # _daily_report_sent не сбрасывался и «Итоги дня» молчали.
+            if check_daily_reset():
+                try:
+                    _b0 = await exchange.fetch_balance({'type': 'unified'})
+                    _b0_usdt = float(_b0.get('USDT', {}).get('total', 0))
+                    if _b0_usdt > 0:
+                        day_start_bal = _b0_usdt
+                    logging.info(f"📅 Новый день: стартовый баланс ${day_start_bal:.2f}")
+                except Exception as _be:
+                    logging.warning(f"📅 day_start_bal не обновлён: {_be}")
+
             while not _signal_queue.empty():
                 signal = await _signal_queue.get()
                 await execute_signal(signal)
