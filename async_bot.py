@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v47'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v48'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -3199,8 +3199,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-27-v47'
+CODE_VERSION = '2026-07-28-v48'
 CHANGELOG = [
+    ('2026-07-28-v48', 'fix /stats_analyze и /shadow_analyze после v47 (RB-миграция сломала SELECT/индексы); добавлен logging.exception в except чтобы причина падения была видна в логах'),
     ('2026-07-27-v47', 'fix регрессии v40 в воркере (check_daily_reset в главный цикл — отчёты молчали при днях без сигналов); новая SHADOW-стратегия RB Range-Bounce/Liquidity-Sweep под флэт (свип границы диапазона + reclaim + объём 1.5x), только виртуальные сделки'),
     ('2026-07-23-v46', '[SA SCAN] диагностика отсева в INFO-логи (была слепая зона на DEBUG); SA_MIN_RR 0.7→0.5 — порог был калиброван на популяции до фильтра v42, вместе они давали пустое окно при ATR<0.318% цены'),
     ('2026-07-21-v45', 'лимит маржи на сделку вынесен в ENV MARGIN_PCT_SA/MARGIN_PCT_ALT (было хардкод 0.30/0.15); лимит 15% блокировал валидные SMC-сетапы с SL>1.3%'),
@@ -3625,6 +3626,7 @@ def shadow_analyze() -> str:
                      ('12-18h', 12, 18), ('18-24h', 18, 24)])
         con.close()
     except Exception as _e:
+        logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
         return f'[ANALYZE] fail: {_e}'
     parts.append('\n⭐ = PF&gt;1 при n&gt;=15 (кандидат в фильтр)')
     return '\n'.join(parts)
@@ -4035,6 +4037,7 @@ def stats_analyze() -> str:
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
         con.close()
     except Exception as _e:
+        logging.exception('[STATS_ANALYZE] fail')   # [v48] полный traceback в лог
         return f'[STATS_ANALYZE] fail: {_e}'
 
     return '\n'.join(lines)
