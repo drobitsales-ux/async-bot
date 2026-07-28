@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v48'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v49'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -311,6 +311,31 @@ def load_all():
 # ═══════════════════════════════════════════════════════
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════
+TG_MAX_LEN = 4000   # [v49] запас от жёсткого лимита Telegram sendMessage 4096 символов
+
+def _split_tg_text(text: str, max_len: int = TG_MAX_LEN) -> list:
+    """Режет длинный текст на части по границам СТРОК (не разрывая <b>...</b>,
+    которые в этом коде всегда открываются и закрываются в пределах одной строки).
+    Если отдельная строка сама длиннее max_len — режется жёстко (редкий край)."""
+    lines = text.split('\n')
+    chunks, cur = [], ''
+    for line in lines:
+        candidate = f'{cur}\n{line}' if cur else line
+        if len(candidate) <= max_len:
+            cur = candidate
+            continue
+        if cur:
+            chunks.append(cur)
+        if len(line) <= max_len:
+            cur = line
+        else:
+            for i in range(0, len(line), max_len):
+                chunks.append(line[i:i + max_len])
+            cur = ''
+    if cur:
+        chunks.append(cur)
+    return chunks
+
 async def tg(text: str):
     # [P-1] Логируем причину молчания вместо тихого return
     if not TOKEN:
@@ -326,17 +351,22 @@ async def tg(text: str):
         return
     if not http:
         return
-    try:
-        async with http.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logging.warning(f"⚠️ [TG] API вернул {resp.status}: {body[:200]}")
-    except Exception as e:
-        logging.warning(f"⚠️ [TG] Ошибка отправки: {e}")
+    # [v49] Длинные отчёты (/stats_analyze при росте данных) раньше молча не
+    # доставлялись: Telegram отклонял sendMessage >4096 символов (HTTP 400),
+    # tg() это тихо логировал warning-ом, вызывающий код не узнавал о неудаче.
+    chunks = _split_tg_text(text) if len(text) > TG_MAX_LEN else [text]
+    for chunk in chunks:
+        try:
+            async with http.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"⚠️ [TG] API вернул {resp.status}: {body[:200]}")
+        except Exception as e:
+            logging.warning(f"⚠️ [TG] Ошибка отправки: {e}")
 
 # ═══════════════════════════════════════════════════════
 #  НОВОСТНОЙ ФИЛЬТР  [R-FIX-10]
@@ -3199,8 +3229,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-28-v48'
+CODE_VERSION = '2026-07-28-v49'
 CHANGELOG = [
+    ('2026-07-28-v49', 'РЕАЛЬНАЯ причина молчания /stats_analyze: отчёт (4402 симв. на реальных данных) превышал жёсткий лимит Telegram sendMessage 4096 симв. → HTTP 400, tg() тихо логировал warning, вызывающий код не узнавал. Не связано с v47/RB (диагностика v48 подтверждена: RB/shadow_signals ни при чём). tg() теперь режет длинный текст на части по границам строк'),
     ('2026-07-28-v48', 'fix /stats_analyze и /shadow_analyze после v47 (RB-миграция сломала SELECT/индексы); добавлен logging.exception в except чтобы причина падения была видна в логах'),
     ('2026-07-27-v47', 'fix регрессии v40 в воркере (check_daily_reset в главный цикл — отчёты молчали при днях без сигналов); новая SHADOW-стратегия RB Range-Bounce/Liquidity-Sweep под флэт (свип границы диапазона + reclaim + объём 1.5x), только виртуальные сделки'),
     ('2026-07-23-v46', '[SA SCAN] диагностика отсева в INFO-логи (была слепая зона на DEBUG); SA_MIN_RR 0.7→0.5 — порог был калиброван на популяции до фильтра v42, вместе они давали пустое окно при ATR<0.318% цены'),
