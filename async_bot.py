@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v51'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v52'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -313,6 +313,12 @@ def load_all():
 # ═══════════════════════════════════════════════════════
 TG_MAX_LEN = 4000   # [v49] запас от жёсткого лимита Telegram sendMessage 4096 символов
 
+def _esc(s) -> str:
+    """[v52] Экранирует значение для вставки в HTML-текст Telegram-сообщения.
+    Применять ТОЛЬКО к вставляемым ЗНАЧЕНИЯМ (свободный текст от AI-оракула и т.п.),
+    НЕ к разметке (<b>, <code>...) — иначе теги превратятся в текст."""
+    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
 def _split_tg_text(text: str, max_len: int = TG_MAX_LEN) -> list:
     """Режет длинный текст на части по границам СТРОК (не разрывая <b>...</b>,
     которые в этом коде всегда открываются и закрываются в пределах одной строки).
@@ -365,6 +371,18 @@ async def tg(text: str):
                 if resp.status != 200:
                     body = await resp.text()
                     logging.warning(f"⚠️ [TG] API вернул {resp.status}: {body[:200]}")
+                    # [v52] Страховка: если проблема в HTML-разметке (неэкранированный
+                    # текст оракула и т.п.) — шлём тем же текстом БЕЗ parse_mode, чтобы
+                    # уведомление дошло хотя бы без форматирования, а не терялось молча.
+                    if resp.status == 400 and 'parse' in body.lower():
+                        try:
+                            async with http.post(
+                                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                                json={"chat_id": CHAT_ID, "text": chunk}
+                            ) as r2:
+                                logging.info(f"[TG] fallback без parse_mode: {r2.status}")
+                        except Exception as _fe:
+                            logging.warning(f"[TG] fallback fail: {_fe}")
         except Exception as e:
             logging.warning(f"⚠️ [TG] Ошибка отправки: {e}")
 
@@ -2118,6 +2136,14 @@ async def execute(sym: str, sig: dict, strategy: str,
         logging.error(f"[{strategy}] Order error {sym}: {e}")
         return
 
+    # [v52] Лог факта открытия — СРАЗУ после успешного create_order, ДО
+    # формирования/отправки TG-сообщения. Раньше стоял после await tg(msg):
+    # если Telegram отклонял сообщение (напр. неэкранированный '<'/'>' в
+    # AI-комментарии → 400 Bad Request), факт открытия не попадал в лог,
+    # хотя ордер на бирже был уже исполнен.
+    logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | "
+                 f"Qty:{qty} | Notional:${qty*price:.2f} | Risk:${risk_usdt:.2f}")
+
     rec = {
         'symbol':      sym,
         'direction':   mode,
@@ -2170,13 +2196,14 @@ async def execute(sym: str, sig: dict, strategy: str,
         # [v39] Qty/Notional/Риск — от РЕАЛЬНОГО округлённого объёма (= биржа)
         f"Qty: <code>{qty}</code>  Notional: <b>${qty * price:.2f}</b>\n"
         f"RR: <b>1:{rr:.2f}</b>  Риск: <b>${risk_usdt:.2f}</b>\n"
+        # [v52] ai['comment'] — свободный текст от AI-оракула (Groq/Gemini),
+        # может содержать '<','>','&' (напр. "RSI > 68") — ломало parse_mode=HTML
+        # → Telegram отклонял ВСЁ сообщение (400), уведомление об открытии терялось.
         + (f"🤖 AI: bypass\n" if 'bypass' in ai['comment']
-           else f"🧠 AI({provider}): {ai['conf']}/100 | {ai['comment']}\n")
+           else f"🧠 AI({_esc(provider)}): {ai['conf']}/100 | {_esc(ai['comment'])}\n")
         + extra_tg
     )
     await tg(msg)
-    logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | "
-                 f"Qty:{qty} | Notional:${qty*price:.2f} | Risk:${risk_usdt:.2f}")
     # Публикуем сигнал воркерам (копи-трейдинг на Bybit и др.)
     # [PB] экспериментальный PB НЕ копируем на воркер до валидации (n>=30)
     if strategy != 'PB':
@@ -3240,8 +3267,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-28-v51'
+CODE_VERSION = '2026-07-29-v52'
 CHANGELOG = [
+    ('2026-07-29-v52', 'fix потери TG-уведомления об открытии: HTML-экранирование AI-комментария (символы <>& от оракула ломали parse_mode=HTML → 400); fallback-отправка без разметки; лог открытия перенесён до tg()'),
     ('2026-07-28-v51', 'fix ложного circuit breaker: monitor_all() при закрытии позиции звал save_all() ДО обрезки списков позиций (обрезка — после цикла) → на диске оставался "призрак" уже закрытой позиции; при рестарте (деплой) load_all() восстанавливал призрака, и закрытие засчитывалось ПОВТОРНО (daily_stats trades/pnl_pct) на каждом деплое. Подтверждено: -0.678%×4≈-2.71% = ровно показанная в алерте просадка при 1 факт. сделке. Добавлен финальный save_all() после обрезки списков'),
     ('2026-07-28-v50', 'fix HTML-парсинга /stats_analyze: подпись бакета RR-входа "<0.7" (v46) шла в Telegram НЕэкранированной → сегмент "RR входа" ломал HTML конкретного чанка (Telegram парсил "<0.7" как тег), после v49-разбивки на чанки это выглядело как "приходит только последняя строка". Переименовано в "lt0.7" (стиль остальных лейблов той же функции: lt40/lt35). Полный аудит: других непарных </> в generated-тексте stats_analyze нет'),
     ('2026-07-28-v49', 'РЕАЛЬНАЯ причина молчания /stats_analyze: отчёт (4402 симв. на реальных данных) превышал жёсткий лимит Telegram sendMessage 4096 симв. → HTTP 400, tg() тихо логировал warning, вызывающий код не узнавал. Не связано с v47/RB (диагностика v48 подтверждена: RB/shadow_signals ни при чём). tg() теперь режет длинный текст на части по границам строк'),
