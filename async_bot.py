@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v52'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v53'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -119,11 +119,12 @@ SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
 SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение от VWAP в ATR для входа
 SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '2.2'))  # [v42] потолок: дальше — импульсная нога, не растяжение
-SA_MIN_RR = float(os.getenv('SA_MIN_RR', '0.5'))
-# [v46] 0.5 (было 0.7): порог 0.7 калиброван на WR 51% всей популяции, включая
-# бакет 2.2+ (WR 34%), заблокированный фильтром v42. Торгуемая зона 1.5-2.2 ATR
-# даёт WR 74-80% (n=23), безубыточный RR там 0.25-0.35. При RR 0.5 безубыток = WR 67%,
-# запас к наблюдаемому WR сохраняется. ПЕРЕСМОТРЕТЬ по сегменту "RR входа" при n>=30.
+SA_MIN_RR = float(os.getenv('SA_MIN_RR', '0.7'))
+# [v53] откат 0.5→0.7: форвард дал 0 побед из 7 при RR<0.7.
+# Снижение до 0.5 в v46 опиралось на in-sample WR 74-80% зоны 1.5-2.2 ATR,
+# которая на форварде распалась до WR ~61% (см. BOT_SPEC.md §2.3) — тот же
+# паттерн переобучения, что и с PB. Сегмент "RR входа": lt0.7 → 7 сд, WR 0%,
+# Avg -2.54%, PF 0.00. P(0 побед из 7 | даже WR 40%) = 0.028 — не случайность.
 SA_RSI_LO    = float(os.getenv('SA_RSI_LO', '30'))       # лонг: RSI ниже этого (перепродан)
 SA_RSI_HI    = float(os.getenv('SA_RSI_HI', '70'))       # шорт: RSI выше этого (перекуплен)
 SA_WINDOW    = os.getenv('SA_WINDOW', '')                # окно UTC 'HH-HH' или '' = весь день
@@ -192,6 +193,7 @@ daily_stats     = {
 news_events     = []       # [float timestamp, ...]
 notified        = {}       # {sym: timestamp}  cooldown 4h
 _rb_last_range  = {}       # [v47] {(sym,mode): (range_low, range_high)} — дедуп по диапазону
+_sa_shadow_last_ts = 0.0   # [v53] дедуп SA_SHADOW: не чаще 1 записи/60 мин по BTC
 markets_cache   = None
 markets_ts      = 0.0
 news_ts         = 0.0
@@ -1765,9 +1767,11 @@ async def rb_signal(sym: str, btc_ctx: dict):
     if atr <= 0:
         return None, 'atr'
 
+    # [v53] fix off-by-one: срез [-49:-1] включал свип-свечу [-2] →
+    # range_low <= lo2 всегда → условие пробоя невыполнимо.
     # Диапазон по RB_RANGE_BARS ЗАКРЫТЫМ барам, без свип-свечи [-2] и текущей [-1]
-    range_high = float(np.max(h[-(RB_RANGE_BARS + 1):-1]))
-    range_low  = float(np.min(l[-(RB_RANGE_BARS + 1):-1]))
+    range_high = float(np.max(h[-(RB_RANGE_BARS + 2):-2]))
+    range_low  = float(np.min(l[-(RB_RANGE_BARS + 2):-2]))
     range_w_atr = (range_high - range_low) / atr
 
     # Гейт флэта: широкий диапазон = трендовый режим, свип-логика не работает
@@ -1899,16 +1903,11 @@ async def single_asset_signal(btc_ctx: dict):
     diag = {'dist_atr': round(dist_atr, 2), 'vol_ratio': round(vol_ratio, 2),
             'rsi': round(rsi, 1), 'atr_pct': round(atr_pct, 3), 'rr': round(_rr, 2)}
 
-    # [v37] Volume window 1.3-2.0x (данные n=16):
-    # 1.3-2x: WR 83% PF 9.55 | 2-4x: WR 10% PF 0.02 — выше 2x это кульминация
-    # импульса, MR против него уходит во флэт/таймаут.
-    if not (1.3 <= vol_ratio <= 2.0):
-        return None, 'vol_climax', diag
-
-    # [v42] За ~2.2 ATR от VWAP — импульсная нога, не растяжение. Возврата нет.
-    if abs(dist_atr) > SA_ATR_DIST_MAX:
-        return None, 'vwap_far', diag
-
+    # [v53] mode по dist_atr/RSI считается ОДИН раз здесь (та же формула, что
+    # была ниже) и переиспользуется реальным путём — порядок и условия ранних
+    # return НЕ меняются. Нужен заранее для shadow-логирования отсеянных
+    # сетапов (см. ниже): нужно знать, был бы сетап валиден, если бы не
+    # volume/RR фильтр.
     mode = None
     # Лонг: цена сильно НИЖЕ VWAP + перепродан → возврат вверх к VWAP
     if dist_atr <= -SA_ATR_DIST and rsi <= SA_RSI_LO:
@@ -1916,6 +1915,26 @@ async def single_asset_signal(btc_ctx: dict):
     # Шорт: цена сильно ВЫШЕ VWAP + перекуплен → возврат вниз к VWAP
     elif dist_atr >= SA_ATR_DIST and rsi >= SA_RSI_HI:
         mode = 'Short'
+    # "Остальные условия выполнены" = направление есть И дистанция в
+    # торгуемой зоне [SA_ATR_DIST, SA_ATR_DIST_MAX] (не vwap_far).
+    _sa_setup_valid = mode is not None and abs(dist_atr) <= SA_ATR_DIST_MAX
+    _sa_hyp_sl = (price * (1 - sl_pct)) if mode == 'Long' else (price * (1 + sl_pct))
+
+    # [v37] Volume window 1.3-2.0x (данные n=16):
+    # 1.3-2x: WR 83% PF 9.55 | 2-4x: WR 10% PF 0.02 — выше 2x это кульминация
+    # импульса, MR против него уходит во флэт/таймаут.
+    if not (1.3 <= vol_ratio <= 2.0):
+        # [v53] Нижняя граница 1.3 никогда не валидирована (BOT_SPEC §2.5) —
+        # shadow-запись БЕЗ денег для зоны vol<1.3 (и vol>2.0 заодно).
+        if _sa_setup_valid:
+            _sa_shadow_record(mode, price, _sa_hyp_sl, vwap, vol_ratio,
+                               dist_atr, _rr, rsi, btc_ctx, 'vol_climax')
+        return None, 'vol_climax', diag
+
+    # [v42] За ~2.2 ATR от VWAP — импульсная нога, не растяжение. Возврата нет.
+    if abs(dist_atr) > SA_ATR_DIST_MAX:
+        return None, 'vwap_far', diag
+
     if not mode:
         return None, 'no_setup', diag
 
@@ -1931,6 +1950,10 @@ async def single_asset_signal(btc_ctx: dict):
     # риск 1% ради <0.7% при WR~51% математически убыточен по построению.
     # _rr — та же величина, что в diag выше (симметрична для Long/Short).
     if _rr < SA_MIN_RR:
+        # [v53] Форвард уже показал 0/7 при RR<0.7 (§2.2) — но shadow даёт
+        # доп. точки без риска, если данные когда-то потребуются повторно.
+        _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
+                           rsi, btc_ctx, 'low_rr')
         return None, 'low_rr', diag
 
     return {
@@ -3234,9 +3257,11 @@ def _init_trades_db():
     except Exception:
         pass  # [v19] TP для SA mean-reversion (выход по VWAP)
     # [v47] RB (Range Bounce): доп. признаки + вторая цель (TP2)
+    # [v53] + dist_atr для SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr)
     for _scol in ['entry_hour INTEGER DEFAULT -1', 'btc_trend TEXT DEFAULT \'\'',
                   'entry_rr REAL DEFAULT 0', 'range_w_atr REAL DEFAULT 0',
-                  'sweep_depth_atr REAL DEFAULT 0', 'tp2_price REAL DEFAULT 0']:
+                  'sweep_depth_atr REAL DEFAULT 0', 'tp2_price REAL DEFAULT 0',
+                  'dist_atr REAL DEFAULT 0']:
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -3267,8 +3292,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-29-v52'
+CODE_VERSION = '2026-07-31-v53'
 CHANGELOG = [
+    ('2026-07-31-v53', 'fix off-by-one в rb_signal (окно диапазона включало свип-свечу → RB не мог дать сигнал никогда); откат SA_MIN_RR 0.5→0.7 (форвард: 0 побед из 7 при RR<0.7); shadow-логирование отсеянных SA-сетапов для валидации зон vol<1.3 и RR<0.7'),
     ('2026-07-29-v52', 'fix потери TG-уведомления об открытии: HTML-экранирование AI-комментария (символы <>& от оракула ломали parse_mode=HTML → 400); fallback-отправка без разметки; лог открытия перенесён до tg()'),
     ('2026-07-28-v51', 'fix ложного circuit breaker: monitor_all() при закрытии позиции звал save_all() ДО обрезки списков позиций (обрезка — после цикла) → на диске оставался "призрак" уже закрытой позиции; при рестарте (деплой) load_all() восстанавливал призрака, и закрытие засчитывалось ПОВТОРНО (daily_stats trades/pnl_pct) на каждом деплое. Подтверждено: -0.678%×4≈-2.71% = ровно показанная в алерте просадка при 1 факт. сделке. Добавлен финальный save_all() после обрезки списков'),
     ('2026-07-28-v50', 'fix HTML-парсинга /stats_analyze: подпись бакета RR-входа "<0.7" (v46) шла в Telegram НЕэкранированной → сегмент "RR входа" ломал HTML конкретного чанка (Telegram парсил "<0.7" как тег), после v49-разбивки на чанки это выглядело как "приходит только последняя строка". Переименовано в "lt0.7" (стиль остальных лейблов той же функции: lt40/lt35). Полный аудит: других непарных </> в generated-тексте stats_analyze нет'),
@@ -3431,8 +3457,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
-            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?)",
+            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
@@ -3443,10 +3469,30 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              # Для PB/MOM/SA не заданы в msig → дефолты 0/'' безвредны.
              datetime.now(timezone.utc).hour, str(btc_ctx.get('btc_trend', '')),
              float(msig.get('entry_rr', 0)), float(msig.get('range_w_atr', 0)),
-             float(msig.get('sweep_depth_atr', 0)), float(msig.get('tp2', 0))))
+             float(msig.get('sweep_depth_atr', 0)), float(msig.get('tp2', 0)),
+             float(msig.get('dist_atr', 0))))  # [v53] SA_SHADOW
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
+
+
+def _sa_shadow_record(mode: str, price: float, sl: float, tp: float,
+                       vol_ratio: float, dist_atr: float, rr: float,
+                       rsi: float, btc_ctx: dict, reason: str):
+    """[v53] Shadow-логирование SA-сетапов, отсеянных 'vol_climax'/'low_rr', у
+    которых остальные условия (направление + дистанция в торгуемой зоне)
+    выполнены. Валидация зон vol<1.3 и RR<0.7 БЕЗ реальных денег — эти зоны
+    никогда не изучались, т.к. реальные фильтры туда не пускают.
+    Дедуп: не чаще 1 записи/60 мин (SA — всегда BTC, дублей по символу не бывает)."""
+    global _sa_shadow_last_ts
+    if time.time() - _sa_shadow_last_ts < 3600:
+        return
+    msig = {'sl': sl, 'tp': tp, 'atr': 0.0, 'adx': 0.0, 'rsi': rsi,
+            'vol_ratio': vol_ratio, 'entry_rr': rr, 'dist_atr': dist_atr}
+    shadow_record(SA_SYMBOL, mode, price, msig, btc_ctx, 'SA_SHADOW')
+    _sa_shadow_last_ts = time.time()
+    logging.info(f'👁 [SA_SHADOW] {mode} @ {price:.2f} отсеян по {reason} | '
+                 f'vol:{vol_ratio:.2f} dist:{dist_atr:+.2f}ATR rr:{rr:.2f}')
 
 
 async def shadow_check():
@@ -3475,8 +3521,9 @@ async def shadow_check():
             is_long = (mode == 'Long')
             atr = atr if atr > 0 else entry * 0.01
 
-            # [SA] mean-reversion: выход по TP (VWAP) или SL, без трейлинга
-            if strat == 'SA':
+            # [SA] mean-reversion: выход по TP (VWAP) или SL, без трейлинга.
+            # [v53] SA_SHADOW — те же уровни/логика, отдельная метка для отчёта.
+            if strat in ('SA', 'SA_SHADOW'):
                 bars_sa = 0
                 try:
                     _ot = datetime.fromisoformat(open_t)
@@ -3501,7 +3548,7 @@ async def shadow_check():
                         "pnl_pct=?,bars_held=? WHERE id=?",
                         (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl,3),
                          bars_sa, sid))
-                    logging.info(f"👁 [SA CLOSE] {sym} {mode} → {rsn} "
+                    logging.info(f"👁 [{strat} CLOSE] {sym} {mode} → {rsn} "
                                  f"PnL: {pnl:+.2f}% ({bars_sa} баров)")
                 con.commit(); con.close()
                 continue
@@ -3653,8 +3700,9 @@ def shadow_analyze() -> str:
     try:
         con = sqlite3.connect(TRADES_DB)
         parts = [f'🔬 Анализ {RSI_TF} (closed shadow)']
-        # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce)
-        for strat, emoji in [('PB', '🎯'), ('RB', '🎯')]:
+        # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce).
+        # [v53] + SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr, БЕЗ денег)
+        for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('SA_SHADOW', '🎯')]:
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
                 (strat,)).fetchone()[0]
@@ -3696,6 +3744,16 @@ def shadow_analyze() -> str:
                 parts += _feature(con, strat, 'entry_hour',
                     [('00-06h', 0, 6), ('06-12h', 6, 12),
                      ('12-18h', 12, 18), ('18-24h', 18, 24)])
+            elif strat == 'SA_SHADOW':
+                # [v53] Валидация зон, которые реальные фильтры SA никогда не
+                # пускали: нижняя граница объёма 1.3 (§2.5) и RR<0.7 (§2.2)
+                parts.append('  Объём:')
+                parts += _feature(con, strat, 'vol_ratio',
+                    [('<1.0', 0, 1.0), ('1.0-1.3', 1.0, 1.3), ('1.3-2.0', 1.3, 2.0)])
+                parts.append('  RR входа:')
+                parts += _feature(con, strat, 'entry_rr',
+                    [('<0.5', 0, 0.5), ('0.5-0.7', 0.5, 0.7),
+                     ('0.7-1.0', 0.7, 1.0), ('1.0+', 1.0, 99)])
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
