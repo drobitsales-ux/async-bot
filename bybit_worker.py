@@ -1,6 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     BYBIT WORKER  v47  —  UTA (Unified Trading Account)     ║
+║     BYBIT WORKER  v54  —  UTA (Unified Trading Account)     ║
+║                                                              ║
+║  Изменения v54:                                              ║
+║  [RISK] RISK_PCT 2%→0.5% (в 4 раза меньше): edge SA под      ║
+║        вопросом форвардом (BOT_SPEC §2.3/§2.4), но стратегия ║
+║        остаётся live на проп-счёте ради сбора реальных       ║
+║        данных с реальным проскальзыванием — депозит горит    ║
+║        значительно медленнее на время сбора статистики.      ║
 ║                                                              ║
 ║  Изменения v47:                                              ║
 ║  [FIX] Регрессия v40: check_daily_reset() вызывался только   ║
@@ -40,7 +47,7 @@
 ║    TELEGRAM_TOKEN    = токен бота                            ║
 ║    GROUP_CHAT_ID     = ID группы                            ║
 ║    PROP_BALANCE      = 100  (депозит для теста)             ║
-║    RISK_PCT          = 0.02 (2% для теста $100)             ║
+║    RISK_PCT          = 0.005 (0.5%, снижено с 2% в v54)     ║
 ║    LEVERAGE          = 5                                     ║
 ║    MAX_POS           = 2                                     ║
 ║    SA_PARTIAL_PCT    = 0.8  (порог частичной фиксации SA)   ║
@@ -64,7 +71,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v47'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v54'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -77,7 +84,11 @@ except ValueError:
     CHAT_ID = -1
 
 PROP_BALANCE   = float(os.getenv('PROP_BALANCE', '100'))
-RISK_PER_TRADE = float(os.getenv('RISK_PCT', '0.02'))   # 2% для теста $100
+# [v54] 2%→0.5% (в 4 раза меньше риска на сделку): воркер SA-only
+# (ALLOWED_STRATEGIES), edge SA под вопросом форвардом (BOT_SPEC §2.3/§2.4) —
+# держим стратегию live на боевом проп-счёте ради сбора реальных данных с
+# реальным проскальзыванием, но резко замедляем расход депозита на время сбора.
+RISK_PER_TRADE = float(os.getenv('RISK_PCT', '0.005'))   # 0.5% (было 2%, v54)
 LEVERAGE       = int(os.getenv('LEVERAGE', '5'))
 # [v45] Лимит маржи на сделку, доля депозита. Потолок notional = bal × LEVERAGE × pct.
 # Имена ENV ОБЯЗАНЫ совпадать с async_bot.py — иначе настройки расходятся между ботами.

@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v53'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v54'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -133,6 +133,11 @@ SA_HIST_OFFSET = 37  # сделок SA до перевода в live (включ
 SA_PARTIAL_PCT = float(os.getenv('SA_PARTIAL_PCT', '0.8'))  # [SA-EXIT] фикс 50% при +0.8% (MFE гаснет ~1%)
 SA_TRAIL_ATR   = float(os.getenv('SA_TRAIL_ATR',  '0.8'))   # [SA-EXIT] чувствительный трейл хвоста (MR-ход короткий)
 SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeout MFE-порог (было 0.35, строгое <)
+# [v54] SA_MIN_RR (§2.3 BOT_SPEC) и edge под вопросом форвардом — SA остаётся
+# live (сбор реальных данных с реальным проскальзыванием), но риск на сделку
+# снижен вдвое (1%→0.5% от RISK_PER_TRADE), чтобы вдвое медленнее жечь депозит
+# на время сбора статистики. По образцу PB_RISK_MULT.
+SA_RISK_MULT   = float(os.getenv('SA_RISK_MULT', '0.5'))
 LEVERAGE         = 5
 # [v45] Лимит маржи на сделку, доля депозита. Потолок notional = bal × LEVERAGE × pct.
 # Не влияет на расчёт риска (qty = risk/sl_dist) — только ограничивает сверху.
@@ -3292,8 +3297,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-31-v53'
+CODE_VERSION = '2026-07-31-v54'
 CHANGELOG = [
+    ('2026-07-31-v54', 'риск SA снижен вдвое (1%→0.5%, SA_RISK_MULT=0.5) — edge под вопросом форвардом, SA остаётся live для сбора реальных данных с реальным проскальзыванием, но депозит горит вдвое медленнее. Зеркально в bybit_worker.py (RISK_PCT 2%→0.5%, в 4 раза меньше)'),
     ('2026-07-31-v53', 'fix off-by-one в rb_signal (окно диапазона включало свип-свечу → RB не мог дать сигнал никогда); откат SA_MIN_RR 0.5→0.7 (форвард: 0 побед из 7 при RR<0.7); shadow-логирование отсеянных SA-сетапов для валидации зон vol<1.3 и RR<0.7'),
     ('2026-07-29-v52', 'fix потери TG-уведомления об открытии: HTML-экранирование AI-комментария (символы <>& от оракула ломали parse_mode=HTML → 400); fallback-отправка без разметки; лог открытия перенесён до tg()'),
     ('2026-07-28-v51', 'fix ложного circuit breaker: monitor_all() при закрытии позиции звал save_all() ДО обрезки списков позиций (обрезка — после цикла) → на диске оставался "призрак" уже закрытой позиции; при рестарте (деплой) load_all() восстанавливал призрака, и закрытие засчитывалось ПОВТОРНО (daily_stats trades/pnl_pct) на каждом деплое. Подтверждено: -0.678%×4≈-2.71% = ровно показанная в алерте просадка при 1 факт. сделке. Добавлен финальный save_all() после обрезки списков'),
@@ -4483,7 +4489,8 @@ async def main():
                                 if not _sa_open and _sa_cooldown_ok:
                                     _sa_len_before = len(sa_positions)
                                     await execute(SA_SYMBOL, _sasig, 'SA', sa_positions,
-                                                  f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}")
+                                                  f"VWAP-dist:{_sasig['vwap_dist']:+.2f}ATR RSI:{_sasig['rsi']:.0f}",
+                                                  risk_mult=SA_RISK_MULT)
                                     # cooldown только если позиция реально добавлена
                                     if len(sa_positions) > _sa_len_before:
                                         _sa_last_entry = time.time()
