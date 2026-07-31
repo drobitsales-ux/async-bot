@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v54'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v55'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -1902,11 +1902,23 @@ async def single_asset_signal(btc_ctx: dict):
     # [v25] Volume Climax filter: защита от "падающего ножа" без кульминации
     # Используем полную историю (ohlcv) для устойчивого среднего объёма
     v_full = np.array([float(x[5]) for x in ohlcv])
-    avg_vol = float(np.mean(v_full[-21:-1])) if len(v_full) > 21 else float(np.mean(v_full[:-1]))
+    # [v55] median вместо mean: один спайк x10 задирал среднее и блокировал
+    # вход на 20 баров; окно больше не включает измеряемый бар.
+    _base = v_full[-22:-2]          # 20 баров, БЕЗ измеряемого [-2]
+    avg_vol = float(np.median(_base)) if len(_base) else 0.0
     vol_ratio = float(v_full[-2]) / avg_vol if avg_vol > 0 else 0.0
 
     diag = {'dist_atr': round(dist_atr, 2), 'vol_ratio': round(vol_ratio, 2),
             'rsi': round(rsi, 1), 'atr_pct': round(atr_pct, 3), 'rr': round(_rr, 2)}
+    # [v55] Составные флаги нарушений — вычисляются ДО возврата по первой
+    # причине. Счётчик [SA SCAN] раньше показывал только ПЕРВОЕ нарушенное
+    # условие (объём проверяется первым в коде), маскируя случаи, когда
+    # нарушено сразу несколько условий (напр. dist -4..-5.6 ATR при потолке
+    # 2.2 — счётчик показывал vol_climax, хотя vwap_far тоже нарушен).
+    # Логика фильтров и порядок проверок НЕ меняются — это только диагностика.
+    diag['f_vol']   = not (1.3 <= vol_ratio <= 2.0)
+    diag['f_dist']  = abs(dist_atr) > SA_ATR_DIST_MAX
+    diag['f_setup'] = not (abs(dist_atr) >= SA_ATR_DIST and (rsi <= SA_RSI_LO or rsi >= SA_RSI_HI))
 
     # [v53] mode по dist_atr/RSI считается ОДИН раз здесь (та же формула, что
     # была ниже) и переиспользуется реальным путём — порядок и условия ранних
@@ -2835,6 +2847,22 @@ async def get_tickers_cached() -> dict:
     return _tickers_cache
 
 
+async def _scan_universe() -> list:
+    """[v55] Список ~80 монет с предфильтром объёма — общий для scan_smc/scan_rb,
+    чтобы не дублировать логику получения списка."""
+    markets = await get_markets()
+    # Предфильтр: получаем объёмы всех монет ОДНИМ запросом
+    # Это в 50x быстрее чем 250 отдельных fetch_ticker
+    all_tickers = await get_tickers_cached()
+    # Предпорог 30% от MIN_VOL — отсекает мусор, но не режет живые монеты
+    vol_pre = MIN_VOL_USDT * 0.3
+    return [
+        s for s in list(markets.keys())
+        if sym_allowed(s)
+        and float((all_tickers.get(s) or {}).get('quoteVolume', 0) or 0) >= vol_pre
+    ][:SCAN_LIMIT]
+
+
 async def scan_smc():
     """Сканер SMC: запускается каждые 60 сек в торговые сессии."""
     if not is_session():
@@ -2846,26 +2874,12 @@ async def scan_smc():
     # [v16.1] btc-контекст один раз на скан (для alt_score в /stats_analyze)
     smc_btc_ctx = await get_btc_context()
 
-    markets = await get_markets()
-    # Предфильтр: получаем объёмы всех монет ОДНИМ запросом
-    # Это в 50x быстрее чем 250 отдельных fetch_ticker
-    all_tickers = await get_tickers_cached()
-    # Предпорог 30% от MIN_VOL — отсекает мусор, но не режет живые монеты
-    vol_pre = MIN_VOL_USDT * 0.3
-    scan = [
-        s for s in list(markets.keys())
-        if sym_allowed(s)
-        and float((all_tickers.get(s) or {}).get('quoteVolume', 0) or 0) >= vol_pre
-    ][:SCAN_LIMIT]
+    scan = await _scan_universe()
     sem  = asyncio.Semaphore(SCAN_SEM)
     st   = {k: 0 for k in ['session','news','vol','structure','choch','short_blocked',
                             'vwap','rsi','adx_flat','fvg','fvg_test','ok']}
-    # [v47] RB (Range Bounce) — shadow-only, тот же скан-список ~80 монет что SMC
-    st_rb = {k: 0 for k in ['trend_regime', 'no_sweep', 'vol', 'low_rr', 'ok']}
-    rb_shadow_n = 0   # фактически записанных shadow-сделок за цикл (после дедупа по диапазону)
 
     async def check(sym):
-        nonlocal rb_shadow_n
         if sym in notified:
             return
         try:
@@ -2883,36 +2897,6 @@ async def scan_smc():
             if st['error'] <= 2:  # логируем только первые 2 (не спамим)
                 logging.warning(f'[SMC] {sym} error: {type(_e).__name__}: {_e}')
 
-        # [v47] RB shadow-детект: независимо от исхода SMC-сигнала выше.
-        # Только виртуальный трекинг — БЕЗ реальной торговли и публикации воркеру.
-        if RB_ENABLED:
-            try:
-                async with sem:
-                    rsig, rreason = await rb_signal(sym, smc_btc_ctx)
-                st_rb[rreason] = st_rb.get(rreason, 0) + 1
-                if rsig:
-                    _rb_key = (sym, rsig['mode'])
-                    _rb_rng = (round(rsig['range_low'], 8), round(rsig['range_high'], 8))
-                    _prev = _rb_last_range.get(_rb_key)
-                    # Дедуп: тот же диапазон (допуск 0.05%) — уже отслежен, не дублируем
-                    _same_range = (
-                        _prev is not None
-                        and abs(_rb_rng[0] - _prev[0]) < abs(_prev[0]) * 0.0005
-                        and abs(_rb_rng[1] - _prev[1]) < abs(_prev[1]) * 0.0005
-                    )
-                    if not _same_range:
-                        _rb_last_range[_rb_key] = _rb_rng
-                        rsig['alt_score'] = smc_btc_ctx.get('alt_score', 0)
-                        logging.info(
-                            f"🎯 [RB SHADOW] {sym} {rsig['mode']} @ {rsig['rsi']:.0f}rsi "
-                            f"sweep:{rsig['sweep_depth_atr']:.2f}ATR range:{rsig['range_w_atr']:.1f}ATR "
-                            f"Vol:{rsig['vol_ratio']:.1f}x RR:{rsig['entry_rr']:.2f}"
-                        )
-                        shadow_record(sym, rsig['mode'], rsig['entry'], rsig, smc_btc_ctx, 'RB')
-                        rb_shadow_n += 1
-            except Exception as _re:
-                logging.debug(f'[RB] {sym} error: {type(_re).__name__}: {_re}')
-
     await asyncio.gather(*[check(s) for s in scan])
     logging.info(
         f"[SMC SCAN] news:{st['news']} vol:{st['vol']} struct:{st['structure']} "
@@ -2923,12 +2907,63 @@ async def scan_smc():
         f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
         f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
-    if RB_ENABLED:
-        logging.info(
-            f"[RB SCAN] total:{len(scan)} no_range:{st_rb['trend_regime']} "
-            f"no_sweep:{st_rb['no_sweep']} vol:{st_rb['vol']} low_rr:{st_rb['low_rr']} "
-            f"→ SHADOW:{rb_shadow_n}"
-        )
+
+
+async def scan_rb():
+    """[v55] RB (Range Bounce) — круглосуточный shadow-сканер, БЕЗ гейта сессии.
+    Раньше жил внутри scan_smc() и молчал 56% суток (вне 06:30-17:00 UTC) —
+    именно азиатские/ночные часы, когда рынок чаще всего во флэте, а RB —
+    стратегия флэта. Только сбор данных: реальной торговли RB по-прежнему нет,
+    поэтому check_circuit_breaker() (гейт РЕАЛЬНОЙ торговли) не нужен. Гейт
+    'notified' тоже не применяется — он унаследован от SMC/RSI и не имеет
+    смысла для shadow-стратегии (не блокирует реальный вход, блокировать
+    нечего)."""
+    if not RB_ENABLED:
+        return
+
+    rb_btc_ctx = await get_btc_context()
+    scan = await _scan_universe()
+    sem  = asyncio.Semaphore(SCAN_SEM)
+    st_rb = {k: 0 for k in ['trend_regime', 'no_sweep', 'vol', 'low_rr', 'ok']}
+    rb_shadow_n = 0   # фактически записанных shadow-сделок за цикл (после дедупа по диапазону)
+
+    async def check(sym):
+        nonlocal rb_shadow_n
+        try:
+            async with sem:
+                rsig, rreason = await rb_signal(sym, rb_btc_ctx)
+            st_rb[rreason] = st_rb.get(rreason, 0) + 1
+            if rsig:
+                _rb_key = (sym, rsig['mode'])
+                _rb_rng = (round(rsig['range_low'], 8), round(rsig['range_high'], 8))
+                _prev = _rb_last_range.get(_rb_key)
+                # Дедуп: тот же диапазон (допуск 0.05%) — уже отслежен, не дублируем
+                _same_range = (
+                    _prev is not None
+                    and abs(_rb_rng[0] - _prev[0]) < abs(_prev[0]) * 0.0005
+                    and abs(_rb_rng[1] - _prev[1]) < abs(_prev[1]) * 0.0005
+                )
+                if not _same_range:
+                    _rb_last_range[_rb_key] = _rb_rng
+                    rsig['alt_score'] = rb_btc_ctx.get('alt_score', 0)
+                    logging.info(
+                        f"🎯 [RB SHADOW] {sym} {rsig['mode']} @ {rsig['rsi']:.0f}rsi "
+                        f"sweep:{rsig['sweep_depth_atr']:.2f}ATR range:{rsig['range_w_atr']:.1f}ATR "
+                        f"Vol:{rsig['vol_ratio']:.1f}x RR:{rsig['entry_rr']:.2f}"
+                    )
+                    shadow_record(sym, rsig['mode'], rsig['entry'], rsig, rb_btc_ctx, 'RB')
+                    rb_shadow_n += 1
+        except Exception as _re:
+            st_rb['error'] = st_rb.get('error', 0) + 1
+            if st_rb['error'] <= 2:
+                logging.debug(f'[RB] {sym} error: {type(_re).__name__}: {_re}')
+
+    await asyncio.gather(*[check(s) for s in scan])
+    logging.info(
+        f"[RB SCAN] total:{len(scan)} no_range:{st_rb['trend_regime']} "
+        f"no_sweep:{st_rb['no_sweep']} vol:{st_rb['vol']} low_rr:{st_rb['low_rr']} "
+        f"→ SHADOW:{rb_shadow_n}"
+    )
 
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
@@ -3297,8 +3332,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-07-31-v54'
+CODE_VERSION = '2026-08-01-v55'
 CHANGELOG = [
+    ('2026-08-01-v55', 'RB вынесен в отдельный круглосуточный сканер (был внутри scan_smc → слеп 56% суток, включая флэтовые азиатские часы); база vol_ratio SA: median вместо mean + исключён измеряемый бар (спайк блокировал вход на 5 часов); [SA SCAN] показывает все нарушенные условия, а не первое'),
     ('2026-07-31-v54', 'риск SA снижен вдвое (1%→0.5%, SA_RISK_MULT=0.5) — edge под вопросом форвардом, SA остаётся live для сбора реальных данных с реальным проскальзыванием, но депозит горит вдвое медленнее. Зеркально в bybit_worker.py (RISK_PCT 2%→0.5%, в 4 раза меньше)'),
     ('2026-07-31-v53', 'fix off-by-one в rb_signal (окно диапазона включало свип-свечу → RB не мог дать сигнал никогда); откат SA_MIN_RR 0.5→0.7 (форвард: 0 побед из 7 при RR<0.7); shadow-логирование отсеянных SA-сетапов для валидации зон vol<1.3 и RR<0.7'),
     ('2026-07-29-v52', 'fix потери TG-уведомления об открытии: HTML-экранирование AI-комментария (символы <>& от оракула ломали parse_mode=HTML → 400); fallback-отправка без разметки; лог открытия перенесён до tg()'),
@@ -4458,6 +4494,17 @@ async def main():
                         _sa_st = {k: 0 for k in
                                   ('atr', 'vol_climax', 'vwap_far', 'no_setup', 'low_rr', 'ok')}
                         _sa_st[_sa_reason] = _sa_st.get(_sa_reason, 0) + 1
+                        # [v55] Составной блок: счётчик выше показывает только ПЕРВУЮ
+                        # причину отсева (объём проверяется первым в коде), маскируя
+                        # случаи, когда нарушено сразу несколько условий (напр. dist
+                        # -4..-5.6 ATR при потолке 2.2 — счётчик покажет vol_climax,
+                        # хотя vwap_far тоже нарушен). Флаги f_vol/f_dist/f_setup
+                        # считаются в single_asset_signal ДО первого return.
+                        _sa_blocked = '+'.join(
+                            lbl for lbl, key in (('vol', 'f_vol'), ('dist', 'f_dist'),
+                                                  ('setup', 'f_setup'))
+                            if _sa_diag.get(key, False)
+                        ) or '-'
                         logging.info(
                             f"[SA SCAN] BTC | atr:{_sa_st['atr']} vol_climax:{_sa_st['vol_climax']} "
                             f"vwap_far:{_sa_st['vwap_far']} no_setup:{_sa_st['no_setup']} "
@@ -4466,7 +4513,8 @@ async def main():
                             f"vol:{_sa_diag.get('vol_ratio', 0):.2f} "
                             f"rsi:{_sa_diag.get('rsi', 0):.0f} "
                             f"atr:{_sa_diag.get('atr_pct', 0):.2f}% "
-                            f"rr:{_sa_diag.get('rr', 0):.2f}"
+                            f"rr:{_sa_diag.get('rr', 0):.2f} "
+                            f"| блок: {_sa_blocked}"
                         )
                         if _sasig:
                             _sa_live_str = 'LIVE' if SA_LIVE else 'SHADOW'
@@ -4525,12 +4573,13 @@ async def main():
                 results = await asyncio.gather(
                     scan_smc(),
                     scan_rsi(),
+                    scan_rb(),   # [v55] круглосуточно, не гейтится is_session()
                     return_exceptions=True
                 )
                 # Логируем исключения из сканеров (ранее проглатывались молча)
                 for _i, _r in enumerate(results):
                     if isinstance(_r, Exception):
-                        _name = ['scan_smc', 'scan_rsi'][_i]
+                        _name = ['scan_smc', 'scan_rsi', 'scan_rb'][_i]
                         logging.error(f'❌ {_name} exception: {_r}', exc_info=_r)
                 scan_elapsed = time.time() - scan_t0
                 cb_status = '🔴CB' if circuit_open else ''
