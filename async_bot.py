@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v55'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v56'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -103,7 +103,7 @@ PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: �
 # [v47] RANGE BOUNCE — свип границы флэт-диапазона + reclaim + объём. Только shadow.
 RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
 RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
-RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '5.0')) # гейт флэта: ширина диапазона в ATR
+RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '8.0')) # гейт флэта: ширина диапазона в ATR [v56] 5.0→8.0: было тише случайного блуждания (мед. range/ATR≈11.7 на 48 барах), отсекало ~85% символов — временно, ждём эмпирической калибровки по [RB SCAN] логам
 RB_SWEEP_MIN_ATR = float(os.getenv('RB_SWEEP_MIN_ATR', '0.15'))
 RB_SWEEP_MAX_ATR = float(os.getenv('RB_SWEEP_MAX_ATR', '1.0'))
 RB_VOL_MIN       = float(os.getenv('RB_VOL_MIN', '1.5'))
@@ -1753,8 +1753,10 @@ async def pullback_signal(sym: str, btc_ctx: dict):
 #  против выноса, цель — середина/противоположная граница диапазона.
 #  Только виртуальный трекинг, БЕЗ реальной торговли и публикации воркеру.
 # ═══════════════════════════════════════════════════════
-async def rb_signal(sym: str, btc_ctx: dict):
-    """Range Bounce: свип границы N-барного диапазона + reclaim + объём."""
+async def rb_signal(sym: str, btc_ctx: dict, range_stats: list = None):
+    """Range Bounce: свип границы N-барного диапазона + reclaim + объём.
+    range_stats: если передан список — в него добавляется range_w_atr
+    ДО применения гейта флэта (для сбора реального распределения метрики)."""
     try:
         ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=RB_RANGE_BARS + 5)
     except Exception:
@@ -1778,6 +1780,8 @@ async def rb_signal(sym: str, btc_ctx: dict):
     range_high = float(np.max(h[-(RB_RANGE_BARS + 2):-2]))
     range_low  = float(np.min(l[-(RB_RANGE_BARS + 2):-2]))
     range_w_atr = (range_high - range_low) / atr
+    if range_stats is not None:
+        range_stats.append(range_w_atr)
 
     # Гейт флэта: широкий диапазон = трендовый режим, свип-логика не работает
     if range_w_atr > RB_MAX_RANGE_ATR:
@@ -2198,6 +2202,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'be_moved':    False,
         'tp50_hit':    False,
         'tp100_hit':   False,
+        'sl_on_exchange': True,  # [v56] SL создан выше (create_order успешен) — реальный стоп на бирже
         'atr':         atr,
         'adx':         round(float(sig.get('adx', 0)), 1),  # [FIX] sig.get вместо bare adx
         'sl_dist_pct': abs(price - sl) / price * 100,  # для динамического BE/TP50
@@ -2539,18 +2544,35 @@ async def monitor_all():
             if pnl >= tp50_thr_dyn and not pos.get('tp50_hit'):
                 close_qty = round(real_qty * 0.5, 8)
                 remain    = round(real_qty - close_qty, 8)
-                # [FIX] Если 50% округляется в 0 (мелкая позиция) — 
-                # двигаем SL в BE без частичного закрытия
+                # [v56] Принцип: tp50_hit=True ставится ТОЛЬКО после подтверждённого
+                # размещения BE-стопа на бирже. Раньше (мелкая позиция, qty→0) старый
+                # SL отменялся, а новый НИКОГДА не создавался — pos['current_sl']
+                # был чистой in-memory бухгалтерией без реального ордера, и ОБА
+                # таймаута (обычный + smart) отключались флагом tp50_hit=True.
+                # Итог: SL-сделки жили 379мин при лимите 150 и закрывались -1.93%
+                # вместо ~0% на БУ (BOT_SPEC §2.7).
                 if close_qty <= 0 or remain <= 0:
-                    pos['tp50_hit'] = True  # помечаем, чтобы сработал BE
-                    logging.info(f'{sym}: TP50 qty→0 (мелкая поз), только BE без фиксации')
+                    be_price = entry * (1 + sl_dist_pct/100 * 0.2) if is_long else entry * (1 - sl_dist_pct/100 * 0.2)
                     try:
                         if pos.get('sl_order_id'):
                             await exchange.cancel_order(pos['sl_order_id'], sym)
-                        be_price = entry * (1 + sl_dist_pct/100 * 0.2) if is_long else entry * (1 - sl_dist_pct/100 * 0.2)
-                        pos['current_sl'] = be_price
+                        sl_ord = await exchange.create_order(
+                            sym, 'STOP_MARKET', sl_side, real_qty,
+                            params={'positionSide': pos_side,
+                                    'stopPrice': round(be_price, 8),
+                                    'reduceOnly': True}
+                        )
+                        pos.update({'tp50_hit': True, 'be_moved': True,
+                                    'current_sl': be_price, 'sl_order_id': sl_ord['id'],
+                                    'sl_on_exchange': True})
+                        logging.info(f'{sym}: TP50 qty→0 (мелкая поз) — БУ реально выставлен на бирже')
                     except Exception as _e:
-                        logging.warning(f'{sym}: BE move fail: {_e}')
+                        # tp50_hit/be_moved НЕ ставим — позиция остаётся под защитой
+                        # обычного/smart-таймаута вместо БУ, которого физически нет.
+                        pos['sl_on_exchange'] = False
+                        logging.error(f'{sym}: TP50 (мелкая поз) SL НЕ переставлен — '
+                                      f'позиция без БУ, таймаут остаётся активен: {_e}')
+                        await tg(f"🚨 <b>[{strategy}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
                     save_all()
                     return True  # [FIX] continue→return (мы в функции, не в цикле)
                 try:
@@ -2558,10 +2580,19 @@ async def monitor_all():
                         sym, 'market', sl_side, close_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
+                except Exception as e:
+                    # Закрытие 50% не прошло — позиция цела, ничего не менялось,
+                    # tp50_hit всё ещё False → следующий цикл повторит попытку.
+                    logging.error(f"TP50 close_qty error {sym}: {e}")
+                    return True
+                # [v56] Отдельный try: сбой ЗДЕСЬ означает, что 50% УЖЕ закрыто на
+                # бирже, но новый SL(БУ) не подтверждён — tp50_hit/be_moved НЕ
+                # ставим, чтобы позиция осталась под защитой таймаута.
+                be_after_tp50 = entry * 1.0015 if is_long else entry * 0.9985
+                try:
                     if pos.get('sl_order_id'):
                         await exchange.cancel_order(pos['sl_order_id'], sym)
                     # [SA-EXIT] БУ хвоста с учётом 2×комиссии (голый entry = минус на фи)
-                    be_after_tp50 = entry * 1.0015 if is_long else entry * 0.9985
                     sl_ord = await exchange.create_order(
                         sym, 'STOP_MARKET', sl_side, remain,
                         params={'positionSide': pos_side,
@@ -2574,12 +2605,20 @@ async def monitor_all():
                     pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw - tp50_fee
                     pos.update({'tp50_hit': True, 'current_qty': remain,
                                 'sl_order_id': sl_ord['id'], 'be_moved': True,
-                                'current_sl': be_after_tp50})  # [SA-EXIT] БУ ровно в момент TP50
+                                'current_sl': be_after_tp50,  # [SA-EXIT] БУ ровно в момент TP50
+                                'sl_on_exchange': True})
                     save_all()
                     await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
                              f"P&L: +{pnl:.2f}% | {tp50_raw - tp50_fee:+.2f} USDT")
                 except Exception as e:
-                    logging.error(f"TP50 error {sym}: {e}")
+                    # Частичное закрытие УЖЕ прошло на бирже (позиция физически
+                    # уменьшена) — синхронизируем qty, но БУ не подтверждён.
+                    pos['current_qty'] = remain
+                    pos['sl_on_exchange'] = False
+                    save_all()
+                    logging.error(f"[{strategy}] {sym}: SL НЕ переставлен после TP50 close! "
+                                  f"Позиция уменьшена на бирже, БУ не подтверждён: {e}")
+                    await tg(f"🚨 <b>[{strategy}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
 
             # ── [SA-FRONTRUN v38] Защитный БУ при недоходе до VWAP ──
             # Если цена прошла >=80% пути к TP, но не коснулась его — переводим
@@ -2607,7 +2646,8 @@ async def monitor_all():
                                             'reduceOnly': True})
                                 pos.update({'current_sl': be_price,
                                             'sl_order_id': sl_ord['id'],
-                                            'be_moved': True})
+                                            'be_moved': True,
+                                            'sl_on_exchange': True})  # [v56]
                                 save_all()
                                 await tg(f"🛡 <b>[SA] {sym}</b>: фронтран "
                                          f"{peak*100:.0f}% пути к VWAP — SL→БУ "
@@ -2768,6 +2808,15 @@ async def monitor_all():
             mae_pct = abs(float(pos['mae_price']) - entry) / entry * 100
             dur_min = int(seconds / 60)
 
+            # [v56] Отличаем «БУ реально был на бирже» от «БУ только в памяти» —
+            # диагностика на будущее (см. BOT_SPEC §2.7: SL-сделки жили 379мин
+            # при лимите 150 и закрывались -1.93% вместо ~0% на БУ).
+            logging.info(
+                f"{sym}: закрыта | be_moved={pos.get('be_moved', False)} "
+                f"tp50_hit={pos.get('tp50_hit', False)} "
+                f"sl_on_exchange={pos.get('sl_on_exchange', True)}"
+            )
+
             winrate_d = (daily_stats['wins'] / daily_stats['trades'] * 100
                          if daily_stats['trades'] > 0 else 0)
             # [WIN-FIX] тег согласован с is_win — убран конфликт «(TP✓) + 🛑»
@@ -2926,12 +2975,13 @@ async def scan_rb():
     sem  = asyncio.Semaphore(SCAN_SEM)
     st_rb = {k: 0 for k in ['trend_regime', 'no_sweep', 'vol', 'low_rr', 'ok']}
     rb_shadow_n = 0   # фактически записанных shadow-сделок за цикл (после дедупа по диапазону)
+    rb_range_stats = []  # [v56] range_w_atr по ВСЕМ символам, до применения гейта — для калибровки
 
     async def check(sym):
         nonlocal rb_shadow_n
         try:
             async with sem:
-                rsig, rreason = await rb_signal(sym, rb_btc_ctx)
+                rsig, rreason = await rb_signal(sym, rb_btc_ctx, range_stats=rb_range_stats)
             st_rb[rreason] = st_rb.get(rreason, 0) + 1
             if rsig:
                 _rb_key = (sym, rsig['mode'])
@@ -2959,10 +3009,18 @@ async def scan_rb():
                 logging.debug(f'[RB] {sym} error: {type(_re).__name__}: {_re}')
 
     await asyncio.gather(*[check(s) for s in scan])
+    # [v56] Распределение range_w_atr по всем просканированным символам (до гейта) —
+    # для эмпирической калибровки RB_MAX_RANGE_ATR вместо симуляции.
+    if rb_range_stats:
+        _rb_med = float(np.median(rb_range_stats))
+        _rb_p25 = float(np.percentile(rb_range_stats, 25))
+        _rb_dist = f" | range_w_atr med:{_rb_med:.1f} p25:{_rb_p25:.1f}"
+    else:
+        _rb_dist = ""
     logging.info(
         f"[RB SCAN] total:{len(scan)} no_range:{st_rb['trend_regime']} "
         f"no_sweep:{st_rb['no_sweep']} vol:{st_rb['vol']} low_rr:{st_rb['low_rr']} "
-        f"→ SHADOW:{rb_shadow_n}"
+        f"→ SHADOW:{rb_shadow_n}{_rb_dist}"
     )
 
 async def scan_rsi():
@@ -3332,8 +3390,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-01-v55'
+CODE_VERSION = '2026-08-02-v56'
 CHANGELOG = [
+    ('2026-08-02-v56', 'tp50_hit ставится только после подтверждённого размещения BE на бирже (SL-сделки жили 379мин при лимите 150 и закрывались -1.93% — БУ был только в памяти); RB_MAX_RANGE_ATR 5.0→8.0 + логирование распределения range_w_atr для эмпирической калибровки'),
     ('2026-08-01-v55', 'RB вынесен в отдельный круглосуточный сканер (был внутри scan_smc → слеп 56% суток, включая флэтовые азиатские часы); база vol_ratio SA: median вместо mean + исключён измеряемый бар (спайк блокировал вход на 5 часов); [SA SCAN] показывает все нарушенные условия, а не первое'),
     ('2026-07-31-v54', 'риск SA снижен вдвое (1%→0.5%, SA_RISK_MULT=0.5) — edge под вопросом форвардом, SA остаётся live для сбора реальных данных с реальным проскальзыванием, но депозит горит вдвое медленнее. Зеркально в bybit_worker.py (RISK_PCT 2%→0.5%, в 4 раза меньше)'),
     ('2026-07-31-v53', 'fix off-by-one в rb_signal (окно диапазона включало свип-свечу → RB не мог дать сигнал никогда); откат SA_MIN_RR 0.5→0.7 (форвард: 0 побед из 7 при RR<0.7); shadow-логирование отсеянных SA-сетапов для валидации зон vol<1.3 и RR<0.7'),

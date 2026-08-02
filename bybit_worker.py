@@ -71,7 +71,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v54'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v56'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -506,6 +506,7 @@ async def execute_signal(signal: dict):
         )
         logging.info(f"✅ {sym}: market order открыт | id={entry_ord.get('id', '?')}")
         await asyncio.sleep(2.0)  # ждём регистрации позиции
+        sl_placed = False
         try:
             # [FIX-TP50] Устанавливаем ТОЛЬКО SL при открытии.
             # TP убран из trading_stop — он блокировал частичное закрытие (tpslMode:Full
@@ -514,6 +515,7 @@ async def execute_signal(signal: dict):
                     'stopLoss':str(round(sl,8)),'slTriggerBy':'LastPrice','tpslMode':'Full'}
             await exchange.private_post_v5_position_trading_stop(sl_p)
             logging.info(f"✅ {sym}: SL={sl:.6f} (trading_stop, без TP — трейлинг в monitor)")
+            sl_placed = True
         except Exception as _sle:
             logging.warning(f"⚠️ trading_stop: {_sle} — STOP_MARKET fallback")
             try:
@@ -522,6 +524,7 @@ async def execute_signal(signal: dict):
                     'category':'linear','positionIdx':position_idx,
                     'triggerPrice':round(sl,8),'triggerBy':'LastPrice','reduceOnly':True})
                 logging.info(f"✅ {sym}: SL via STOP_MARKET")
+                sl_placed = True
             except Exception as _sle2:
                 logging.error(f"❌ {sym}: SL не установлен! {_sle2}")
                 await tg(f"🚨 <b>{sym}</b>: ПОЗИЦИЯ БЕЗ SL! Закройте вручную!")
@@ -545,6 +548,7 @@ async def execute_signal(signal: dict):
             'mfe_price':         entry,            # [TRAIL] для трейлинга
             'sl_dist_pct':       sl_pct,           # [TP50] для динамического порога
             'atr':               sig_atr,           # [v4] реальный ATR от бота (0 = fallback)
+            'sl_on_exchange':    sl_placed,        # [v56] реальный SL/BE-стоп на бирже
         }
         active_positions.append(rec)
         save_positions()  # [PERSIST] сразу фиксируем открытие — переживёт рестарт
@@ -794,24 +798,28 @@ async def monitor():
                 remain = round(float(pos.get('current_qty', real_qty)) - close_qty, 6)
                 if close_qty <= 0 or remain <= 0:
                     # [v43] Неделимый лот (qty=0.001): partial невозможен физически.
-                    # Раньше ставился только флаг, а SL оставался на -1% → защита не работала.
-                    # Теперь: полный объём остаётся, но SL сразу переводится в БУ на бирже.
-                    pos['tp50_hit'] = True
+                    # [v56] tp50_hit/be_moved ставятся ТОЛЬКО после подтверждённого
+                    # trading_stop — раньше флаг ставился безусловно, а при сбое SL
+                    # оставался на -1% в рассинхроне с памятью (CLAUDE.md §2.7).
                     be_sl = entry * 1.0015 if is_long else entry * 0.9985
                     try:
                         await exchange.private_post_v5_position_trading_stop({
                             'category':'linear','symbol':sym,'positionIdx':0,
                             'stopLoss':str(round(be_sl,8)),
                             'slTriggerBy':'LastPrice','tpslMode':'Full'})
-                        pos['current_sl'] = be_sl
-                        pos['be_moved']   = True
+                        pos['current_sl']     = be_sl
+                        pos['be_moved']       = True
+                        pos['tp50_hit']       = True
+                        pos['sl_on_exchange'] = True
                         logging.info(f"{sym}: TP50 qty→0 (мелкий лот 0.001) — весь объём, SL→БУ {be_sl:.2f}")
                         await tg(
                             f"🛡 <b>[SA] {sym}</b>: лот неделим (0.001) — TP50 пропущен, "
                             f"весь объём под БУ | P&L: +{pnl:.2f}%"
                         )
                     except Exception as _be0:
-                        logging.warning(f"BE (indivisible lot) fail {sym}: {_be0}")
+                        pos['sl_on_exchange'] = False
+                        logging.error(f"BE (indivisible lot) fail {sym}: {_be0} — позиция без БУ, tp50_hit НЕ ставим!")
+                        await tg(f"🚨 <b>[SA] {sym}</b>: SL НЕ переставлен (неделимый лот) — позиция без БУ!")
                 else:
                     try:
                         cl_side = 'sell' if is_long else 'buy'
@@ -819,10 +827,12 @@ async def monitor():
                             sym, 'market', cl_side, close_qty,
                             params={'category':'linear','positionIdx':0,'reduceOnly':True}
                         )
+                    except Exception as e:
+                        logging.error(f"TP50 error {sym}: {e}")
+                    else:
                         # [FIX-PNL] накапливаем зафиксированный USDT от 50%
                         tp50_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
                         pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp50_raw
-                        pos['tp50_hit']   = True
                         pos['current_qty'] = remain
                         logging.info(f"💰 {sym}: TP50 {close_qty} закрыто +{pnl:.2f}% | +{tp50_raw:+.2f}$")
                         # [v39 LOG-STD] формат идентичен BingX + пометка фронтрана
@@ -834,18 +844,24 @@ async def monitor():
                         )
                         # [SA-EXIT] Двигаем SL в БУ на runner-часть с учётом 2×комиссии
                         # (было 0.1% — на грани фи; 0.15% синхронно с async_bot)
+                        # [v56] tp50_hit/be_moved — ТОЛЬКО после подтверждённого trading_stop:
+                        # раньше tp50_hit ставился сразу после закрытия 50%, ДО попытки БУ, и
+                        # при сбое BE-стопа гейт SA smart-timeout (`not tp50_hit`) уже был снят,
+                        # а реальной защиты на бирже не было (CLAUDE.md §2.7).
                         be_sl = entry * 1.0015 if is_long else entry * 0.9985
                         try:
                             await exchange.private_post_v5_position_trading_stop({
                                 'category':'linear','symbol':sym,'positionIdx':0,
                                 'stopLoss':str(round(be_sl,8)),
                                 'slTriggerBy':'LastPrice','tpslMode':'Full'})
-                            pos['current_sl'] = be_sl
-                            pos['be_moved']   = True
+                            pos['current_sl']     = be_sl
+                            pos['be_moved']       = True
+                            pos['tp50_hit']       = True
+                            pos['sl_on_exchange'] = True
                         except Exception as _be:
-                            logging.warning(f"BE after TP50 fail {sym}: {_be}")
-                    except Exception as e:
-                        logging.error(f"TP50 error {sym}: {e}")
+                            pos['sl_on_exchange'] = False
+                            logging.error(f"BE after TP50 fail {sym}: {_be} — SL НЕ переставлен, tp50_hit НЕ ставим!")
+                            await tg(f"🚨 <b>[{pos.get('strategy','?')}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
 
             # ── [SA-FRONTRUN v38] Защитный БУ при недоходе до VWAP ──
             # Прошли >=80% пути к TP, но не коснулись его → остаток в БУ.
@@ -868,6 +884,7 @@ async def monitor():
                                     'slTriggerBy':'LastPrice','tpslMode':'Full'})
                                 pos['current_sl'] = _be
                                 pos['be_moved']   = True
+                                pos['sl_on_exchange'] = True  # [v56]
                                 pos['frontrun_hit'] = True  # [v39] пометка для TP50-лога
                                 # [v39 LOG-STD] P&L в сообщении (был голый технический лог)
                                 await tg(f"🛡 <b>[SA] {sym}</b>: фронтран "
@@ -1003,6 +1020,13 @@ async def monitor():
             logging.info(
                 f"{icon} {sym}: закрыта | entry={entry:.6f} exit={exit_p:.6f} "
                 f"pnl={pnl_pct:+.2f}% ({pnl_usdt_pos:+.2f}$) | {int(secs/60)}мин"
+            )
+            # [v56] Отличаем «БУ реально был на бирже» от «БУ только в памяти» —
+            # диагностика на будущее (см. CLAUDE.md §2.7).
+            logging.info(
+                f"{sym}: be_moved={pos.get('be_moved', False)} "
+                f"tp50_hit={pos.get('tp50_hit', False)} "
+                f"sl_on_exchange={pos.get('sl_on_exchange', True)}"
             )
             await tg(
                 f"{icon} <b>[{pos['strategy']}] {sym}</b> закрыта\n"
