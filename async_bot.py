@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v57'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v58'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -154,6 +154,11 @@ DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] �
 SCAN_LIMIT       = 80       # [EXPAND] 60→80: больше монет, +33% шансов на сетап
 SCAN_SEM         = 60       # [EXPAND] 50→60: больше параллелизма для 80 символов
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
+# [v58] Защита от блокировки входов галлюцинацией AI-оракула (Groq выдавал
+# дословно один текст на разных символах независимо от реальных чисел —
+# для SA/RSI при conf<thr это блокировало реальный вход). AI_BLOCK=0 → оракул
+# всегда advisory (только логируется). Дефолт '1' — поведение не меняется.
+AI_BLOCK_ENABLED = os.getenv('AI_BLOCK', '1') == '1'
 
 # ── Webhook для копи-трейдинга (Bybit Worker и другие) ──────────
 # Когда BingX открывает сделку → POST на воркеры со структурой сигнала
@@ -632,6 +637,44 @@ GROQ_MODELS     = [
     'gemma2-9b-it',             # Google, запасная
 ]
 
+# [v58] Детектор шаблонных ответов оракула: LLM иногда возвращает дословно
+# один и тот же comment на разных символах независимо от факт. чисел сетапа
+# (задокументировано: ADA @ RSI 66.1, XLM, DASH — все получили
+# 'REJECT (100/100) | RSI > 68'). Храним последние 10 (sym, comment).
+_ai_recent_verdicts: list = []
+
+
+def _ai_template_repeat(sym: str, comment: str) -> bool:
+    """[v58] True, если ПОСЛЕДНИЕ 3 вердикта оракула (включая текущий) несут
+    дословно одинаковый comment на >=2 РАЗНЫХ символах — признак шаблонной
+    галлюцинации, а не реального анализа. Пустой comment не считается."""
+    global _ai_recent_verdicts
+    _ai_recent_verdicts.append((sym, comment))
+    del _ai_recent_verdicts[:-10]  # храним последние 10
+    if not comment or not comment.strip():
+        return False
+    if len(_ai_recent_verdicts) < 3:
+        return False
+    last3 = _ai_recent_verdicts[-3:]
+    same_comment = len({c for _, c in last3}) == 1
+    diff_syms    = len({s for s, _ in last3}) >= 2
+    return same_comment and diff_syms
+
+
+def _ai_apply_template_guard(sym: str, result: dict) -> dict:
+    """[v58] Если ответ оракула — шаблонная галлюцинация (см.
+    _ai_template_repeat), помечает result['advisory']=True: вердикт
+    остаётся в логе как есть, но execute() трактует его как НЕ блокирующий
+    для ВСЕХ стратегий (не только SMC)."""
+    comment = str(result.get('comment', ''))
+    if _ai_template_repeat(sym, comment):
+        logging.warning(
+            f'[AI] шаблонный ответ N раз подряд — вердикт понижен до advisory | '
+            f'"{comment}"'
+        )
+        result['advisory'] = True
+    return result
+
 async def oracle_groq(sym: str, strategy: str, mode: str,
                       price: float, extra: dict = None) -> dict:
     """
@@ -870,23 +913,26 @@ async def oracle_ai(sym: str, strategy: str, mode: str,
     Приоритет 3: Локальный скоринг (всегда работает)
     """
     ctx = extra or {}
+    result = None
 
     # 1. Groq
     groq_key = os.getenv('GROQ_API_KEY', '')
     if groq_key and _groq_quota_ok:
         result = await oracle_groq(sym, strategy, mode, price, ctx)
         if result['comment'] not in ('groq_not_set', 'groq_quota_wait', 'groq_all_failed'):
-            return result
+            return _ai_apply_template_guard(sym, result)
+        result = None
 
     # 2. Gemini
     if GEMINI_KEY and _gemini_quota_ok:
         result = await oracle_gemini(sym, strategy, mode, price, ctx)
         if result['comment'] not in ('API not set', 'quota_wait'):
-            return result
+            return _ai_apply_template_guard(sym, result)
+        result = None
 
     # 3. Локальный скоринг
     logging.info(f'📊 [{strategy}] {sym} — AI недоступен, используем локальный скоринг')
-    return score_setup_local(strategy, mode, ctx)
+    return _ai_apply_template_guard(sym, score_setup_local(strategy, mode, ctx))
 
 
 
@@ -2081,8 +2127,13 @@ async def execute(sym: str, sig: dict, strategy: str,
     # Общие лимиты позиций
     all_pos = all_positions()
     if len(all_pos) >= MAX_TOTAL_POS:
+        # [v58] был немой return — сигналы, отсеянные лимитом позиций,
+        # исчезали из логов без следа (см. кейс DASH/USDT).
+        logging.warning(f'[{strategy}] {sym}: всего позиций {len(all_pos)}/{MAX_TOTAL_POS} — пропуск')
         return
-    if sum(1 for p in all_pos if p['direction'] == mode) >= MAX_PER_DIR:
+    _dir_cnt = sum(1 for p in all_pos if p['direction'] == mode)
+    if _dir_cnt >= MAX_PER_DIR:
+        logging.warning(f'[{strategy}] {sym}: позиций в направлении {mode} {_dir_cnt}/{MAX_PER_DIR} — пропуск')
         return
 
     # Запрет хеджа: если BCH Short открыт — BCH Long не открываем (и наоборот)
@@ -2114,8 +2165,15 @@ async def execute(sym: str, sig: dict, strategy: str,
     ai = await oracle_ai(sym, strategy, mode, price, extra_ctx)
     if not ai['ok']:
         thr = 70 if strategy == 'SMC' else 55
+        # [v58] Блокирующий вердикт обходится: (а) SMC-приоритет CHoCH как раньше,
+        # (б) детектор шаблонных ответов пометил ai['advisory'] для ЛЮБОЙ стратегии,
+        # (в) AI_BLOCK=0 — оракул полностью advisory (защита от галлюцинаций).
         if strategy == 'SMC' and ai['conf'] >= 30:
             logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — CHoCH приоритет")
+        elif ai.get('advisory'):
+            logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — шаблонный ответ, не блокирует")
+        elif not AI_BLOCK_ENABLED:
+            logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — AI_BLOCK=0")
         else:
             logging.info(f"[{strategy}] {sym}: AI reject (conf={ai['conf']}/{thr})")
             return
@@ -2128,11 +2186,13 @@ async def execute(sym: str, sig: dict, strategy: str,
         logging.error(f"Balance error: {e}")
         return
     if free_usdt < 50:
+        logging.warning(f'[{strategy}] {sym}: free_usdt ${free_usdt:.2f} < $50 — пропуск')
         return
 
     risk_usdt = free_usdt * current_risk() * risk_mult  # [PB] risk_mult<1 для gated-live
     sl_dist   = abs(price - sl)
     if sl_dist <= 0:
+        logging.warning(f'[{strategy}] {sym}: sl_dist={sl_dist} <= 0 (price={price}, sl={sl}) — пропуск')
         return
 
     # ── [v39] Объём: округление к БЛИЖАЙШЕМУ шагу лота биржи ──────────────
@@ -3429,8 +3489,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-03-v57'
+CODE_VERSION = '2026-08-05-v58'
 CHANGELOG = [
+    ('2026-08-05-v58', 'логирование всех немых return в execute() (сигнал DASH пропал без следа в логах); защита от шаблонных галлюцинаций оракула — повтор одного текста на разных символах понижает вердикт до advisory + ENV AI_BLOCK для полного отключения блокировки'),
     ('2026-08-03-v57', 'median-база объёма для SMC/RSI/PB/RB (v55 починил только SA; mean-база блокировала 94% символов после спайка — причина 0 сделок RSI за всю историю); SA_SHADOW расширен на vwap_far/no_setup + логирование atr_pct/dist_pct для проверки гипотезы о смене режима волатильности'),
     ('2026-08-02-v56', 'tp50_hit ставится только после подтверждённого размещения BE на бирже (SL-сделки жили 379мин при лимите 150 и закрывались -1.93% — БУ был только в памяти); RB_MAX_RANGE_ATR 5.0→8.0 + логирование распределения range_w_atr для эмпирической калибровки'),
     ('2026-08-01-v55', 'RB вынесен в отдельный круглосуточный сканер (был внутри scan_smc → слеп 56% суток, включая флэтовые азиатские часы); база vol_ratio SA: median вместо mean + исключён измеряемый бар (спайк блокировал вход на 5 часов); [SA SCAN] показывает все нарушенные условия, а не первое'),
