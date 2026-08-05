@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v58'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v59'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -2247,11 +2247,39 @@ async def execute(sym: str, sig: dict, strategy: str,
     _margin_pct  = MARGIN_PCT_SA if strategy == 'SA' else MARGIN_PCT_ALT  # [v45] ENV-настраиваемый
     max_notional = free_usdt * LEVERAGE * _margin_pct
     if notional_est > max_notional:
-        logging.warning(
-            f'[{strategy}] {sym}: notional ${notional_est:.1f} > max ${max_notional:.1f} '
-            f'({int(_margin_pct*100)}% маржи × {LEVERAGE}x плечо от ${free_usdt:.0f}) — пропуск'
+        # [v59] Урезаем позицию под лимит вместо отказа от сделки. Риск при
+        # урезании только падает (проп-guard 1.30× выше ловит обратный случай —
+        # превышение риска, а не занижение). Системный конфликт v39/v45:
+        # при MARGIN_PCT_ALT=0.20 × LEVERAGE=5 cap = весь баланс, а риск 1% при
+        # SL на полу MIN_SL_PCT=1.0% даёт notional РОВНО = cap — округление
+        # ROUND вверх (v39) систематически выталкивало за лимит на копейки
+        # (DASH: $75.5 > $75.4, превышение 0.13%) и отклоняло КАЖДУЮ такую сделку.
+        _qty_capped = max_notional / price
+        # округление ТОЛЬКО вниз (TRUNCATE) — иначе снова вылезем за лимит
+        try:
+            if '_mkt' not in dir() or _mkt is None:
+                _mkt = exchange.market(sym)
+            qty_new = float(exchange.decimal_to_precision(
+                _qty_capped, ccxt_async.TRUNCATE, _mkt['precision']['amount'],
+                exchange.precisionMode, exchange.paddingMode))
+        except Exception:
+            qty_new = float(int(_qty_capped * 10000)) / 10000
+        _notional_new = qty_new * price
+        if qty_new <= 0 or (_min_qty and qty_new < _min_qty) or _notional_new < 20:
+            logging.warning(
+                f'[{strategy}] {sym}: после урезания под лимит qty={qty_new} '
+                f'(notional ${_notional_new:.1f}) ниже минимума — пропуск'
+            )
+            return
+        _risk_new = qty_new * sl_dist
+        logging.info(
+            f'[{strategy}] {sym}: notional ${notional_est:.1f} > лимит ${max_notional:.1f} — '
+            f'позиция урезана {qty}→{qty_new} | notional ${_notional_new:.1f} | '
+            f'риск ${risk_usdt:.2f}→${_risk_new:.2f}'
         )
-        return
+        qty = qty_new
+        notional_est = _notional_new
+        risk_usdt = _risk_new     # лог/TG/воркер используют фактический риск
 
     pos_side   = 'LONG'  if mode == 'Long'  else 'SHORT'
     order_side = 'buy'   if mode == 'Long'  else 'sell'
@@ -3489,8 +3517,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-05-v58'
+CODE_VERSION = '2026-08-05-v59'
 CHANGELOG = [
+    ('2026-08-05-v59', 'notional-лимит урезает позицию вместо отказа от сделки (DASH отклонён из-за превышения на $0.10 = 0.13%); при MARGIN_PCT=0.20 × плечо 5 cap равен всему балансу, а риск 1% при SL на полу 1.0% даёт ровно 100% cap → округление вверх из v39 систематически выталкивало за лимит'),
     ('2026-08-05-v58', 'логирование всех немых return в execute() (сигнал DASH пропал без следа в логах); защита от шаблонных галлюцинаций оракула — повтор одного текста на разных символах понижает вердикт до advisory + ENV AI_BLOCK для полного отключения блокировки'),
     ('2026-08-03-v57', 'median-база объёма для SMC/RSI/PB/RB (v55 починил только SA; mean-база блокировала 94% символов после спайка — причина 0 сделок RSI за всю историю); SA_SHADOW расширен на vwap_far/no_setup + логирование atr_pct/dist_pct для проверки гипотезы о смене режима волатильности'),
     ('2026-08-02-v56', 'tp50_hit ставится только после подтверждённого размещения BE на бирже (SL-сделки жили 379мин при лимите 150 и закрывались -1.93% — БУ был только в памяти); RB_MAX_RANGE_ATR 5.0→8.0 + логирование распределения range_w_atr для эмпирической калибровки'),
