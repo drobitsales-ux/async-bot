@@ -71,7 +71,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v56'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v59'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -411,6 +411,22 @@ async def execute_signal(signal: dict):
                     pass
         return round(q, 4)
 
+    def _to_precision_trunc(q: float) -> float:
+        """[v59] Округление ТОЛЬКО ВНИЗ (TRUNCATE) — используется исключительно
+        для урезания qty под notional-лимит ниже: ROUND здесь мог округлить
+        обратно ВВЕРХ и снова вылезти за max_notional_usdt (тот же баг, что
+        чинили в async_bot.py execute() — DASH отклонён из-за превышения на
+        0.13% после ROUND). Основной расчёт qty (_to_precision выше) остаётся
+        ROUND — это корректно (v39), здесь другая точка применения."""
+        if market is not None:
+            try:
+                return float(exchange.decimal_to_precision(
+                    q, ccxt_async.TRUNCATE, market['precision']['amount'],
+                    exchange.precisionMode, exchange.paddingMode))
+            except Exception:
+                pass
+        return float(int(q * 10000)) / 10000
+
     qty = _to_precision(qty_raw)
 
     if qty <= 0:
@@ -424,7 +440,8 @@ async def execute_signal(signal: dict):
     max_notional_usdt = free_usdt * LEVERAGE * _margin_pct
     notional_pre      = qty * entry
     if notional_pre > max_notional_usdt:
-        qty_capped = _to_precision(max_notional_usdt / entry)
+        # [v59] TRUNCATE, не ROUND — иначе округление капа снова вылезает за лимит
+        qty_capped = _to_precision_trunc(max_notional_usdt / entry)
         # [v3] Сравниваем с реальным min_qty биржи, а не с хардкодом 0.01
         if qty_capped < min_qty or qty_capped <= 0:
             logging.warning(
