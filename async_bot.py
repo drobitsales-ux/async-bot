@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v59'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v60'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -101,6 +101,10 @@ PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к E
 PB_RSI_LO    = float(os.getenv('PB_RSI_LO', '40'))       # RSI reset зона: низ
 PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: верх   # лонг только если RSI < этого
 # [v47] RANGE BOUNCE — свип границы флэт-диапазона + reclaim + объём. Только shadow.
+# [v60] КРИТЕРИИ ПРОМОУШЕНА RB Long → микро-live (зафиксированы 07.08 при n=44, PF 2.75,
+# форвард-продолжение 16/20 на новых данных): n>=60, PF>=1.5, Fisher Long-vs-Short
+# p<0.001, нижняя граница Wilson CI WR > 45%. До выполнения ВСЕХ — только shadow.
+# Short RB (PF 0.45, n=36) в live не выводится ни при каких условиях без отдельной валидации.
 RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
 RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
 RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '8.0')) # гейт флэта: ширина диапазона в ATR [v56] 5.0→8.0: было тише случайного блуждания (мед. range/ATR≈11.7 на 48 барах), отсекало ~85% символов — временно, ждём эмпирической калибровки по [RB SCAN] логам
@@ -118,7 +122,11 @@ REPORT_HOUR_UTC = int(os.getenv('REPORT_HOUR_UTC', '19'))
 SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
 SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение от VWAP в ATR для входа
-SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '2.2'))  # [v42] потолок: дальше — импульсная нога, не растяжение
+SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '99'))  # было 2.2 (v42)
+# [v60] откат v42: фильтр вводился на in-sample p=0.007 (не прошёл Бонферрони
+# 0.00067), опорная зона 1.8-2.2 развалилась PF 14.4→1.00, зоны сравнялись
+# (1.00 vs 1.17, p=0.037). Защита от ножей остаётся: vol<=2.0 (Бонферрони OK).
+# ENV позволяет вернуть потолок без деплоя, если SA_SHADOW покажет обратное.
 SA_MIN_RR = float(os.getenv('SA_MIN_RR', '0.7'))
 # [v53] откат 0.5→0.7: форвард дал 0 побед из 7 при RR<0.7.
 # Снижение до 0.5 в v46 опиралось на in-sample WR 74-80% зоны 1.5-2.2 ATR,
@@ -3517,8 +3525,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-05-v59'
+CODE_VERSION = '2026-08-07-v60'
 CHANGELOG = [
+    ('2026-08-07-v60', 'откат потолка vwap_far (in-sample p=0.007 не пережил ни Бонферрони, ни форвард: зоны 1.00 vs 1.17); [SA SCAN] показывает news/window-блокировку (нулевая строка выглядела поломкой); бакеты 5-8 в отчёте RB (60 из 80 сделок были невидимы); критерии промоушена RB Long зафиксированы в коде'),
     ('2026-08-05-v59', 'notional-лимит урезает позицию вместо отказа от сделки (DASH отклонён из-за превышения на $0.10 = 0.13%); при MARGIN_PCT=0.20 × плечо 5 cap равен всему балансу, а риск 1% при SL на полу 1.0% даёт ровно 100% cap → округление вверх из v39 систематически выталкивало за лимит'),
     ('2026-08-05-v58', 'логирование всех немых return в execute() (сигнал DASH пропал без следа в логах); защита от шаблонных галлюцинаций оракула — повтор одного текста на разных символах понижает вердикт до advisory + ENV AI_BLOCK для полного отключения блокировки'),
     ('2026-08-03-v57', 'median-база объёма для SMC/RSI/PB/RB (v55 починил только SA; mean-база блокировала 94% символов после спайка — причина 0 сделок RSI за всю историю); SA_SHADOW расширен на vwap_far/no_setup + логирование atr_pct/dist_pct для проверки гипотезы о смене режима волатильности'),
@@ -3975,8 +3984,10 @@ def shadow_analyze() -> str:
                 parts += _feature(con, strat, 'vol_ratio',
                     [('1.5-2.5x', 1.5, 2.5), ('2.5x+', 2.5, 99)])
                 parts.append('  Ширина диапазона (ATR):')
+                # [v60] +5-6.5/6.5-8: после подъёма гейта RB_MAX_RANGE_ATR до 8.0
+                # старые 2 бакета (<=5) покрывали 20 из 80 сделок — 60 были невидимы.
                 parts += _feature(con, strat, 'range_w_atr',
-                    [('<=3', 0, 3), ('3-5', 3, 5)])
+                    [('<=3', 0, 3), ('3-5', 3, 5), ('5-6.5', 5, 6.5), ('6.5-8', 6.5, 8)])
                 parts.append('  Час входа (UTC):')
                 parts += _feature(con, strat, 'entry_hour',
                     [('00-06h', 0, 6), ('06-12h', 6, 12),
@@ -4700,8 +4711,13 @@ async def main():
                         # [v46] Счётчик причин отсева SA за цикл — раньше только на
                         # DEBUG (слепая зона в проде). Диагностика самодостаточна:
                         # текущие dist/vol/rsi/atr%/rr прямо из single_asset_signal.
+                        # [v60] window/news добавлены в счётчик — раньше эти причины
+                        # (ранний return ДО вычисления цены/ATR, diag={}) не попадали
+                        # в счётчик и печатали фиктивные dist:+0.00 vol:0.00 rsi:0,
+                        # выглядевшие как штатный "чистый" скан.
                         _sa_st = {k: 0 for k in
-                                  ('atr', 'vol_climax', 'vwap_far', 'no_setup', 'low_rr', 'ok')}
+                                  ('window', 'news', 'atr', 'vol_climax', 'vwap_far',
+                                   'no_setup', 'low_rr', 'ok')}
                         _sa_st[_sa_reason] = _sa_st.get(_sa_reason, 0) + 1
                         # [v55] Составной блок: счётчик выше показывает только ПЕРВУЮ
                         # причину отсева (объём проверяется первым в коде), маскируя
@@ -4714,17 +4730,26 @@ async def main():
                                                   ('setup', 'f_setup'))
                             if _sa_diag.get(key, False)
                         ) or '-'
-                        logging.info(
-                            f"[SA SCAN] BTC | atr:{_sa_st['atr']} vol_climax:{_sa_st['vol_climax']} "
+                        _sa_counts_str = (
+                            f"window:{_sa_st['window']} news:{_sa_st['news']} "
+                            f"atr:{_sa_st['atr']} vol_climax:{_sa_st['vol_climax']} "
                             f"vwap_far:{_sa_st['vwap_far']} no_setup:{_sa_st['no_setup']} "
-                            f"low_rr:{_sa_st['low_rr']} → ВХОДЫ:{_sa_st['ok']} | "
-                            f"dist:{_sa_diag.get('dist_atr', 0):+.2f}ATR "
-                            f"vol:{_sa_diag.get('vol_ratio', 0):.2f} "
-                            f"rsi:{_sa_diag.get('rsi', 0):.0f} "
-                            f"atr:{_sa_diag.get('atr_pct', 0):.2f}% "
-                            f"rr:{_sa_diag.get('rr', 0):.2f} "
-                            f"| блок: {_sa_blocked}"
+                            f"low_rr:{_sa_st['low_rr']} → ВХОДЫ:{_sa_st['ok']}"
                         )
+                        if _sa_diag:
+                            logging.info(
+                                f"[SA SCAN] BTC | {_sa_counts_str} | "
+                                f"dist:{_sa_diag.get('dist_atr', 0):+.2f}ATR "
+                                f"vol:{_sa_diag.get('vol_ratio', 0):.2f} "
+                                f"rsi:{_sa_diag.get('rsi', 0):.0f} "
+                                f"atr:{_sa_diag.get('atr_pct', 0):.2f}% "
+                                f"rr:{_sa_diag.get('rr', 0):.2f} "
+                                f"| блок: {_sa_blocked}"
+                            )
+                        else:
+                            # [v60] diag пуст (window/news/fetch_err/no_data) — вместо
+                            # фиктивных dist/vol/rsi печатаем факт. причину раннего выхода.
+                            logging.info(f"[SA SCAN] BTC | {_sa_counts_str} | причина: {_sa_reason}")
                         if _sasig:
                             _sa_live_str = 'LIVE' if SA_LIVE else 'SHADOW'
                             logging.info(
