@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v60'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v61'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -114,6 +114,18 @@ RB_VOL_MIN       = float(os.getenv('RB_VOL_MIN', '1.5'))
 RB_MIN_QUOTE     = float(os.getenv('RB_MIN_QUOTE', '5000'))
 RB_MIN_RR        = float(os.getenv('RB_MIN_RR', '1.0'))        # RR до TP1 (середина диапазона)
 RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
+# [v61] ORB (Asia Range Breakout) — диапазон 00:00-06:00 UTC (азиатская сессия,
+# часто узкая консолидация), пробой торгуется в окне 06:00-12:00 UTC (открытие
+# европейской сессии, приходит объём). Компрессия → пробой, дополняет RB
+# (диапазон → возврат — противоположная ставка). Только shadow.
+# КРИТЕРИИ ПРОМОУШЕНА ORB (зафиксированы до сбора данных): n>=60, PF>=1.5,
+# Fisher Long-vs-Short или vs-50% p<0.001, Wilson CI нижняя граница WR > 45%.
+# До выполнения ВСЕХ — только shadow. Пороги (0.1*ATR, vol 1.5, RR 1.5) НЕ тюнить
+# до n>=60: сначала полный сбор, потом сегментация.
+ORB_ENABLED   = os.getenv('ORB_ENABLED', 'true').lower() == 'true'
+ORB_VOL_MIN   = float(os.getenv('ORB_VOL_MIN', '1.5'))
+ORB_MIN_RR    = float(os.getenv('ORB_MIN_RR', '1.5'))
+ORB_BREAK_ATR = float(os.getenv('ORB_BREAK_ATR', '0.1'))
 # [SHADOW] кулдаун: не пересэмплировать тот же символ+стратегию+направление
 SHADOW_COOLDOWN_BARS = int(os.getenv('SHADOW_COOLDOWN_BARS', '6'))
 # [v18] час отправки 'Итоги дня' (UTC). 19 UTC = 22:00 Киев. Настраивается.
@@ -211,6 +223,7 @@ daily_stats     = {
 news_events     = []       # [float timestamp, ...]
 notified        = {}       # {sym: timestamp}  cooldown 4h
 _rb_last_range  = {}       # [v47] {(sym,mode): (range_low, range_high)} — дедуп по диапазону
+_orb_last_day   = {}       # [v61] {(sym,mode): 'YYYY-MM-DD'} — один вход на символ+направление в сутки
 _sa_shadow_last_ts = 0.0   # [v53] дедуп SA_SHADOW: не чаще 1 записи/60 мин по BTC
 markets_cache   = None
 markets_ts      = 0.0
@@ -1901,6 +1914,105 @@ async def rb_signal(sym: str, btc_ctx: dict, range_stats: list = None):
 
 
 # ═══════════════════════════════════════════════════════
+#  ORB — Asia Range Breakout [shadow, v61]
+#  Диапазон 00:00-06:00 UTC (азиатская сессия, часто узкая консолидация),
+#  пробой торгуется в окне 06:00-12:00 UTC (открытие европейской сессии,
+#  приходит объём). Компрессия → пробой — дополняет RB (диапазон → возврат,
+#  противоположная ставка). Только виртуальный трекинг, БЕЗ реальной торговли.
+# ═══════════════════════════════════════════════════════
+def _orb_in_window() -> bool:
+    """True если текущий час UTC в окне торговли пробоя 06:00-12:00."""
+    h = datetime.now(timezone.utc).hour
+    return 6 <= h < 12
+
+
+async def orb_signal(sym: str, btc_ctx: dict):
+    """Asia Range Breakout: пробой диапазона 00-06 UTC закрытием (не фитилём)
+    в окне 06-12 UTC, с подтверждением объёмом."""
+    if not _orb_in_window():
+        return None, 'no_window'
+    try:
+        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)
+    except Exception:
+        return None, 'fetch_err'
+    if not ohlcv or len(ohlcv) < 30:
+        return None, 'no_data'
+
+    h = np.array([float(x[2]) for x in ohlcv])
+    l = np.array([float(x[3]) for x in ohlcv])
+    c = np.array([float(x[4]) for x in ohlcv])
+    v = np.array([float(x[5]) for x in ohlcv])
+    price = float(c[-1])
+
+    atr = calc_atr(h, l, c)
+    if atr <= 0:
+        return None, 'atr'
+
+    # Диапазон 00:00-06:00 UTC ТЕКУЩИХ суток, только закрытые бары этого окна
+    today = datetime.now(timezone.utc).date()
+    range_bars = [x for x in ohlcv
+                  if datetime.fromtimestamp(x[0] / 1000, timezone.utc).date() == today
+                  and datetime.fromtimestamp(x[0] / 1000, timezone.utc).hour < 6]
+    if len(range_bars) < 20:   # ждём 24 бара на 15m — допускаем небольшой недобор
+        return None, 'no_data'
+
+    orb_high = float(max(x[2] for x in range_bars))
+    orb_low  = float(min(x[3] for x in range_bars))
+    orb_w    = orb_high - orb_low
+    if orb_w <= 0:
+        return None, 'no_data'
+    orb_w_atr = orb_w / atr
+
+    # Пробой закрытием ПОСЛЕДНЕЙ ЗАКРЫТОЙ свечи [-2] — не фитилём, не текущей [-1]
+    cl2 = float(c[-2])
+
+    mode = None
+    if cl2 > orb_high + ORB_BREAK_ATR * atr:
+        mode = 'Long'
+    elif cl2 < orb_low - ORB_BREAK_ATR * atr:
+        mode = 'Short'
+    if not mode:
+        return None, 'no_break'
+
+    # [та же median-база, что RB/SA с v55/v57 — один спайк не должен душить вход]
+    avg_v = float(np.median(v[-22:-2])) if len(v) > 22 else 0.0
+    vol_ratio = float(v[-2]) / avg_v if avg_v > 0 else 0.0
+    quote_vol = float(v[-2]) * price
+    if vol_ratio < ORB_VOL_MIN or quote_vol < 5000:
+        return None, 'vol'
+
+    rsi = calc_rsi(c, RSI_PERIOD)
+
+    # SL — середина диапазона (симметрично для обеих сторон пробоя).
+    # TP1/TP2 — проекция ширины диапазона от пробитой границы. При SL на
+    # середине это конструктивно даёт RR≈2:1 к TP1.
+    sl = (orb_high + orb_low) / 2
+    if mode == 'Long':
+        tp1 = orb_high + orb_w * 1.0
+        tp2 = orb_high + orb_w * 1.5
+    else:
+        tp1 = orb_low - orb_w * 1.0
+        tp2 = orb_low - orb_w * 1.5
+
+    sl_d  = abs(price - sl)
+    tp1_d = abs(tp1 - price)
+    rr = (tp1_d / sl_d) if sl_d > 0 else 0
+    if rr < ORB_MIN_RR:
+        return None, 'low_rr'
+
+    return {
+        'mode': mode, 'sl': sl, 'tp': tp1, 'tp2': tp2, 'atr': atr,
+        'adx': 0.0, 'rsi': rsi, 'vol_ratio': round(vol_ratio, 2),
+        'entry': price,
+        # [reuse] range_w_atr — тот же смысл "ширина релевантного диапазона в
+        # ATR", что у RB; отдельная колонка в БД не нужна.
+        'range_w_atr': round(orb_w_atr, 2),
+        'entry_rr': round(rr, 2),
+        'btc_trend': btc_ctx.get('btc_trend', ''),
+    }, 'ok'
+
+
+# ═══════════════════════════════════════════════════════
 #  SINGLE-ASSET СИГНАЛ [shadow] — mean reversion BTC от VWAP
 #  Гипотеза: BTC внутри дня отклоняется от дневного VWAP и
 #  возвращается к нему. Вход на отклонении N×ATR + RSI-разворот,
@@ -3155,6 +3267,59 @@ async def scan_rb():
         f"→ SHADOW:{rb_shadow_n}{_rb_dist}"
     )
 
+async def scan_orb():
+    """[v61] ORB (Asia Range Breakout) — shadow-сканер, торгуемое окно
+    06:00-12:00 UTC (диапазон формируется 00:00-06:00 UTC). Вне окна не тратим
+    запросы на все 80 символов — одна строка лога в едином формате
+    (no_window=total), без спама и без реальной торговли/publish_to_workers."""
+    if not ORB_ENABLED:
+        return
+    scan = await _scan_universe()
+    if not _orb_in_window():
+        logging.info(
+            f"[ORB SCAN] total:{len(scan)} no_window:{len(scan)} "
+            f"no_break:0 vol:0 low_rr:0 → SHADOW:0"
+        )
+        return
+
+    orb_btc_ctx = await get_btc_context()
+    sem  = asyncio.Semaphore(SCAN_SEM)
+    st_orb = {k: 0 for k in ['no_break', 'vol', 'low_rr', 'ok']}
+    orb_shadow_n = 0
+    today_str = datetime.now(timezone.utc).date().isoformat()
+
+    async def check(sym):
+        nonlocal orb_shadow_n
+        try:
+            async with sem:
+                osig, oreason = await orb_signal(sym, orb_btc_ctx)
+            st_orb[oreason] = st_orb.get(oreason, 0) + 1
+            if osig:
+                # Дедуп: один вход на символ+направление в сутки (пробой
+                # одного диапазона торгуется один раз).
+                _orb_key = (sym, osig['mode'])
+                if _orb_last_day.get(_orb_key) == today_str:
+                    return
+                _orb_last_day[_orb_key] = today_str
+                osig['alt_score'] = orb_btc_ctx.get('alt_score', 0)
+                logging.info(
+                    f"🎯 [ORB SHADOW] {sym} {osig['mode']} @ {osig['rsi']:.0f}rsi "
+                    f"w:{osig['range_w_atr']:.1f}ATR Vol:{osig['vol_ratio']:.1f}x "
+                    f"RR:{osig['entry_rr']:.2f}"
+                )
+                shadow_record(sym, osig['mode'], osig['entry'], osig, orb_btc_ctx, 'ORB')
+                orb_shadow_n += 1
+        except Exception as _oe:
+            st_orb['error'] = st_orb.get('error', 0) + 1
+            if st_orb['error'] <= 2:
+                logging.debug(f'[ORB] {sym} error: {type(_oe).__name__}: {_oe}')
+
+    await asyncio.gather(*[check(s) for s in scan])
+    logging.info(
+        f"[ORB SCAN] total:{len(scan)} no_window:0 no_break:{st_orb['no_break']} "
+        f"vol:{st_orb['vol']} low_rr:{st_orb['low_rr']} → SHADOW:{orb_shadow_n}"
+    )
+
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
     if not check_circuit_breaker():
@@ -3525,8 +3690,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-07-v60'
+CODE_VERSION = '2026-08-09-v61'
 CHANGELOG = [
+    ('2026-08-09-v61', 'новая SHADOW-стратегия ORB Asia-Range-Breakout 00-06 UTC → пробой 06-12 UTC (режим компрессия→пробой, дополняет RB); критерии промоушена зафиксированы до сбора данных; реальная торговля не затронута'),
     ('2026-08-07-v60', 'откат потолка vwap_far (in-sample p=0.007 не пережил ни Бонферрони, ни форвард: зоны 1.00 vs 1.17); [SA SCAN] показывает news/window-блокировку (нулевая строка выглядела поломкой); бакеты 5-8 в отчёте RB (60 из 80 сделок были невидимы); критерии промоушена RB Long зафиксированы в коде'),
     ('2026-08-05-v59', 'notional-лимит урезает позицию вместо отказа от сделки (DASH отклонён из-за превышения на $0.10 = 0.13%); при MARGIN_PCT=0.20 × плечо 5 cap равен всему балансу, а риск 1% при SL на полу 1.0% даёт ровно 100% cap → округление вверх из v39 систематически выталкивало за лимит'),
     ('2026-08-05-v58', 'логирование всех немых return в execute() (сигнал DASH пропал без следа в логах); защита от шаблонных галлюцинаций оракула — повтор одного текста на разных символах понижает вердикт до advisory + ENV AI_BLOCK для полного отключения блокировки'),
@@ -3840,6 +4006,50 @@ async def shadow_check():
                 con.commit(); con.close()
                 continue
 
+            # [ORB v61] Asia Range Breakout: TP1(1.0×ширины)/TP2(1.5×ширины)/
+            # SL(середина диапазона)/таймаут — по wall-clock 18:00 UTC ТОГО ЖЕ
+            # дня открытия (не по числу баров — сделка открывается в разное
+            # время окна 06-12 UTC, держим до конца евро-американской сессии).
+            # Приоритет при пересечении в одном баре: SL > TP2 > TP1.
+            elif strat == 'ORB':
+                _now_orb = datetime.now(timezone.utc)
+                bars_orb = 0
+                try:
+                    _ot = datetime.fromisoformat(open_t)
+                    tf_m = 60 if RSI_TF == '1h' else 15
+                    bars_orb = int((_now_orb - _ot).total_seconds()/60/tf_m)
+                except Exception:
+                    _ot = _now_orb
+                if is_long:
+                    sl_hit  = lo <= sl_p
+                    tp2_hit = hi >= tp2_p
+                    tp1_hit = hi >= tp_p
+                else:
+                    sl_hit  = hi >= sl_p
+                    tp2_hit = lo <= tp2_p
+                    tp1_hit = lo <= tp_p
+                orb_timeout = (_now_orb.date() > _ot.date()) or (_now_orb.hour >= 18)
+                con = sqlite3.connect(TRADES_DB)
+                if sl_hit or tp2_hit or tp1_hit or orb_timeout:
+                    if sl_hit:
+                        exit_p, rsn = sl_p, 'SL'
+                    elif tp2_hit:
+                        exit_p, rsn = tp2_p, 'TP2'
+                    elif tp1_hit:
+                        exit_p, rsn = tp_p, 'TP1'
+                    else:
+                        exit_p, rsn = curr, 'TIMEOUT'
+                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
+                    con.execute(
+                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
+                        "pnl_pct=?,bars_held=? WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl,3),
+                         bars_orb, sid))
+                    logging.info(f"👁 [ORB CLOSE] {sym} {mode} → {rsn} "
+                                 f"PnL: {pnl:+.2f}% ({bars_orb} баров)")
+                con.commit(); con.close()
+                continue
+
             # [BREATHING STOP] Трейлинг включается ТОЛЬКО после +1% профита.
             # До этого работает исходный широкий SL — сделка 'дышит',
             # не выбивается шумом свечи входа (фикс '0 баров' закрытий).
@@ -3948,7 +4158,8 @@ def shadow_analyze() -> str:
         parts = [f'🔬 Анализ {RSI_TF} (closed shadow)']
         # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce).
         # [v53] + SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr, БЕЗ денег)
-        for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('SA_SHADOW', '🎯')]:
+        # [v61] + ORB (Asia Range Breakout, дополняет RB — пробой вместо возврата)
+        for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('ORB', '🎯'), ('SA_SHADOW', '🎯')]:
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
                 (strat,)).fetchone()[0]
@@ -3992,6 +4203,18 @@ def shadow_analyze() -> str:
                 parts += _feature(con, strat, 'entry_hour',
                     [('00-06h', 0, 6), ('06-12h', 6, 12),
                      ('12-18h', 12, 18), ('18-24h', 18, 24)])
+            elif strat == 'ORB':
+                # [v61] range_w_atr здесь = ширина ORB-диапазона (00-06 UTC) в
+                # ATR — переиспользуем колонку RB, отдельная не нужна.
+                parts.append('  Ширина диапазона (ATR):')
+                parts += _feature(con, strat, 'range_w_atr',
+                    [('<=2', 0, 2), ('2-4', 2, 4), ('4+', 4, 999)])
+                parts.append('  Объём:')
+                parts += _feature(con, strat, 'vol_ratio',
+                    [('1.5-2.5x', 1.5, 2.5), ('2.5x+', 2.5, 99)])
+                parts.append('  Час входа (UTC):')
+                parts += _feature(con, strat, 'entry_hour',
+                    [('06-08h', 6, 8), ('08-10h', 8, 10), ('10-12h', 10, 12)])
             elif strat == 'SA_SHADOW':
                 # [v53] Валидация зон, которые реальные фильтры SA никогда не
                 # пускали: нижняя граница объёма 1.3 (§2.5) и RR<0.7 (§2.2)
@@ -4808,12 +5031,13 @@ async def main():
                     scan_smc(),
                     scan_rsi(),
                     scan_rb(),   # [v55] круглосуточно, не гейтится is_session()
+                    scan_orb(),  # [v61] круглосуточно, самогейтится окном 06-12 UTC
                     return_exceptions=True
                 )
                 # Логируем исключения из сканеров (ранее проглатывались молча)
                 for _i, _r in enumerate(results):
                     if isinstance(_r, Exception):
-                        _name = ['scan_smc', 'scan_rsi', 'scan_rb'][_i]
+                        _name = ['scan_smc', 'scan_rsi', 'scan_rb', 'scan_orb'][_i]
                         logging.error(f'❌ {_name} exception: {_r}', exc_info=_r)
                 scan_elapsed = time.time() - scan_t0
                 cb_status = '🔴CB' if circuit_open else ''
