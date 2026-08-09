@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v61'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v62'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -2103,6 +2103,10 @@ async def single_asset_signal(btc_ctx: dict):
     diag['f_vol']   = not (1.3 <= vol_ratio <= 2.0)
     diag['f_dist']  = abs(dist_atr) > SA_ATR_DIST_MAX
     diag['f_setup'] = not (abs(dist_atr) >= SA_ATR_DIST and (rsi <= SA_RSI_LO or rsi >= SA_RSI_HI))
+    # [v62] f_rr отсутствовал в составном флаге — нарушение RR (напр. rr:0.11
+    # при SA_MIN_RR=0.7) не попадало в 'блок:', хотя reason мог оказаться
+    # 'vol_climax'/'vwap_far'/'no_setup', маскируя, что RR ТОЖЕ не пройден бы.
+    diag['f_rr']    = _rr < SA_MIN_RR
 
     # [v53] mode по dist_atr/RSI считается ОДИН раз здесь (та же формула, что
     # была ниже) и переиспользуется реальным путём — порядок и условия ранних
@@ -3690,8 +3694,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-09-v61'
+CODE_VERSION = '2026-08-09-v62'
 CHANGELOG = [
+    ('2026-08-09-v62', 'f_rr включён в составную диагностику блокировок [SA SCAN] (rr:0.11 не отображался в блок:); tp_net в [SA SCAN] — видимость комиссионной жизнеспособности (ATR 0.05-0.08% делает TP-ход меньше round-trip комиссии); проверка/фикс деплоя ORB v61'),
     ('2026-08-09-v61', 'новая SHADOW-стратегия ORB Asia-Range-Breakout 00-06 UTC → пробой 06-12 UTC (режим компрессия→пробой, дополняет RB); критерии промоушена зафиксированы до сбора данных; реальная торговля не затронута'),
     ('2026-08-07-v60', 'откат потолка vwap_far (in-sample p=0.007 не пережил ни Бонферрони, ни форвард: зоны 1.00 vs 1.17); [SA SCAN] показывает news/window-блокировку (нулевая строка выглядела поломкой); бакеты 5-8 в отчёте RB (60 из 80 сделок были невидимы); критерии промоушена RB Long зафиксированы в коде'),
     ('2026-08-05-v59', 'notional-лимит урезает позицию вместо отказа от сделки (DASH отклонён из-за превышения на $0.10 = 0.13%); при MARGIN_PCT=0.20 × плечо 5 cap равен всему балансу, а риск 1% при SL на полу 1.0% даёт ровно 100% cap → округление вверх из v39 систематически выталкивало за лимит'),
@@ -4946,11 +4951,13 @@ async def main():
                         # причину отсева (объём проверяется первым в коде), маскируя
                         # случаи, когда нарушено сразу несколько условий (напр. dist
                         # -4..-5.6 ATR при потолке 2.2 — счётчик покажет vol_climax,
-                        # хотя vwap_far тоже нарушен). Флаги f_vol/f_dist/f_setup
+                        # хотя vwap_far тоже нарушен). Флаги f_vol/f_dist/f_setup/f_rr
                         # считаются в single_asset_signal ДО первого return.
+                        # [v62] +f_rr: rr:0.11 (<SA_MIN_RR) не отображался в 'блок:',
+                        # если reason оказывался vol_climax/vwap_far/no_setup раньше RR.
                         _sa_blocked = '+'.join(
                             lbl for lbl, key in (('vol', 'f_vol'), ('dist', 'f_dist'),
-                                                  ('setup', 'f_setup'))
+                                                  ('setup', 'f_setup'), ('rr', 'f_rr'))
                             if _sa_diag.get(key, False)
                         ) or '-'
                         _sa_counts_str = (
@@ -4960,6 +4967,13 @@ async def main():
                             f"low_rr:{_sa_st['low_rr']} → ВХОДЫ:{_sa_st['ok']}"
                         )
                         if _sa_diag:
+                            # [v62] tp_net — ожидаемый ход до VWAP минус round-trip
+                            # комиссия, % цены. Только диагностика (видимость
+                            # комиссионной нежизнеспособности при низком ATR,
+                            # см. CLAUDE.md/BOT_SPEC) — RR-гейт уже блокирует
+                            # эти состояния корректно, новых гейтов нет.
+                            _sa_tp_net = (_sa_diag.get('dist_atr', 0) * _sa_diag.get('atr_pct', 0)
+                                          - 2 * FEE_RATE * 100)
                             logging.info(
                                 f"[SA SCAN] BTC | {_sa_counts_str} | "
                                 f"dist:{_sa_diag.get('dist_atr', 0):+.2f}ATR "
@@ -4968,6 +4982,7 @@ async def main():
                                 f"atr:{_sa_diag.get('atr_pct', 0):.2f}% "
                                 f"rr:{_sa_diag.get('rr', 0):.2f} "
                                 f"| блок: {_sa_blocked}"
+                                f" | tp_net:{_sa_tp_net:+.2f}%"
                             )
                         else:
                             # [v60] diag пуст (window/news/fetch_err/no_data) — вместо
