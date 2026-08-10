@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v62'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v63'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -105,6 +105,9 @@ PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: �
 # форвард-продолжение 16/20 на новых данных): n>=60, PF>=1.5, Fisher Long-vs-Short
 # p<0.001, нижняя граница Wilson CI WR > 45%. До выполнения ВСЕХ — только shadow.
 # Short RB (PF 0.45, n=36) в live не выводится ни при каких условиях без отдельной валидации.
+# [v63] Проверка при n=61 (10.08): PF 2.51 ✅, n>=60 ✅, НО Fisher p=0.0074 ❌ (порог
+# 0.001), Wilson lower 43.3% ❌ (порог 45%). Порции: 80%→50%→44% — деградация.
+# Промоушен ОТКЛОНЁН. Следующая проверка при n=80. Пороги НЕ смягчать.
 RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
 RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
 RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '8.0')) # гейт флэта: ширина диапазона в ATR [v56] 5.0→8.0: было тише случайного блуждания (мед. range/ATR≈11.7 на 48 барах), отсекало ~85% символов — временно, ждём эмпирической калибровки по [RB SCAN] логам
@@ -3694,8 +3697,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-09-v62'
+CODE_VERSION = '2026-08-10-v63'
 CHANGELOG = [
+    ('2026-08-10-v63', 'сверка/фикс формулы tp_net в [SA SCAN]; вычет round-trip комиссии в shadow-статистике всех стратегий (Avg +0.02..0.13% при комиссии 0.10% давал ложно-положительные PF); зафиксирован отказ в промоушене RB Long при n=61'),
     ('2026-08-09-v62', 'f_rr включён в составную диагностику блокировок [SA SCAN] (rr:0.11 не отображался в блок:); tp_net в [SA SCAN] — видимость комиссионной жизнеспособности (ATR 0.05-0.08% делает TP-ход меньше round-trip комиссии); проверка/фикс деплоя ORB v61'),
     ('2026-08-09-v61', 'новая SHADOW-стратегия ORB Asia-Range-Breakout 00-06 UTC → пробой 06-12 UTC (режим компрессия→пробой, дополняет RB); критерии промоушена зафиксированы до сбора данных; реальная торговля не затронута'),
     ('2026-08-07-v60', 'откат потолка vwap_far (in-sample p=0.007 не пережил ни Бонферрони, ни форвард: зоны 1.00 vs 1.17); [SA SCAN] показывает news/window-блокировку (нулевая строка выглядела поломкой); бакеты 5-8 в отчёте RB (60 из 80 сделок были невидимы); критерии промоушена RB Long зафиксированы в коде'),
@@ -4136,7 +4140,16 @@ def _analyze_feature(con, strategy, col, buckets):
 
 def shadow_analyze() -> str:
     """Мина данных: ищет, какие условия отделяют победителей.
-    ⭐ = PF>1 при выборке >=15 (кандидат в фильтр; проверять форвардом)."""
+    ⭐ = PF>1 при выборке >=15 (кандидат в фильтр; проверять форвардом).
+    [v63] Все pnl_pct читаются NET — минус round-trip комиссия (2×FEE_RATE).
+    Shadow не исполняется на бирже и не платит комиссию физически, но
+    PF/WR без неё систематически оптимистичны (SA_SHADOW показывал PF
+    1.13-3.64 при Avg +0.02..+0.13% — меньше самой комиссии ~0.10%, то
+    есть в реальности зона убыточна). Вычитается ПРИ РАСЧЁТЕ отчёта (в
+    SQL-запросе), БД не переписывается — исторические записи не искажены,
+    /stats_analyze по реальным сделкам (таблица trades) не затронут."""
+    _SHADOW_FEE_PCT = 2 * FEE_RATE * 100  # round-trip комиссия, % цены
+
     def _fmt(label, rows):
         n, wr, avg, pf = _bucket_stats(rows)
         if n == 0:
@@ -4150,7 +4163,7 @@ def shadow_analyze() -> str:
         out = []
         for label, lo, hi in buckets:
             rows = con.execute(
-                f"SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+                f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' "
                 f"AND strategy=? AND {col} >= ? AND {col} < ?",
                 (strat, lo, hi)).fetchall()
             line = _fmt(label, rows)
@@ -4160,7 +4173,7 @@ def shadow_analyze() -> str:
 
     try:
         con = sqlite3.connect(TRADES_DB)
-        parts = [f'🔬 Анализ {RSI_TF} (closed shadow)']
+        parts = [f'🔬 Анализ {RSI_TF} (closed shadow, net — после комиссий)']
         # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce).
         # [v53] + SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr, БЕЗ денег)
         # [v61] + ORB (Asia Range Breakout, дополняет RB — пробой вместо возврата)
@@ -4170,10 +4183,10 @@ def shadow_analyze() -> str:
                 (strat,)).fetchone()[0]
             if total == 0:
                 continue
-            parts.append(f'\n{emoji} {strat} (всего {total})')
+            parts.append(f'\n{emoji} {strat} (всего {total}, net — после комиссий)')
             for d in ('Long', 'Short'):
                 rows = con.execute(
-                    "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+                    f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' "
                     "AND strategy=? AND direction=?", (strat, d)).fetchall()
                 line = _fmt(d, rows)
                 if line:
@@ -4972,7 +4985,12 @@ async def main():
                             # комиссионной нежизнеспособности при низком ATR,
                             # см. CLAUDE.md/BOT_SPEC) — RR-гейт уже блокирует
                             # эти состояния корректно, новых гейтов нет.
-                            _sa_tp_net = (_sa_diag.get('dist_atr', 0) * _sa_diag.get('atr_pct', 0)
+                            # [v63 FIX] dist_atr знаковый (>0 выше VWAP, <0 ниже) —
+                            # без abs() при dist_atr<0 умножение давало ОТРИЦАТЕЛЬНЫЙ
+                            # "ход к VWAP" вместо положительного, tp_net занижался
+                            # на 2×|dist_atr×atr_pct| (напр. dist=-1.62 atr%=0.14:
+                            # было -0.33%, верно +0.13%). Ход до VWAP — это |dist_atr|.
+                            _sa_tp_net = (abs(_sa_diag.get('dist_atr', 0)) * _sa_diag.get('atr_pct', 0)
                                           - 2 * FEE_RATE * 100)
                             logging.info(
                                 f"[SA SCAN] BTC | {_sa_counts_str} | "
