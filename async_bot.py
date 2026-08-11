@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v63'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v64'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -108,6 +108,11 @@ PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: �
 # [v63] Проверка при n=61 (10.08): PF 2.51 ✅, n>=60 ✅, НО Fisher p=0.0074 ❌ (порог
 # 0.001), Wilson lower 43.3% ❌ (порог 45%). Порции: 80%→50%→44% — деградация.
 # Промоушен ОТКЛОНЁН. Следующая проверка при n=80. Пороги НЕ смягчать.
+# [v64] ВАЖНО: все критерии промоушена оцениваются по NET-числам (после комиссий, v63).
+# Проверка при n=71 net: Long PF 1.43 (было gross 2.51). Все бакеты кроме часа 00-06
+# ушли ниже 1.0 после комиссий. RB 00-06h: n=37, WR 57%, PF 2.18 net, но
+# P(>=21 из 37 | монета)=0.26 — НЕ значимо, Бонферрони(16 бакетов) требует p<0.003.
+# Промоушен по-прежнему ОТКЛОНЁН. Следующая проверка при n=100 net. Пороги не смягчать.
 RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
 RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
 RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '8.0')) # гейт флэта: ширина диапазона в ATR [v56] 5.0→8.0: было тише случайного блуждания (мед. range/ATR≈11.7 на 48 барах), отсекало ~85% символов — временно, ждём эмпирической калибровки по [RB SCAN] логам
@@ -161,6 +166,10 @@ SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeo
 # снижен вдвое (1%→0.5% от RISK_PER_TRADE), чтобы вдвое медленнее жечь депозит
 # на время сбора статистики. По образцу PB_RISK_MULT.
 SA_RISK_MULT   = float(os.getenv('SA_RISK_MULT', '0.5'))
+SA_LONG_HTFUP_SHADOW = os.getenv('SA_LONG_HTFUP_SHADOW', '1') == '1'
+# [v64] Long при htf_trend='Up' (n=18, WR 17%, PF 0.21, p=0.012) уводится в shadow:
+# реальных денег не тратим, но продолжаем копить форвард-данные по сегменту.
+# Отключается установкой ENV=0. Решение по восстановлению — при n>=30 в shadow.
 LEVERAGE         = 5
 # [v45] Лимит маржи на сделку, доля депозита. Потолок notional = bal × LEVERAGE × pct.
 # Не влияет на расчёт риска (qty = risk/sl_dist) — только ограничивает сверху.
@@ -2135,6 +2144,10 @@ async def single_asset_signal(btc_ctx: dict):
     # Сетап "осмысленный" хотя бы по одному критерию — не пишем мусорные
     # состояния (цена у VWAP, RSI нейтрален).
     _sa_meaningful = (rsi <= SA_RSI_LO or rsi >= SA_RSI_HI) or abs(dist_atr) >= SA_ATR_DIST
+    # [v64] Диагностический флаг — независим от SA_LONG_HTFUP_SHADOW-тумблера
+    # (виден в 'блок:' даже если реальный увод в shadow отключён через ENV),
+    # показывает, попал бы Long в сегмент htf_trend='Up' (WR 17%, PF 0.21, n=18).
+    diag['f_htfup'] = (mode == 'Long' and btc_ctx.get('htf_slope') == 'Up')
 
     # [v37] Volume window 1.3-2.0x (данные n=16):
     # 1.3-2x: WR 83% PF 9.55 | 2-4x: WR 10% PF 0.02 — выше 2x это кульминация
@@ -2185,6 +2198,17 @@ async def single_asset_signal(btc_ctx: dict):
         _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
                            rsi, btc_ctx, 'low_rr', atr_pct, dist_pct)
         return None, 'low_rr', diag
+
+    # [v64] Long при htf_trend='Up': реальные сделки показали WR 17%/PF 0.21
+    # на n=18 (p=0.012) — половина всех Long-сделок SA лежит в этом сегменте,
+    # обе последние убыточные сделки тоже. Прямой запрет на n=18 повторил бы
+    # ошибку зоны 1.8-2.2 ATR/PB ADX 60+ (решение на недостаточной выборке) —
+    # вместо этого уводим в shadow: денег не тратим, форвард-данные копим до
+    # n>=30. Отключается SA_LONG_HTFUP_SHADOW=0.
+    if mode == 'Long' and btc_ctx.get('htf_slope') == 'Up' and SA_LONG_HTFUP_SHADOW:
+        _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
+                           rsi, btc_ctx, 'htfup_shadow', atr_pct, dist_pct)
+        return None, 'htfup_shadow', diag
 
     return {
         'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
@@ -3662,11 +3686,13 @@ def _init_trades_db():
     # [v53] + dist_atr для SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr)
     # [v57] atr_pct/dist_pct для SA_SHADOW (vwap_far/no_setup) — абсолютные
     # величины, не зависящие от режима ATR, см. §2.4.
+    # [v64] + htf_trend — сегментация SA_SHADOW по наклону EMA200 (Up/Flat/Down),
+    # видимость сегмента Long×Up (n=18, WR 17%, PF 0.21), уведённого в shadow.
     for _scol in ['entry_hour INTEGER DEFAULT -1', 'btc_trend TEXT DEFAULT \'\'',
                   'entry_rr REAL DEFAULT 0', 'range_w_atr REAL DEFAULT 0',
                   'sweep_depth_atr REAL DEFAULT 0', 'tp2_price REAL DEFAULT 0',
                   'dist_atr REAL DEFAULT 0', 'atr_pct REAL DEFAULT 0',
-                  'dist_pct REAL DEFAULT 0']:
+                  'dist_pct REAL DEFAULT 0', 'htf_trend TEXT DEFAULT \'\'']:
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -3697,8 +3723,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-10-v63'
+CODE_VERSION = '2026-08-11-v64'
 CHANGELOG = [
+    ('2026-08-11-v64', 'SA Long при htf_trend=Up уведён в shadow (n=18, WR 17%, PF 0.21 — половина всех лонгов, обе вчерашние убыточные сделки оттуда); критерии промоушена RB пересчитаны на net-числа после v63; диагностика entry_rr без учёта комиссии'),
     ('2026-08-10-v63', 'сверка/фикс формулы tp_net в [SA SCAN]; вычет round-trip комиссии в shadow-статистике всех стратегий (Avg +0.02..0.13% при комиссии 0.10% давал ложно-положительные PF); зафиксирован отказ в промоушене RB Long при n=61'),
     ('2026-08-09-v62', 'f_rr включён в составную диагностику блокировок [SA SCAN] (rr:0.11 не отображался в блок:); tp_net в [SA SCAN] — видимость комиссионной жизнеспособности (ATR 0.05-0.08% делает TP-ход меньше round-trip комиссии); проверка/фикс деплоя ORB v61'),
     ('2026-08-09-v61', 'новая SHADOW-стратегия ORB Asia-Range-Breakout 00-06 UTC → пробой 06-12 UTC (режим компрессия→пробой, дополняет RB); критерии промоушена зафиксированы до сбора данных; реальная торговля не затронута'),
@@ -3872,8 +3899,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
-            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?)",
+            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
@@ -3886,7 +3913,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              float(msig.get('entry_rr', 0)), float(msig.get('range_w_atr', 0)),
              float(msig.get('sweep_depth_atr', 0)), float(msig.get('tp2', 0)),
              float(msig.get('dist_atr', 0)),   # [v53] SA_SHADOW
-             float(msig.get('atr_pct', 0)), float(msig.get('dist_pct', 0))))  # [v57] SA_SHADOW
+             float(msig.get('atr_pct', 0)), float(msig.get('dist_pct', 0)),  # [v57] SA_SHADOW
+             str(btc_ctx.get('htf_slope', ''))))  # [v64] SA_SHADOW htf_trend-сегментация
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -4257,6 +4285,19 @@ def shadow_analyze() -> str:
                 parts += _feature(con, strat, 'dist_pct',
                     [('<0.5', 0, 0.5), ('0.5-1.0', 0.5, 1.0),
                      ('1.0-1.5', 1.0, 1.5), ('1.5+', 1.5, 999)])
+                # [v64] HTF-тренд × направление — видимость сегмента Long×Up
+                # (реальные сделки: n=18, WR 17%, PF 0.21), уведённого в shadow
+                # SA_LONG_HTFUP_SHADOW-тумблером, без реальных денег.
+                parts.append('  HTF-тренд × направление:')
+                for _htf in ('Up', 'Flat', 'Down'):
+                    for _d in ('Long', 'Short'):
+                        rows = con.execute(
+                            f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
+                            "WHERE status='closed' AND strategy=? AND htf_trend=? "
+                            "AND direction=?", (strat, _htf, _d)).fetchall()
+                        line = _fmt(f'{_htf}×{_d}', rows)
+                        if line:
+                            parts.append(line)
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
@@ -4956,28 +4997,33 @@ async def main():
                         # (ранний return ДО вычисления цены/ATR, diag={}) не попадали
                         # в счётчик и печатали фиктивные dist:+0.00 vol:0.00 rsi:0,
                         # выглядевшие как штатный "чистый" скан.
+                        # [v64] +htfup_shadow — Long при htf_trend='Up' (n=18 real,
+                        # WR 17%, PF 0.21) уводится в SA_SHADOW, а не блокируется.
                         _sa_st = {k: 0 for k in
                                   ('window', 'news', 'atr', 'vol_climax', 'vwap_far',
-                                   'no_setup', 'low_rr', 'ok')}
+                                   'no_setup', 'low_rr', 'htfup_shadow', 'ok')}
                         _sa_st[_sa_reason] = _sa_st.get(_sa_reason, 0) + 1
                         # [v55] Составной блок: счётчик выше показывает только ПЕРВУЮ
                         # причину отсева (объём проверяется первым в коде), маскируя
                         # случаи, когда нарушено сразу несколько условий (напр. dist
                         # -4..-5.6 ATR при потолке 2.2 — счётчик покажет vol_climax,
-                        # хотя vwap_far тоже нарушен). Флаги f_vol/f_dist/f_setup/f_rr
-                        # считаются в single_asset_signal ДО первого return.
+                        # хотя vwap_far тоже нарушен). Флаги f_vol/f_dist/f_setup/f_rr/
+                        # f_htfup считаются в single_asset_signal ДО первого return.
                         # [v62] +f_rr: rr:0.11 (<SA_MIN_RR) не отображался в 'блок:',
                         # если reason оказывался vol_climax/vwap_far/no_setup раньше RR.
+                        # [v64] +f_htfup: видно даже если реальный увод отключён ENV.
                         _sa_blocked = '+'.join(
                             lbl for lbl, key in (('vol', 'f_vol'), ('dist', 'f_dist'),
-                                                  ('setup', 'f_setup'), ('rr', 'f_rr'))
+                                                  ('setup', 'f_setup'), ('rr', 'f_rr'),
+                                                  ('htfup', 'f_htfup'))
                             if _sa_diag.get(key, False)
                         ) or '-'
                         _sa_counts_str = (
                             f"window:{_sa_st['window']} news:{_sa_st['news']} "
                             f"atr:{_sa_st['atr']} vol_climax:{_sa_st['vol_climax']} "
                             f"vwap_far:{_sa_st['vwap_far']} no_setup:{_sa_st['no_setup']} "
-                            f"low_rr:{_sa_st['low_rr']} → ВХОДЫ:{_sa_st['ok']}"
+                            f"low_rr:{_sa_st['low_rr']} htfup_shadow:{_sa_st['htfup_shadow']} "
+                            f"→ ВХОДЫ:{_sa_st['ok']}"
                         )
                         if _sa_diag:
                             # [v62] tp_net — ожидаемый ход до VWAP минус round-trip
