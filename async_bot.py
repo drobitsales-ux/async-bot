@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v64'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v65'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -113,6 +113,10 @@ PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: �
 # ушли ниже 1.0 после комиссий. RB 00-06h: n=37, WR 57%, PF 2.18 net, но
 # P(>=21 из 37 | монета)=0.26 — НЕ значимо, Бонферрони(16 бакетов) требует p<0.003.
 # Промоушен по-прежнему ОТКЛОНЁН. Следующая проверка при n=100 net. Пороги не смягчать.
+# [v65] РАСПАД ПОДТВЕРЖДЁН при n=95 net: Long PF 1.43→1.03, час 00-06 PF 2.18→1.44
+# (P=0.50, монета). Траектория gross 2.75→2.66→2.51 → net 1.03 — профиль PB.
+# RB СНЯТА с рассмотрения как кандидат в live. Остаётся в shadow только как источник
+# данных. Возврат к вопросу — не ранее n=300 и только при PF net >= 1.3 устойчиво.
 RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
 RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
 RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '8.0')) # гейт флэта: ширина диапазона в ATR [v56] 5.0→8.0: было тише случайного блуждания (мед. range/ATR≈11.7 на 48 барах), отсекало ~85% символов — временно, ждём эмпирической калибровки по [RB SCAN] логам
@@ -130,6 +134,11 @@ RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
 # Fisher Long-vs-Short или vs-50% p<0.001, Wilson CI нижняя граница WR > 45%.
 # До выполнения ВСЕХ — только shadow. Пороги (0.1*ATR, vol 1.5, RR 1.5) НЕ тюнить
 # до n>=60: сначала полный сбор, потом сегментация.
+# [v65] Наблюдение: первый сигнал по времени пробоя — час 06-08 PF 0.14 (n=12),
+# 08-10 PF 0.31 (n=6), 10-12 PF 6.18 (n=8, WR 75%). n мал, ФИЛЬТР ПО ВРЕМЕНИ НЕ
+# ВВОДИТСЯ. Порог действия по ЛЮБОМУ сегменту ORB (включая час/minutes_since_
+# range_end): n>=30 В БАКЕТЕ И p<0.001 (Бонферрони на ~15 бакетов ORB в отчёте).
+# До выполнения — сегмент остаётся наблюдением, не фильтром.
 ORB_ENABLED   = os.getenv('ORB_ENABLED', 'true').lower() == 'true'
 ORB_VOL_MIN   = float(os.getenv('ORB_VOL_MIN', '1.5'))
 ORB_MIN_RR    = float(os.getenv('ORB_MIN_RR', '1.5'))
@@ -1968,6 +1977,14 @@ async def orb_signal(sym: str, btc_ctx: dict):
     if len(range_bars) < 20:   # ждём 24 бара на 15m — допускаем небольшой недобор
         return None, 'no_data'
 
+    # [v65] Минуты от конца диапазона (06:00 UTC) до текущего входа — прямая
+    # проверка гипотезы "чем позже пробой после открытия EU-ликвидности, тем
+    # надёжнее", независимо от календарного часа (окно 06-12 UTC само по себе
+    # неоднородно: первый осмысленный сигнал 06-08 PF 0.14 vs 10-12 PF 6.18).
+    _now_utc = datetime.now(timezone.utc)
+    _range_end = _now_utc.replace(hour=6, minute=0, second=0, microsecond=0)
+    minutes_since_range_end = (_now_utc - _range_end).total_seconds() / 60
+
     orb_high = float(max(x[2] for x in range_bars))
     orb_low  = float(min(x[3] for x in range_bars))
     orb_w    = orb_high - orb_low
@@ -2021,6 +2038,7 @@ async def orb_signal(sym: str, btc_ctx: dict):
         'range_w_atr': round(orb_w_atr, 2),
         'entry_rr': round(rr, 2),
         'btc_trend': btc_ctx.get('btc_trend', ''),
+        'minutes_since_range_end': round(minutes_since_range_end, 1),  # [v65]
     }, 'ok'
 
 
@@ -3688,11 +3706,15 @@ def _init_trades_db():
     # величины, не зависящие от режима ATR, см. §2.4.
     # [v64] + htf_trend — сегментация SA_SHADOW по наклону EMA200 (Up/Flat/Down),
     # видимость сегмента Long×Up (n=18, WR 17%, PF 0.21), уведённого в shadow.
+    # [v65] + minutes_since_range_end — для ORB, проверка гипотезы "чем позже
+    # пробой после конца диапазона (06:00 UTC), тем надёжнее", независимо
+    # от календарного часа.
     for _scol in ['entry_hour INTEGER DEFAULT -1', 'btc_trend TEXT DEFAULT \'\'',
                   'entry_rr REAL DEFAULT 0', 'range_w_atr REAL DEFAULT 0',
                   'sweep_depth_atr REAL DEFAULT 0', 'tp2_price REAL DEFAULT 0',
                   'dist_atr REAL DEFAULT 0', 'atr_pct REAL DEFAULT 0',
-                  'dist_pct REAL DEFAULT 0', 'htf_trend TEXT DEFAULT \'\'']:
+                  'dist_pct REAL DEFAULT 0', 'htf_trend TEXT DEFAULT \'\'',
+                  'minutes_since_range_end REAL DEFAULT 0']:
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -3723,8 +3745,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-11-v64'
+CODE_VERSION = '2026-08-13-v65'
 CHANGELOG = [
+    ('2026-08-13-v65', 'зафиксирован распад RB (Long PF net 1.43→1.03, час 00-06 2.18→1.44 — снята с рассмотрения); детальная сегментация ORB по времени пробоя (10-12h PF 6.18 при n=8 — наблюдение); диагностика entry_rr без комиссии — все 10 live-сделок с RR убыточны'),
     ('2026-08-11-v64', 'SA Long при htf_trend=Up уведён в shadow (n=18, WR 17%, PF 0.21 — половина всех лонгов, обе вчерашние убыточные сделки оттуда); критерии промоушена RB пересчитаны на net-числа после v63; диагностика entry_rr без учёта комиссии'),
     ('2026-08-10-v63', 'сверка/фикс формулы tp_net в [SA SCAN]; вычет round-trip комиссии в shadow-статистике всех стратегий (Avg +0.02..0.13% при комиссии 0.10% давал ложно-положительные PF); зафиксирован отказ в промоушене RB Long при n=61'),
     ('2026-08-09-v62', 'f_rr включён в составную диагностику блокировок [SA SCAN] (rr:0.11 не отображался в блок:); tp_net в [SA SCAN] — видимость комиссионной жизнеспособности (ATR 0.05-0.08% делает TP-ход меньше round-trip комиссии); проверка/фикс деплоя ORB v61'),
@@ -3899,8 +3922,9 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
-            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend,"
+            "minutes_since_range_end) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
@@ -3914,7 +3938,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              float(msig.get('sweep_depth_atr', 0)), float(msig.get('tp2', 0)),
              float(msig.get('dist_atr', 0)),   # [v53] SA_SHADOW
              float(msig.get('atr_pct', 0)), float(msig.get('dist_pct', 0)),  # [v57] SA_SHADOW
-             str(btc_ctx.get('htf_slope', ''))))  # [v64] SA_SHADOW htf_trend-сегментация
+             str(btc_ctx.get('htf_slope', '')),  # [v64] SA_SHADOW htf_trend-сегментация
+             float(msig.get('minutes_since_range_end', 0))))  # [v65] ORB
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -4258,9 +4283,21 @@ def shadow_analyze() -> str:
                 parts.append('  Объём:')
                 parts += _feature(con, strat, 'vol_ratio',
                     [('1.5-2.5x', 1.5, 2.5), ('2.5x+', 2.5, 99)])
+                # [v65] Часовые бакеты сужены до 1ч (было 06-08/08-10/10-12) —
+                # первый осмысленный сигнал показал перепад внутри старых
+                # бакетов (06-08 PF 0.14 vs 10-12 PF 6.18, n мал) — точнее
+                # видно границу перехода "тонкий рынок → EU-ликвидность".
                 parts.append('  Час входа (UTC):')
                 parts += _feature(con, strat, 'entry_hour',
-                    [('06-08h', 6, 8), ('08-10h', 8, 10), ('10-12h', 10, 12)])
+                    [('06-07h', 6, 7), ('07-08h', 7, 8), ('08-09h', 8, 9),
+                     ('09-10h', 9, 10), ('10-11h', 10, 11), ('11-12h', 11, 12)])
+                # [v65] minutes_since_range_end — прямая проверка гипотезы
+                # "чем позже пробой после 06:00 UTC, тем надёжнее" независимо
+                # от календарного часа (час входа неоднороден внутри себя).
+                parts.append('  Минут от конца диапазона (06:00 UTC):')
+                parts += _feature(con, strat, 'minutes_since_range_end',
+                    [('0-60', 0, 60), ('60-120', 60, 120), ('120-180', 120, 180),
+                     ('180-240', 180, 240), ('240+', 240, 9999)])
             elif strat == 'SA_SHADOW':
                 # [v53] Валидация зон, которые реальные фильтры SA никогда не
                 # пускали: нижняя граница объёма 1.3 (§2.5) и RR<0.7 (§2.2)
