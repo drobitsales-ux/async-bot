@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v65'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v66'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -139,6 +139,12 @@ RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
 # ВВОДИТСЯ. Порог действия по ЛЮБОМУ сегменту ORB (включая час/minutes_since_
 # range_end): n>=30 В БАКЕТЕ И p<0.001 (Бонферрони на ~15 бакетов ORB в отчёте).
 # До выполнения — сегмент остаётся наблюдением, не фильтром.
+# [v66] Форвард n=26→96: Long PF 0.71→1.86, Short 0.60→1.01. Ключевой срез —
+# минуты от конца диапазона: 0-60 PF 0.65 (n=43) vs 60+ PF 1.38-6.43 (n=53),
+# Fisher p=0.054 (Бонферрони требует 0.0028 — НЕ пройден). Механика: ранний пробой
+# в тонком рынке ложный, после притока EU-ликвидности — истинный.
+# Действие при: n>=60 в бакете 60+ И p<0.003. Тогда — гейт ORB_MIN_DELAY_MIN=60.
+# Промоушен в live: n>=100 суммарно, PF net>=1.5, p<0.001. Сейчас НЕ пройден.
 ORB_ENABLED   = os.getenv('ORB_ENABLED', 'true').lower() == 'true'
 ORB_VOL_MIN   = float(os.getenv('ORB_VOL_MIN', '1.5'))
 ORB_MIN_RR    = float(os.getenv('ORB_MIN_RR', '1.5'))
@@ -179,6 +185,10 @@ SA_LONG_HTFUP_SHADOW = os.getenv('SA_LONG_HTFUP_SHADOW', '1') == '1'
 # [v64] Long при htf_trend='Up' (n=18, WR 17%, PF 0.21, p=0.012) уводится в shadow:
 # реальных денег не тратим, но продолжаем копить форвард-данные по сегменту.
 # Отключается установкой ENV=0. Решение по восстановлению — при n>=30 в shadow.
+SA_SHORT_HTFUP_SHADOW = os.getenv('SA_SHORT_HTFUP_SHADOW', '1') == '1'
+# [v66] Short при htf_trend='Up' — зеркало v64. Шорт против растущего HTF: серия
+# из 3 SL подряд 21.08 (circuit breaker -3.12%), Short/BTC-Long PF 1.74→0.86.
+# Уводится в shadow: денег не тратим, данные копим. ENV=0 отключает.
 LEVERAGE         = 5
 # [v45] Лимит маржи на сделку, доля депозита. Потолок notional = bal × LEVERAGE × pct.
 # Не влияет на расчёт риска (qty = risk/sl_dist) — только ограничивает сверху.
@@ -673,8 +683,13 @@ _groq_req_times: list = []
 _groq_quota_ok  = True
 _groq_quota_reset: float = 0.0
 GROQ_RPM        = 25    # запас от лимита 30/min
+# [v66] Основная модель вынесена в ENV — 08.2026 llama-3.1-8b-instant начала
+# возвращать 404 на всех запросах (Groq деприкейтил/переименовал модель),
+# оракул молча работал fail-open несколько суток без единого алерта (см.
+# детектор устойчивого отказа ниже). Актуальное имя задаётся без деплоя.
+GROQ_MODEL      = os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')
 GROQ_MODELS     = [
-    'llama-3.1-8b-instant',     # очень быстро (~100ms)
+    GROQ_MODEL,                  # [v66] ENV-настраиваемая основная модель
     'llama-3.3-70b-versatile',  # лучшее качество
     'gemma2-9b-it',             # Google, запасная
 ]
@@ -946,6 +961,40 @@ def score_setup_local(strategy: str, mode: str, extra: dict) -> dict:
 
 
 # ── Единый каскадный AI Oracle ───────────────────────────────
+# [v66] Детектор устойчивого отказа оракула. Технические ошибки Gemini
+# ('no candidates: code=404', 'daily_quota_bypass') возвращаются с ok=True
+# (fail-open — намеренно, чтобы не останавливать торговлю целиком), из-за
+# чего execute() их не отличает от реального одобрения: сигналы месяцами
+# могли не фильтроваться ИИ БЕЗ единого уведомления (задокументировано:
+# 'AI(Groq): 0/100 | no candidates: code=404' на всех сделках подряд).
+# Сама fail-open логика НЕ меняется — только видимость её причины.
+_AI_FAIL_STREAK_N = 5
+_ai_error_streak = 0
+_ai_error_alerted = False
+
+
+async def _ai_finalize(sym: str, result: dict) -> dict:
+    """Считает подряд идущие технические отказы оракула (не реальные
+    вердикты). При N подряд — ERROR в лог + ОДНО TG-уведомление (не на
+    каждый скан). Сбрасывается первым же нормальным ответом (реальный
+    вердикт Groq/Gemini ИЛИ рабочий LocalScore-фолбэк — оба не 'ошибка')."""
+    global _ai_error_streak, _ai_error_alerted
+    comment = str(result.get('comment', ''))
+    is_error = comment.startswith('no candidates:') or comment == 'daily_quota_bypass'
+    if is_error:
+        _ai_error_streak += 1
+        if _ai_error_streak >= _AI_FAIL_STREAK_N and not _ai_error_alerted:
+            _ai_error_alerted = True
+            _msg = (f'🚨 [AI] Оракул недоступен {_ai_error_streak} запросов подряд '
+                    f'({comment}). Работает fail-open — сигналы НЕ фильтруются ИИ.')
+            logging.error(_msg)
+            await tg(_msg)
+    else:
+        _ai_error_streak = 0
+        _ai_error_alerted = False
+    return result
+
+
 async def oracle_ai(sym: str, strategy: str, mode: str,
                     price: float, extra: dict = None) -> dict:
     """
@@ -962,19 +1011,19 @@ async def oracle_ai(sym: str, strategy: str, mode: str,
     if groq_key and _groq_quota_ok:
         result = await oracle_groq(sym, strategy, mode, price, ctx)
         if result['comment'] not in ('groq_not_set', 'groq_quota_wait', 'groq_all_failed'):
-            return _ai_apply_template_guard(sym, result)
+            return await _ai_finalize(sym, _ai_apply_template_guard(sym, result))
         result = None
 
     # 2. Gemini
     if GEMINI_KEY and _gemini_quota_ok:
         result = await oracle_gemini(sym, strategy, mode, price, ctx)
         if result['comment'] not in ('API not set', 'quota_wait'):
-            return _ai_apply_template_guard(sym, result)
+            return await _ai_finalize(sym, _ai_apply_template_guard(sym, result))
         result = None
 
     # 3. Локальный скоринг
     logging.info(f'📊 [{strategy}] {sym} — AI недоступен, используем локальный скоринг')
-    return _ai_apply_template_guard(sym, score_setup_local(strategy, mode, ctx))
+    return await _ai_finalize(sym, _ai_apply_template_guard(sym, score_setup_local(strategy, mode, ctx)))
 
 
 
@@ -2166,6 +2215,9 @@ async def single_asset_signal(btc_ctx: dict):
     # (виден в 'блок:' даже если реальный увод в shadow отключён через ENV),
     # показывает, попал бы Long в сегмент htf_trend='Up' (WR 17%, PF 0.21, n=18).
     diag['f_htfup'] = (mode == 'Long' and btc_ctx.get('htf_slope') == 'Up')
+    # [v66] Зеркало: Short ПРОТИВ растущего HTF (htf_trend='Up', НЕ 'Down' —
+    # шорт против растущей EMA200, контртренд). Short/BTC-Long PF 1.74→0.86.
+    diag['f_htfup_short'] = (mode == 'Short' and btc_ctx.get('htf_slope') == 'Up')
 
     # [v37] Volume window 1.3-2.0x (данные n=16):
     # 1.3-2x: WR 83% PF 9.55 | 2-4x: WR 10% PF 0.02 — выше 2x это кульминация
@@ -2227,6 +2279,18 @@ async def single_asset_signal(btc_ctx: dict):
         _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
                            rsi, btc_ctx, 'htfup_shadow', atr_pct, dist_pct)
         return None, 'htfup_shadow', diag
+
+    # [v66] Зеркало v64: Short при htf_trend='Up' (шорт ПРОТИВ растущего HTF,
+    # НЕ 'Down' — проверено дважды, знак направления здесь стоит денег).
+    # Форвард: Short PF 2.12→1.01 (n=26→37), Short/BTC-Long (контртренд)
+    # PF 1.74→0.86 (n=36), Short+SL avg -1.23%→-2.42%. 21.08: три шорта
+    # подряд в SL при росте BTC → circuit breaker (-3.12%). Уводим в shadow
+    # по тому же принципу — деньги не тратим, форвард-данные копим до n>=30.
+    # Отключается SA_SHORT_HTFUP_SHADOW=0.
+    if mode == 'Short' and btc_ctx.get('htf_slope') == 'Up' and SA_SHORT_HTFUP_SHADOW:
+        _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
+                           rsi, btc_ctx, 'htfup_short_shadow', atr_pct, dist_pct)
+        return None, 'htfup_short_shadow', diag
 
     return {
         'mode': mode, 'sl': sl, 'tp': tp, 'atr': atr,
@@ -3745,8 +3809,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-13-v65'
+CODE_VERSION = '2026-08-23-v66'
 CHANGELOG = [
+    ('2026-08-23-v66', 'TG-алерт при пропуске по min_lot на Bybit (проп-счёт 4 дня молча не торговал: риск 0.5% + BTC 78k → qty 0.00049 < 0.001); детектор отказа AI-оракула (404 на всех запросах, llama-3.1-8b недоступна) + GROQ_MODEL в ENV; SA Short при htf_trend=Up уведён в shadow — зеркало v64 (3 SL подряд → circuit breaker); зафиксировано форвард-подтверждение ORB'),
     ('2026-08-13-v65', 'зафиксирован распад RB (Long PF net 1.43→1.03, час 00-06 2.18→1.44 — снята с рассмотрения); детальная сегментация ORB по времени пробоя (10-12h PF 6.18 при n=8 — наблюдение); диагностика entry_rr без комиссии — все 10 live-сделок с RR убыточны'),
     ('2026-08-11-v64', 'SA Long при htf_trend=Up уведён в shadow (n=18, WR 17%, PF 0.21 — половина всех лонгов, обе вчерашние убыточные сделки оттуда); критерии промоушена RB пересчитаны на net-числа после v63; диагностика entry_rr без учёта комиссии'),
     ('2026-08-10-v63', 'сверка/фикс формулы tp_net в [SA SCAN]; вычет round-trip комиссии в shadow-статистике всех стратегий (Avg +0.02..0.13% при комиссии 0.10% давал ложно-положительные PF); зафиксирован отказ в промоушене RB Long при n=61'),
@@ -5036,23 +5101,28 @@ async def main():
                         # выглядевшие как штатный "чистый" скан.
                         # [v64] +htfup_shadow — Long при htf_trend='Up' (n=18 real,
                         # WR 17%, PF 0.21) уводится в SA_SHADOW, а не блокируется.
+                        # [v66] +htfup_short_shadow — зеркало для Short (см. f_htfup_short).
                         _sa_st = {k: 0 for k in
                                   ('window', 'news', 'atr', 'vol_climax', 'vwap_far',
-                                   'no_setup', 'low_rr', 'htfup_shadow', 'ok')}
+                                   'no_setup', 'low_rr', 'htfup_shadow',
+                                   'htfup_short_shadow', 'ok')}
                         _sa_st[_sa_reason] = _sa_st.get(_sa_reason, 0) + 1
                         # [v55] Составной блок: счётчик выше показывает только ПЕРВУЮ
                         # причину отсева (объём проверяется первым в коде), маскируя
                         # случаи, когда нарушено сразу несколько условий (напр. dist
                         # -4..-5.6 ATR при потолке 2.2 — счётчик покажет vol_climax,
                         # хотя vwap_far тоже нарушен). Флаги f_vol/f_dist/f_setup/f_rr/
-                        # f_htfup считаются в single_asset_signal ДО первого return.
+                        # f_htfup/f_htfup_short считаются в single_asset_signal ДО
+                        # первого return.
                         # [v62] +f_rr: rr:0.11 (<SA_MIN_RR) не отображался в 'блок:',
                         # если reason оказывался vol_climax/vwap_far/no_setup раньше RR.
                         # [v64] +f_htfup: видно даже если реальный увод отключён ENV.
+                        # [v66] +f_htfup_short: зеркало для Short.
                         _sa_blocked = '+'.join(
                             lbl for lbl, key in (('vol', 'f_vol'), ('dist', 'f_dist'),
                                                   ('setup', 'f_setup'), ('rr', 'f_rr'),
-                                                  ('htfup', 'f_htfup'))
+                                                  ('htfup', 'f_htfup'),
+                                                  ('htfup_short', 'f_htfup_short'))
                             if _sa_diag.get(key, False)
                         ) or '-'
                         _sa_counts_str = (
@@ -5060,6 +5130,7 @@ async def main():
                             f"atr:{_sa_st['atr']} vol_climax:{_sa_st['vol_climax']} "
                             f"vwap_far:{_sa_st['vwap_far']} no_setup:{_sa_st['no_setup']} "
                             f"low_rr:{_sa_st['low_rr']} htfup_shadow:{_sa_st['htfup_shadow']} "
+                            f"htfup_short_shadow:{_sa_st['htfup_short_shadow']} "
                             f"→ ВХОДЫ:{_sa_st['ok']}"
                         )
                         if _sa_diag:
