@@ -71,7 +71,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v59'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v66'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -136,10 +136,12 @@ daily_smc        = 0    # SMC сделок за день
 daily_rsi        = 0    # RSI сделок за день
 daily_sa         = 0    # [v24] SA сделок за день
 daily_be_closes  = 0    # BE-закрытий за день (0.1% < pnl < 0.5%)
+daily_min_lot_skips = 0  # [v66] пропусков сделок по min_lot за день
 day_start_bal    = 0.0
 day_start_time   = time.time()
 circuit_open     = False
 _daily_report_sent = False
+_min_lot_alert_sent = {}  # [v66] {symbol: 'YYYY-MM-DD'} — TG-алерт раз/сутки/символ
 http_session     = None
 _signal_queue: asyncio.Queue = None
 
@@ -258,7 +260,7 @@ def _register_close(pos: dict, pnl_pct: float, pnl_usdt: float):
 
 def check_daily_reset() -> bool:
     """True — только в цикле, где произошла смена суток (вызвавшая сброс)."""
-    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
+    global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins, daily_smc, daily_rsi, daily_sa, daily_be_closes, daily_min_lot_skips, day_start_time, circuit_open, _daily_report_sent, _last_reset_date
     today = datetime.now(timezone.utc).date()
     if _last_reset_date is None:
         _last_reset_date = today
@@ -272,12 +274,33 @@ def check_daily_reset() -> bool:
         daily_rsi       = 0
         daily_sa        = 0
         daily_be_closes = 0
+        daily_min_lot_skips = 0  # [v66]
         day_start_time  = time.time()
         circuit_open   = False
         _daily_report_sent = False
         logging.info("📅 Daily stats reset")
         return True
     return False
+
+
+async def _alert_min_lot(strategy: str, sym: str, qty_raw: float, min_qty: float,
+                          risk_amount: float, sl_dist: float):
+    """[v66] Молчаливый пропуск сделки по min_lot на боевом проп-счёте
+    недопустим — риск 0.5% (v54) + рост BTC до ~78k дали qty=0.00049 < шага
+    лота 0.001, и Bybit не открыл ни одной позиции 4 дня без единого
+    уведомления. WARNING уже логируется на месте вызова — здесь только
+    TG-алерт, не чаще раза в сутки на символ, чтобы не спамить."""
+    global daily_min_lot_skips
+    daily_min_lot_skips += 1
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    if _min_lot_alert_sent.get(sym) == today_str:
+        return
+    _min_lot_alert_sent[sym] = today_str
+    await tg(
+        f"⚠️ [{strategy}] {sym}: qty {qty_raw:.5f} < min_lot {min_qty} — сделка НЕ открыта.\n"
+        f"Причина: риск ${risk_amount:.2f} при SL-дистанции ${sl_dist:.0f}. "
+        f"Нужен риск от ${min_qty * sl_dist:.2f}."
+    )
 
 def is_trading_allowed() -> bool:
     global circuit_open
@@ -430,7 +453,8 @@ async def execute_signal(signal: dict):
     qty = _to_precision(qty_raw)
 
     if qty <= 0:
-        logging.warning(f"⚠️ {sym}: qty={qty} <= 0")
+        logging.warning(f"⚠️ {sym}: qty={qty} <= 0 (qty_raw={qty_raw:.5f} < шаг лота, min_lot={min_qty})")
+        await _alert_min_lot(strategy, sym, qty_raw, min_qty, risk_amount, sl_dist)
         return
 
     # [v2] Margin guard: risk-based qty может требовать больше маржи, чем есть
@@ -460,6 +484,7 @@ async def execute_signal(signal: dict):
     elif qty < min_qty:
         # risk-based qty оказался меньше биржевого минимума — отдельная причина отказа
         logging.warning(f"⚠️ {sym}: qty={qty} < min_lot={min_qty} биржи — пропуск")
+        await _alert_min_lot(strategy, sym, qty_raw, min_qty, risk_amount, sl_dist)
         return
 
     # Минимальный notional Bybit ~$5
@@ -1256,6 +1281,9 @@ async def main():
                     f"({daily_wins}/{daily_trades})\n"
                     f"SMC: {daily_smc} | RSI: {daily_rsi} | SA: {daily_sa} | "
                     f"BE: {daily_be_closes}\n"
+                    # [v66] видимость "тихого" дня без сделок — риск/шаг лота
+                    # не позволяют открыть позицию, а не отсутствие сигналов.
+                    f"Пропущено по min_lot: {daily_min_lot_skips}\n"
                     f"PnL: <code>{day_pct:+.2f}%</code> | "
                     f"<code>{day_usdt:+.2f} USDT</code>\n"
                     f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
