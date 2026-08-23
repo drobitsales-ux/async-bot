@@ -32,6 +32,7 @@
 """
 
 import asyncio
+import glob
 import json
 import os
 import logging
@@ -47,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v66'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v67'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -153,6 +154,8 @@ ORB_BREAK_ATR = float(os.getenv('ORB_BREAK_ATR', '0.1'))
 SHADOW_COOLDOWN_BARS = int(os.getenv('SHADOW_COOLDOWN_BARS', '6'))
 # [v18] час отправки 'Итоги дня' (UTC). 19 UTC = 22:00 Киев. Настраивается.
 REPORT_HOUR_UTC = int(os.getenv('REPORT_HOUR_UTC', '19'))
+# [v67] час автоотправки суточного дайджеста самодиагностики (UTC).
+DIGEST_HOUR = int(os.getenv('DIGEST_HOUR', '9'))
 # [v19] SINGLE-ASSET алгоритм: mean reversion BTC от дневного VWAP (shadow)
 SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
@@ -240,6 +243,8 @@ EXCLUDED_PARTS = [
     'SATS', 'RATS', 'ORDI', '1000',
 ]
 
+_PROCESS_START_TS = time.time()  # [v67] для аптайма в суточном дайджесте
+
 # ── Состояние ────────────────────────────────────────────
 smc_positions   = []   # [R-FIX-12] отдельные списки
 rsi_positions   = []
@@ -264,6 +269,7 @@ circuit_open    = False    # [R-FIX-11] дневной DD-стоп
 _tg_offset         = 0     # Telegram getUpdates offset
 _sync_counter      = 0     # счётчик до авто-синхронизации
 _daily_report_sent = False  # флаг отчёта сегодня (19:00 UTC)
+_digest_auto_sent  = False  # [v67] флаг авт. дайджеста сегодня (DIGEST_HOUR UTC)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -406,6 +412,43 @@ def _split_tg_text(text: str, max_len: int = TG_MAX_LEN) -> list:
         chunks.append(cur)
     return chunks
 
+def _classify_alert_kind(text: str) -> str:
+    """[v67] Грубая классификация TG-алерта для журнала alert_history/
+    дайджеста — полный текст сохраняется отдельно, kind нужен только для
+    группировки, не для точности."""
+    t = text.lower()
+    if '🚨' in text or 'критич' in t:
+        return 'critical'
+    if 'итоги дня' in t or '📊' in text:
+        return 'daily_report'
+    if 'закрыта' in t or '✅' in text or '🛑' in text or '⚖️' in text:
+        return 'trade_close'
+    if '🟢' in text or '🔴' in text:
+        return 'trade_open'
+    if 'trail' in t or 'трейл' in t:
+        return 'trailing'
+    if 'оракул' in t or '[ai]' in t:
+        return 'ai_oracle'
+    if 'min_lot' in t or 'min-lot' in t:
+        return 'min_lot'
+    return 'other'
+
+
+def _log_alert_history(text: str):
+    """[v67] Записывает КАЖДЫЙ отправляемый TG-алерт для суточного
+    дайджеста (Уровень 2 самодиагностики). Сбой записи не должен мешать
+    самой отправке — тихий except."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute(
+            "INSERT INTO alert_history (ts,kind,text) VALUES (?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), _classify_alert_kind(text), text)
+        )
+        con.commit(); con.close()
+    except Exception as _e:
+        logging.debug(f'[ALERT_HISTORY] write fail: {_e}')
+
+
 async def tg(text: str):
     # [P-1] Логируем причину молчания вместо тихого return
     if not TOKEN:
@@ -421,6 +464,8 @@ async def tg(text: str):
         return
     if not http:
         return
+    # [v67] Журнал ВСЕХ отправляемых алертов — для суточного дайджеста.
+    _log_alert_history(text)
     # [v49] Длинные отчёты (/stats_analyze при росте данных) раньше молча не
     # доставлялись: Telegram отклонял sendMessage >4096 символов (HTTP 400),
     # tg() это тихо логировал warning-ом, вызывающий код не узнавал о неудаче.
@@ -2455,6 +2500,9 @@ async def execute(sym: str, sig: dict, strategy: str,
     # раздуть риск в разы → отказ от сделки вместо превышения дневного DD.
     risk_real = qty * sl_dist
     _risk_dev = risk_real / risk_usdt if risk_usdt > 0 else 1.0
+    # [v67] Уровень 1 самодиагностики (INV-10) — не блокирует, гейт 1.30×
+    # ниже уже защищает торговлю; здесь только фиксация для дайджеста.
+    check_invariants({'risk_target': risk_usdt, 'risk_real': risk_real})
     if _risk_dev > 1.30:
         logging.warning(
             f'[{strategy}] {sym}: шаг лота грубый — реальный риск ${risk_real:.2f} = '
@@ -2611,6 +2659,70 @@ async def execute(sym: str, sig: dict, strategy: str,
     if strategy != 'PB':
         asyncio.create_task(publish_to_workers(sym, mode, price, sl, tp, strategy, risk_usdt,
                                                atr=float(sig.get('atr', 0.0))))
+
+# ═══════════════════════════════════════════════════════
+#  ЗАЩИТА ПОЗИЦИИ ПРИ ОСТАТКЕ НИЖЕ ТОЧНОСТИ БИРЖИ [v67]
+#  Баг 23.08: SA-позиция qty=0.0005 → TP50 зафиксировал половину → остаток
+#  0.00025 не проходит валидацию BingX (точность/минимум лота). Трейлинг/
+#  TP100 кидали исключение КАЖДЫЙ цикл (5+ суток), позиция оставалась без
+#  защиты (старый SL-ордер уже отменён к моменту сбоя). Тот же класс, что
+#  v43 на Bybit (неделимый лот) — исправлено симметрично: qty приводится
+#  к precision биржи ДО попытки ордера, при недостижимом минимуме позиция
+#  не остаётся голой, а закрывается рынком с явным уведомлением.
+# ═══════════════════════════════════════════════════════
+_err_log_last = {}  # {(sym, kind): last_ts} — anti-spam повторяющихся ошибок позиций
+
+
+def _log_throttled(sym: str, kind: str, msg: str, level: str = 'warning'):
+    """Одинаковая ошибка по (символ, вид) — не чаще раза в 30 минут."""
+    key = (sym, kind)
+    now = time.time()
+    if now - _err_log_last.get(key, 0) < 1800:
+        return
+    _err_log_last[key] = now
+    (logging.error if level == 'error' else logging.warning)(msg)
+
+
+async def _qty_precision_check(sym: str, qty: float):
+    """Приводит qty к precision биржи, возвращает (qty_rounded, min_qty).
+    При сбое загрузки market info — (0.0, 0.0): безопасный отказ, вызывающий
+    код обязан трактовать это как "ниже минимума" и защитить позицию."""
+    try:
+        if not exchange.markets or sym not in exchange.markets:
+            await exchange.load_markets()
+        mkt = exchange.market(sym)
+        min_qty = float((mkt.get('limits', {}).get('amount', {}) or {}).get('min') or 0)
+        qty_p = float(exchange.amount_to_precision(sym, qty))
+        return qty_p, min_qty
+    except Exception as _e:
+        logging.debug(f'{sym}: precision check fail: {_e}')
+        return 0.0, 0.0
+
+
+async def _close_trail_impossible(pos: dict, sym: str, strategy: str,
+                                   sl_side: str, pos_side: str, qty: float):
+    """Остаток позиции ниже минимальной точности/лота биржи — ни трейлинг,
+    ни защитный стоп физически невозможны. Закрываем остаток рынком вместо
+    бесконечного цикла ошибок без защиты; trail_impossible гасит ретраи."""
+    pos['trail_impossible'] = True
+    try:
+        if pos.get('sl_order_id'):
+            try:
+                await exchange.cancel_order(pos['sl_order_id'], sym)
+            except Exception:
+                pass  # ордер мог уже не существовать (см. "order not exist") — не критично
+        await exchange.create_order(
+            sym, 'market', sl_side, qty,
+            params={'positionSide': pos_side, 'reduceOnly': True}
+        )
+        _msg = (f"⚠️ [{strategy}] {sym}: остаток {qty} ниже минимума биржи — "
+                f"трейлинг невозможен, остаток закрыт по рынку")
+        logging.warning(_msg)
+        await tg(_msg)
+    except Exception as _ce:
+        _log_throttled(sym, 'trail_impossible_close_fail',
+                        f'{sym}: не удалось закрыть остаток ниже минимума: {_ce}', 'error')
+
 
 # ═══════════════════════════════════════════════════════
 #  МОНИТОРИНГ ПОЗИЦИЙ (общий)
@@ -3017,7 +3129,7 @@ async def monitor_all():
             # а не только pos['current_sl'] в памяти. Защищает runner при краше/
             # рестарте бота: стоп уже стоит на BingX независимо от процесса.
             # Ордер переставляем ТОЛЬКО когда трейл реально сдвинулся — экономим API.
-            if pos.get('tp50_hit') and not pos.get('tp100_hit'):
+            if pos.get('tp50_hit') and not pos.get('tp100_hit') and not pos.get('trail_impossible'):
                 atr_v = float(pos.get('atr', entry * 0.005))
                 mfe_p = float(pos['mfe_price'])
                 trail_mult = SA_TRAIL_ATR if strategy == 'SA' else 1.2  # [SA-EXIT] узкий трейл для MR
@@ -3027,88 +3139,147 @@ async def monitor_all():
                              else mfe_p + atr_v * trail_mult)
                 moved = new_trail > cur_sl if is_long else new_trail < cur_sl
                 if moved and run_qty > 0:
-                    try:
-                        if pos.get('sl_order_id'):
-                            await exchange.cancel_order(pos['sl_order_id'], sym)
-                        sl_ord = await exchange.create_order(
-                            sym, 'STOP_MARKET', sl_side, run_qty,
-                            params={'positionSide': pos_side,
-                                    'stopPrice': round(new_trail, 8),
-                                    'reduceOnly': True}
-                        )
-                        pos['current_sl']  = new_trail
-                        pos['sl_order_id'] = sl_ord['id']
-                        logging.debug(f'{sym} trail SL (биржа) → {new_trail:.6f}')
-                    except Exception as _tr:
-                        # Не удалось переставить — оставляем прежний биржевой стоп,
-                        # current_sl НЕ трогаем, чтобы память не разошлась с биржей.
-                        logging.warning(f'{sym} trail re-issue fail: {_tr}')
+                    # [v67] precision-check ДО попытки — раньше остаток ниже
+                    # точности/минимума биржи кидал исключение каждый цикл.
+                    run_qty_p, _min_q = await _qty_precision_check(sym, run_qty)
+                    if run_qty_p <= 0 or (_min_q and run_qty_p < _min_q):
+                        await _close_trail_impossible(pos, sym, strategy, sl_side, pos_side, run_qty)
+                        save_all()
+                    else:
+                        try:
+                            if pos.get('sl_order_id'):
+                                try:
+                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                except Exception:
+                                    pass  # [v67] ордер мог уже не существовать — не блокируем перевыпуск
+                            sl_ord = await exchange.create_order(
+                                sym, 'STOP_MARKET', sl_side, run_qty_p,
+                                params={'positionSide': pos_side,
+                                        'stopPrice': round(new_trail, 8),
+                                        'reduceOnly': True}
+                            )
+                            pos['current_sl']  = new_trail
+                            pos['sl_order_id'] = sl_ord['id']
+                            logging.debug(f'{sym} trail SL (биржа) → {new_trail:.6f}')
+                        except Exception as _tr:
+                            # Не удалось переставить — оставляем прежний биржевой стоп,
+                            # current_sl НЕ трогаем, чтобы память не разошлась с биржей.
+                            _log_throttled(sym, 'trail_reissue', f'{sym} trail re-issue fail: {_tr}')
 
             # ── TP100 + trailing ───────────────────────────────
             tp100 = float(pos.get('tp1', entry))
             if (pos.get('tp50_hit') and not pos.get('tp100_hit')
+                    and not pos.get('trail_impossible')
                     and ((is_long and curr_p >= tp100)
                          or (not is_long and curr_p <= tp100))):
                 close_qty = round(float(pos['current_qty']) * 0.5, 8)
                 remain    = round(float(pos['current_qty']) - close_qty, 8)
                 atr_v     = float(pos.get('atr', entry * 0.01))
                 trail_sl  = (tp100 - atr_v if is_long else tp100 + atr_v)
-                # [FIX] Если 50% округляется в 0 — только трейлим SL, без закрытия
-                if close_qty <= 0 or remain <= 0:
-                    pos['tp100_hit'] = True
-                    pos['current_sl'] = trail_sl
-                    logging.info(f'{sym}: TP100 qty→0 (мелкая поз), только трейл SL')
+                # [v67] precision-check ДО попытки: голый round(...,8) не
+                # учитывал ни decimal-step, ни минимум биржи (BingX: "amount
+                # must be greater than minimum amount precision of 4") —
+                # попытка кидала исключение КАЖДЫЙ цикл без защиты позиции.
+                close_qty_p, _min_q = await _qty_precision_check(sym, close_qty)
+                remain_p, _         = await _qty_precision_check(sym, remain)
+                if (close_qty <= 0 or remain <= 0 or close_qty_p <= 0 or remain_p <= 0
+                        or (_min_q and (close_qty_p < _min_q or remain_p < _min_q))):
+                    # Разделить 50/50 невозможно — остаток ниже мин. лота.
+                    # Пробуем защитить ВЕСЬ текущий объём одним трейлинг-
+                    # стопом вместо частичного закрытия (вместо того чтобы
+                    # просто обновить current_sl в памяти без реального
+                    # ордера — тот же принцип, что v56 для tp50_hit).
+                    full_qty_p, _fmin = await _qty_precision_check(sym, float(pos['current_qty']))
+                    if full_qty_p <= 0 or (_fmin and full_qty_p < _fmin):
+                        await _close_trail_impossible(pos, sym, strategy, sl_side, pos_side,
+                                                       float(pos['current_qty']))
+                    else:
+                        try:
+                            if pos.get('sl_order_id'):
+                                try:
+                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                except Exception:
+                                    pass
+                            sl_ord = await exchange.create_order(
+                                sym, 'STOP_MARKET', sl_side, full_qty_p,
+                                params={'positionSide': pos_side,
+                                        'stopPrice': round(trail_sl, 8),
+                                        'reduceOnly': True}
+                            )
+                            pos.update({'tp100_hit': True, 'current_sl': trail_sl,
+                                        'sl_order_id': sl_ord['id']})
+                            logging.info(f'{sym}: TP100 остаток не делится по мин. лоту — '
+                                         f'весь объём под трейл-стопом на бирже')
+                        except Exception as _fe:
+                            # tp100_hit НЕ ставим — попробуем снова следующим циклом
+                            _log_throttled(sym, 'tp100_full_trail_fail',
+                                           f'{sym}: не удалось выставить трейл на весь объём: {_fe}',
+                                           'error')
                     save_all()
-                    return True  # [FIX] continue→return
+                    return True
                 try:
                     await exchange.create_order(
-                        sym, 'market', sl_side, close_qty,
+                        sym, 'market', sl_side, close_qty_p,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                        try:
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                        except Exception:
+                            pass  # [v67] ордер мог уже не существовать — не блокируем перевыпуск
                     sl_ord = await exchange.create_order(
-                        sym, 'STOP_MARKET', sl_side, remain,
+                        sym, 'STOP_MARKET', sl_side, remain_p,
                         params={'positionSide': pos_side,
                                 'stopPrice': round(trail_sl, 8),
                                 'reduceOnly': True}
                     )
                     # [v39] Фиксируем USDT от закрытых на TP100 25% — раньше эта
                     # частичка НЕ попадала в realized_pnl_usdt и занижала итог позиции
-                    tp100_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
-                    tp100_fee = close_qty * curr_p * FEE_RATE
+                    tp100_raw = (curr_p - entry) * close_qty_p if is_long else (entry - curr_p) * close_qty_p
+                    tp100_fee = close_qty_p * curr_p * FEE_RATE
                     tp100_net = tp100_raw - tp100_fee
                     pos['realized_pnl_usdt'] = pos.get('realized_pnl_usdt', 0.0) + tp100_net
-                    pos.update({'tp100_hit': True, 'current_qty': remain,
+                    pos.update({'tp100_hit': True, 'current_qty': remain_p,
                                 'sl_order_id': sl_ord['id'],
                                 'current_sl': trail_sl})
                     save_all()
                     await tg(f"🏆 <b>[{strategy}] {sym}</b>: TP100 взят! "
                              f"Трейлинг включён P&L: +{pnl:.2f}% | {tp100_net:+.2f} USDT")
                 except Exception as e:
-                    logging.error(f"TP100 error {sym}: {e}")
+                    _log_throttled(sym, 'tp100_error', f"TP100 error {sym}: {e}", 'error')
 
             # ── Обновление трейлинга ────────────────────────────
-            if pos.get('tp100_hit'):
+            if pos.get('tp100_hit') and not pos.get('trail_impossible'):
                 atr_v    = float(pos.get('atr', entry * 0.01))
                 new_trail = (curr_p - atr_v if is_long else curr_p + atr_v)
                 cur_sl    = float(pos.get('current_sl', 0))
                 if ((is_long and new_trail > cur_sl)
                         or (not is_long and new_trail < cur_sl)):
-                    try:
-                        if pos.get('sl_order_id'):
-                            await exchange.cancel_order(pos['sl_order_id'], sym)
-                        sl_ord = await exchange.create_order(
-                            sym, 'STOP_MARKET', sl_side,
-                            float(pos['current_qty']),
-                            params={'positionSide': pos_side,
-                                    'stopPrice': round(new_trail, 8),
-                                    'reduceOnly': True}
-                        )
-                        pos.update({'sl_order_id': sl_ord['id'],
-                                    'current_sl': new_trail})
-                    except:
-                        pass
+                    # [v67] precision-check + был полностью бесшумный except:
+                    # pass — сбой не оставлял НИ следа в логах.
+                    run_qty_p, _min_q = await _qty_precision_check(sym, float(pos['current_qty']))
+                    if run_qty_p <= 0 or (_min_q and run_qty_p < _min_q):
+                        await _close_trail_impossible(pos, sym, strategy, sl_side, pos_side,
+                                                       float(pos['current_qty']))
+                        save_all()
+                    else:
+                        try:
+                            if pos.get('sl_order_id'):
+                                try:
+                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                except Exception:
+                                    pass
+                            sl_ord = await exchange.create_order(
+                                sym, 'STOP_MARKET', sl_side, run_qty_p,
+                                params={'positionSide': pos_side,
+                                        'stopPrice': round(new_trail, 8),
+                                        'reduceOnly': True}
+                            )
+                            pos.update({'sl_order_id': sl_ord['id'],
+                                        'current_sl': new_trail})
+                        except Exception as _pte:
+                            _log_throttled(sym, 'post_tp100_trail_fail',
+                                           f'{sym} post-TP100 trail fail: {_pte}')
 
             return True  # позиция жива
 
@@ -3173,6 +3344,19 @@ async def monitor_all():
                 f"tp50_hit={pos.get('tp50_hit', False)} "
                 f"sl_on_exchange={pos.get('sl_on_exchange', True)}"
             )
+
+            # [v67] Уровень 1 самодиагностики — ПЕРЕД TG-уведомлением о закрытии.
+            # INV-5: позиция закрылась без подтверждённой защиты на бирже.
+            # INV-7: длительность > 1.5× лимита стратегии (см. §2.7 — SL-сделки
+            # жили 379мин при лимите 150 из-за рассинхрона tp50_hit/биржа).
+            _max_dur_cls = (MAX_TRADE_MIN_SMC if strategy == 'SMC'
+                             else MAX_TRADE_MIN_SA if strategy == 'SA'
+                             else MAX_TRADE_MIN_RSI)
+            check_invariants({
+                'event': 'trade_closed', 'symbol': sym, 'strategy': strategy,
+                'sl_on_exchange': pos.get('sl_on_exchange', True),
+                'dur_min': dur_min, 'max_dur': _max_dur_cls,
+            })
 
             winrate_d = (daily_stats['wins'] / daily_stats['trades'] * 100
                          if daily_stats['trades'] > 0 else 0)
@@ -3379,6 +3563,9 @@ async def scan_rb():
         f"no_sweep:{st_rb['no_sweep']} vol:{st_rb['vol']} low_rr:{st_rb['low_rr']} "
         f"→ SHADOW:{rb_shadow_n}{_rb_dist}"
     )
+    _record_scan_summary('RB', {'total': len(scan), 'no_range': st_rb['trend_regime'],
+                                 'no_sweep': st_rb['no_sweep'], 'vol': st_rb['vol'],
+                                 'low_rr': st_rb['low_rr'], 'ok': rb_shadow_n})
 
 async def scan_orb():
     """[v61] ORB (Asia Range Breakout) — shadow-сканер, торгуемое окно
@@ -3432,6 +3619,9 @@ async def scan_orb():
         f"[ORB SCAN] total:{len(scan)} no_window:0 no_break:{st_orb['no_break']} "
         f"vol:{st_orb['vol']} low_rr:{st_orb['low_rr']} → SHADOW:{orb_shadow_n}"
     )
+    _record_scan_summary('ORB', {'total': len(scan), 'no_break': st_orb['no_break'],
+                                  'vol': st_orb['vol'], 'low_rr': st_orb['low_rr'],
+                                  'ok': orb_shadow_n})
 
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
@@ -3558,6 +3748,14 @@ async def send_daily_report():
     day_pct  = (bal_usdt - start) / start * 100 if start > 0 else 0
     day_usdt = bal_usdt - start
 
+    # [v67] Уровень 1 самодиагностики — ПЕРЕД отправкой отчёта. INV-3
+    # (баланс==стартовому при trades>0) поймал бы истёкший API-ключ Bybit,
+    # не замеченный 4 суток. INV-1/2 — WR-математика и WR-vs-PnL.
+    check_invariants({
+        'trades': trades, 'wins': wins, 'wr': wrate, 'pnl_pct': day_pct,
+        'balance_today': round(bal_usdt, 2), 'balance_yesterday': round(start, 2),
+    })
+
     await tg(
         f"📊 <b>BingX — Итоги дня {daily_stats.get('stat_date', '')} 22:00</b>\n"
         f"Сделок: {trades} | WR: {wrate:.1f}% ({wins}/{trades})\n"
@@ -3570,7 +3768,7 @@ async def send_daily_report():
 
 
 async def daily_reset():
-    global daily_stats, circuit_open, _daily_report_sent
+    global daily_stats, circuit_open, _daily_report_sent, _digest_auto_sent
     today = datetime.now(timezone.utc).date()
     if daily_stats.get('stat_date') == today:
         return
@@ -3592,6 +3790,7 @@ async def daily_reset():
     }
     circuit_open = False
     _daily_report_sent = False  # сброс флага на новый день
+    _digest_auto_sent  = False  # [v67] сброс флага авт. дайджеста на новый день
     save_all()
     logging.info(f"📅 Daily stats reset for {today}")
 
@@ -3797,10 +3996,428 @@ def _init_trades_db():
             pass
     # [EPOCH] таблица meta: время последнего деплоя (для статистики 'Последнее')
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    # [v67] Самодиагностика — Уровень 1 (инварианты) и журнал алертов для
+    # суточного дайджеста (Уровень 2). См. §11 BOT_SPEC.md.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS anomalies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, severity TEXT, kind TEXT, detail TEXT, context_json TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS alert_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, kind TEXT, text TEXT
+        )
+    """)
+    # [v67] Персистентный журнал WARNING/ERROR — переживает деплой (частые
+    # рестарты на Render иначе стирали бы историю ошибок), нужен для блока
+    # "топ-10 ошибок" суточного дайджеста.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS log_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, level TEXT, message TEXT
+        )
+    """)
     con.commit()
     con.close()
 
 _init_trades_db()
+
+
+# ═══════════════════════════════════════════════════════
+#  САМОДИАГНОСТИКА — Уровень 1: инварианты [v67]
+#  Цель: ловить молчаливые сбои автоматически, а не через дни чтения логов.
+#  Реальные кейсы: истёкший API-ключ Bybit → баланс в отчётах не менялся
+#  4 суток; цикл ошибок TP100 5 суток; оракул 404 на всех запросах;
+#  "Сделок: 1 | WR: 100%" при факт. "PnL: -0.31%". Нарушение НЕ блокирует
+#  отправку алерта — только пишется в anomalies (/data/trades.db).
+# ═══════════════════════════════════════════════════════
+# [v67] Внутрисуточный аккумулятор счётчиков отсева сканеров (SA/RB/ORB) —
+# для блока "сводка сканов" в суточном дайджесте (Уровень 2). Только в
+# памяти (не критично для целостности — теряется при рестарте, дайджест
+# просто покажет меньше циклов за день; сами anomalies/alert_history
+# персистентны в БД).
+_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': []}
+
+
+def _record_scan_summary(strategy: str, counts: dict):
+    _scan_summary_accum.setdefault(strategy, []).append(counts)
+
+
+def _write_anomaly(severity: str, kind: str, detail: str, context: dict = None):
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute(
+            "INSERT INTO anomalies (ts,severity,kind,detail,context_json) VALUES (?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), severity, kind, detail,
+             json.dumps(context or {}, ensure_ascii=False, default=str))
+        )
+        con.commit(); con.close()
+    except Exception as _e:
+        logging.debug(f'[ANOMALY] write fail: {_e}')
+
+
+def check_invariants(payload: dict) -> list:
+    """Вызывается ПЕРЕД отправкой ключевых TG-уведомлений (суточный отчёт,
+    закрытие сделки, риск-гейт входа) с тем, что уже посчитано в этой точке
+    — payload с опциональными полями, проверяются только применимые
+    инварианты. Нарушение НЕ блокирует отправку. Возвращает список найденных
+    аномалий (для логирования вызывающим кодом), каждая уже записана в БД.
+    INV-6 (повтор ошибки) и INV-8 (auth-ошибки биржи) — не здесь: они
+    cквозные и ловятся глобальным _AnomalyLogHandler на logging."""
+    found = []
+
+    def _flag(sev, kind, detail):
+        _write_anomaly(sev, kind, detail, payload)
+        found.append({'severity': sev, 'kind': kind, 'detail': detail})
+
+    trades = payload.get('trades')
+    wins   = payload.get('wins')
+    wr     = payload.get('wr')
+    pnl    = payload.get('pnl_pct')
+
+    # INV-1: WR-математика
+    if trades is not None and wins is not None and wr is not None and trades > 0:
+        _real_wr = wins / trades * 100
+        if abs(_real_wr - wr) > 0.5:
+            _flag('warning', 'INV-1',
+                  f'WR не совпадает с математикой: заявлен {wr:.1f}%, факт {_real_wr:.1f}% ({wins}/{trades})')
+
+    # INV-2: WR vs PnL
+    if wr is not None and pnl is not None:
+        if wr >= 50 and pnl < 0:
+            _flag('warning', 'INV-2', f'WR {wr:.0f}% при дневном PnL {pnl:+.2f}% (отрицательном)')
+        elif wr == 0 and pnl > 0:
+            _flag('warning', 'INV-2', f'WR 0% при дневном PnL {pnl:+.2f}% (положительном)')
+
+    # INV-3: баланс не менялся при наличии сделок (поймало бы истёкший ключ Bybit)
+    bal_today = payload.get('balance_today')
+    bal_yday  = payload.get('balance_yesterday')
+    if bal_today is not None and bal_yday is not None and trades:
+        if bal_today == bal_yday:
+            _flag('critical', 'INV-3',
+                  f'Баланс не изменился ({bal_today}) при {trades} сделках за день — возможен истёкший/невалидный API-ключ')
+
+    # INV-4: тишина при генерируемых сигналах
+    days_silent = payload.get('days_silent')
+    if days_silent is not None and days_silent >= 3 and payload.get('signals_generated'):
+        _flag('warning', 'INV-4', f'{days_silent} дней подряд без сделок при генерируемых сигналах')
+
+    # INV-5: позиция закрыта без подтверждённой защиты на бирже
+    if payload.get('event') == 'trade_closed' and payload.get('sl_on_exchange') is False:
+        _flag('critical', 'INV-5',
+              f"Сделка {payload.get('symbol','?')} [{payload.get('strategy','?')}] закрыта с sl_on_exchange=False")
+
+    # INV-7: длительность сделки > 1.5× лимита стратегии
+    dur_min = payload.get('dur_min')
+    max_dur = payload.get('max_dur')
+    if dur_min is not None and max_dur:
+        if dur_min > max_dur * 1.5:
+            _flag('warning', 'INV-7',
+                  f"Длительность {dur_min:.0f}мин > 1.5×лимита ({max_dur}мин) для {payload.get('strategy','?')} {payload.get('symbol','')}")
+
+    # INV-9: доля технических отказов оракула за сутки
+    oracle_ratio = payload.get('oracle_error_ratio')
+    if oracle_ratio is not None and oracle_ratio > 0.5:
+        _flag('critical', 'INV-9', f'Доля технических отказов оракула за сутки {oracle_ratio*100:.0f}% (>50%)')
+
+    # INV-10: фактический риск сделки far от целевого
+    risk_target = payload.get('risk_target')
+    risk_real   = payload.get('risk_real')
+    if risk_target and risk_real is not None:
+        _dev = risk_real / risk_target
+        if _dev > 1.5 or _dev < (1 / 1.5):
+            _flag('warning', 'INV-10',
+                  f'Факт. риск ${risk_real:.2f} отличается от целевого ${risk_target:.2f} в {_dev:.2f}×')
+
+    return found
+
+
+class _AnomalyLogHandler(logging.Handler):
+    """[v67] INV-6 (одинаковый ERROR >=10 раз/час) и INV-8 (auth/expired
+    ошибки API биржи в ЛЮБОМ логе) — сквозные проверки, не привязаны к
+    конкретной TG-отправке, поэтому слушают logging глобально вместо
+    ручной инструментации каждого места, где ловится исключение."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self._counts = {}  # {msg: [ts, ...]} за последний час
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+            now = time.time()
+            # [v67] Персистентный журнал для "топ-10 ошибок" суточного дайджеста
+            # (Уровень 2) — переживает деплой, в отличие от stdout-логов Render.
+            try:
+                con = sqlite3.connect(TRADES_DB)
+                con.execute(
+                    "INSERT INTO log_events (ts,level,message) VALUES (?,?,?)",
+                    (datetime.now(timezone.utc).isoformat(), record.levelname, msg[:500])
+                )
+                con.commit(); con.close()
+            except Exception:
+                pass
+            if record.levelno >= logging.ERROR:
+                hist = self._counts.setdefault(msg, [])
+                hist.append(now)
+                hist[:] = [t for t in hist if now - t < 3600]
+                if len(hist) == 10:  # ровно на 10-м — не плодим anomaly на каждый следующий повтор
+                    _write_anomaly('warning', 'INV-6',
+                                    f'Повторяющаяся ошибка >=10 раз/час: {msg[:200]}')
+            _low = msg.lower()
+            if any(k in _low for k in ('expired', 'invalid api', 'unauthorized',
+                                        'invalid signature', 'apikey', 'api key', 'authentication')):
+                _write_anomaly('critical', 'INV-8',
+                                f'Возможная ошибка авторизации API биржи: {msg[:300]}')
+        except Exception:
+            pass  # самодиагностика не должна ронять бота
+
+
+logging.getLogger().addHandler(_AnomalyLogHandler())
+
+
+# ═══════════════════════════════════════════════════════
+#  САМОДИАГНОСТИКА — Уровень 2: суточный дайджест [v67]
+#  Собирает alert_history/anomalies/log_events/_scan_summary_accum за сутки
+#  в файл /data/logs/digest_YYYY-MM-DD.txt. Уровень 3 (доставка) — /logs и
+#  автоотправка в DIGEST_HOUR UTC, см. ниже у check_tg_commands()/main().
+# ═══════════════════════════════════════════════════════
+DIGEST_DIR = '/data/logs' if os.path.exists('/data') else '/tmp/logs'
+
+
+def _digest_rotate(keep: int = 14):
+    """Хранит только последние `keep` файлов дайджеста — без этого /data
+    будет расти бесконечно на Render."""
+    try:
+        os.makedirs(DIGEST_DIR, exist_ok=True)
+        files = sorted(glob.glob(os.path.join(DIGEST_DIR, 'digest_*.txt')))
+        for f in files[:-keep]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    except Exception as _e:
+        logging.debug(f'[DIGEST] rotate fail: {_e}')
+
+
+async def _fetch_worker_status() -> str:
+    """[v67] Баланс/статус Bybit-воркера через GET на его health-check
+    эндпоинт (do_GET в bybit_worker.py, обновляет last_known_balance раз/
+    сутки в 19:00 UTC). _worker_urls хранит POST-адрес .../signal —
+    для GET берём базовый URL без этого суффикса."""
+    if not _worker_urls or not http:
+        return 'н/д (WORKER_URLS не задан)'
+    url = _worker_urls[0]
+    base = url[:-len('/signal')] if url.endswith('/signal') else url
+    try:
+        async with http.get(base, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                return (await resp.text()).strip()[:200]
+            return f'н/д (HTTP {resp.status})'
+    except Exception as e:
+        return f'н/д ({e})'
+
+
+async def build_daily_digest(date_str: str = None):
+    """Строит суточный дайджест самодиагностики и пишет его в
+    /data/logs/digest_YYYY-MM-DD.txt. Возвращает (filepath, verdict_text)
+    — verdict_text уже готов для первой строки сопроводительного TG-
+    сообщения (см. Блок 3 Уровень 3: вердикт должен быть виден без
+    открытия файла)."""
+    if not date_str:
+        date_str = datetime.now(timezone.utc).date().isoformat()
+    like = f'{date_str}%'
+    lines = []
+    lines.append(f'═══ ДАЙДЖЕСТ {date_str} — {CODE_VERSION} ═══')
+    uptime_h = (time.time() - _PROCESS_START_TS) / 3600
+    lines.append(f'Аптайм процесса: {uptime_h:.1f}ч')
+    try:
+        bal = await exchange.fetch_balance()
+        bal_bingx = float(bal.get('USDT', {}).get('total', 0))
+        lines.append(f'Баланс BingX: {bal_bingx:.2f} USDT')
+    except Exception as e:
+        lines.append(f'Баланс BingX: н/д ({e})')
+    lines.append(f'Bybit (воркер): {await _fetch_worker_status()}')
+    lines.append('')
+
+    con = sqlite3.connect(TRADES_DB)
+
+    # ── Сделки за день ──
+    lines.append('── СДЕЛКИ ──')
+    rows = con.execute(
+        "SELECT strategy, close_reason, net_usdt FROM trades WHERE close_time LIKE ?",
+        (like,)
+    ).fetchall()
+    if not rows:
+        lines.append('Сделок нет.')
+    else:
+        by_strat = {}
+        for strat, reason, net_usdt in rows:
+            d = by_strat.setdefault(strat or '?', {'n': 0, 'wins': 0, 'net': 0.0, 'reasons': {}})
+            d['n'] += 1
+            if (net_usdt or 0) > 0:
+                d['wins'] += 1
+            d['net'] += net_usdt or 0
+            d['reasons'][reason or '?'] = d['reasons'].get(reason or '?', 0) + 1
+        for strat, d in sorted(by_strat.items()):
+            wr = d['wins'] / d['n'] * 100 if d['n'] else 0
+            reasons_str = ', '.join(f'{k}:{v}' for k, v in d['reasons'].items())
+            lines.append(f'{strat}: {d["n"]} сд | WR {wr:.0f}% | PnL {d["net"]:+.2f} USDT | причины: {reasons_str}')
+    lines.append('')
+
+    # ── Алерты ──
+    alerts = con.execute(
+        "SELECT ts, kind, text FROM alert_history WHERE ts LIKE ? ORDER BY ts", (like,)
+    ).fetchall()
+    lines.append(f'── АЛЕРТЫ ({len(alerts)}) ──')
+    for ts, kind, text in alerts:
+        t_short = ts[11:16] if len(ts) > 16 else ts
+        lines.append(f'[{t_short}] ({kind}) {text.splitlines()[0] if text else ""}')
+    lines.append('')
+
+    # ── Аномалии ──
+    anomalies = con.execute(
+        "SELECT ts, severity, kind, detail FROM anomalies WHERE ts LIKE ? ORDER BY ts", (like,)
+    ).fetchall()
+    lines.append(f'── АНОМАЛИИ ({len(anomalies)}) ──')
+    if not anomalies:
+        lines.append('Нет.')
+    else:
+        for ts, sev, kind, detail in anomalies:
+            t_short = ts[11:16] if len(ts) > 16 else ts
+            lines.append(f'[{t_short}] {sev.upper()} {kind}: {detail}')
+    lines.append('')
+
+    # ── Ошибки ──
+    n_errors_total = con.execute(
+        "SELECT COUNT(*) FROM log_events WHERE ts LIKE ?", (like,)
+    ).fetchone()[0]
+    top_errs = con.execute(
+        "SELECT message, level, COUNT(*) c FROM log_events WHERE ts LIKE ? "
+        "GROUP BY message, level ORDER BY c DESC LIMIT 10", (like,)
+    ).fetchall()
+    lines.append(f'── ОШИБКИ (всего {n_errors_total}, топ-10 уникальных) ──')
+    if not top_errs:
+        lines.append('Нет.')
+    else:
+        for msg, level, c in top_errs:
+            lines.append(f'x{c} [{level}] {msg[:200]}')
+    lines.append('')
+
+    con.close()
+
+    # ── Сводка сканов (текущий аптайм процесса, см. комментарий у accum) ──
+    lines.append('── СВОДКА СКАНОВ ──')
+    for strat, samples in _scan_summary_accum.items():
+        if not samples:
+            lines.append(f'{strat}: нет данных за текущий аптайм')
+            continue
+        keys = set()
+        for s in samples:
+            keys.update(s.keys())
+        avgs = {k: sum(s.get(k, 0) for s in samples) / len(samples) for k in keys}
+        avgs_str = ', '.join(f'{k}:{v:.1f}' for k, v in sorted(avgs.items()))
+        lines.append(f'{strat} ({len(samples)} циклов): {avgs_str}')
+
+    text = '\n'.join(lines)
+    fpath = ''
+    try:
+        os.makedirs(DIGEST_DIR, exist_ok=True)
+        fpath = os.path.join(DIGEST_DIR, f'digest_{date_str}.txt')
+        with open(fpath, 'w', encoding='utf-8') as f:
+            f.write(text)
+        _digest_rotate()
+    except Exception as e:
+        logging.warning(f'[DIGEST] write fail: {e}')
+        fpath = ''
+
+    # [v67] Вердикт — ПЕРВАЯ строка сопроводительного сообщения, чтобы решение
+    # принималось без открытия файла (см. Блок 3 Уровень 3).
+    if not anomalies:
+        verdict = f'✅ Аномалий нет ({len(alerts)} алертов, {n_errors_total} ошибок). Файл для архива — разбор не требуется.'
+    else:
+        kinds_uniq = list(dict.fromkeys(a[2] for a in anomalies))
+        n_crit = sum(1 for a in anomalies if a[1] == 'critical')
+        verdict = (f'⚠️ АНОМАЛИИ: {len(anomalies)} ({", ".join(kinds_uniq)}), '
+                   f'из них critical: {n_crit}. → Файл нужно передать на разбор.')
+
+    return fpath, verdict
+
+
+async def tg_send_document(filepath: str, caption: str = '') -> bool:
+    """[v67] Отправляет файл в Telegram (sendDocument) — tg() умеет только
+    sendMessage. Используется для суточного дайджеста."""
+    if not TOKEN:
+        logging.warning('⚠️ [TG] sendDocument пропущен — TELEGRAM_TOKEN не задан')
+        return False
+    if CHAT_ID == -1:
+        logging.warning('⚠️ [TG] sendDocument пропущен — GROUP_CHAT_ID не задан')
+        return False
+    if not http:
+        return False
+    try:
+        with open(filepath, 'rb') as f:
+            data = aiohttp.FormData()
+            data.add_field('chat_id', str(CHAT_ID))
+            if caption:
+                data.add_field('caption', caption[:1024])
+            data.add_field('document', f, filename=os.path.basename(filepath))
+            async with http.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendDocument",
+                data=data, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f'⚠️ [TG] sendDocument вернул {resp.status}: {body[:200]}')
+                    return False
+                return True
+    except Exception as e:
+        logging.warning(f'⚠️ [TG] sendDocument ошибка: {e}')
+        return False
+
+
+async def send_digest_now(date_str: str = None):
+    """Строит и доставляет дайджест: сначала вердикт текстом (мгновенно
+    видно, нужен ли разбор), затем сам файл документом."""
+    fpath, verdict = await build_daily_digest(date_str)
+    await tg(verdict)
+    if fpath:
+        await tg_send_document(fpath, caption=f'Дайджест {date_str or datetime.now(timezone.utc).date().isoformat()}')
+    else:
+        await tg('⚠️ [DIGEST] не удалось записать файл дайджеста (см. логи) — вердикт выше по данным из БД.')
+
+
+async def maybe_send_daily_digest():
+    """[v67] Автоотправка суточного дайджеста в DIGEST_HOUR UTC — за ПРЕДЫДУЩИЕ
+    полные сутки (в 09:00 UTC текущий день только начался, отчёт о нём был
+    бы почти пустым). Персист-гард по дате в meta — переживает рестарт
+    Render, как и send_daily_report()."""
+    global _digest_auto_sent
+    if _digest_auto_sent:
+        return
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        r = con.execute("SELECT value FROM meta WHERE key='last_digest_date'").fetchone()
+        con.close()
+        if r and r[0] == today_str:
+            _digest_auto_sent = True
+            return
+    except Exception:
+        pass
+    _digest_auto_sent = True
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_digest_date',?)",
+                    (today_str,))
+        con.commit(); con.close()
+    except Exception:
+        pass
+    yesterday_str = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    await send_digest_now(yesterday_str)
+    logging.info(f'📄 [DIGEST] Автоотправка за {yesterday_str} выполнена')
 
 
 # ═══════════════════════════════════════════════════════
@@ -3809,8 +4426,9 @@ _init_trades_db()
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-23-v66'
+CODE_VERSION = '2026-08-24-v67'
 CHANGELOG = [
+    ('2026-08-24-v67', 'фикс бесконечного цикла TP100/трейлинг при остатке ниже точности биржи — позиция оставалась без защиты; система самодиагностики: инварианты алертов → таблица anomalies, суточный дайджест в /data/logs/, команда /logs и автоотправка в 09:00 UTC с вердиктом о наличии аномалий; BOT_SPEC.md догнан с v59 до v67'),
     ('2026-08-23-v66', 'TG-алерт при пропуске по min_lot на Bybit (проп-счёт 4 дня молча не торговал: риск 0.5% + BTC 78k → qty 0.00049 < 0.001); детектор отказа AI-оракула (404 на всех запросах, llama-3.1-8b недоступна) + GROQ_MODEL в ENV; SA Short при htf_trend=Up уведён в shadow — зеркало v64 (3 SL подряд → circuit breaker); зафиксировано форвард-подтверждение ORB'),
     ('2026-08-13-v65', 'зафиксирован распад RB (Long PF net 1.43→1.03, час 00-06 2.18→1.44 — снята с рассмотрения); детальная сегментация ORB по времени пробоя (10-12h PF 6.18 при n=8 — наблюдение); диагностика entry_rr без комиссии — все 10 live-сделок с RR убыточны'),
     ('2026-08-11-v64', 'SA Long при htf_trend=Up уведён в shadow (n=18, WR 17%, PF 0.21 — половина всех лонгов, обе вчерашние убыточные сделки оттуда); критерии промоушена RB пересчитаны на net-числа после v63; диагностика entry_rr без учёта комиссии'),
@@ -4941,6 +5559,20 @@ async def check_tg_commands():
                     pass
                 await send_daily_report()
 
+            elif cmd == '/logs' or cmd.startswith('/logs '):
+                # [v67] /logs — дайджест самодиагностики за сегодня;
+                # /logs YYYY-MM-DD — за конкретную дату.
+                _cmd_parts = cmd.split()
+                _log_date = _cmd_parts[1].strip() if len(_cmd_parts) > 1 and _cmd_parts[1].strip() else None
+                if _log_date:
+                    try:
+                        datetime.strptime(_log_date, '%Y-%m-%d')
+                    except ValueError:
+                        await tg('⚠️ Неверный формат даты. Используйте /logs YYYY-MM-DD')
+                        _log_date = '__invalid__'
+                if _log_date != '__invalid__':
+                    await send_digest_now(_log_date)
+
             elif cmd in ('/help', '/commands'):
                 await tg(
                     '🤖 <b>Команды бота</b>\n\n'
@@ -4949,7 +5581,8 @@ async def check_tg_commands():
                     '/stats_analyze — анализ по признакам (ADX/RSI/час/объём)\n'
                     '/report — прислать Итоги дня сейчас\n'
                     '/status — открытые позиции и состояние\n'
-                    '/csv — экспорт всех сделок\n\n'
+                    '/csv — экспорт всех сделок\n'
+                    '/logs [YYYY-MM-DD] — дайджест самодиагностики (файл + вердикт)\n\n'
                     '<b>Shadow (виртуальные стратегии):</b>\n'
                     '/shadow — статистика Momentum/Pullback\n'
                     '/shadow_analyze — мина данных по признакам\n'
@@ -4996,6 +5629,7 @@ async def main():
     load_all()
     set_deploy_epoch()   # [EPOCH] метка времени деплоя для статистики 'Последнее'
     logging.info(f'⏰ [REPORT] Итоги дня в {REPORT_HOUR_UTC}:00 UTC ежедневно')
+    logging.info(f'⏰ [DIGEST] Суточный дайджест самодиагностики в {DIGEST_HOUR}:00 UTC ежедневно')
     http = aiohttp.ClientSession()
 
     Thread(target=run_health, daemon=True).start()
@@ -5080,6 +5714,10 @@ async def main():
                 if _now_utc.hour >= REPORT_HOUR_UTC:
                     await send_daily_report()
 
+                # [v67] Суточный дайджест самодиагностики в DIGEST_HOUR UTC
+                if _now_utc.hour >= DIGEST_HOUR:
+                    await maybe_send_daily_digest()
+
                 # Мониторинг позиций
                 await monitor_all()
 
@@ -5133,6 +5771,7 @@ async def main():
                             f"htfup_short_shadow:{_sa_st['htfup_short_shadow']} "
                             f"→ ВХОДЫ:{_sa_st['ok']}"
                         )
+                        _record_scan_summary('SA', dict(_sa_st))
                         if _sa_diag:
                             # [v62] tp_net — ожидаемый ход до VWAP минус round-trip
                             # комиссия, % цены. Только диагностика (видимость
