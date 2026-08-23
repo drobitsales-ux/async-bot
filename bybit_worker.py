@@ -71,7 +71,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v66'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v67'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -142,6 +142,7 @@ day_start_time   = time.time()
 circuit_open     = False
 _daily_report_sent = False
 _min_lot_alert_sent = {}  # [v66] {symbol: 'YYYY-MM-DD'} — TG-алерт раз/сутки/символ
+last_known_balance = 0.0  # [v67] для GET /-статуса — читает суточный дайджест async_bot.py
 http_session     = None
 _signal_queue: asyncio.Queue = None
 
@@ -301,6 +302,41 @@ async def _alert_min_lot(strategy: str, sym: str, qty_raw: float, min_qty: float
         f"Причина: риск ${risk_amount:.2f} при SL-дистанции ${sl_dist:.0f}. "
         f"Нужен риск от ${min_qty * sl_dist:.2f}."
     )
+
+
+# [v67] Зеркальная проверка бага async_bot.py (TP100/trail при остатке ниже
+# точности биржи). Bybit-воркер архитектурно устойчивее: трейлинг/БУ идут
+# через private_post_v5_position_trading_stop (цена стоп-лосса на уровне
+# позиции, БЕЗ параметра qty) — там прецизионный баг физически невозможен.
+# Единственная точка с явным qty — TP50 market-close (close_qty); уже
+# округляется через amount_to_precision (см. монитор), но не сверялась
+# с реальным лимитом биржи limits.amount.min (только precision-нулём).
+_err_log_last = {}  # {(sym, kind): last_ts} — anti-spam, как в async_bot.py
+
+
+def _log_throttled(sym: str, kind: str, msg: str, level: str = 'warning') -> bool:
+    """Одинаковая ошибка по (символ, вид) — не чаще раза в 30 минут.
+    Возвращает True, если реально залогировано (не подавлено) — вызывающий
+    код использует это, чтобы так же не спамить TG тем же событием."""
+    key = (sym, kind)
+    now = time.time()
+    if now - _err_log_last.get(key, 0) < 1800:
+        return False
+    (logging.error if level == 'error' else logging.warning)(msg)
+    _err_log_last[key] = now
+    return True
+
+
+async def _min_qty_for(sym: str) -> float:
+    """Минимальный объём лота с биржи (0.0 при сбое — не блокирует, только
+    диагностика: precision-нуль (close_qty<=0) уже ловится вызывающим кодом)."""
+    try:
+        if sym not in exchange.markets:
+            await exchange.load_markets()
+        return float(exchange.market(sym).get('limits', {}).get('amount', {}).get('min') or 0.0)
+    except Exception:
+        return 0.0
+
 
 def is_trading_allowed() -> bool:
     global circuit_open
@@ -838,7 +874,11 @@ async def monitor():
                 except Exception:
                     close_qty = round(close_qty, 3)
                 remain = round(float(pos.get('current_qty', real_qty)) - close_qty, 6)
-                if close_qty <= 0 or remain <= 0:
+                # [v67] Раньше сверялись только с 0 — precision-нуль ловился,
+                # но валидный precision-мультипл НИЖЕ реального лимита биржи
+                # (limits.amount.min) — нет. Та же проверка, что в async_bot.py.
+                _min_q50 = await _min_qty_for(sym)
+                if close_qty <= 0 or remain <= 0 or (_min_q50 and (close_qty < _min_q50 or remain < _min_q50)):
                     # [v43] Неделимый лот (qty=0.001): partial невозможен физически.
                     # [v56] tp50_hit/be_moved ставятся ТОЛЬКО после подтверждённого
                     # trading_stop — раньше флаг ставился безусловно, а при сбое SL
@@ -860,8 +900,11 @@ async def monitor():
                         )
                     except Exception as _be0:
                         pos['sl_on_exchange'] = False
-                        logging.error(f"BE (indivisible lot) fail {sym}: {_be0} — позиция без БУ, tp50_hit НЕ ставим!")
-                        await tg(f"🚨 <b>[SA] {sym}</b>: SL НЕ переставлен (неделимый лот) — позиция без БУ!")
+                        # [v67] anti-spam: та же ошибка не чаще раза в 30 мин на символ
+                        if _log_throttled(sym, 'be_indivisible_fail',
+                                          f"BE (indivisible lot) fail {sym}: {_be0} — позиция без БУ, tp50_hit НЕ ставим!",
+                                          'error'):
+                            await tg(f"🚨 <b>[SA] {sym}</b>: SL НЕ переставлен (неделимый лот) — позиция без БУ!")
                 else:
                     try:
                         cl_side = 'sell' if is_long else 'buy'
@@ -870,7 +913,7 @@ async def monitor():
                             params={'category':'linear','positionIdx':0,'reduceOnly':True}
                         )
                     except Exception as e:
-                        logging.error(f"TP50 error {sym}: {e}")
+                        _log_throttled(sym, 'tp50_error', f"TP50 error {sym}: {e}", 'error')
                     else:
                         # [FIX-PNL] накапливаем зафиксированный USDT от 50%
                         tp50_raw = (curr_p - entry) * close_qty if is_long else (entry - curr_p) * close_qty
@@ -902,8 +945,10 @@ async def monitor():
                             pos['sl_on_exchange'] = True
                         except Exception as _be:
                             pos['sl_on_exchange'] = False
-                            logging.error(f"BE after TP50 fail {sym}: {_be} — SL НЕ переставлен, tp50_hit НЕ ставим!")
-                            await tg(f"🚨 <b>[{pos.get('strategy','?')}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
+                            if _log_throttled(sym, 'be_after_tp50_fail',
+                                              f"BE after TP50 fail {sym}: {_be} — SL НЕ переставлен, tp50_hit НЕ ставим!",
+                                              'error'):
+                                await tg(f"🚨 <b>[{pos.get('strategy','?')}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
 
             # ── [SA-FRONTRUN v38] Защитный БУ при недоходе до VWAP ──
             # Прошли >=80% пути к TP, но не коснулись его → остаток в БУ.
@@ -973,7 +1018,7 @@ async def monitor():
                         except Exception as _tr:
                             # [SYMMETRY] при сбое current_sl НЕ трогаем (уже так);
                             # логируем warning как в боте — чтобы видеть проблему в проде
-                            logging.warning(f"{sym} trail re-issue fail: {_tr}")
+                            _log_throttled(sym, "trail_reissue", f"{sym} trail re-issue fail: {_tr}")
                 else:
                     new_trail = mfe_now + atr_v * trail_mult
                     if new_trail < float(pos.get('current_sl', 999999)):
@@ -987,7 +1032,7 @@ async def monitor():
                         except Exception as _tr:
                             # [SYMMETRY] при сбое current_sl НЕ трогаем (уже так);
                             # логируем warning как в боте — чтобы видеть проблему в проде
-                            logging.warning(f"{sym} trail re-issue fail: {_tr}")
+                            _log_throttled(sym, "trail_reissue", f"{sym} trail re-issue fail: {_tr}")
 
             new_positions.append(pos)
 
@@ -1090,7 +1135,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             f"Bybit Worker {BOT_VERSION} UTA [SA-only] | "
             f"Positions: {len(active_positions)} | "
             f"DD: {daily_pnl_pct*100:+.2f}% | "
-            f"Circuit: {'OPEN' if circuit_open else 'OK'}"
+            f"Circuit: {'OPEN' if circuit_open else 'OK'} | "
+            f"Balance: {last_known_balance:.2f} USDT"  # [v67] для дайджеста async_bot.py
         ).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
@@ -1144,6 +1190,7 @@ def run_http():
 async def main():
     global http_session, _signal_queue
     global day_start_bal
+    global last_known_balance  # [v67] для GET /-статуса
     # [FIX] Эти переменные модифицируются в while-loop main() — нужны global
     global _daily_report_sent
     global daily_pnl_pct, daily_pnl_usdt, daily_trades, daily_wins
@@ -1265,6 +1312,7 @@ async def main():
                 try:
                     _bal = await exchange.fetch_balance({'type': 'unified'})
                     bal_usdt = float(_bal.get('USDT', {}).get('total', 0))
+                    last_known_balance = bal_usdt  # [v67] для GET /-статуса
                 except:
                     bal_usdt = day_start_bal
                 # PnL от реального баланса (если есть)
