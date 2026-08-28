@@ -71,7 +71,7 @@ import ccxt.async_support as ccxt_async
 # ══════════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════
-BOT_VERSION   = 'v67'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v68'          # единый источник версии для стартовых сообщений
 BYBIT_KEY     = os.getenv('BYBIT_API_KEY', '')
 BYBIT_SECRET  = os.getenv('BYBIT_SECRET', '')
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')
@@ -98,6 +98,11 @@ MAX_POSITIONS  = int(os.getenv('MAX_POS', '2'))
 MAX_TRADE_MIN_SMC = int(os.getenv('MAX_TRADE_MIN_SMC', '180'))  # SMC: 12 свечей (3ч)
 MAX_TRADE_MIN_RSI = int(os.getenv('MAX_TRADE_MIN_RSI', '240'))  # RSI: 16 свечей (4ч)
 MAX_TRADE_MIN_SA  = int(os.getenv('MAX_TRADE_MIN_SA', '150'))   # [v4] SA: 2.5ч (синхр. с ботом)
+# [v68] АБСОЛЮТНЫЙ потолок длительности, независим от tp50_hit — зеркало
+# async_bot.py (та же константа/дефолт). Причина: async_bot.py таймауты
+# гасились при tp50_hit=True (INV-7 поймал 1914мин SA-сделку); здесь тот
+# же потолок применяется отдельным явным чеком для консистентности.
+MAX_TRADE_MIN_HARD = int(os.getenv('MAX_TRADE_MIN_HARD', '480'))
 # [v40] SA-ONLY: боевой проп-счёт Bybit торгует ТОЛЬКО SA (лучший edge: PF 2.10, n=37).
 # SMC/RSI продолжают работать на BingX для форвард-статистики, сюда не зеркалятся.
 # Расширение списка — осознанное решение после валидации n>=30, не через env.
@@ -750,6 +755,34 @@ async def monitor():
 
             secs = time.time() - pos['open_time']
 
+            # ── [v68] Жёсткий потолок длительности — НЕЗАВИСИМО от tp50_hit,
+            # проверяется ДО остальных таймаутов. Зеркало async_bot.py.
+            if secs > MAX_TRADE_MIN_HARD * 60:
+                logging.warning(
+                    f'⏰ [{pos.get("strategy","?")}] {sym}: жёсткий потолок '
+                    f'{MAX_TRADE_MIN_HARD}мин превышен ({secs/60:.0f}мин, '
+                    f'tp50_hit={pos.get("tp50_hit", False)}) — принудительное закрытие по рынку'
+                )
+                try:
+                    order_hs = 'sell' if is_long else 'buy'
+                    await exchange.create_order(
+                        sym, 'market', order_hs, real_qty,
+                        params={'category':'linear','positionIdx':0,'reduceOnly':True}
+                    )
+                    _hs_usdt = ((curr_p - entry) * real_qty if is_long
+                                else (entry - curr_p) * real_qty)
+                    _hs_usdt += float(pos.get('realized_pnl_usdt', 0.0))
+                    _register_close(pos, pnl, _hs_usdt)
+                    await tg(
+                        f'⏰ [{pos.get("strategy","?")}] {sym}: жёсткий потолок '
+                        f'{MAX_TRADE_MIN_HARD}мин — закрыто по рынку\n'
+                        f'Длительность: {secs/60:.0f}мин | PnL: {pnl:+.2f}% ({_hs_usdt:+.2f} USDT)'
+                    )
+                except Exception as _he:
+                    logging.error(f'⏰ {sym} hard-timeout close: {_he}')
+                    await tg(f'❌ <b>{sym}</b>: ошибка жёсткого таймаута! Закройте вручную.')
+                continue
+
             # Обновляем MFE для трейлинга
             mfe_p = float(pos.get('mfe_price', entry))
             if is_long and curr_p > mfe_p:
@@ -1230,7 +1263,7 @@ async def main():
     logging.info(f"   Leverage: {LEVERAGE}x | Max позиций: {MAX_POSITIONS}")
     logging.info(f"   [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info(f"   SA-выход: частичник +{SA_PARTIAL_PCT}% | трейл {SA_TRAIL_ATR}·ATR")
-    logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин SA={MAX_TRADE_MIN_SA}мин")
+    logging.info(f"   Таймаут: SMC={MAX_TRADE_MIN_SMC}мин RSI={MAX_TRADE_MIN_RSI}мин SA={MAX_TRADE_MIN_SA}мин | Жёсткий потолок={MAX_TRADE_MIN_HARD}мин")
     try:
         _bal = await exchange.fetch_balance({'type': 'unified'})
         day_start_bal = float(_bal.get('USDT', {}).get('total', 0))

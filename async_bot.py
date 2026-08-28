@@ -48,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v67'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v68'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -77,6 +77,10 @@ CHAT_ID = _parse_chat_id()
 BINGX_KEY     = os.getenv('BINGX_API_KEY')
 BINGX_SECRET  = os.getenv('BINGX_SECRET')
 GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
+# [v68] модель Gemini в ENV — 08.2026 gemini-2.0-flash перестала быть
+# доступна ('no longer available'), хардкод-имя означал деплой на любую
+# смену модели у провайдера.
+GEMINI_MODEL  = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
@@ -144,8 +148,12 @@ RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
 # минуты от конца диапазона: 0-60 PF 0.65 (n=43) vs 60+ PF 1.38-6.43 (n=53),
 # Fisher p=0.054 (Бонферрони требует 0.0028 — НЕ пройден). Механика: ранний пробой
 # в тонком рынке ложный, после притока EU-ликвидности — истинный.
+# [v68] Форвард продолжен n=96→145: 0-60мин PF 0.62 (n=46, WR 33%) vs 60+мин
+# PF 1.10-2.24 (n=99, WR 53%). Fisher p УЛУЧШИЛСЯ 0.054→0.019, но Бонферрони
+# (0.0028) ПО-ПРЕЖНЕМУ не пройден — направление устойчиво, значимость ещё нет.
 # Действие при: n>=60 в бакете 60+ И p<0.003. Тогда — гейт ORB_MIN_DELAY_MIN=60.
-# Промоушен в live: n>=100 суммарно, PF net>=1.5, p<0.001. Сейчас НЕ пройден.
+# Сейчас НЕ вводится. Промоушен в live: n>=100 суммарно, PF net>=1.5, p<0.001.
+# Сейчас НЕ пройден.
 ORB_ENABLED   = os.getenv('ORB_ENABLED', 'true').lower() == 'true'
 ORB_VOL_MIN   = float(os.getenv('ORB_VOL_MIN', '1.5'))
 ORB_MIN_RR    = float(os.getenv('ORB_MIN_RR', '1.5'))
@@ -203,6 +211,12 @@ MIN_SL_PCT       = 1.0        # мин. SL чтобы не убивало спр
 MAX_TRADE_MIN_SMC = 180       # SMC: 12 свечей (3ч) — даём отработать структуре
 MAX_TRADE_MIN_RSI = 240       # RSI MR: 16 свечей (4ч) — возврат к среднему медленнее
 MAX_TRADE_MIN_SA  = 150       # [v36] SA: возврат к дневному VWAP; нет за 2.5ч → сетап мёртв
+# [v68] АБСОЛЮТНЫЙ потолок длительности — независим от tp50_hit/be_moved.
+# Причина: 'dur_min > max_dur and not tp50_hit' (v36+) освобождает сделки с
+# сработавшим TP50 от обоих таймаутов — INV-7 поймал SA-сделку 1914мин (32ч)
+# при MAX_TRADE_MIN_SA=150. TP-сделки в среднем 320мин → 480 не заденет
+# нормальные выигрышные сделки, но отсечёт зависания.
+MAX_TRADE_MIN_HARD = int(os.getenv('MAX_TRADE_MIN_HARD', '480'))
 FEE_RATE         = 0.0005
 DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] стоп торговли при -2.5% за день
 SCAN_LIMIT       = 80       # [EXPAND] 60→80: больше монет, +33% шансов на сетап
@@ -213,6 +227,11 @@ MIN_LOT_USDT     = 1.0      # Минимальный размер позиции
 # для SA/RSI при conf<thr это блокировало реальный вход). AI_BLOCK=0 → оракул
 # всегда advisory (только логируется). Дефолт '1' — поведение не меняется.
 AI_BLOCK_ENABLED = os.getenv('AI_BLOCK', '1') == '1'
+# [v68] Аварийный рубильник каскада целиком — если ВСЕ модели мертвы (см.
+# GROQ_MODELS/GEMINI_MODEL выше), нет смысла тратить время цикла на 3
+# заведомо неудачных HTTP-запроса и засорять логи 404. AI_ORACLE_ENABLED=0 →
+# оракул не вызывается вообще, сигнал идёт как advisory 'oracle disabled'.
+AI_ORACLE_ENABLED = os.getenv('AI_ORACLE_ENABLED', '1') == '1'
 
 # ── Webhook для копи-трейдинга (Bybit Worker и другие) ──────────
 # Когда BingX открывает сделку → POST на воркеры со структурой сигнала
@@ -417,6 +436,10 @@ def _classify_alert_kind(text: str) -> str:
     дайджеста — полный текст сохраняется отдельно, kind нужен только для
     группировки, не для точности."""
     t = text.lower()
+    # [v68] Проверяется РАНЬШЕ trade_close: вердикт дайджеста "✅ Аномалий
+    # нет..." попадал под '✅' in text и классифицировался как trade_close.
+    if 'аномал' in t or 'дайджест' in t:
+        return 'digest'
     if '🚨' in text or 'критич' in t:
         return 'critical'
     if 'итоги дня' in t or '📊' in text:
@@ -732,12 +755,17 @@ GROQ_RPM        = 25    # запас от лимита 30/min
 # возвращать 404 на всех запросах (Groq деприкейтил/переименовал модель),
 # оракул молча работал fail-open несколько суток без единого алерта (см.
 # детектор устойчивого отказа ниже). Актуальное имя задаётся без деплоя.
-GROQ_MODEL      = os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')
-GROQ_MODELS     = [
-    GROQ_MODEL,                  # [v66] ENV-настраиваемая основная модель
-    'llama-3.3-70b-versatile',  # лучшее качество
-    'gemma2-9b-it',             # Google, запасная
-]
+# [v68] ВЕСЬ каскад моделей — в ENV (не только первая). 08.2026 дайджесты
+# 26-27.08 зафиксировали ВСЕ три модели каскада мёртвыми одновременно:
+# gemma2-9b-it (decommissioned Groq), llama-3.1-8b-instant (404),
+# llama-3.3-70b-versatile (404) — оракул месяцами отдавал conf=0 fail-open
+# без единого валидного вердикта. Дефолт ниже — те же имена, что были
+# хардкодом до v68 (сохраняет текущее поведение); новые имена задаются
+# через ENV после ручной проверки актуального списка у провайдера —
+# бот сам их не подбирает.
+GROQ_MODELS = [m.strip() for m in os.getenv(
+    'GROQ_MODELS', 'llama-3.1-8b-instant,llama-3.3-70b-versatile,gemma2-9b-it'
+).split(',') if m.strip()]
 
 # [v58] Детектор шаблонных ответов оракула: LLM иногда возвращает дословно
 # один и тот же comment на разных символах независимо от факт. чисел сетапа
@@ -1048,6 +1076,10 @@ async def oracle_ai(sym: str, strategy: str, mode: str,
     Приоритет 2: Gemini (если Groq недоступен)
     Приоритет 3: Локальный скоринг (всегда работает)
     """
+    # [v68] Полное отключение каскада — см. AI_ORACLE_ENABLED выше.
+    if not AI_ORACLE_ENABLED:
+        return {'ok': True, 'conf': 0, 'comment': 'oracle disabled', 'advisory': True}
+
     ctx = extra or {}
     result = None
 
@@ -1168,7 +1200,7 @@ async def oracle_gemini(sym: str, strategy: str, mode: str,
     prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
 
     url = (f"https://generativelanguage.googleapis.com/v1beta/"
-           f"models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}")
+           f"models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"},
@@ -2868,6 +2900,41 @@ async def monitor_all():
                        else MAX_TRADE_MIN_SA if strategy == 'SA'
                        else MAX_TRADE_MIN_RSI)
 
+            # ── [v68] Жёсткий потолок длительности — НЕЗАВИСИМО от tp50_hit/
+            # be_moved (см. MAX_TRADE_MIN_HARD выше). Проверяется ДО всех
+            # остальных таймаутов, которые пропускают сделки после TP50.
+            if dur_min > MAX_TRADE_MIN_HARD:
+                logging.warning(
+                    f'⏰ [{strategy}] {sym}: жёсткий потолок {MAX_TRADE_MIN_HARD}мин '
+                    f'превышен ({dur_min:.0f}мин, tp50_hit={pos.get("tp50_hit", False)}) '
+                    f'— принудительное закрытие по рынку'
+                )
+                try:
+                    if pos.get('sl_order_id'):
+                        try:
+                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                        except Exception:
+                            pass  # SL уже мог быть снят/исполнен — не блокируем закрытие
+                    await exchange.create_order(
+                        sym, 'market', sl_side, real_qty,
+                        params={'positionSide': pos_side, 'reduceOnly': True}
+                    )
+                    mfe_t = abs(float(pos.get('mfe_price', entry)) - entry) / entry * 100
+                    mae_t = abs(float(pos.get('mae_price', entry)) - entry) / entry * 100
+                    _q     = float(pos.get('current_qty', 0))
+                    _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
+                    _fee   = _q * (entry + curr_p) * FEE_RATE
+                    _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    log_trade(pos, curr_p, pnl, _to_net, mfe_t, mae_t,
+                              int(dur_min), 'Timeout')
+                    await tg(
+                        f'⏰ [{strategy}] {sym}: жёсткий потолок {MAX_TRADE_MIN_HARD}мин — закрыто по рынку\n'
+                        f'Длительность: {dur_min:.0f}мин | PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
+                    )
+                except Exception as _he:
+                    logging.error(f'Hard timeout close error {sym}: {_he}')
+                return False
+
             # ── [v36] Smart Timeout (SMC): раннее закрытие мёртвых сделок ──
             # Данные: 9/21 сд закрыты Timeout с Avg -0.95% — съедают TP-профит.
             # Если 90+ мин, pnl слегка отрицательный (но не у SL) и TP50 не было —
@@ -4084,8 +4151,11 @@ def check_invariants(payload: dict) -> list:
             _flag('warning', 'INV-1',
                   f'WR не совпадает с математикой: заявлен {wr:.1f}%, факт {_real_wr:.1f}% ({wins}/{trades})')
 
-    # INV-2: WR vs PnL
-    if wr is not None and pnl is not None:
+    # INV-2: WR vs PnL. [v68] Порог значимости |pnl|>=0.05% — иначе "WR 0%
+    # при PnL +0.00%" ложно считало пренебрежимо малый (округлённый до нуля)
+    # PnL положительным и срабатывало на шуме округления, а не на реальном
+    # противоречии.
+    if wr is not None and pnl is not None and abs(pnl) >= 0.05:
         if wr >= 50 and pnl < 0:
             _flag('warning', 'INV-2', f'WR {wr:.0f}% при дневном PnL {pnl:+.2f}% (отрицательном)')
         elif wr == 0 and pnl > 0:
@@ -4426,8 +4496,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-24-v67'
+CODE_VERSION = '2026-08-28-v68'
 CHANGELOG = [
+    ('2026-08-28-v68','жёсткий потолок длительности MAX_TRADE_MIN_HARD=480мин независимо от tp50_hit (INV-7 поймал сделку 1914мин); все модели AI-оракула в ENV + AI_ORACLE_ENABLED + сегмент AI conf в отчёте для измерения ценности оракула; INV-2 порог значимости 0.05% против ложных срабатываний; сводка 0-60 vs 60+ для ORB'),
     ('2026-08-24-v67', 'фикс бесконечного цикла TP100/трейлинг при остатке ниже точности биржи — позиция оставалась без защиты; система самодиагностики: инварианты алертов → таблица anomalies, суточный дайджест в /data/logs/, команда /logs и автоотправка в 09:00 UTC с вердиктом о наличии аномалий; BOT_SPEC.md догнан с v59 до v67'),
     ('2026-08-23-v66', 'TG-алерт при пропуске по min_lot на Bybit (проп-счёт 4 дня молча не торговал: риск 0.5% + BTC 78k → qty 0.00049 < 0.001); детектор отказа AI-оракула (404 на всех запросах, llama-3.1-8b недоступна) + GROQ_MODEL в ENV; SA Short при htf_trend=Up уведён в shadow — зеркало v64 (3 SL подряд → circuit breaker); зафиксировано форвард-подтверждение ORB'),
     ('2026-08-13-v65', 'зафиксирован распад RB (Long PF net 1.43→1.03, час 00-06 2.18→1.44 — снята с рассмотрения); детальная сегментация ORB по времени пробоя (10-12h PF 6.18 при n=8 — наблюдение); диагностика entry_rr без комиссии — все 10 live-сделок с RR убыточны'),
@@ -4981,6 +5052,12 @@ def shadow_analyze() -> str:
                 parts += _feature(con, strat, 'minutes_since_range_end',
                     [('0-60', 0, 60), ('60-120', 60, 120), ('120-180', 120, 180),
                      ('180-240', 180, 240), ('240+', 240, 9999)])
+                # [v68] Сводная строка по ДВУМ группам вместо ручного суммирования
+                # 4 бакетов выше — отслеживать forward п.62/0.019 Fisher одним
+                # взглядом (см. комментарий-контракт ORB, п.151-156).
+                parts.append('  Сводка 0-60 vs 60+:')
+                parts += _feature(con, strat, 'minutes_since_range_end',
+                    [('0-60', 0, 60), ('60+', 60, 9999)])
             elif strat == 'SA_SHADOW':
                 # [v53] Валидация зон, которые реальные фильтры SA никогда не
                 # пускали: нижняя граница объёма 1.3 (§2.5) и RR<0.7 (§2.2)
@@ -5428,6 +5505,21 @@ def stats_analyze() -> str:
         else:
             lines.append(f'⚠️ Мало live-данных ({len(sa_new)} сд). Нужно 5+ для анализа.')
 
+        # [v68] AI conf входа (все стратегии) — измеряет, добавляет ли
+        # AI-оракул ценность. ai_conf уже логируется в trades для каждой
+        # реальной сделки; conf=0 = оракул был недоступен/выключен/зафейлил
+        # ВСЕ модели (fail-open), не реальный низкий вердикт.
+        ai_rows = con.execute("SELECT pnl_pct, ai_conf FROM trades").fetchall()
+        if ai_rows:
+            lines.append('\n📡 <b>AI conf входа (все стратегии):</b>')
+            for lbl, lo, hi in [('0 (оракул недоступен/выключен)', 0, 1),
+                                 ('1-54', 1, 55), ('55-69', 55, 70), ('70-100', 70, 101)]:
+                rows_ai = [(r[0],) for r in ai_rows if lo <= (r[1] or 0) < hi]
+                n, wr, avg, pf = _bucket_stats(rows_ai)
+                if n:
+                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
         con.close()
     except Exception as _e:
@@ -5652,6 +5744,10 @@ async def main():
     logging.info(f"🔑 BINGX_API_KEY:   {'✅ задан' if BINGX_KEY else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 BINGX_SECRET:    {'✅ задан' if BINGX_SECRET else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 GEMINI_API_KEY:  {'✅ задан' if GEMINI_KEY else '⚠️ не задан (AI oracle выключен)'}")
+    logging.info(
+        f"🤖 [v68] AI oracle: {'ENABLED' if AI_ORACLE_ENABLED else 'DISABLED (AI_ORACLE_ENABLED=0)'} | "
+        f"GROQ_MODELS={GROQ_MODELS} | GEMINI_MODEL={GEMINI_MODEL}"
+    )
     logging.info(f"⚙️ [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info("=" * 60)
 
