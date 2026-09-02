@@ -34,6 +34,7 @@
 import asyncio
 import glob
 import json
+import math
 import os
 import logging
 import sqlite3
@@ -154,6 +155,24 @@ RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
 # Действие при: n>=60 в бакете 60+ И p<0.003. Тогда — гейт ORB_MIN_DELAY_MIN=60.
 # Сейчас НЕ вводится. Промоушен в live: n>=100 суммарно, PF net>=1.5, p<0.001.
 # Сейчас НЕ пройден.
+# [v69] ПРЕ-КОММИТ 2026-09-02: гейт задержки пробоя и критерии промоушена ORB.
+# Данные на момент фиксации (n=204 net): 0-60мин 16/57 WR 28% PF 0.53 vs
+# 60+мин 70/147 WR 48% PF 1.44, Fisher p=0.012 (Бонферрони 0.003 НЕ пройден,
+# но p монотонно 0.054→0.019→0.012 при росте n — не распадается, в отличие
+# от зон SA/RB/PB). Механика: первые 60 мин после 06:00 UTC — тонкий рынок
+# до открытия Лондона (07:00), ложные пробои; позже — EU-ликвидность.
+# ГЕЙТ ORB_MIN_DELAY_MIN СЕЙЧАС НЕ ПРИМЕНЯЕТСЯ — только граница бакета в отчёте.
+# ФОРВАРД считается ТОЛЬКО по сделкам с open_time >= ORB_GATE_FORWARD_FROM
+# (все 204 сделки до этой даты — in-sample, на них гипотеза найдена).
+# КРИТЕРИИ ПРОМОУШЕНА в микро-live BingX (ВСЕ одновременно, net-числа):
+#   1) форвард n>=40 в бакете 60+;
+#   2) форвард PF net >= 1.3 в бакете 60+;
+#   3) Fisher 0-60 vs 60+ p<0.003 на НАКОПЛЕННОЙ выборке (in-sample+форвард);
+#   4) Wilson нижняя граница WR (60+, форвард) > 40%.
+# Условия микро-live при промоушене: риск 0.25%, 1 сделка/день, дневной стоп -1.0%.
+# Пороги НЕ смягчать. Проверка — по строке 'ФОРВАРД' в /shadow_analyze.
+ORB_MIN_DELAY_MIN     = int(os.getenv('ORB_MIN_DELAY_MIN', '60'))
+ORB_GATE_FORWARD_FROM = os.getenv('ORB_GATE_FORWARD_FROM', '2026-09-02')  # ISO-дата, UTC
 ORB_ENABLED   = os.getenv('ORB_ENABLED', 'true').lower() == 'true'
 ORB_VOL_MIN   = float(os.getenv('ORB_VOL_MIN', '1.5'))
 ORB_MIN_RR    = float(os.getenv('ORB_MIN_RR', '1.5'))
@@ -4496,8 +4515,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-08-28-v68'
+CODE_VERSION = '2026-09-02-v69'
 CHANGELOG = [
+    ('2026-09-02-v69', 'ORB: пре-коммит критериев промоушена + маркер форварда ORB_GATE_FORWARD_FROM (гейт задержки НЕ применяется, только отчёт); строка ФОРВАРД с Fisher p и Wilson CI в /shadow_analyze (хелперы без scipy); ENV на Render: SA_LIVE=false (SA → shadow, PF 1.12 n=86 неотличим от 0), AI_ORACLE_ENABLED=0 (ценность не показана, модели мертвы)'),
     ('2026-08-28-v68','жёсткий потолок длительности MAX_TRADE_MIN_HARD=480мин независимо от tp50_hit (INV-7 поймал сделку 1914мин); все модели AI-оракула в ENV + AI_ORACLE_ENABLED + сегмент AI conf в отчёте для измерения ценности оракула; INV-2 порог значимости 0.05% против ложных срабатываний; сводка 0-60 vs 60+ для ORB'),
     ('2026-08-24-v67', 'фикс бесконечного цикла TP100/трейлинг при остатке ниже точности биржи — позиция оставалась без защиты; система самодиагностики: инварианты алертов → таблица anomalies, суточный дайджест в /data/logs/, команда /logs и автоотправка в 09:00 UTC с вердиктом о наличии аномалий; BOT_SPEC.md догнан с v59 до v67'),
     ('2026-08-23-v66', 'TG-алерт при пропуске по min_lot на Bybit (проп-счёт 4 дня молча не торговал: риск 0.5% + BTC 78k → qty 0.00049 < 0.001); детектор отказа AI-оракула (404 на всех запросах, llama-3.1-8b недоступна) + GROQ_MODEL в ENV; SA Short при htf_trend=Up уведён в shadow — зеркало v64 (3 SL подряд → circuit breaker); зафиксировано форвард-подтверждение ORB'),
@@ -4914,6 +4934,32 @@ async def shadow_check():
             logging.debug(f'[SHADOW] check {sym}: {_e}')
 
 
+def _fisher_2x2(a, b, c, d) -> float:
+    """[v69] Двусторонний Fisher exact для [[a,b],[c,d]] без scipy.
+    a/b = wins/losses группы 1, c/d = wins/losses группы 2.
+    Проверено против scipy.stats.fisher_exact (совпадение до 1e-12)."""
+    n = a + b + c + d
+    r1, c1 = a + b, a + c
+    if n == 0 or r1 == 0 or c1 == 0 or r1 == n or c1 == n:
+        return 1.0
+    def _p(x):
+        return (math.comb(r1, x) * math.comb(n - r1, c1 - x)) / math.comb(n, c1)
+    p_obs = _p(a)
+    lo, hi = max(0, c1 - (n - r1)), min(r1, c1)
+    return min(1.0, sum(_p(x) for x in range(lo, hi + 1) if _p(x) <= p_obs * (1 + 1e-9)))
+
+
+def _wilson_lower(wins: int, n: int, z: float = 1.96) -> float:
+    """[v69] Нижняя граница 95% Wilson CI для WR, в процентах."""
+    if n == 0:
+        return 0.0
+    p = wins / n
+    den = 1 + z * z / n
+    ctr = p + z * z / (2 * n)
+    adj = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (ctr - adj) / den * 100
+
+
 def _bucket_stats(rows):
     """rows = [(pnl,)] → (n, wr, avg, pf)."""
     n = len(rows)
@@ -5058,6 +5104,37 @@ def shadow_analyze() -> str:
                 parts.append('  Сводка 0-60 vs 60+:')
                 parts += _feature(con, strat, 'minutes_since_range_end',
                     [('0-60', 0, 60), ('60+', 60, 9999)])
+                # [v69] Форвард по пре-коммиту (см. комментарий-контракт у
+                # ORB_MIN_DELAY_MIN). Граница бакета = ORB_MIN_DELAY_MIN, дата
+                # отсечения = ORB_GATE_FORWARD_FROM. Fisher — на накопленной
+                # выборке (критерий 3), n/PF/Wilson — только форвард (1,2,4).
+                _d = ORB_MIN_DELAY_MIN
+                def _orb_rows(lo, hi, since=None):
+                    q = (f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
+                         f"WHERE status='closed' AND strategy='ORB' "
+                         f"AND minutes_since_range_end >= ? AND minutes_since_range_end < ?")
+                    args = [lo, hi]
+                    if since:
+                        q += " AND open_time >= ?"; args.append(since)
+                    return con.execute(q, args).fetchall()
+                _early_all = _orb_rows(0, _d)
+                _late_all  = _orb_rows(_d, 9999)
+                _late_fwd  = _orb_rows(_d, 9999, ORB_GATE_FORWARD_FROM)
+                _ea_w = sum(1 for r in _early_all if r[0] > 0)
+                _la_w = sum(1 for r in _late_all  if r[0] > 0)
+                _lf_n, _lf_wr, _lf_avg, _lf_pf = _bucket_stats(_late_fwd)
+                _lf_w = sum(1 for r in _late_fwd if r[0] > 0)
+                _p    = _fisher_2x2(_ea_w, len(_early_all) - _ea_w,
+                                    _la_w, len(_late_all) - _la_w)
+                _wl   = _wilson_lower(_lf_w, _lf_n)
+                _ok   = (_lf_n >= 40 and _lf_pf >= 1.3 and _p < 0.003 and _wl > 40)
+                parts.append(f'  ФОРВАРД {_d}+ с {ORB_GATE_FORWARD_FROM}: '
+                             f'{_lf_n} сд | WR {_lf_wr:.0f}% | Avg {_lf_avg:+.2f}% | PF {_lf_pf:.2f}')
+                parts.append(f'  Fisher 0-{_d} vs {_d}+ (накопл.): p={_p:.4f} | '
+                             f'Wilson lower (форвард): {_wl:.1f}%')
+                parts.append(f'  Промоушен: {"✅ КРИТЕРИИ ВЫПОЛНЕНЫ — на разбор" if _ok else "❌ не выполнен"} '
+                             f'(n>=40:{"✅" if _lf_n>=40 else "❌"} PF>=1.3:{"✅" if _lf_pf>=1.3 else "❌"} '
+                             f'p<0.003:{"✅" if _p<0.003 else "❌"} WL>40:{"✅" if _wl>40 else "❌"})')
             elif strat == 'SA_SHADOW':
                 # [v53] Валидация зон, которые реальные фильтры SA никогда не
                 # пускали: нижняя граница объёма 1.3 (§2.5) и RR<0.7 (§2.2)
@@ -5748,6 +5825,7 @@ async def main():
         f"🤖 [v68] AI oracle: {'ENABLED' if AI_ORACLE_ENABLED else 'DISABLED (AI_ORACLE_ENABLED=0)'} | "
         f"GROQ_MODELS={GROQ_MODELS} | GEMINI_MODEL={GEMINI_MODEL}"
     )
+    logging.info(f"📐 [v69] ORB форвард с {ORB_GATE_FORWARD_FROM}, бакет {ORB_MIN_DELAY_MIN}+ мин | SA_LIVE={SA_LIVE}")
     logging.info(f"⚙️ [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info("=" * 60)
 
