@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v68'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v70'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -1347,10 +1347,20 @@ def sym_allowed(sym: str) -> bool:
 # ═══════════════════════════════════════════════════════
 async def get_btc_context() -> dict:
     """Возвращает {'btc_trend': 'Long'|'Short'|'Flat', 'altseason': bool}."""
+    # [v70] funding_rate BTC — топливо для сквиза (лог-only, НЕ фильтр, см.
+    # комментарий-контракт у SA_ATR_DIST выше/ORB). fetch_funding_rate дёшев,
+    # кэшируем на цикл вместе с остальным btc_ctx — один раз, не на символ.
+    try:
+        _fr = await exchange.fetch_funding_rate(SA_SYMBOL)
+        funding_rate = float(_fr.get('fundingRate') or 0.0)
+    except Exception as _fe:
+        funding_rate = 0.0  # НИКОГДА не блокирует — отсутствие данных = нейтрально
+        logging.debug(f'[FUNDING] fetch fail: {_fe}')
     try:
         btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
         if not btc_ohlcv or len(btc_ohlcv) < 200:
-            return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50, 'htf_slope': 'Flat'}
+            return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0,
+                    'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate}
         btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
         ema200 = calc_ema(btc_c, 200)
         dist = (btc_c[-1] - ema200) / ema200 * 100
@@ -1390,9 +1400,11 @@ async def get_btc_context() -> dict:
 
         return {'btc_trend': trend, 'altseason': altseason,
                 'eth_btc_spread': eth_btc_spread, 'alt_score': alt_score,
-                'htf_slope': htf_slope}   # [v38]
+                'htf_slope': htf_slope,       # [v38]
+                'funding_rate': funding_rate}  # [v70]
     except Exception:
-        return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0, 'alt_score': 50, 'htf_slope': 'Flat'}
+        return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0,
+                'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate}
 
 # ═══════════════════════════════════════════════════════
 #  SMC СИГНАЛ
@@ -2398,6 +2410,7 @@ async def single_asset_signal(btc_ctx: dict):
         'btc_trend': btc_ctx.get('btc_trend', ''),
         'htf_trend': btc_ctx.get('htf_slope', 'Flat'),  # [v38] наклон EMA200 → лог
         'entry_rr': round(_rr, 2),
+        'funding_rate': float(btc_ctx.get('funding_rate', 0)),  # [v70] лог-only
     }, 'ok', diag
 
 
@@ -2675,6 +2688,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'btc_trend':   str(sig.get('btc_trend', '')),
         'htf_trend':   str(sig.get('htf_trend', '')),  # [v38] Up/Down/Flat (пока только SA)
         'entry_rr':    float(sig.get('entry_rr', 0)),  # [v44] RR входа (пока только SA)
+        'funding_rate': float(sig.get('funding_rate', 0)),  # [v70] лог-only, пока только SA
         # [v16] признаки для /stats_analyze
         'adx_val':     round(float(sig.get('adx', 0)), 1),
         'alt_score':   int(sig.get('alt_score', 0)),
@@ -4063,7 +4077,8 @@ def _init_trades_db():
                   'sweep_depth_atr REAL DEFAULT 0', 'tp2_price REAL DEFAULT 0',
                   'dist_atr REAL DEFAULT 0', 'atr_pct REAL DEFAULT 0',
                   'dist_pct REAL DEFAULT 0', 'htf_trend TEXT DEFAULT \'\'',
-                  'minutes_since_range_end REAL DEFAULT 0']:
+                  'minutes_since_range_end REAL DEFAULT 0',
+                  'funding_rate REAL DEFAULT 0']:                  # [v70]
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -4075,7 +4090,8 @@ def _init_trades_db():
                  'open_time TEXT DEFAULT ""',
                  'htf_trend TEXT DEFAULT ""',         # [v38] наклон EMA200(15m) на входе
                  'mfe_time_min INTEGER DEFAULT -1',   # [v38] минута пика MFE
-                 'entry_rr REAL DEFAULT 0']:          # [v44] RR входа (SA)
+                 'entry_rr REAL DEFAULT 0',           # [v44] RR входа (SA)
+                 'funding_rate REAL DEFAULT 0']:      # [v70] funding rate BTC на входе
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
@@ -4515,8 +4531,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-09-02-v69'
+CODE_VERSION = '2026-09-06-v70'
 CHANGELOG = [
+    ('2026-09-06-v70', 'funding_rate BTC — лог-only гипотеза (НЕ фильтр): фетч раз/цикл в get_btc_context(), колонка в trades/shadow_signals, запись при входе (execute-путь SA + shadow_record), сегмент по бакетам в /stats_analyze и /shadow_analyze (ORB/SA_SHADOW), критерий будущего решения зафиксирован в коде до сбора данных; попутный фикс HTML-парсинга /shadow_analyze (p<0.003 ломал parse_mode, введено в v69, тот же класс бага что v50)'),
     ('2026-09-02-v69', 'ORB: пре-коммит критериев промоушена + маркер форварда ORB_GATE_FORWARD_FROM (гейт задержки НЕ применяется, только отчёт); строка ФОРВАРД с Fisher p и Wilson CI в /shadow_analyze (хелперы без scipy); ENV на Render: SA_LIVE=false (SA → shadow, PF 1.12 n=86 неотличим от 0), AI_ORACLE_ENABLED=0 (ценность не показана, модели мертвы)'),
     ('2026-08-28-v68','жёсткий потолок длительности MAX_TRADE_MIN_HARD=480мин независимо от tp50_hit (INV-7 поймал сделку 1914мин); все модели AI-оракула в ENV + AI_ORACLE_ENABLED + сегмент AI conf в отчёте для измерения ценности оракула; INV-2 порог значимости 0.05% против ложных срабатываний; сводка 0-60 vs 60+ для ORB'),
     ('2026-08-24-v67', 'фикс бесконечного цикла TP100/трейлинг при остатке ниже точности биржи — позиция оставалась без защиты; система самодиагностики: инварианты алертов → таблица anomalies, суточный дайджест в /data/logs/, команда /logs и автоотправка в 09:00 UTC с вердиктом о наличии аномалий; BOT_SPEC.md догнан с v59 до v67'),
@@ -4627,8 +4644,8 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 rsi_val, vol_ratio, sma_dist, vwap_dist, btc_trend,
                 ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
                 adx_val, alt_score, entry_hour, open_time,
-                htf_trend, mfe_time_min, entry_rr
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                htf_trend, mfe_time_min, entry_rr, funding_rate
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -4659,6 +4676,7 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('htf_trend', ''),       # [v38]
             pos.get('mfe_time_min', -1),    # [v38]
             pos.get('entry_rr', 0),         # [v44]
+            pos.get('funding_rate', 0),     # [v70]
         ))
         con.commit()
         con.close()
@@ -4697,8 +4715,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
             "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend,"
-            "minutes_since_range_end) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "minutes_since_range_end,funding_rate) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
@@ -4713,7 +4731,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              float(msig.get('dist_atr', 0)),   # [v53] SA_SHADOW
              float(msig.get('atr_pct', 0)), float(msig.get('dist_pct', 0)),  # [v57] SA_SHADOW
              str(btc_ctx.get('htf_slope', '')),  # [v64] SA_SHADOW htf_trend-сегментация
-             float(msig.get('minutes_since_range_end', 0))))  # [v65] ORB
+             float(msig.get('minutes_since_range_end', 0)),  # [v65] ORB
+             float(btc_ctx.get('funding_rate', 0))))  # [v70] лог-only
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -5132,9 +5151,26 @@ def shadow_analyze() -> str:
                              f'{_lf_n} сд | WR {_lf_wr:.0f}% | Avg {_lf_avg:+.2f}% | PF {_lf_pf:.2f}')
                 parts.append(f'  Fisher 0-{_d} vs {_d}+ (накопл.): p={_p:.4f} | '
                              f'Wilson lower (форвард): {_wl:.1f}%')
+                # [v70] фикс HTML-парсинга: 'p<0.003' — голый '<' перед цифрой
+                # ломал parse_mode=HTML у /shadow_analyze (тот же класс бага,
+                # что BOT_SPEC §2 v50 у '<0.7' в /stats_analyze); tg() ловил
+                # 400 и слал fallback без разметки — сообщение доходило, но
+                # без форматирования. '&lt;' — экранированный литерал, не тег.
                 parts.append(f'  Промоушен: {"✅ КРИТЕРИИ ВЫПОЛНЕНЫ — на разбор" if _ok else "❌ не выполнен"} '
                              f'(n>=40:{"✅" if _lf_n>=40 else "❌"} PF>=1.3:{"✅" if _lf_pf>=1.3 else "❌"} '
-                             f'p<0.003:{"✅" if _p<0.003 else "❌"} WL>40:{"✅" if _wl>40 else "❌"})')
+                             f'p&lt;0.003:{"✅" if _p<0.003 else "❌"} WL>40:{"✅" if _wl>40 else "❌"})')
+                # [v70] Funding rate BTC на входе — ЛОГ-ONLY гипотеза, не
+                # фильтр. Критерий будущего решения (зафиксирован до сбора
+                # данных, как для ORB/RB): фандинг становится фильтром/весом
+                # ТОЛЬКО при n>=30 в крайних бакетах, Fisher "правильная
+                # сторона vs остальное" p<0.003, механическое подтверждение
+                # (шорт при высоком+ фандинге лучше лонга при том же). До
+                # этого — только сегмент в отчёте. И даже тогда — увод в
+                # shadow, не жёсткий бан (как HTF-фильтр SA, §3 фильтр №5).
+                parts.append('  Funding rate BTC:')
+                parts += _feature(con, strat, 'funding_rate',
+                    [('&lt;-0.05%', -99, -0.0005), ('-0.05..0', -0.0005, 0),
+                     ('0..0.05%', 0, 0.0005), ('0.05%+', 0.0005, 99)])
             elif strat == 'SA_SHADOW':
                 # [v53] Валидация зон, которые реальные фильтры SA никогда не
                 # пускали: нижняя граница объёма 1.3 (§2.5) и RR<0.7 (§2.2)
@@ -5172,6 +5208,12 @@ def shadow_analyze() -> str:
                         line = _fmt(f'{_htf}×{_d}', rows)
                         if line:
                             parts.append(line)
+                # [v70] Funding rate BTC — лог-only, см. комментарий-контракт
+                # у ORB-ветки выше (тот же критерий будущего решения).
+                parts.append('  Funding rate BTC:')
+                parts += _feature(con, strat, 'funding_rate',
+                    [('&lt;-0.05%', -99, -0.0005), ('-0.05..0', -0.0005, 0),
+                     ('0..0.05%', 0, 0.0005), ('0.05%+', 0.0005, 99)])
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
@@ -5430,7 +5472,7 @@ def stats_analyze() -> str:
         sa_new = con.execute(
             "SELECT pnl_pct, direction, rsi_val, alt_score, vol_ratio, "
             "close_reason, entry_hour, vwap_dist, mfe_pct, dur_min, "
-            "htf_trend, mfe_time_min, btc_trend, entry_rr FROM trades "
+            "htf_trend, mfe_time_min, btc_trend, entry_rr, funding_rate FROM trades "
             "WHERE strategy='SA'"
         ).fetchall()
         sa_deploy = con.execute(
@@ -5576,6 +5618,24 @@ def stats_analyze() -> str:
                                      ('1.0-1.5', 1.0, 1.5), ('1.5+', 1.5, 99)]:
                     rows_rr = [(r[0],) for r in _rr_rows if lo <= r[13] < hi]
                     n, wr, avg, pf = _bucket_stats(rows_rr)
+                    if n:
+                        flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                        lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+            # [v70] Funding rate BTC на входе — ЛОГ-ONLY гипотеза, не фильтр.
+            # Критерий будущего решения (см. комментарий-контракт у
+            # ORB_MIN_DELAY_MIN): n>=30 в крайних бакетах, Fisher "правильная
+            # сторона vs остальное" p<0.003, механическое подтверждение (шорт
+            # при высоком+ фандинге лучше лонга при том же). До этого — только
+            # наблюдение. funding_rate=0 отфильтрован — не отличим от "нет данных"
+            # (старые строки до v70), тот же приём, что у entry_rr выше.
+            _fr_rows = [r for r in sa_new if r[14]]
+            if _fr_rows:
+                lines.append('\n<b>Funding rate BTC на входе:</b>')
+                for lbl, lo, hi in [('&lt;-0.05%', -99, -0.0005), ('-0.05..0', -0.0005, 0),
+                                     ('0..0.05%', 0, 0.0005), ('0.05%+', 0.0005, 99)]:
+                    rows_fr = [(r[0],) for r in _fr_rows if lo <= r[14] < hi]
+                    n, wr, avg, pf = _bucket_stats(rows_fr)
                     if n:
                         flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
                         lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
