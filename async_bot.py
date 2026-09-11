@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v70'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v71'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -2892,7 +2892,8 @@ async def monitor_all():
                         net_u = pos.get('initial_qty', 0) * entry * (pnl_f/100) * LEVERAGE
                         await tg(f"🚀 <b>[{pos.get('strategy')}] {sym}</b> трейл-выход "
                                  f"<code>{curr_p:.6f}</code>  P&L: {pnl_f:+.2f}%")
-                        log_trade(pos, curr_p, pnl_f, net_u, mfe_t, -mae_t,
+                        # [v71] pnl_f — сырой price-move %, лог требует ROE (см. log_trade())
+                        log_trade(pos, curr_p, pnl_f * LEVERAGE, net_u, mfe_t, -mae_t,
                                   dur_m, 'TRAIL')
                     except Exception as _e:
                         logging.error(f'MOM exit {sym}: {_e}')
@@ -2924,6 +2925,13 @@ async def monitor_all():
 
             pnl = ((curr_p - entry) / entry * 100 if is_long
                    else (entry - curr_p) / entry * 100)
+            # [v71] `pnl` здесь — сырой price-move % (БЕЗ ×LEVERAGE). Путь
+            # закрытия через биржу (else-ветка ниже) считает pnl_pct как ROE
+            # (price_move_pct × LEVERAGE) — эти две величины раньше писались
+            # в одну колонку trades.pnl_pct в разных единицах (Timeout-пути
+            # ниже занижали потери в LEVERAGE раз против SL/TP). Все вызовы
+            # log_trade(...) из таймаутов этого блока теперь передают
+            # `pnl * LEVERAGE`, чтобы единицы совпадали. См. log_trade().
 
             # ── Таймаут позиции ────────────────────────────────
             dur_s   = (datetime.now(timezone.utc)
@@ -2958,7 +2966,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
-                    log_trade(pos, curr_p, pnl, _to_net, mfe_t, mae_t,
+                    log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ [{strategy}] {sym}: жёсткий потолок {MAX_TRADE_MIN_HARD}мин — закрыто по рынку\n'
@@ -2993,7 +3001,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
-                    log_trade(pos, curr_p, pnl, _to_net, mfe_t, mae_t,
+                    log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ <b>[SMC] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
@@ -3028,7 +3036,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
-                    log_trade(pos, curr_p, pnl, _to_net, _sa_mfe_pct, mae_t,
+                    log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, _sa_mfe_pct, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ <b>[SA] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
@@ -3058,7 +3066,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
-                    log_trade(pos, curr_p, pnl, _to_net, mfe_t, mae_t,
+                    log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
                         f'⏰ <b>[{strategy}] {sym}</b>: таймаут {dur_min:.0f}мин\n'
@@ -3473,8 +3481,16 @@ async def monitor_all():
                 f"День: {daily_stats['trades']} сделок | "
                 f"{daily_stats['wins']} побед | WR {winrate_d:.0f}%"
             )
-            # Determine close reason
-            _close_reason = ('TP' if pos.get('tp50_hit') and pnl_pct >= 0.5 * LEVERAGE
+            # [v71] Determine close reason — МЕХАНИЧЕСКАЯ классификация по
+            # флагам позиции (как выход был исполнен), а не по величине
+            # движения остатка. Раньше 'TP' присваивался по pnl_pct-порогу
+            # независимо от механики — сделки, выбитые трейлом на плюсе,
+            # смешивались с TP100-выходами. tp100_hit ⟹ остаток закрылся
+            # трейлингом после TP100 (или полным трейлом при неделимом
+            # лоте — см. _close_trail_impossible); tp50_hit без tp100_hit ⟹
+            # остаток закрылся по БУ после TP50 (SL на цене входа).
+            _close_reason = ('TP100_TRAIL' if pos.get('tp100_hit')
+                             else 'TP50_BE' if pos.get('tp50_hit')
                              else 'BE' if is_be
                              else 'SL' if pnl_pct < 0
                              else 'WIN')
@@ -3998,7 +4014,10 @@ async def sync_positions_with_exchange() -> int:
 TRADES_DB = '/data/trades.db' if os.path.exists('/data') else '/tmp/trades.db'  # [DISK] на /data переживает деплой
 
 def _init_trades_db():
-    """Создаёт таблицу trades если не существует."""
+    """Создаёт таблицу trades если не существует.
+    [v71] trades.pnl_pct до 2026-09-10-v71 смешан по единицам (ROE/raw
+    price-move %) — см. docstring log_trade(). Не полагаться на сегментацию
+    'по причинам закрытия' на исторических строках до v71."""
     con = sqlite3.connect(TRADES_DB)
     con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
@@ -4531,8 +4550,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-09-06-v70'
+CODE_VERSION = '2026-09-10-v71'
 CHANGELOG = [
+    ('2026-09-10-v71', 'учёт/отчётность (без изменения торговой логики): единые единицы pnl_pct (ROE) во всех путях log_trade в monitor_all() — таймауты/TRAIL раньше писали сырой price-move% вместо ROE, занижая Timeout Avg в LEVERAGE раз против SL/TP; история до v71 в trades.pnl_pct смешанная, сегменты по причинам недействительны на старых строках; close_reason теперь механическая классификация по флагам позиции (TP100_TRAIL/TP50_BE вместо TP по pnl-порогу) — не смешивает трейл-выходы на плюсе с TP100; устранено расхождение Fisher p в /shadow_analyze ORB (0.012 vs 0.2109) — один хелпер _fisher_2x2, таблица сопряжённости печатается для ручной воспроизводимости'),
     ('2026-09-06-v70', 'funding_rate BTC — лог-only гипотеза (НЕ фильтр): фетч раз/цикл в get_btc_context(), колонка в trades/shadow_signals, запись при входе (execute-путь SA + shadow_record), сегмент по бакетам в /stats_analyze и /shadow_analyze (ORB/SA_SHADOW), критерий будущего решения зафиксирован в коде до сбора данных; попутный фикс HTML-парсинга /shadow_analyze (p<0.003 ломал parse_mode, введено в v69, тот же класс бага что v50)'),
     ('2026-09-02-v69', 'ORB: пре-коммит критериев промоушена + маркер форварда ORB_GATE_FORWARD_FROM (гейт задержки НЕ применяется, только отчёт); строка ФОРВАРД с Fisher p и Wilson CI в /shadow_analyze (хелперы без scipy); ENV на Render: SA_LIVE=false (SA → shadow, PF 1.12 n=86 неотличим от 0), AI_ORACLE_ENABLED=0 (ценность не показана, модели мертвы)'),
     ('2026-08-28-v68','жёсткий потолок длительности MAX_TRADE_MIN_HARD=480мин независимо от tp50_hit (INV-7 поймал сделку 1914мин); все модели AI-оракула в ENV + AI_ORACLE_ENABLED + сегмент AI conf в отчёте для измерения ценности оракула; INV-2 порог значимости 0.05% против ложных срабатываний; сводка 0-60 vs 60+ для ORB'),
@@ -4632,7 +4652,15 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
               dur_min: int, close_reason: str):
     """
     Логирует закрытую сделку в SQLite.
-    close_reason: 'SL' | 'TP' | 'BE' | 'Timeout' | 'Manual'
+    close_reason: 'SL' | 'TP100_TRAIL' | 'TP50_BE' | 'BE' | 'WIN' | 'Timeout' | 'TRAIL' | 'Manual'
+
+    pnl_pct — ЕДИНИЦЫ: ROE (движение цены × LEVERAGE), как биржа.
+    [v71] ДО 2026-09-10-v71 вызовы из таймаутов/трейла в monitor_all() передавали
+    сырой price-move % БЕЗ ×LEVERAGE, а путь закрытия через биржу — уже ROE.
+    Единые единицы (ROE) во всех путях log_trade — с v71. ИСТОРИЯ ДО v71 В
+    trades.pnl_pct СМЕШАННАЯ (ROE/raw) — сегментация /stats_analyze «по
+    причинам закрытия» (SL vs Timeout Avg) на строках до v71 недействительна.
+    Миграция старых строк не выполнялась (см. BOT_SPEC §2.12).
     """
     try:
         con = sqlite3.connect(TRADES_DB)
@@ -5127,6 +5155,21 @@ def shadow_analyze() -> str:
                 # ORB_MIN_DELAY_MIN). Граница бакета = ORB_MIN_DELAY_MIN, дата
                 # отсечения = ORB_GATE_FORWARD_FROM. Fisher — на накопленной
                 # выборке (критерий 3), n/PF/Wilson — только форвард (1,2,4).
+                # [v71] ЕДИНСТВЕННОЕ место в коде, считающее Fisher для ORB —
+                # используется ТОЛЬКО _fisher_2x2 (без scipy, см. её докстринг).
+                # Таблица сопряжённости (задокументировано здесь, не менять
+                # без обновления BOT_SPEC §6/§2.12): строки = бакеты 0-{ORB_MIN_
+                # DELAY_MIN} мин vs {ORB_MIN_DELAY_MIN}+ мин от конца диапазона,
+                # столбцы = win/loss (win = net_pnl > 0, т.е. pnl_pct за вычетом
+                # round-trip комиссии _SHADOW_FEE_PCT), выборка НАКОПЛЕННАЯ —
+                # ВСЕ closed ORB-сделки без фильтра по дате (in-sample + форвард
+                # вместе), та же, что в критериях промоушена §6. Ранее (до v71)
+                # расчёт p не сопровождался печатью самой таблицы wins/losses —
+                # расхождение между зафиксированным в BOT_SPEC p=0.012 (снимок
+                # на 2026-09-02, n=204) и живым p в отчёте создавало впечатление
+                # двух разных вычислений, хотя формула одна — просто накопленная
+                # выборка выросла с момента снимка. Печать таблицы ниже делает
+                # p воспроизводимым вручную в любой момент (см. BOT_SPEC §2.12).
                 _d = ORB_MIN_DELAY_MIN
                 def _orb_rows(lo, hi, since=None):
                     q = (f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
@@ -5140,15 +5183,21 @@ def shadow_analyze() -> str:
                 _late_all  = _orb_rows(_d, 9999)
                 _late_fwd  = _orb_rows(_d, 9999, ORB_GATE_FORWARD_FROM)
                 _ea_w = sum(1 for r in _early_all if r[0] > 0)
+                _ea_l = len(_early_all) - _ea_w
                 _la_w = sum(1 for r in _late_all  if r[0] > 0)
+                _la_l = len(_late_all) - _la_w
                 _lf_n, _lf_wr, _lf_avg, _lf_pf = _bucket_stats(_late_fwd)
                 _lf_w = sum(1 for r in _late_fwd if r[0] > 0)
-                _p    = _fisher_2x2(_ea_w, len(_early_all) - _ea_w,
-                                    _la_w, len(_late_all) - _la_w)
+                _p    = _fisher_2x2(_ea_w, _ea_l, _la_w, _la_l)
                 _wl   = _wilson_lower(_lf_w, _lf_n)
                 _ok   = (_lf_n >= 40 and _lf_pf >= 1.3 and _p < 0.003 and _wl > 40)
                 parts.append(f'  ФОРВАРД {_d}+ с {ORB_GATE_FORWARD_FROM}: '
                              f'{_lf_n} сд | WR {_lf_wr:.0f}% | Avg {_lf_avg:+.2f}% | PF {_lf_pf:.2f}')
+                # [v71] Таблица сопряжённости печатается для воспроизводимости
+                # p вручную (2×2: win/loss × бакет 0-{_d} vs {_d}+, накопленная
+                # выборка — см. комментарий-контракт выше).
+                parts.append(f'  Таблица (накопл.): 0-{_d}мин {_ea_w}W/{_ea_l}L (n={len(_early_all)}) | '
+                             f'{_d}+мин {_la_w}W/{_la_l}L (n={len(_late_all)})')
                 parts.append(f'  Fisher 0-{_d} vs {_d}+ (накопл.): p={_p:.4f} | '
                              f'Wilson lower (форвард): {_wl:.1f}%')
                 # [v70] фикс HTML-парсинга: 'p<0.003' — голый '<' перед цифрой
@@ -5406,7 +5455,9 @@ def stats_analyze() -> str:
                     lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
 
             lines.append('\n<b>Причина закрытия:</b>')
-            for reason in ('SL', 'TP', 'BE', 'Timeout'):
+            # [v71] 'TP' → 'TP100_TRAIL'/'TP50_BE' (механическая классификация
+            # по флагам позиции, см. _close_reason в monitor_all()).
+            for reason in ('SL', 'TP100_TRAIL', 'TP50_BE', 'BE', 'Timeout'):
                 rows = con.execute(
                     "SELECT pnl_pct FROM trades WHERE strategy IN ('SMC','RSI') AND close_reason=?",
                     (reason,)).fetchall()
@@ -5416,7 +5467,7 @@ def stats_analyze() -> str:
 
             lines.append('\n<b>Причина × Направление:</b>')
             for d in ('Long', 'Short'):
-                for reason in ('SL', 'TP', 'BE', 'Timeout'):
+                for reason in ('SL', 'TP100_TRAIL', 'TP50_BE', 'BE', 'Timeout'):
                     rows = con.execute(
                         "SELECT pnl_pct FROM trades WHERE strategy IN ('SMC','RSI') "
                         "AND direction=? AND close_reason=?",
@@ -5524,7 +5575,8 @@ def stats_analyze() -> str:
             # [v38] Причина закрытия: avg MFE + длительность = диагностика висяков.
             # MFE таймаутов >=0.5% → проблема выхода; ~0.1-0.2% → проблема входа.
             lines.append('\n<b>Причина закрытия (avg MFE | мин):</b>')
-            for reas in ('TP', 'WIN', 'BE', 'SL', 'Timeout', 'Manual'):
+            # [v71] 'TP' → 'TP100_TRAIL'/'TP50_BE' (механическая классификация)
+            for reas in ('TP100_TRAIL', 'TP50_BE', 'WIN', 'BE', 'SL', 'Timeout', 'Manual'):
                 rows_c = [r for r in sa_new if r[5] == reas]
                 if rows_c:
                     _n = len(rows_c)
@@ -5537,7 +5589,7 @@ def stats_analyze() -> str:
             # [v38] Причина × Направление — где именно вязнут шорты
             lines.append('\n<b>Причина × Направление:</b>')
             for d in ('Long', 'Short'):
-                for reas in ('TP', 'WIN', 'BE', 'SL', 'Timeout'):
+                for reas in ('TP100_TRAIL', 'TP50_BE', 'WIN', 'BE', 'SL', 'Timeout'):
                     rows_cd = [r for r in sa_new if r[5] == reas and r[1] == d]
                     if rows_cd:
                         _n = len(rows_cd)
