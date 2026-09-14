@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v71'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v72'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -90,7 +90,8 @@ RISK_WEEKEND     = 0.01     # [USER] 1% в выходные (тест; для п
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 # ── [MOMENTUM] режим тренд-следования (shadow по умолчанию) ──
-MOMENTUM_ENABLED = os.getenv('MOMENTUM_ENABLED', 'true').lower() == 'true'   # детект+лог
+# [v72] true→false: 222 shadow-сделки, edge нет.
+MOMENTUM_ENABLED = os.getenv('MOMENTUM_ENABLED', 'false').lower() == 'true'   # детект+лог
 MOMENTUM_LIVE    = os.getenv('MOMENTUM_LIVE', 'false').lower() == 'true'      # реальная торговля
 MOM_ADX_MIN      = 25      # тренд должен быть сильным
 MOM_TRAIL_ATR    = float(os.getenv('MOM_TRAIL_ATR', '1.5'))  # чандельер-трейл множитель ATR (env-настройка; 3.0 не фиксировал прибыль → 1.5)
@@ -100,7 +101,12 @@ MOM_MIN_QUOTE    = 5000.0   # мин. оборот свечи USDT
 MOM_RSI_SHORT_MAX = float(os.getenv('MOM_RSI_SHORT_MAX', '35'))  # шорт только если RSI > этого
 MOM_RSI_LONG_MIN  = float(os.getenv('MOM_RSI_LONG_MIN', '65'))
 # [PULLBACK] вход по откату к EMA20 внутри тренда (НЕ пробой экстремума)
-PB_ENABLED   = os.getenv('PB_ENABLED', 'true').lower() == 'true'   # shadow-детект pullback
+# [v72] true→false: 224 shadow-сделки, все сегменты PF net <= 0.97, edge нет.
+# Возврат — только при PF net >= 1.3 на n >= 300.
+# ВАЖНО: PB-детект живёт ВНУТРИ scan_rsi(). При RSI_ENABLED=0 скан не
+# запускается, поэтому PB не заработает даже при PB_ENABLED=1 — для
+# возврата PB нужны оба флага.
+PB_ENABLED   = os.getenv('PB_ENABLED', 'false').lower() == 'true'   # shadow-детект pullback
 PB_LIVE      = os.getenv('PB_LIVE', 'false').lower() == 'true'      # [PB] gated live (микро-размер)
 PB_RISK_MULT = float(os.getenv('PB_RISK_MULT', '0.25'))            # [PB] 25% риска до накопления n>=30
 PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к EMA20 (1.2%)
@@ -211,6 +217,11 @@ SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeo
 # снижен вдвое (1%→0.5% от RISK_PER_TRADE), чтобы вдвое медленнее жечь депозит
 # на время сбора статистики. По образцу PB_RISK_MULT.
 SA_RISK_MULT   = float(os.getenv('SA_RISK_MULT', '0.5'))
+SMC_RISK_MULT = float(os.getenv('SMC_RISK_MULT', '0.5'))
+# [v72] Риск SMC урезан вдвое на время эксперимента с пропускной способностью
+# (правка 1, pivot 5→3). WR 29% при n=34 → ожидаемая макс. серия убытков ~13
+# на 100 сделок. Возврат к 1.0 — при n>=30 НОВЫХ сделок с PF net >= 1.3.
+# По образцу SA_RISK_MULT (v54). Порог не смягчать.
 SA_LONG_HTFUP_SHADOW = os.getenv('SA_LONG_HTFUP_SHADOW', '1') == '1'
 # [v64] Long при htf_trend='Up' (n=18, WR 17%, PF 0.21, p=0.012) уводится в shadow:
 # реальных денег не тратим, но продолжаем копить форвард-данные по сегменту.
@@ -262,13 +273,22 @@ WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')  # общий с�
 
 # ── SMC-параметры ───────────────────────────────────────
 SMC_TF          = '15m'
-SMC_PIVOT_ORDER = 5
+SMC_PIVOT_ORDER = int(os.getenv('SMC_PIVOT_ORDER', '3'))
+# [v72] 5→3. Механическое ослабление, НЕ статистическая подгонка: order=5
+# требует 11-барное окно на пивот, при limit=60 гейт len(h_idx)>=3 and
+# len(l_idx)>=3 проходили 2-4 символа из 80 ([SMC SCAN] struct:). Симуляция
+# на 300 синтетических рядах: доля символов с >=3 пивотами каждого типа
+# 61% (order=5) → 98% (order=3) при том же limit=60. Откат — ENV без деплоя.
 
 # ── RSI-параметры ───────────────────────────────────────
 RSI_TF          = '15m'
 RSI_LONG_MAX    = 30    # [FIX] 27→30: на 15m RSI<27 почти недостижимо в логах
 RSI_SHORT_MIN   = 70    # [FIX] 73→70: симметрично
 RSI_PERIOD      = 14
+# [v72] 1 реальная сделка за всю историю, vol-гейт режет 55-71 из 80 —
+# стратегия конструктивно мертва. Возврат только после пересмотра механики
+# фильтра, не «просто включить обратно».
+RSI_ENABLED = os.getenv('RSI_ENABLED', 'false').lower() == 'true'
 
 # ── Исключения (части имён символов) ───────────────────
 # [R-FIX-8] Проверка через `any(kw in sym for kw in EXCLUDED_PARTS)`
@@ -299,6 +319,13 @@ notified        = {}       # {sym: timestamp}  cooldown 4h
 _rb_last_range  = {}       # [v47] {(sym,mode): (range_low, range_high)} — дедуп по диапазону
 _orb_last_day   = {}       # [v61] {(sym,mode): 'YYYY-MM-DD'} — один вход на символ+направление в сутки
 _sa_shadow_last_ts = 0.0   # [v53] дедуп SA_SHADOW: не чаще 1 записи/60 мин по BTC
+# [v72] SMC_SHADOW: дедуп per-symbol (у SMC 80 символов, глобальный таймстамп
+# как у SA не подходит) + суточный потолок, см. _smc_shadow_record().
+_smc_shadow_last: dict = {}      # {sym: ts}
+_smc_shadow_day = {'date': '', 'n': 0}
+SMC_SHADOW_COOLDOWN_SEC = 6 * 3600
+SMC_SHADOW_MAX_PER_DAY  = 50
+_rsi_disabled_log_ts = 0.0   # [v72] троттлинг debug-лога 'RSI_ENABLED=0' — не чаще раза в сутки
 markets_cache   = None
 markets_ts      = 0.0
 news_ts         = 0.0
@@ -692,6 +719,33 @@ def find_fvg(h, l, mode: str, lookback: int = 15):  # баров поиска FV
         if mode == 'Short' and l[idx - 1] > h[idx + 1]:
             return {'top': float(l[idx - 1]), 'bottom': float(h[idx + 1])}
     return None
+
+def _smc_levels(h, l, price: float, mode: str, atr: float):
+    """[v72] Уровни SMC (SL по структуре + ATR, TP) — единая формула для
+    живого входа и для SMC_SHADOW. Зависит только от h/l/price/atr, поэтому
+    корректно считается в ЛЮБОЙ точке отсева, включая отсев на 'structure'.
+    Вынесено, чтобы shadow-сетапы измерялись по ТОЙ ЖЕ модели выхода, что и
+    живые сделки — иначе сравнение популяций некорректно (§8.4)."""
+    # ── ДИНАМИЧЕСКИЙ SL по структуре + ATR ─────────────────
+    # SL = за минимум/максимум 3 последних свечей + 0.5*ATR (буфер от шума)
+    # При высокой волатильности SL расширяется, при низкой — сужается
+    if mode == 'Long':
+        struct_low = float(np.min(l[-4:-1]))
+        raw_sl     = min(struct_low - atr * 0.5, price - atr * 1.5)
+        sl         = max(raw_sl, price * (1 - MAX_SL_PCT / 100))   # capped at MAX_SL_PCT
+        sl         = min(sl, price * (1 - MIN_SL_PCT / 100))       # минимум MIN_SL_PCT
+    else:  # Short
+        struct_high = float(np.max(h[-4:-1]))
+        raw_sl      = max(struct_high + atr * 0.5, price + atr * 1.5)
+        sl          = min(raw_sl, price * (1 + MAX_SL_PCT / 100))  # capped
+        sl          = max(sl, price * (1 + MIN_SL_PCT / 100))      # минимум
+
+    # TP считается от РЕАЛЬНОЙ дистанции SL, а не от MAX_SL_PCT
+    sl_dist_actual = abs(price - sl)
+    tp_mult_smc    = 1.5  # RR 1:1.5
+    tp             = (price + sl_dist_actual * tp_mult_smc if mode == 'Long'
+                      else price - sl_dist_actual * tp_mult_smc)
+    return sl, tp
 
 # ═══════════════════════════════════════════════════════
 #  ОРАКУЛЫ
@@ -1438,6 +1492,10 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     l = np.array([float(x[3]) for x in ohlcv])
     v = np.array([float(x[5]) for x in ohlcv])
     price = float(c[-1])
+    # [v72] Поднято сюда (было перед _smc_levels): чистая функция от h/l/c,
+    # не влияет на гейты ниже, но теперь нужна во ВСЕХ return-точках ниже
+    # для SMC_SHADOW (_smc_shadow_record требует atr). Вычисляется один раз.
+    atr = calc_atr(h, l, c)
 
     # Volume: закрытая свеча [-2]
     # [v57] median вместо mean — один спайк задирал базу и блокировал
@@ -1445,10 +1503,19 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     avg_v = np.median(v[-21:-2]) if len(v) > 21 else 0.0
     if avg_v <= 0 or v[-2] < avg_v * 1.5:
         return None, 'vol'
+    vol_ratio = v[-2] / avg_v  # [v72] для SMC_SHADOW-сегментации (§4.6)
 
     # CHoCH
     h_idx, l_idx = get_pivots(h, l, order=SMC_PIVOT_ORDER)
     if len(h_idx) < 3 or len(l_idx) < 3:
+        # [v72] SMC_SHADOW: mode ещё не определён (CHoCH не считался) —
+        # синтетическое направление по цене относительно VWAP, посчитанному
+        # здесь же (дёшево, без сетевых запросов).
+        _sh_vwap = calc_vwap(h, l, c, v)
+        _sh_mode = 'Long' if price >= _sh_vwap else 'Short'
+        _smc_shadow_record(sym, _sh_mode, price, 'structure', btc_ctx, h, l, atr,
+                            vol_ratio=vol_ratio,
+                            dist_pct=(price - _sh_vwap) / _sh_vwap * 100)
         return None, 'structure'
 
     rh = [h[i] for i in h_idx[-3:]]
@@ -1459,10 +1526,23 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     elif rl[-1] > rl[-2] and price < rl[-1]:  # Bearish CHoCH
         mode = 'Short'
     if not mode:
+        # [v72] SMC_SHADOW: ни бычий, ни медвежий CHoCH — mode синтетический,
+        # тем же способом, что при 'structure'.
+        _sh_vwap = calc_vwap(h, l, c, v)
+        _sh_mode = 'Long' if price >= _sh_vwap else 'Short'
+        _smc_shadow_record(sym, _sh_mode, price, 'choch', btc_ctx, h, l, atr,
+                            vol_ratio=vol_ratio,
+                            dist_pct=(price - _sh_vwap) / _sh_vwap * 100)
         return None, 'choch'
 
     # [DATA v23] SMC Short: WR25%/PF0.66 — убыточен, оставляем только Long
     if mode == 'Short':
+        # [v72] SMC_SHADOW: единственный способ проверить запрет Short без
+        # реальных денег — n=8 (WR 25%, PF 0.66) была догадкой, не решением.
+        _sh_vwap = calc_vwap(h, l, c, v)
+        _smc_shadow_record(sym, mode, price, 'short_blocked', btc_ctx, h, l, atr,
+                            vol_ratio=vol_ratio,
+                            dist_pct=(price - _sh_vwap) / _sh_vwap * 100)
         return None, 'short_blocked'
 
     # VWAP
@@ -1476,9 +1556,15 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # ЗАПРЕЩАЕМ: Long если цена > 1.5% над VWAP (растянуто, покупка на хае)
     # [AUDIT] 1.005 → 1.015: 0.5% слишком тесно для CHoCH импульса
     if mode == 'Long'  and price > vwap * 1.015:
+        _smc_shadow_record(sym, mode, price, 'vwap', btc_ctx, h, l, atr,
+                            vol_ratio=vol_ratio,
+                            dist_pct=(price - vwap) / vwap * 100)
         return None, 'vwap'
     # ЗАПРЕЩАЕМ: Short если цена < 1.5% под VWAP
     if mode == 'Short' and price < vwap * 0.985:
+        _smc_shadow_record(sym, mode, price, 'vwap', btc_ctx, h, l, atr,
+                            vol_ratio=vol_ratio,
+                            dist_pct=(price - vwap) / vwap * 100)
         return None, 'vwap'
 
     # RSI — защита от входа в конце тренда
@@ -1489,6 +1575,9 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # Верх 68 (НЕ 70): bucket 65+ = PF 0.06, и LLM (RULE 2) всё равно жёстко
     #   режет RSI>68 — зона 68-70 впустую жгла бы LLM-вызовы.
     if not (45 <= rsi <= 68):
+        _smc_shadow_record(sym, mode, price, 'rsi_exhaustion', btc_ctx, h, l, atr,
+                            rsi=rsi, vol_ratio=vol_ratio,
+                            dist_pct=(price - vwap) / vwap * 100)
         return None, 'rsi_exhaustion'
 
     # [SMC-REVIVE v39] alt_score: порог 45 СОХРАНЁН (запрошенное <50 ОТКЛОНЕНО
@@ -1496,46 +1585,43 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # ровно проигрышную зону. Частоту возвращает RSI-расширение выше (низ 45
     # исторически почти удваивает воронку: 7 сд было в 40-55 против 11 в 55-65).
     if btc_ctx.get('alt_score', 50) >= 45:
+        _smc_shadow_record(sym, mode, price, 'alt_high', btc_ctx, h, l, atr,
+                            rsi=rsi, vol_ratio=vol_ratio,
+                            dist_pct=(price - vwap) / vwap * 100)
         return None, 'alt_high'
     # ── ADX фильтр для SMC: тренд должен быть выраженным ──
     # ADX < 18 = слабый рынок, CHoCH = ложный сигнал
     # ADX > 18 = направленное движение, CHoCH = реальный слом
     adx = calc_adx(h, l, c, 14)
     if adx < 18:
+        _smc_shadow_record(sym, mode, price, 'adx_flat', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
+                            dist_pct=(price - vwap) / vwap * 100)
         return None, 'adx_flat'
 
     # FVG
     fvg = find_fvg(h, l, mode)
     if not fvg:
+        _smc_shadow_record(sym, mode, price, 'fvg', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
+                            dist_pct=(price - vwap) / vwap * 100)
         return None, 'fvg'
     if mode == 'Long':
         if not (fvg['bottom'] * 0.992 <= price <= fvg['top'] * 1.008):  # [FIX-FVG] буфер ±0.8%
+            _smc_shadow_record(sym, mode, price, 'fvg_test', btc_ctx, h, l, atr,
+                                rsi=rsi, adx=adx, vol_ratio=vol_ratio,
+                                dist_pct=(price - vwap) / vwap * 100)
             return None, 'fvg_test'
     else:
         if not (fvg['bottom'] * 0.992 <= price <= fvg['top'] * 1.008):  # [FIX-FVG] буфер ±0.8%
+            _smc_shadow_record(sym, mode, price, 'fvg_test', btc_ctx, h, l, atr,
+                                rsi=rsi, adx=adx, vol_ratio=vol_ratio,
+                                dist_pct=(price - vwap) / vwap * 100)
             return None, 'fvg_test'
 
-    atr = calc_atr(h, l, c)
-
-    # ── ДИНАМИЧЕСКИЙ SL по структуре + ATR ─────────────────
-    # SL = за минимум/максимум 3 последних свечей + 0.5*ATR (буфер от шума)
-    # При высокой волатильности SL расширяется, при низкой — сужается
-    if mode == 'Long':
-        struct_low = float(np.min(l[-4:-1]))
-        raw_sl     = min(struct_low - atr * 0.5, price - atr * 1.5)
-        sl         = max(raw_sl, price * (1 - MAX_SL_PCT / 100))   # capped at MAX_SL_PCT
-        sl         = min(sl, price * (1 - MIN_SL_PCT / 100))       # минимум MIN_SL_PCT
-    else:  # Short
-        struct_high = float(np.max(h[-4:-1]))
-        raw_sl      = max(struct_high + atr * 0.5, price + atr * 1.5)
-        sl          = min(raw_sl, price * (1 + MAX_SL_PCT / 100))  # capped
-        sl          = max(sl, price * (1 + MIN_SL_PCT / 100))      # минимум
-
-    # TP считается от РЕАЛЬНОЙ дистанции SL, а не от MAX_SL_PCT
-    sl_dist_actual = abs(price - sl)
-    tp_mult_smc    = 1.5  # RR 1:1.5
-    tp             = (price + sl_dist_actual * tp_mult_smc if mode == 'Long'
-                      else price - sl_dist_actual * tp_mult_smc)
+    # [v72] Уровни вынесены в _smc_levels() — та же формула используется
+    # для SMC_SHADOW (см. _smc_shadow_record), формулы не изменены.
+    sl, tp = _smc_levels(h, l, price, mode, atr)
 
     return {
         'sym': sym, 'mode': mode, 'price': price,
@@ -3597,7 +3683,7 @@ async def scan_smc():
                 # [v16] передаём alt_score для /stats_analyze
                 sig['alt_score'] = smc_btc_ctx.get('alt_score', 0)
                 await execute(sym, sig, 'SMC', smc_positions,
-                              f"RSI: {sig['rsi']:.1f}")
+                              f"RSI: {sig['rsi']:.1f}", risk_mult=SMC_RISK_MULT)
         except Exception as _e:
             st['error'] = st.get('error', 0) + 1
             if st['error'] <= 2:  # логируем только первые 2 (не спамим)
@@ -3610,7 +3696,13 @@ async def scan_smc():
         f"vwap:{st['vwap']} rsi:{st['rsi']} "
         f"adx:{st.get('adx_flat',0)} "
         f"rsi_exh:{st.get('rsi_exhaustion',0)} alt_hi:{st.get('alt_high',0)} "
-        f"fvg:{st.get('fvg',0)+st.get('fvg_test',0)} "
+        # [v72] Счётчики разделены: 'fvg' (зона не найдена за lookback=15) и 'fvg_test'
+        # (зона найдена, цена вне буфера ±0.8%) — разные причины и разные решения.
+        # Решение о find_fvg lookback 15→30 ОТЛОЖЕНО до появления ненулевых чисел по
+        # этим счётчикам после правки 1. Гипотеза, которую надо будет проверить:
+        # расширение lookback перенесёт отсев с 'fvg' на 'fvg_test' (старая зона —
+        # цена уже ушла), то есть чистого выигрыша может не быть.
+        f"fvg:{st.get('fvg',0)} fvg_test:{st.get('fvg_test',0)} "
         f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
 
@@ -3741,6 +3833,16 @@ async def scan_orb():
 
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
+    # [v72] RSI конструктивно мертва (1 сделка за всю историю) — гейт до
+    # circuit_breaker/сетевых вызовов, разгружает цикл. PB тоже живёт здесь
+    # (см. комментарий у PB_ENABLED) — при RSI_ENABLED=0 PB не сработает,
+    # даже если PB_ENABLED=1.
+    global _rsi_disabled_log_ts
+    if not RSI_ENABLED:
+        if time.time() - _rsi_disabled_log_ts > 86400:
+            logging.debug('[RSI] RSI_ENABLED=0 — скан пропущен (конструктивно мертва, см. v72)')
+            _rsi_disabled_log_ts = time.time()
+        return
     if not check_circuit_breaker():
         logging.debug('[RSI] Circuit breaker активен — скан пропущен')
         return
@@ -4097,7 +4199,8 @@ def _init_trades_db():
                   'dist_atr REAL DEFAULT 0', 'atr_pct REAL DEFAULT 0',
                   'dist_pct REAL DEFAULT 0', 'htf_trend TEXT DEFAULT \'\'',
                   'minutes_since_range_end REAL DEFAULT 0',
-                  'funding_rate REAL DEFAULT 0']:                  # [v70]
+                  'funding_rate REAL DEFAULT 0',                   # [v70]
+                  "shadow_reason TEXT DEFAULT ''"]:                # [v72]
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -4550,8 +4653,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-09-10-v71'
+CODE_VERSION = '2026-09-12-v72'
 CHANGELOG = [
+    ('2026-09-12-v72', 'SMC: SMC_PIVOT_ORDER 5→3 через ENV (доля символов с >=3 пивотами 61%→98% на симуляции 300 рядов, гейт struct: проходили 2-4 из 80); fvg/fvg_test счётчики в [SMC SCAN] разделены (были одной суммой); расчёт SL/TP вынесен в _smc_levels() без изменения формул; SMC_SHADOW — логирование отсеянных сетапов (structure/choch/short_blocked/vwap/rsi_exhaustion/alt_high/adx_flat/fvg/fvg_test) с той же моделью выхода, что live (SL/TP/таймаут MAX_TRADE_MIN_SMC), лимит 1/символ/6ч + 50/сутки; SMC_RISK_MULT=0.5 на время эксперимента с pivot (WR 29% n=34 → ожид. серия убытков ~13/100 сделок); PB_ENABLED и MOMENTUM_ENABLED дефолт false (224 и 222 shadow-сделки без edge), новый RSI_ENABLED=false (1 реальная сделка за всю историю, конструктивно мертва) — PB требует ОБА флага, т.к. живёт внутри scan_rsi()'),
     ('2026-09-10-v71', 'учёт/отчётность (без изменения торговой логики): единые единицы pnl_pct (ROE) во всех путях log_trade в monitor_all() — таймауты/TRAIL раньше писали сырой price-move% вместо ROE, занижая Timeout Avg в LEVERAGE раз против SL/TP; история до v71 в trades.pnl_pct смешанная, сегменты по причинам недействительны на старых строках; close_reason теперь механическая классификация по флагам позиции (TP100_TRAIL/TP50_BE вместо TP по pnl-порогу) — не смешивает трейл-выходы на плюсе с TP100; устранено расхождение Fisher p в /shadow_analyze ORB (0.012 vs 0.2109) — один хелпер _fisher_2x2, таблица сопряжённости печатается для ручной воспроизводимости'),
     ('2026-09-06-v70', 'funding_rate BTC — лог-only гипотеза (НЕ фильтр): фетч раз/цикл в get_btc_context(), колонка в trades/shadow_signals, запись при входе (execute-путь SA + shadow_record), сегмент по бакетам в /stats_analyze и /shadow_analyze (ORB/SA_SHADOW), критерий будущего решения зафиксирован в коде до сбора данных; попутный фикс HTML-парсинга /shadow_analyze (p<0.003 ломал parse_mode, введено в v69, тот же класс бага что v50)'),
     ('2026-09-02-v69', 'ORB: пре-коммит критериев промоушена + маркер форварда ORB_GATE_FORWARD_FROM (гейт задержки НЕ применяется, только отчёт); строка ФОРВАРД с Fisher p и Wilson CI в /shadow_analyze (хелперы без scipy); ENV на Render: SA_LIVE=false (SA → shadow, PF 1.12 n=86 неотличим от 0), AI_ORACLE_ENABLED=0 (ценность не показана, модели мертвы)'),
@@ -4743,8 +4847,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
             "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend,"
-            "minutes_since_range_end,funding_rate) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "minutes_since_range_end,funding_rate,shadow_reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
@@ -4760,7 +4864,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              float(msig.get('atr_pct', 0)), float(msig.get('dist_pct', 0)),  # [v57] SA_SHADOW
              str(btc_ctx.get('htf_slope', '')),  # [v64] SA_SHADOW htf_trend-сегментация
              float(msig.get('minutes_since_range_end', 0)),  # [v65] ORB
-             float(btc_ctx.get('funding_rate', 0))))  # [v70] лог-only
+             float(btc_ctx.get('funding_rate', 0)),  # [v70] лог-only
+             str(msig.get('shadow_reason', ''))))  # [v72] SMC_SHADOW причина отсева
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -4788,6 +4893,38 @@ def _sa_shadow_record(mode: str, price: float, sl: float, tp: float,
     logging.info(f'👁 [SA_SHADOW] {mode} @ {price:.2f} отсеян по {reason} | '
                  f'vol:{vol_ratio:.2f} dist:{dist_atr:+.2f}ATR rr:{rr:.2f} '
                  f'atr%:{atr_pct:.3f} dist%:{dist_pct:.2f}')
+
+
+def _smc_shadow_record(sym, mode, price, reason, btc_ctx, h, l, atr,
+                       rsi=0.0, adx=0.0, vol_ratio=0.0, dist_pct=0.0):
+    """[v72] Shadow-логирование SMC-сетапов, прошедших vol-гейт и отсеянных
+    дальше по цепочке. Уровни считаются _smc_levels() — той же формулой, что
+    у живого входа, чтобы популяции были сопоставимы.
+    Лимиты: 1 запись на символ / 6ч + не более 50 записей в сутки. Причина
+    жёсткого потолка — shadow_check() опрашивает КАЖДУЮ открытую запись
+    отдельным последовательным fetch_ohlcv; сотни открытых строк добавили бы
+    минуты к циклу и создали бы риск rate-limit для управления ЖИВЫМИ
+    позициями. 50/сутки хватает для n>=30 по причине за 1-2 недели."""
+    global _smc_shadow_day
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _smc_shadow_day['date'] != today:
+        _smc_shadow_day = {'date': today, 'n': 0}  # [v72] суточный сброс по смене даты UTC
+    if _smc_shadow_day['n'] >= SMC_SHADOW_MAX_PER_DAY:
+        return
+    # [v72] Кулдаун 6ч — ко ВСЕМ причинам одинаково (не только 'vol'), иначе
+    # один символ с устойчивым 'structure' выел бы всю дневную квоту.
+    last_ts = _smc_shadow_last.get(sym, 0.0)
+    if time.time() - last_ts < SMC_SHADOW_COOLDOWN_SEC:
+        return
+    sl, tp = _smc_levels(h, l, price, mode, atr)  # та же формула, что live-вход
+    msig = {'sl': sl, 'tp': tp, 'atr': atr, 'adx': adx, 'rsi': rsi,
+            'vol_ratio': vol_ratio, 'dist_pct': dist_pct,
+            'shadow_reason': 'smc_' + reason}
+    shadow_record(sym, mode, price, msig, btc_ctx, 'SMC_SHADOW')
+    _smc_shadow_last[sym] = time.time()
+    _smc_shadow_day['n'] += 1
+    logging.info(f'👁 [SMC_SHADOW] {sym} {mode} @ {price:.6f} отсеян по {reason} | '
+                 f'rsi:{rsi:.1f} adx:{adx:.1f} vol:{vol_ratio:.2f} dist%:{dist_pct:.2f}')
 
 
 async def shadow_check():
@@ -4930,6 +5067,47 @@ async def shadow_check():
                          bars_orb, sid))
                     logging.info(f"👁 [ORB CLOSE] {sym} {mode} → {rsn} "
                                  f"PnL: {pnl:+.2f}% ({bars_orb} баров)")
+                con.commit(); con.close()
+                continue
+
+            # [v72] SMC_SHADOW — зеркало выходов живого SMC: SL / TP / таймаут
+            # MAX_TRADE_MIN_SMC (минуты, НЕ бары — как у живых SMC-позиций).
+            # Приоритет при пересечении в одном баре: SL > TP (консервативно).
+            # ИЗВЕСТНОЕ УПРОЩЕНИЕ: TP50/БУ/трейлинг живого SMC здесь НЕ
+            # моделируются — shadow даёт верхнюю границу по SL (позиция была
+            # бы частично защищена раньше) и нижнюю по частичным выходам
+            # (реальная сделка фиксирует часть прибыли до полного TP).
+            elif strat == 'SMC_SHADOW':
+                mins_smc = 0
+                try:
+                    _ot = datetime.fromisoformat(open_t)
+                    mins_smc = (datetime.now(timezone.utc) - _ot).total_seconds() / 60
+                except Exception:
+                    pass
+                if is_long:
+                    sl_hit = lo <= sl_p
+                    tp_hit = hi >= tp_p
+                else:
+                    sl_hit = hi >= sl_p
+                    tp_hit = lo <= tp_p
+                smc_timeout = mins_smc >= MAX_TRADE_MIN_SMC
+                con = sqlite3.connect(TRADES_DB)
+                if sl_hit or tp_hit or smc_timeout:
+                    if sl_hit:
+                        exit_p, rsn = sl_p, 'SL'
+                    elif tp_hit:
+                        exit_p, rsn = tp_p, 'TP'
+                    else:
+                        exit_p, rsn = curr, 'TIMEOUT'
+                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
+                    bars_smc = int(mins_smc / (60 if RSI_TF == '1h' else 15))
+                    con.execute(
+                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
+                        "pnl_pct=?,bars_held=? WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl, 3),
+                         bars_smc, sid))
+                    logging.info(f"👁 [SMC_SHADOW CLOSE] {sym} {mode} → {rsn} "
+                                 f"PnL: {pnl:+.2f}% ({mins_smc:.0f}мин)")
                 con.commit(); con.close()
                 continue
 
@@ -5077,7 +5255,8 @@ def shadow_analyze() -> str:
         # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce).
         # [v53] + SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr, БЕЗ денег)
         # [v61] + ORB (Asia Range Breakout, дополняет RB — пробой вместо возврата)
-        for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('ORB', '🎯'), ('SA_SHADOW', '🎯')]:
+        for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('ORB', '🎯'), ('SA_SHADOW', '🎯'),
+                             ('SMC_SHADOW', '🎯')]:  # [v72]
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
                 (strat,)).fetchone()[0]
@@ -5263,6 +5442,35 @@ def shadow_analyze() -> str:
                 parts += _feature(con, strat, 'funding_rate',
                     [('&lt;-0.05%', -99, -0.0005), ('-0.05..0', -0.0005, 0),
                      ('0..0.05%', 0, 0.0005), ('0.05%+', 0.0005, 99)])
+            elif strat == 'SMC_SHADOW':
+                # [v72] Главный срез — по shadow_reason. GROUP BY по факт.
+                # значениям в БД (не фиксированный список бакетов, как везде
+                # выше) — новые причины появятся сами, без правки отчёта.
+                # По direction (Long/Short) — уже покрыто общим блоком выше
+                # (см. цикл 'for d in (Long, Short)') — проверка запрета
+                # short_blocked видна там же.
+                parts.append('  По причине отсева (shadow_reason):')
+                reasons = con.execute(
+                    "SELECT DISTINCT shadow_reason FROM shadow_signals "
+                    "WHERE status='closed' AND strategy=? AND shadow_reason != ''",
+                    (strat,)).fetchall()
+                for (reason,) in sorted(reasons):
+                    rows = con.execute(
+                        f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
+                        "WHERE status='closed' AND strategy=? AND shadow_reason=?",
+                        (strat, reason)).fetchall()
+                    line = _fmt(reason, rows)
+                    if line:
+                        parts.append(line)
+                parts.append('  Entry RSI:')
+                parts += _feature(con, strat, 'entry_rsi',
+                    [('lt45', 0, 45), ('45-55', 45, 55), ('55-68', 55, 68), ('68+', 68, 100)])
+                parts.append('  Объём:')
+                parts += _feature(con, strat, 'vol_ratio',
+                    [('1.5-2.5x', 1.5, 2.5), ('2.5x+', 2.5, 99)])
+                parts.append('  ADX:')
+                parts += _feature(con, strat, 'adx',
+                    [('lt18', 0, 18), ('18-30', 18, 30), ('30+', 30, 99)])
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
