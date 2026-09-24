@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v72'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v73'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -179,7 +179,10 @@ RB_TIMEOUT_MIN   = int(os.getenv('RB_TIMEOUT_MIN', '240'))
 # Пороги НЕ смягчать. Проверка — по строке 'ФОРВАРД' в /shadow_analyze.
 ORB_MIN_DELAY_MIN     = int(os.getenv('ORB_MIN_DELAY_MIN', '60'))
 ORB_GATE_FORWARD_FROM = os.getenv('ORB_GATE_FORWARD_FROM', '2026-09-02')  # ISO-дата, UTC
-ORB_ENABLED   = os.getenv('ORB_ENABLED', 'true').lower() == 'true'
+# [v73] Промоушен закрыт: форвард 60+ n=80, WR 35%, PF net 0.80; разница
+# 0-60 vs 60+ исчезла (PF 1.18 vs 1.18, Fisher p=0.28). Пре-коммит v69
+# отработал — гипотеза отвергнута до вложения денег. Возврат — ENV.
+ORB_ENABLED   = os.getenv('ORB_ENABLED', 'false').lower() == 'true'
 ORB_VOL_MIN   = float(os.getenv('ORB_VOL_MIN', '1.5'))
 ORB_MIN_RR    = float(os.getenv('ORB_MIN_RR', '1.5'))
 ORB_BREAK_ATR = float(os.getenv('ORB_BREAK_ATR', '0.1'))
@@ -222,6 +225,29 @@ SMC_RISK_MULT = float(os.getenv('SMC_RISK_MULT', '0.5'))
 # (правка 1, pivot 5→3). WR 29% при n=34 → ожидаемая макс. серия убытков ~13
 # на 100 сделок. Возврат к 1.0 — при n>=30 НОВЫХ сделок с PF net >= 1.3.
 # По образцу SA_RISK_MULT (v54). Порог не смягчать.
+SMC_FORWARD_FROM = os.getenv('SMC_FORWARD_FROM', '2026-09-12')  # деплой v72
+# [v73] ПРЕ-КОММИТ 2026-09-24. Состояние на фиксации: SMC Long 44 сд,
+# WR 43%, PF 2.01 (ROE при плече 5), t≈2.0 — пограничная значимость; фильтры
+# подбирались на этих же сделках; форвард (17 сд) совпал с ростом BTC +10% —
+# edge не отделён от беты.
+# СТУПЕНЬ 1 (SMC_RISK_MULT 0.5 → 1.0), ВСЕ условия одновременно, только
+# сделки с open_time >= SMC_FORWARD_FROM, только Long:
+#   1) n >= 30;
+#   2) PF net >= 1.3 (net = после round-trip комиссии в ROE:
+#      2*FEE_RATE*100*LEVERAGE, если pnl_pct в trades её не включает);
+#   3) бета-проверка: PF net >= 1.0 в сделках с btc_move_pct <= +0.5%
+#      при n >= 10 в этой группе;
+#   4) Wilson lower WR > 35%.
+# СТУПЕНЬ 2 (риск выше 1%): не раньше n >= 60 форварда, отдельным решением.
+# LEVERAGE не меняется ни на одной ступени: qty = risk/sl_dist, плечо не
+# влияет на прибыль, только приближает ликвидацию.
+# Пороги НЕ смягчать. SMC Short — только после данных SMC_SHADOW short_blocked
+# (n >= 30, PF net >= 1.3), отдельным решением.
+# [ВЫЯСНЕНО v73] trades.pnl_pct НЕ включает комиссию (только ROE от чистого
+# движения цены × LEVERAGE) — net_usdt/net_pnl учитывают fee, а pnl_pct нет
+# (см. log_trade() docstring, execute()/monitor_all()). Поэтому строка
+# ФОРВАРД в /stats_analyze вычитает 2*FEE_RATE*100*LEVERAGE из pnl_pct перед
+# расчётом PF net.
 SA_LONG_HTFUP_SHADOW = os.getenv('SA_LONG_HTFUP_SHADOW', '1') == '1'
 # [v64] Long при htf_trend='Up' (n=18, WR 17%, PF 0.21, p=0.012) уводится в shadow:
 # реальных денег не тратим, но продолжаем копить форвард-данные по сегменту.
@@ -2743,6 +2769,13 @@ async def execute(sym: str, sig: dict, strategy: str,
     logging.info(f"✅ [{strategy}] {sym} {mode} @ {price:.6f} | SL:{sl:.6f} | "
                  f"Qty:{qty} | Notional:${qty*price:.2f} | Risk:${risk_usdt:.2f}")
 
+    # [v73] Цена BTC на входе — для измерения беты (§2.14, изначально SMC).
+    # Берём из уже загруженного tickers_cache (get_tickers_cached() сам не
+    # делает новый запрос, если кэш не старше TICKERS_CACHE_TTL) — НЕ новый
+    # сетевой запрос на каждое открытие позиции.
+    _btc_ticker = (await get_tickers_cached()).get('BTC/USDT:USDT', {})
+    btc_entry_price = float(_btc_ticker.get('last', 0) or 0)
+
     rec = {
         'symbol':      sym,
         'direction':   mode,
@@ -2775,6 +2808,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'htf_trend':   str(sig.get('htf_trend', '')),  # [v38] Up/Down/Flat (пока только SA)
         'entry_rr':    float(sig.get('entry_rr', 0)),  # [v44] RR входа (пока только SA)
         'funding_rate': float(sig.get('funding_rate', 0)),  # [v70] лог-only, пока только SA
+        'btc_entry_price': btc_entry_price,  # [v73] для btc_move_pct при закрытии
         # [v16] признаки для /stats_analyze
         'adx_val':     round(float(sig.get('adx', 0)), 1),
         'alt_score':   int(sig.get('alt_score', 0)),
@@ -2978,6 +3012,8 @@ async def monitor_all():
                         net_u = pos.get('initial_qty', 0) * entry * (pnl_f/100) * LEVERAGE
                         await tg(f"🚀 <b>[{pos.get('strategy')}] {sym}</b> трейл-выход "
                                  f"<code>{curr_p:.6f}</code>  P&L: {pnl_f:+.2f}%")
+                        # [v73] бета: движение BTC за время сделки (§2.14)
+                        pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))
                         # [v71] pnl_f — сырой price-move %, лог требует ROE (см. log_trade())
                         log_trade(pos, curr_p, pnl_f * LEVERAGE, net_u, mfe_t, -mae_t,
                                   dur_m, 'TRAIL')
@@ -3052,6 +3088,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))  # [v73]
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
@@ -3087,6 +3124,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))  # [v73]
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
@@ -3122,6 +3160,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))  # [v73]
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, _sa_mfe_pct, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
@@ -3152,6 +3191,7 @@ async def monitor_all():
                     _gross = (curr_p - entry) * _q if is_long else (entry - curr_p) * _q
                     _fee   = _q * (entry + curr_p) * FEE_RATE
                     _to_net = _gross - _fee + pos.get('realized_pnl_usdt', 0.0)
+                    pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))  # [v73]
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
@@ -3580,6 +3620,7 @@ async def monitor_all():
                              else 'BE' if is_be
                              else 'SL' if pnl_pct < 0
                              else 'WIN')
+            pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))  # [v73]
             log_trade(
                 pos, exit_p, pnl_pct, net_pnl,
                 mfe_pct, mae_pct, dur_min, _close_reason
@@ -3637,6 +3678,24 @@ async def get_tickers_cached() -> dict:
     except Exception as e:
         logging.warning(f'[TICKERS] Ошибка обновления: {e}')
     return _tickers_cache
+
+
+async def _btc_move_pct(entry_btc_price: float) -> float:
+    """[v73] Движение цены BTC от entry_btc_price до текущей, % БЕЗ плеча —
+    для измерения беты (изначально SMC, §2.14). Использует тот же
+    get_tickers_cached(), что и остальной код — новый сетевой запрос
+    случается только если общий кэш тикеров устарел (TICKERS_CACHE_TTL),
+    не из-за этого вызова специально."""
+    if entry_btc_price <= 0:
+        return 0.0
+    try:
+        t = (await get_tickers_cached()).get('BTC/USDT:USDT', {})
+        now_p = float(t.get('last', 0) or 0)
+        if now_p <= 0:
+            return 0.0
+        return (now_p - entry_btc_price) / entry_btc_price * 100
+    except Exception:
+        return 0.0
 
 
 async def _scan_universe() -> list:
@@ -3705,6 +3764,16 @@ async def scan_smc():
         f"fvg:{st.get('fvg',0)} fvg_test:{st.get('fvg_test',0)} "
         f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
     )
+    # [v73] SMC добавлена в сводку сканов дайджеста — раньше отсутствовала
+    # (якорь _scan_summary_accum держал только SA/RB/ORB), по образцу ORB.
+    _record_scan_summary('SMC', {
+        'news': st['news'], 'vol': st['vol'], 'structure': st['structure'],
+        'choch': st['choch'], 'short_blocked': st.get('short_blocked', 0),
+        'vwap': st['vwap'], 'rsi': st['rsi'], 'adx_flat': st.get('adx_flat', 0),
+        'rsi_exhaustion': st.get('rsi_exhaustion', 0), 'alt_high': st.get('alt_high', 0),
+        'fvg': st.get('fvg', 0), 'fvg_test': st.get('fvg_test', 0),
+        'ok': st['ok'],
+    })
 
 
 async def scan_rb():
@@ -4213,7 +4282,9 @@ def _init_trades_db():
                  'htf_trend TEXT DEFAULT ""',         # [v38] наклон EMA200(15m) на входе
                  'mfe_time_min INTEGER DEFAULT -1',   # [v38] минута пика MFE
                  'entry_rr REAL DEFAULT 0',           # [v44] RR входа (SA)
-                 'funding_rate REAL DEFAULT 0']:      # [v70] funding rate BTC на входе
+                 'funding_rate REAL DEFAULT 0',       # [v70] funding rate BTC на входе
+                 'btc_entry_price REAL DEFAULT 0',    # [v73] цена BTC на входе, для беты
+                 'btc_move_pct REAL DEFAULT 0']:      # [v73] движение BTC за сделку, % без плеча
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
@@ -4262,7 +4333,7 @@ _init_trades_db()
 # памяти (не критично для целостности — теряется при рестарте, дайджест
 # просто покажет меньше циклов за день; сами anomalies/alert_history
 # персистентны в БД).
-_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': []}
+_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': [], 'SMC': []}  # [v73] +SMC
 
 
 def _record_scan_summary(strategy: str, counts: dict):
@@ -4653,8 +4724,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-09-12-v72'
+CODE_VERSION = '2026-09-24-v73'
 CHANGELOG = [
+    ('2026-09-24-v73', 'ШАГ0-фикс: shadow_check() был под "if MOMENTUM_ENABLED:" в главном цикле (миграция ещё до v37) — безвредно, пока MOMENTUM_ENABLED=true по умолчанию, но v72 переключил дефолт на false и тем самым заморозил закрытие ВСЕХ теневых стратегий (PB/RB/ORB/SA_SHADOW/SMC_SHADOW), не только SMC_SHADOW; shadow_check() теперь вызывается безусловно (сигнал-генерация MOM отдельно и независимо мертва с v37); SMC добавлен в _scan_summary_accum и пишет сводку скана по образцу ORB; "Причина закрытия" SMC — GROUP BY по факту вместо захардкоженного списка (сумма 44/51 → сходится по построению); новые trades.btc_entry_price/btc_move_pct (без нового сетевого запроса — из get_tickers_cached()) — измерение беты SMC Long (BTC за сделку, BTC-тренд × Long — btc_trend для SMC не пишется, задокументировано, не чинится в этой правке); SMC_FORWARD_FROM=2026-09-12 + пре-коммит контракта на SMC_RISK_MULT 0.5→1.0 (n>=30, PF net>=1.3, бета-группа PF net>=1.0 n>=10, Wilson lower>35%), строка ФОРВАРД в /stats_analyze (pnl_pct не включает комиссию — выяснено и подтверждено по всем 6 путям log_trade, PF net = pnl_pct - 2*FEE_RATE*100*LEVERAGE); ORB_ENABLED дефолт true→false — промоушен закрыт (форвард 60+ n=80 WR 35% PF net 0.80, разница 0-60 vs 60+ исчезла p=0.28), RB не тронут (единственная открытая shadow-гипотеза)'),
     ('2026-09-12-v72', 'SMC: SMC_PIVOT_ORDER 5→3 через ENV (доля символов с >=3 пивотами 61%→98% на симуляции 300 рядов, гейт struct: проходили 2-4 из 80); fvg/fvg_test счётчики в [SMC SCAN] разделены (были одной суммой); расчёт SL/TP вынесен в _smc_levels() без изменения формул; SMC_SHADOW — логирование отсеянных сетапов (structure/choch/short_blocked/vwap/rsi_exhaustion/alt_high/adx_flat/fvg/fvg_test) с той же моделью выхода, что live (SL/TP/таймаут MAX_TRADE_MIN_SMC), лимит 1/символ/6ч + 50/сутки; SMC_RISK_MULT=0.5 на время эксперимента с pivot (WR 29% n=34 → ожид. серия убытков ~13/100 сделок); PB_ENABLED и MOMENTUM_ENABLED дефолт false (224 и 222 shadow-сделки без edge), новый RSI_ENABLED=false (1 реальная сделка за всю историю, конструктивно мертва) — PB требует ОБА флага, т.к. живёт внутри scan_rsi()'),
     ('2026-09-10-v71', 'учёт/отчётность (без изменения торговой логики): единые единицы pnl_pct (ROE) во всех путях log_trade в monitor_all() — таймауты/TRAIL раньше писали сырой price-move% вместо ROE, занижая Timeout Avg в LEVERAGE раз против SL/TP; история до v71 в trades.pnl_pct смешанная, сегменты по причинам недействительны на старых строках; close_reason теперь механическая классификация по флагам позиции (TP100_TRAIL/TP50_BE вместо TP по pnl-порогу) — не смешивает трейл-выходы на плюсе с TP100; устранено расхождение Fisher p в /shadow_analyze ORB (0.012 vs 0.2109) — один хелпер _fisher_2x2, таблица сопряжённости печатается для ручной воспроизводимости'),
     ('2026-09-06-v70', 'funding_rate BTC — лог-only гипотеза (НЕ фильтр): фетч раз/цикл в get_btc_context(), колонка в trades/shadow_signals, запись при входе (execute-путь SA + shadow_record), сегмент по бакетам в /stats_analyze и /shadow_analyze (ORB/SA_SHADOW), критерий будущего решения зафиксирован в коде до сбора данных; попутный фикс HTML-парсинга /shadow_analyze (p<0.003 ломал parse_mode, введено в v69, тот же класс бага что v50)'),
@@ -4776,8 +4848,9 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 rsi_val, vol_ratio, sma_dist, vwap_dist, btc_trend,
                 ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
                 adx_val, alt_score, entry_hour, open_time,
-                htf_trend, mfe_time_min, entry_rr, funding_rate
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                htf_trend, mfe_time_min, entry_rr, funding_rate,
+                btc_entry_price, btc_move_pct
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -4809,6 +4882,8 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('mfe_time_min', -1),    # [v38]
             pos.get('entry_rr', 0),         # [v44]
             pos.get('funding_rate', 0),     # [v70]
+            pos.get('btc_entry_price', 0),  # [v73]
+            pos.get('btc_move_pct', 0),     # [v73]
         ))
         con.commit()
         con.close()
@@ -5663,26 +5738,25 @@ def stats_analyze() -> str:
                     lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
 
             lines.append('\n<b>Причина закрытия:</b>')
-            # [v71] 'TP' → 'TP100_TRAIL'/'TP50_BE' (механическая классификация
-            # по флагам позиции, см. _close_reason в monitor_all()).
-            for reason in ('SL', 'TP100_TRAIL', 'TP50_BE', 'BE', 'Timeout'):
-                rows = con.execute(
-                    "SELECT pnl_pct FROM trades WHERE strategy IN ('SMC','RSI') AND close_reason=?",
-                    (reason,)).fetchall()
-                n, wr, avg, pf = _bucket_stats(rows)
-                if n:
-                    lines.append(f'  {reason}: {n} сд | Avg {avg:+.2f}%')
+            # [v73] Фиксированный список причин расходился с факт. значениями
+            # close_reason в БД (WR73→v71 таксономия TP100_TRAIL/TP50_BE не
+            # включала 'WIN', плюс легаси 'TP' на строках до v71) — сумма
+            # строк не сходилась с "Всего" (44 из 51). GROUP BY по факт.
+            # значениям гарантирует точную сумму по построению.
+            _reason_rows = con.execute(
+                "SELECT close_reason, COUNT(*), AVG(pnl_pct) FROM trades "
+                "WHERE strategy IN ('SMC','RSI') GROUP BY close_reason"
+            ).fetchall()
+            for reason, n, avg in sorted(_reason_rows, key=lambda r: -r[1]):
+                lines.append(f'  {reason}: {n} сд | Avg {avg:+.2f}%')
 
             lines.append('\n<b>Причина × Направление:</b>')
-            for d in ('Long', 'Short'):
-                for reason in ('SL', 'TP100_TRAIL', 'TP50_BE', 'BE', 'Timeout'):
-                    rows = con.execute(
-                        "SELECT pnl_pct FROM trades WHERE strategy IN ('SMC','RSI') "
-                        "AND direction=? AND close_reason=?",
-                        (d, reason)).fetchall()
-                    n, wr, avg, pf = _bucket_stats(rows)
-                    if n:
-                        lines.append(f'  {d}+{reason}: {n} сд | Avg {avg:+.2f}%')
+            _reason_dir_rows = con.execute(
+                "SELECT direction, close_reason, COUNT(*), AVG(pnl_pct) FROM trades "
+                "WHERE strategy IN ('SMC','RSI') GROUP BY direction, close_reason"
+            ).fetchall()
+            for d, reason, n, avg in sorted(_reason_dir_rows, key=lambda r: (r[0] or '', -r[2])):
+                lines.append(f'  {d}+{reason}: {n} сд | Avg {avg:+.2f}%')
 
             def _sr_bucket(col, lo, hi):
                 return _trades_bucket_strat(con, ('SMC', 'RSI'), col, lo, hi)
@@ -5724,6 +5798,66 @@ def stats_analyze() -> str:
                 if n:
                     flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
                     lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+            # [v73] Измерение беты SMC Long — есть ли edge независимо от
+            # роста самого BTC (§2.14). btc_entry_price>0 отсекает строки
+            # без данных (до v73 или сбой тикер-кэша) — не смешивать с 0%.
+            lines.append('\n<b>BTC за время сделки (SMC Long):</b>')
+            for lbl, lo, hi in [('&lt;-1%', -99, -1), ('-1..+1%', -1, 1), ('&gt;+1%', 1, 99)]:
+                rows_btc = con.execute(
+                    "SELECT pnl_pct FROM trades WHERE strategy='SMC' AND direction='Long' "
+                    "AND btc_entry_price > 0 AND btc_move_pct >= ? AND btc_move_pct < ?",
+                    (lo, hi)).fetchall()
+                n, wr, avg, pf = _bucket_stats(rows_btc)
+                if n:
+                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+
+            # [v73] btc_trend на входе для SMC СЕЙЧАС НЕ ПИШЕТСЯ — smc_signal()
+            # не кладёт его в sig (в отличие от SA/single_asset_signal). Сегмент
+            # технически готов и заработает сам, если это исправят отдельно
+            # (не в этой правке — см. BOT_SPEC §2.14 находки шага 0/§4).
+            lines.append('\n<b>BTC-тренд на входе × Long:</b>')
+            _bt_rows = con.execute(
+                "SELECT btc_trend, COUNT(*), AVG(pnl_pct) FROM trades "
+                "WHERE strategy='SMC' AND direction='Long' AND btc_trend != '' "
+                "GROUP BY btc_trend").fetchall()
+            if _bt_rows:
+                for bt, n, avg in _bt_rows:
+                    lines.append(f'  {bt}: {n} сд | Avg {avg:+.2f}%')
+            else:
+                lines.append('  нет данных — btc_trend не пишется для SMC (см. BOT_SPEC §2.14)')
+
+            # [v73] ФОРВАРД-блок пре-коммита масштабирования SMC Long
+            # (контракт — см. комментарий у SMC_FORWARD_FROM, §2.14). PF net =
+            # PF по pnl_pct за вычетом round-trip комиссии в ROE
+            # (2*FEE_RATE*100*LEVERAGE) — trades.pnl_pct сама комиссию НЕ
+            # включает (выяснено v73, в отличие от _SHADOW_FEE_PCT для
+            # shadow_signals, который уже unlevered и используется как есть
+            # в ORB-блоке выше по образцу).
+            _smc_fee_roe = 2 * FEE_RATE * 100 * LEVERAGE
+            _fwd_rows = con.execute(
+                f"SELECT pnl_pct - {_smc_fee_roe}, btc_move_pct, btc_entry_price "
+                "FROM trades WHERE strategy='SMC' AND direction='Long' "
+                "AND open_time >= ?", (SMC_FORWARD_FROM,)).fetchall()
+            _fn, _fwr, _favg, _fpf = _bucket_stats([(r[0],) for r in _fwd_rows])
+            lines.append(f'\n<b>ФОРВАРД SMC Long с {SMC_FORWARD_FROM}:</b>')
+            lines.append(f'  n={_fn} | WR {_fwr:.0f}% | Avg {_favg:+.2f}% | PF net {_fpf:.2f}')
+
+            _beta_rows = [(r[0],) for r in _fwd_rows if r[2] > 0 and r[1] <= 0.5]
+            _bn, _bwr, _bavg, _bpf = _bucket_stats(_beta_rows)
+            lines.append(f'  Бета-группа (BTC &lt;= +0.5%): n={_bn} | PF net {_bpf:.2f}')
+
+            _fwins = sum(1 for r in _fwd_rows if r[0] > 0)
+            _wl = _wilson_lower(_fwins, _fn)
+            lines.append(f'  Wilson lower: {_wl:.0f}%')
+
+            _c1, _c2 = _fn >= 30, _fpf >= 1.3
+            _c3 = (_bn >= 10 and _bpf >= 1.0)
+            _c4 = _wl > 35
+            _ck = lambda b: '✅' if b else '❌'
+            lines.append(f'  Ступень 1: n&gt;=30 {_ck(_c1)} | PF net&gt;=1.3 {_ck(_c2)} | '
+                         f'бета PF net&gt;=1.0(n&gt;=10) {_ck(_c3)} | Wilson&gt;35% {_ck(_c4)}')
 
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
 
@@ -6215,9 +6349,16 @@ async def main():
                 # Мониторинг позиций
                 await monitor_all()
 
-                # [SHADOW] симуляция momentum-сигналов (виртуально)
-                if MOMENTUM_ENABLED:
-                    await shadow_check()
+                # [v73] БАГ-ФИКС: shadow_check() закрывает ВСЕ shadow-стратегии
+                # (PB/RB/ORB/SA_SHADOW/SMC_SHADOW), не только MOM — MOM-сигналы
+                # полностью отключены ещё с v37 (см. закомментированную ветку в
+                # scan_rsi), поэтому MOMENTUM_ENABLED давно ни на что не влияет,
+                # КРОМЕ этого гейта. Когда v72 сменил дефолт MOMENTUM_ENABLED
+                # true→false, шадоу-закрытие молча остановилось для ВСЕХ
+                # стратегий разом — открытые записи копились, ни одна не
+                # закрывалась → /shadow_analyze ничего не показывал (total=0
+                # по 'closed'). Вызывается безусловно.
+                await shadow_check()
 
                 # [SA] single-asset BTC mean-reversion (SA_LIVE = реальная торговля)
                 if SA_ENABLED:
