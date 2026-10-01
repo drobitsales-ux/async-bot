@@ -39,6 +39,7 @@ import math
 import os
 import logging
 import sqlite3
+import statistics
 import time
 import aiohttp
 import numpy as np
@@ -50,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v76'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v77'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -675,6 +676,17 @@ def is_news_now() -> bool:
 # ═══════════════════════════════════════════════════════
 #  CIRCUIT BREAKER  [R-FIX-11]
 # ═══════════════════════════════════════════════════════
+MAX_DD_LIMIT_PCT = float(os.getenv('MAX_DD_LIMIT_PCT', '6.0'))
+# [v77] Общая просадка от пика эквити. 6% при риске 0.5%/сделку ≈
+# 12 полных стопов. После выбора проп-фирмы выставить строже её
+# правила (учесть, считает ли фирма от пика или от стартового
+# баланса — тогда изменить базу, отдельным решением).
+# [v77] ОБЩИЙ breaker: пик = максимум эквити BingX (то же поле, что у дневного DD v76,
+# с нереализованным) с последнего /maxdd_reset (или первого старта v77), хранится
+# в meta. total_dd = (equity − peak)/peak <= −MAX_DD_LIMIT_PCT/100 → то же ДЕЙСТВИЕ,
+# что у дневного breaker (новые входы запрещены в check_circuit_breaker, открытые
+# позиции остаются со своими SL), НО без автоснятия: суточный сброс и /reset его
+# НЕ снимают — только /maxdd_reset. Флаг срабатывания тоже в meta (переживает рестарт).
 # [v76] Дневной DD по ЭКВИТИ счёта BingX (USDT, ВКЛЮЧАЯ нереализованный PnL).
 # Источник — fetch_balance(): ccxt==4.2.14 для BingX swap кладёт в
 # info.data.balance поля {balance, equity, unrealizedProfit, availableMargin,
@@ -690,6 +702,7 @@ def is_news_now() -> bool:
 # скана) не менялось — только условие срабатывания.
 _dd = {'start_equity': 0.0, 'start_date': '', 'equity': 0.0, 'ok_ts': 0.0,
        'fails': 0, 'min_dd': 0.0}
+_mdd = {'peak': 0.0, 'tripped': False}   # [v77] общая просадка от пика эквити
 
 
 def _extract_equity(bal) -> float:
@@ -745,6 +758,64 @@ def dd_load():
         logging.warning(f'[DD] load fail: {_e}')
 
 
+def _mdd_save():
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('maxdd_peak',?)", (str(_mdd['peak']),))
+        con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('maxdd_tripped',?)", ('1' if _mdd['tripped'] else '0'))
+        con.commit(); con.close()
+    except Exception as _e:
+        logging.warning(f'[MAXDD] save fail: {_e}')
+
+
+def mdd_load():
+    """Пик и флаг срабатывания общего breaker из meta (рестарт их не теряет)."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        pk = con.execute("SELECT value FROM meta WHERE key='maxdd_peak'").fetchone()
+        tr = con.execute("SELECT value FROM meta WHERE key='maxdd_tripped'").fetchone()
+        con.close()
+        if pk and float(pk[0]) > 0:
+            _mdd['peak'] = float(pk[0])
+            _mdd['tripped'] = bool(tr and tr[0] == '1')
+            logging.info(f"[MAXDD] пик восстановлен из БД: {_mdd['peak']:.2f} USDT"
+                         + (' | breaker СРАБОТАЛ ранее (снять: /maxdd_reset)' if _mdd['tripped'] else ''))
+    except Exception as _e:
+        logging.warning(f'[MAXDD] load fail: {_e}')
+
+
+def mdd_fraction():
+    """Общая просадка от пика как доля (≤ 0); None — нет данных."""
+    if _mdd['peak'] <= 0 or _dd['equity'] <= 0:
+        return None
+    return (_dd['equity'] - _mdd['peak']) / _mdd['peak']
+
+
+async def _mdd_update(eq: float):
+    """Вызывается из dd_update после УСПЕШНОГО получения эквити (сбой → не вызывается:
+    не срабатывает и не сбрасывает). Пик только растёт; срабатывание — без автоснятия."""
+    if _mdd['peak'] <= 0:
+        _mdd['peak'] = eq
+        _mdd_save()
+        logging.warning(f'[MAXDD] первый старт: пик = текущее эквити {eq:.2f}')
+        await tg(f"ℹ️ <b>Общий breaker</b> (v77): пик эквити зафиксирован = текущее эквити "
+                 f"<code>{eq:.2f} USDT</code>. Лимит просадки от пика: -{MAX_DD_LIMIT_PCT:.1f}%.")
+        return
+    if eq > _mdd['peak']:
+        _mdd['peak'] = eq
+        _mdd_save()
+        return
+    dd = (eq - _mdd['peak']) / _mdd['peak']
+    if not _mdd['tripped'] and dd <= -MAX_DD_LIMIT_PCT / 100 + 1e-9:
+        _mdd['tripped'] = True
+        _mdd_save()
+        logging.warning(f"🔴 [MAXDD] просадка от пика {dd*100:.2f}% → новые входы запрещены")
+        await tg(f"🔴 <b>ОБЩИЙ BREAKER</b>\nПросадка от пика эквити {dd*100:.2f}% "
+                 f"(пик {_mdd['peak']:.2f} → {eq:.2f} USDT) достигла лимита -{MAX_DD_LIMIT_PCT:.1f}%.\n"
+                 f"Новые входы запрещены; открытые позиции остаются со своими SL.\n"
+                 f"Автоматически НЕ снимается (ни суточным сбросом, ни /reset) — только /maxdd_reset.")
+
+
 def dd_fraction():
     """Текущий DD дня как доля (отрицательная = убыток); None — нет данных."""
     today = datetime.now(timezone.utc).date().isoformat()
@@ -769,6 +840,7 @@ async def dd_update(force_rebase: bool = False) -> bool:
         _dd['fails'] = 0
         _dd['equity'] = eq
         _dd['ok_ts'] = time.time()
+        await _mdd_update(eq)   # [v77] пик/общий breaker — только по успешному эквити
         today = datetime.now(timezone.utc).date().isoformat()
         no_base = _dd['start_equity'] <= 0
         if force_rebase or no_base or _dd['start_date'] != today:
@@ -793,6 +865,8 @@ def check_circuit_breaker() -> bool:
     """Возвращает True если торговля разрешена. [v76] Условие — DD по эквити
     (_dd), а не сумма движений цены. Нет данных → состояние не меняется."""
     global circuit_open
+    if _mdd['tripped']:          # [v77] общий breaker: то же действие, без автоснятия
+        return False
     dd = dd_fraction()
     if dd is None:
         return not circuit_open
@@ -809,8 +883,239 @@ def check_circuit_breaker() -> bool:
     return True
 
 
+# ═══════════════════════════════════════════════════════
+#  [v77] ЗАМЕР ЗАДЕРЖКИ ЖИВЫХ ОРДЕРОВ (только измерение, поведение не меняется)
+# ═══════════════════════════════════════════════════════
+# ccxt==4.2.14 для BingX: rateLimit=1000 мс, приватные вызовы (trade/order,
+# user/positions, user/balance) стоят 3 токена → ~1 запрос/с на процесс (3 с на
+# приватный), общая FIFO-очередь со сканерами. Здесь — прозрачные обёртки
+# методов exchange: те же аргументы, то же возвращаемое значение, те же
+# исключения наружу (BaseException записывается и пробрасывается как есть);
+# любой сбой самой записи замера глотается — на живой путь влиять не может.
+# Окно без стопа = время от ответа биржи на ВХОД до ответа на ПЕРВОЕ размещение
+# SL по этому символу (не от вызова входа). Хранение — таблица latency_log
+# (не колонка trades): метрика покрывает все операции, не только сделки, и не
+# требует правки INSERT trades.
+LAT_ALERT_SEC = float(os.getenv('LAT_ALERT_SEC', '10'))
+_lat_buf: list = []            # (ts, op, symbol, dur, ok, qlen)
+_lat_pending_entry: dict = {}  # {symbol: ts ответа на вход} — ждёт первый SL
+_LAT_PENDING_TTL = 900
+_rest_n = 0                    # REST-запросов процесса (счётчик на ccxt fetch)
+_rest_prev = 0
+_lat_last_purge = 0.0
+_LAT_METHODS = ('create_order', 'cancel_order', 'fetch_positions', 'fetch_balance',
+                'set_leverage', 'set_margin_mode', 'fetch_my_trades', 'fetch_tickers')
+
+
+def _lat_qlen(ex) -> int:
+    """Длина очереди throttler ccxt в момент вызова (−1 — недоступно)."""
+    try:
+        th = getattr(ex, 'throttle', None) or getattr(ex, 'throttler', None)
+        return len(th.queue)
+    except Exception:
+        return -1
+
+
+def _lat_classify(name: str, a: tuple, kw: dict):
+    """→ (операция, символ). create_order: STOP* → sl (place/move решает _lat_note),
+    reduceOnly без STOP → close_order (TP50/TP100/таймаут/выход), иначе entry."""
+    try:
+        if name == 'create_order':
+            sym = a[0] if a else kw.get('symbol', '')
+            typ = str(a[1] if len(a) > 1 else kw.get('type', '')).upper()
+            params = kw.get('params') or (a[5] if len(a) > 5 else None) or {}
+            if 'STOP' in typ:
+                return 'sl', sym
+            if params.get('reduceOnly'):
+                return 'close_order', sym
+            return 'entry', sym
+        if name == 'cancel_order':
+            return 'cancel', (a[1] if len(a) > 1 else kw.get('symbol', ''))
+        if name == 'fetch_positions':
+            return 'positions', 'ALL'
+        if name == 'fetch_balance':
+            return 'equity', ''
+        if name in ('set_leverage', 'set_margin_mode'):
+            return 'setup', (a[1] if len(a) > 1 else kw.get('symbol', ''))
+        if name == 'fetch_my_trades':
+            return 'my_trades', (a[0] if a else kw.get('symbol', ''))
+        if name == 'fetch_tickers':
+            return 'tickers', 'ALL'
+    except Exception:
+        pass
+    return name, ''
+
+
+def _lat_note(op: str, sym: str, dur: float, ok: bool, q: int):
+    """Запись замера + окно без стопа. НИКОГДА не бросает исключений."""
+    try:
+        now = time.time()
+        for s_, t_ in list(_lat_pending_entry.items()):     # зависшие входы без SL
+            if now - t_ > _LAT_PENDING_TTL:
+                _lat_pending_entry.pop(s_, None)
+                logging.warning(f'[LAT] unprotected_window=NO_SL {s_} (>{_LAT_PENDING_TTL}s после входа SL не размещён через обёртку)')
+        if op == 'entry':
+            if ok:
+                _lat_pending_entry[sym] = now
+        elif op == 'sl':
+            if ok and sym in _lat_pending_entry:
+                w = now - _lat_pending_entry.pop(sym)
+                op = 'sl_place'
+                _lat_buf.append((now, 'unprotected_window', sym, round(w, 3), 1, q))
+                logging.info(f'[LAT] unprotected_window={w:.2f}s {sym}')
+                lat_flush()
+                if w > LAT_ALERT_SEC:
+                    asyncio.create_task(tg(
+                        f'⚠️ <b>Окно без стопа {w:.1f} с</b> ({sym}): вход подтверждён биржей, SL подтверждён через '
+                        f'{w:.1f} с (порог {LAT_ALERT_SEC:.0f} с). Информационный алерт, действий с позицией нет.'))
+            else:
+                op = 'sl_place' if (sym in _lat_pending_entry) else 'sl_move'
+        _lat_buf.append((now, op, sym, round(dur, 3), 1 if ok else 0, q))
+        if op in ('entry', 'sl_place', 'sl_move', 'close_order', 'cancel'):
+            logging.info(f'[LAT] {op} {sym} {dur:.2f}s ok={int(ok)} queue={q}')
+        if len(_lat_buf) >= 200:
+            lat_flush()
+    except Exception as _e:
+        logging.debug(f'[LAT] note fail: {_e}')
+
+
+def _lat_make(ex, name: str, orig):
+    async def wrapper(*a, **kw):
+        op, sym = _lat_classify(name, a, kw)
+        q = _lat_qlen(ex)
+        t0 = time.time()
+        try:
+            r = await orig(*a, **kw)
+        except BaseException:
+            _lat_note(op, sym, time.time() - t0, False, q)
+            raise
+        _lat_note(op, sym, time.time() - t0, True, q)
+        return r
+    wrapper.__name__ = name
+    return wrapper
+
+
+def lat_install(ex=None):
+    """Ставит обёртки на методы exchange и счётчик REST (на ccxt fetch). Идемпотентно."""
+    ex = ex or exchange
+    if getattr(ex, '_lat_installed', False):
+        return
+    for name in _LAT_METHODS:
+        if hasattr(ex, name):
+            setattr(ex, name, _lat_make(ex, name, getattr(ex, name)))
+    _orig_fetch = ex.fetch
+
+    async def _counted_fetch(*a, **kw):
+        global _rest_n
+        _rest_n += 1
+        return await _orig_fetch(*a, **kw)
+    ex.fetch = _counted_fetch
+    ex._lat_installed = True
+
+
+def lat_flush():
+    """Сбрасывает буфер замеров в latency_log (раз в цикл / при 200 записях); чистка >14 суток."""
+    global _lat_last_purge
+    if not _lat_buf:
+        return
+    rows = list(_lat_buf)
+    del _lat_buf[:]
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.executemany("INSERT INTO latency_log (ts,op,symbol,dur,ok,qlen) VALUES (?,?,?,?,?,?)", rows)
+        if time.time() - _lat_last_purge > 86400:
+            con.execute("DELETE FROM latency_log WHERE ts < ?", (time.time() - 14 * 86400,))
+            _lat_last_purge = time.time()
+        con.commit(); con.close()
+    except Exception as _e:
+        logging.warning(f'[LAT] flush fail: {_e}')
+
+
+def _pct(vals, p):
+    """Перцентиль по методу nearest-rank."""
+    v = sorted(vals)
+    return v[max(0, math.ceil(p / 100 * len(v)) - 1)]
+
+
+def lat_report_text(hours: float = 24) -> str:
+    """По каждой операции за период: n, медиана, p95, максимум; окно без стопа: n, медиана, максимум."""
+    lat_flush()
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        rows = con.execute("SELECT op, dur, ok FROM latency_log WHERE ts >= ?",
+                           (time.time() - hours * 3600,)).fetchall()
+        con.close()
+    except Exception as _e:
+        return f'⏱ Латентность: ошибка чтения ({_e})'
+    by: dict = {}
+    for op, dur, ok in rows:
+        by.setdefault(op, []).append((dur, ok))
+    lines = [f'⏱ <b>Латентность BingX за {hours:g} ч</b> (с, от вызова до ответа)']
+    w = [d for d, _ in by.get('unprotected_window', [])]
+    if w:
+        lines.append(f'Окно без стопа: n={len(w)} | медиана {statistics.median(w):.2f} | максимум {max(w):.2f} '
+                     f'(порог алерта {LAT_ALERT_SEC:.0f})')
+    else:
+        lines.append('Окно без стопа: нет замеров')
+    for op in sorted(k for k in by if k != 'unprotected_window'):
+        d = [x for x, _ in by[op]]
+        err = sum(1 for _, ok in by[op] if not ok)
+        lines.append(f'{op}: n={len(d)} | мед {statistics.median(d):.2f} | p95 {_pct(d, 95):.2f} | макс {max(d):.2f}'
+                     + (f' | ошибок {err}' if err else ''))
+    lines.append(f'REST-запросов процесса всего: {_rest_n}')
+    return '\n'.join(lines)
+
+
+def smc_regime_check_text() -> str:
+    """[v77] ШАГ 5.0 (кучность) — ТОЛЬКО чтение: все живые SMC Long с известным regime_4h:
+    дата открытия, символ, режим, причина закрытия, pnl_pct; число РАЗНЫХ календарных дней
+    у Down+Flat; Fisher Up vs (Down+Flat) по win = net_usdt > 0. Если Down+Flat приходятся
+    на ≤3 дней — эффективная выборка слишком мала (правка режимного фильтра не делается)."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        rows = con.execute(
+            "SELECT open_time, symbol, regime_4h, close_reason, pnl_pct, net_usdt FROM trades "
+            "WHERE strategy='SMC' AND direction='Long' AND regime_4h IN ('Up','Down','Flat') "
+            "ORDER BY open_time").fetchall()
+        tot = con.execute("SELECT COUNT(*) FROM trades WHERE strategy='SMC' AND direction='Long'").fetchone()[0]
+        con.close()
+    except Exception as _e:
+        return f'[SMC_REGIME_CHECK] ошибка: {_e}'
+    lines = [f'🔎 <b>SMC Long × режим 4ч (шаг 5.0)</b>: покрытие {len(rows)}/{tot}']
+    for grp, title in ((('Down', 'Flat'), 'Down + Flat'), (('Up',), 'Up')):
+        sub = [r for r in rows if r[2] in grp]
+        lines.append(f'\n<b>{title}</b> ({len(sub)} сд):')
+        for ot, sym, rg, why, pnl, _nu in sub:
+            lines.append(f'  {str(ot)[:10]} {sym.split("/")[0]} {rg} {why} {pnl:+.2f}%')
+    dn = [r for r in rows if r[2] in ('Down', 'Flat')]
+    up = [r for r in rows if r[2] == 'Up']
+    days = {str(r[0])[:10] for r in dn}
+    uw = sum(1 for r in up if r[5] > 0); dw = sum(1 for r in dn if r[5] > 0)
+    p = _fisher_2x2(uw, len(up) - uw, dw, len(dn) - dw)
+    lines.append(f'\nРазных календарных дней у Down+Flat: <b>{len(days)}</b> ({", ".join(sorted(days))})')
+    lines.append(f'Up {uw}W/{len(up)-uw}L vs Down+Flat {dw}W/{len(dn)-dw}L | Fisher p={p:.4f}')
+    lines.append('🛑 СТОП: Down+Flat на ≤3 дней — эффективная выборка слишком мала, правку не делать'
+                 if len(days) <= 3 else f'✅ кучность не подтверждена: {len(days)} разных дней')
+    lines.append('Look-ahead: regime_4h живой сделки пишется _fill_pos_regime → _regime_4h(now≈open_time) '
+                 '(только закрытые 4ч-свечи) или /regime_backfill (_regime_at по свечам, закрытым ДО open_time).')
+    return '\n'.join(lines)
+
+
+def mdd_status_text() -> str:
+    """[v77] Блок общей просадки для /dd_status."""
+    m = mdd_fraction()
+    return (f"\n📉 <b>Общая просадка от пика</b>: пик <code>{_mdd['peak']:.2f}</code> USDT | "
+            + (f"сейчас <b>{m*100:+.2f}%</b>" if m is not None else "нет данных")
+            + f" | лимит -{MAX_DD_LIMIT_PCT:.1f}% | "
+            + ('🔴 СРАБОТАЛ (снять: /maxdd_reset)' if _mdd['tripped'] else '🟢 OK'))
+
+
 def dd_status_text() -> str:
     """[v76] Текст /dd_status и дневного отчёта."""
+    return _dd_status_core() + mdd_status_text()
+
+
+def _dd_status_core() -> str:
     dd = dd_fraction()
     old = daily_stats['pnl_pct'] * 100
     if dd is None:
@@ -4502,6 +4807,7 @@ async def send_daily_report():
            f"<code>{daily_stats['pnl_pct']*100:+.2f}%</code>"
            if dd_fraction() is not None else
            f"DD по эквити: нет данных | старая метрика (движения цены): <code>{daily_stats['pnl_pct']*100:+.2f}%</code>")
+        + mdd_status_text() + "\n" + lat_report_text(24)   # [v77] общая просадка и латентность за сутки
     )
     logging.info(f"📊 Итоги дня BingX отправлены: {day_pct:+.2f}% ({day_usdt:+.2f} USDT)")
 
@@ -4743,13 +5049,18 @@ def _init_trades_db():
                  'funding_rate REAL DEFAULT 0',       # [v70] funding rate BTC на входе
                  'btc_entry_price REAL DEFAULT 0',    # [v73] цена BTC на входе, для беты
                  'btc_move_pct REAL DEFAULT 0',       # [v73] движение BTC за сделку, % без плеча
-                 "regime_4h TEXT DEFAULT ''"]:        # [v74] режим 4ч на входе (_regime_4h)
+                 "regime_4h TEXT DEFAULT ''",         # [v74] режим 4ч на входе (_regime_4h)
+                 'sl_price REAL DEFAULT 0']:          # [v77] ИСХОДНЫЙ SL при открытии (не перенесённый BE/трейлингом) — для R
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
             pass
     # [EPOCH] таблица meta: время последнего деплоя (для статистики 'Последнее')
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    # [v77] замеры задержки живых вызовов биржи (lat_install/lat_flush)
+    con.execute("CREATE TABLE IF NOT EXISTS latency_log (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "ts REAL, op TEXT, symbol TEXT, dur REAL, ok INTEGER, qlen INTEGER)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_latency_ts ON latency_log (ts)")
     # [v67] Самодиагностика — Уровень 1 (инварианты) и журнал алертов для
     # суточного дайджеста (Уровень 2). См. §11 BOT_SPEC.md.
     con.execute("""
@@ -5183,8 +5494,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-01-v76'
+CODE_VERSION = '2026-10-01-v77'
 CHANGELOG = [
+    ('2026-10-01-v77', 'ЖИВАЯ ЗАЩИТА: общий breaker по просадке от ПИКА эквити BingX (MAX_DD_LIMIT_PCT=6.0, пик и флаг в meta, то же действие что у дневного — новые входы запрещены, позиции со своими SL, БЕЗ автоснятия: суточный сброс и /reset его не снимают, только /maxdd_reset; сбой эквити не срабатывает), /dd_status показывает пик и общую просадку; замер задержки живых ордеров (только измерение): прозрачные обёртки методов exchange (entry/SL/закрытия/отмена/позиции/эквити), таблица latency_log, окно без стопа = ответ на вход -> ответ на SL, [LAT] в логе, алерт при > LAT_ALERT_SEC (10 с, информационный), /lat_status и блок в дневном отчёте (n/медиана/p95/макс), REST-запросов за цикл в логе цикла, глубина очереди throttler ccxt в каждом замере; trades.sl_price (исходный SL, INSERT 33->34) и mean R/t для живого SMC в /stats_analyze; read-only /smc_regime_check (шаг 5.0 — кучность Down+Flat по дням); исследование лимитов BingX/ccxt и вариантов развязки ордеров и сканеров — BOT_SPEC §2.18.2 (без изменений кода)'),
     ('2026-10-01-v76', 'ЖИВАЯ ЗАЩИТА: circuit breaker теперь по ДНЕВНОМУ DD ЭКВИТИ BingX (info.data.balance.equity с нереализованным PnL; база — эквити на начало дня, снимок в суточном сбросе, хранится в meta и переживает рестарт), DAILY_DD_LIMIT_PCT=1.5 вместо суммы движений цены с лимитом 2.5% (метрика завышала убыток в SL_dist/риск ≈ 2.6 раза и не видела таймауты/TP50); действие breaker не менялось; сбой получения эквити не срабатывает и не сбрасывает breaker (3 сбоя подряд — алерт); /dd_status, /dd_reset (после пополнения/вывода), /reset дополнительно переснимает базу; старая метрика считается и выводится в отчёте рядом с новой; PO3 no_data: 4ч-запрос шёл под wait_for(8с), а ccxt==4.2.14 для BingX даёт ОДИН REST-запрос в секунду (rateLimit 1000, FIFO) — запрос PO3 стоял в очереди за SMC/RB и отменялся (на стенде с реальным ccxt-throttler воспроизведён точный прод-симптом no_data:40, SHADOW:0); таймаут 150с (тот же дефект у _regime_4h на горячем пути записи shadow), O текущей 4ч-свечи при её отсутствии в списке — из 15m, подпричины fetch_err/no_4h/no_4h_current/few_15m, один исход на символ, сумма == total; R-метрики (mean R net, t при n>=10, число исключённых sl=0) в первой строке и Long/Short каждой shadow-стратегии, t скрыт при n<10 во всех строках ФОРВАРД; для живого SMC R недоступен (нет sl в trades)'),
     ('2026-10-01-v75', 'shadow-only, живая торговля не менялась: PO3 (Power of Three: sweep -> слом -> ретест на закрытых 15m внутри текущей 4ч-свечи) — po3_signal/_po3_eval, scan_po3 (топ-20 по объёму, только новый закрытый 15m-бар), ветка PO3 в _shadow_exit_eval (SL > TP, таймаут 16 баров по close), секция PO3 в /shadow_analyze, пре-коммит контракта (Long и Short раздельно, все режимы, n>=100, PF net>=1.3, mean R net>0 при t>=2.5) в комментарии у PO3_*; общий кэш 4ч-баров _get_4h_bars для режима и PO3 (один запрос на символ); пре-коммит гипотезы Long против Down-режима (DOWNLONG_FORWARD_FROM) + строка ФОРВАРД Down x Long (n>=60, PF net>=1.3, mean R net>0 при t>=2.5) для RB и SMC_SHADOW — только отчёт; ШАГ0 — расчёт дневного DD для circuit breaker проанализирован, НЕ исправлялся (см. BOT_SPEC §2.16.0: метрика = сумма немасштабированных price-move закрытых сделок, не доля баланса — завышает DD в SL_dist/риск ≈ 2.6 раза); результаты v74 внесены в BOT_SPEC §2.15.0 (заморозка подтверждена, режимный фильтр: пре-коммит не выполнен, 1 из 4)'),
     ('2026-10-01-v74', 'shadow-учёт и разметка, торговая логика не менялась: ШАГ0 — диагностика затянутых shadow-записей НА ПРОДЕ НЕ ВЫПОЛНЕНА (из среды разработки нет доступа к БД/ENV Render и к BingX), воспроизводится командой /shadow_recalc dry (таблица: стратегия | закрытых | затянутых | диапазон open_time | PF net затянутых vs остальных + значение MOMENTUM_ENABLED), числа внести в BOT_SPEC §2.15.0; выход shadow-позиций по ПУТИ цены: чистая _shadow_exit_eval для SA/SA_SHADOW/RB/ORB/SMC_SHADOW (приоритеты внутри бара без изменений, таймаут — по close бара таймаута), shadow_check запрашивает бары от open_time (since, limit<=200), число запросов прежнее — любая пауза цикла больше не теряет SL/TP и не исполняет таймаут по цене пробуждения; shadow_signals.recalc + /shadow_recalc [dry] (фон, Semaphore 2, прогресс каждые 100): пересчёт затянутых по пути цены, recalc=1/2, отчёты исключают recalc=2; режим 4ч (_regime_4h, EMA50 + наклон за 6 баров, кэш до закрытия свечи) в shadow_signals и trades.regime_4h (shadow_record стал async; живая позиция — фоновая задача, регистрацию не задерживает), /regime_backfill без look-ahead, срез Режим x Направление в /shadow_analyze и /stats_analyze (SMC), пре-коммит режимного фильтра зафиксирован в коде; квоты SMC_SHADOW: ранняя группа (structure, choch) 10/сутки + поздняя 40/сутки, кулдаун 6ч по (sym, группа), rsi/adx считаются до первой точки записи (раньше ранние отсевы писали 0); SA_ENABLED дефолт true->false (SA live 86 сд PF 1.12, SA_SHADOW 179 сд все сегменты PF net < 1)'),
@@ -5311,8 +5623,8 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
                 adx_val, alt_score, entry_hour, open_time,
                 htf_trend, mfe_time_min, entry_rr, funding_rate,
-                btc_entry_price, btc_move_pct, regime_4h
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                btc_entry_price, btc_move_pct, regime_4h, sl_price
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -5347,6 +5659,7 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('btc_entry_price', 0),  # [v73]
             pos.get('btc_move_pct', 0),     # [v73]
             pos.get('regime_4h', ''),       # [v74]
+            pos.get('sl_price', 0),         # [v77] исходный SL (rec['sl_price'] не меняется при BE/трейлинге: двигается current_sl)
         ))
         con.commit()
         con.close()
@@ -6857,7 +7170,17 @@ def stats_analyze() -> str:
             # mean R и t по живым сделкам посчитать нельзя. Нужна колонка в
             # trades (отдельным деплоем: схема + INSERT), здесь — только отчёт.
             lines.append('\n<b>R-метрики (SMC live):</b>')
-            lines.append('  недоступны: в trades нет sl_price/sl_dist (не пишется в log_trade)')
+            _lr = con.execute(
+                "SELECT pnl_pct, entry_price, sl_price FROM trades WHERE strategy='SMC'").fetchall()
+            _lok = [((p - _smc_fee_roe) / (abs(e - sl) / e * 100 * LEVERAGE))
+                    for p, e, sl in _lr if sl and sl > 0 and e and abs(e - sl) > 0]
+            _lex = len(_lr) - len(_lok)
+            _ln, _lm, _lt = _mean_r_t(_lok)
+            if _ln:
+                lines.append(f'  mean R net {_lm:+.3f} | {_t_str(_ln, _lt)} | R: n={_ln} '
+                             f'(исключено без sl_price: {_lex}; старые сделки не заполняются задним числом)')
+            else:
+                lines.append(f'  нет сделок с sl_price (исключено без sl_price: {_lex}) — накопится с v77')
 
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
 
@@ -7130,7 +7453,26 @@ async def check_tg_commands():
                                      else ' (эквити не получено — база НЕ переснята, breaker может сработать снова; /dd_reset)') + '. '
                     f'Торговля возобновлена.\n'
                     f'Лимит: {DAILY_DD_LIMIT_PCT:.1f}% эквити/день'
+                    + ('\n⚠️ ОБЩИЙ breaker (просадка от пика) /reset НЕ снимает — только /maxdd_reset.' if _mdd['tripped'] else '')
                 )
+
+            elif cmd == '/smc_regime_check':
+                await tg(smc_regime_check_text())
+
+            elif cmd == '/lat_status':
+                await tg(lat_report_text(24))
+
+            elif cmd == '/maxdd_reset':
+                # [v77] снять общий breaker и переснять пик по текущему эквити — нужно и после
+                # вывода средств (иначе вывод выглядит как просадка). Только по успешному эквити.
+                _eq = await _fetch_equity()
+                if _eq is None:
+                    await tg('❌ Эквити не получено — пик и общий breaker НЕ изменены.')
+                else:
+                    _mdd['peak'], _mdd['tripped'] = _eq, False
+                    _dd['equity'] = _eq
+                    _mdd_save()
+                    await tg(f'✅ Общий breaker снят, пик переснят = <code>{_eq:.2f} USDT</code>.\n' + dd_status_text())
 
             elif cmd == '/dd_status':
                 await tg(dd_status_text())
@@ -7144,6 +7486,8 @@ async def check_tg_commands():
             elif cmd == '/status':
                 all_pos = all_positions()
                 status_cb = '🔴 СТОП' if circuit_open else '🟢 OK'
+                if _mdd['tripped']:
+                    status_cb += ' | 🔴 ОБЩИЙ breaker (просадка от пика, /maxdd_reset)'
                 await tg(
                     f'📊 <b>Статус</b>\n'
                     f'Circuit: {status_cb}\n'
@@ -7230,6 +7574,8 @@ async def check_tg_commands():
                     '/sync — синхронизация позиций с биржей\n'
                     '/dd_status — DD по эквити (база дня, текущее, лимит)\n'
                     '/dd_reset — переснять базу дня (после пополнения/вывода средств)\n'
+                    '/lat_status — латентность ордеров/мониторинга за сутки, окно без стопа\n'
+                    '/maxdd_reset — снять ОБЩИЙ breaker и переснять пик эквити (после вывода средств)\n'
                     '/reset — сброс дневной статистики\n'
                     '/stop — остановка торговли\n'
                     '/help — этот список'
@@ -7276,7 +7622,7 @@ async def check_tg_commands():
 
 
 async def main():
-    global http
+    global http, _rest_prev
 
     init_db()
     load_all()
@@ -7313,7 +7659,9 @@ async def main():
     logging.info(f"⚙️ [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info("=" * 60)
 
+    lat_install()   # [v77] замер задержки живых вызовов биржи + счётчик REST
     dd_load()   # [v76] база дня по эквити (рестарт в тот же день не обнуляет)
+    mdd_load()  # [v77] пик эквити и флаг общего breaker
 
     # Инициализация баланса
     try:
@@ -7535,13 +7883,15 @@ async def main():
                         _name = ['scan_smc', 'scan_rsi', 'scan_rb', 'scan_orb', 'scan_po3'][_i]
                         logging.error(f'❌ {_name} exception: {_r}', exc_info=_r)
                 scan_elapsed = time.time() - scan_t0
-                cb_status = '🔴CB' if circuit_open else ''
+                cb_status = ('🔴CB' if circuit_open else '') + ('🔴MAXDD' if _mdd['tripped'] else '')
                 sess_status = '🟢сессия' if is_session() else '⏸вне'
                 logging.info(
-                    f'⏱ Цикл #{cycle} завершён за {scan_elapsed:.1f}с | '
+                    f'⏱ Цикл #{cycle} завершён за {scan_elapsed:.1f}с | REST:{_rest_n - _rest_prev} | '
                     f'SMC:{len(smc_positions)} RSI:{len(rsi_positions)} поз | '
                     f'{sess_status} {cb_status}'
                 )
+                _rest_prev = _rest_n      # [v77] REST-запросов за следующий цикл — от этой точки
+                lat_flush()               # [v77] замеры задержки → latency_log раз в цикл
 
             except Exception as e:
                 logging.error(f"Main loop #{cycle} error: {e}", exc_info=True)
