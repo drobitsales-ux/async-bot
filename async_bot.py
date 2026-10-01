@@ -32,6 +32,7 @@
 """
 
 import asyncio
+import bisect
 import glob
 import json
 import math
@@ -49,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v73'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v74'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -193,7 +194,9 @@ REPORT_HOUR_UTC = int(os.getenv('REPORT_HOUR_UTC', '19'))
 # [v67] час автоотправки суточного дайджеста самодиагностики (UTC).
 DIGEST_HOUR = int(os.getenv('DIGEST_HOUR', '9'))
 # [v19] SINGLE-ASSET алгоритм: mean reversion BTC от дневного VWAP (shadow)
-SA_ENABLED   = os.getenv('SA_ENABLED', 'true').lower() == 'true'
+# [v74] SA мертва: live 86 сд PF 1.12 (95% CI ожидания включает 0),
+# SA_SHADOW 179 сд — все сегменты PF net < 1. Возврат — ENV.
+SA_ENABLED   = os.getenv('SA_ENABLED', 'false').lower() == 'true'
 SA_SYMBOL    = os.getenv('SA_SYMBOL', 'BTC/USDT:USDT')   # один актив
 SA_ATR_DIST  = float(os.getenv('SA_ATR_DIST', '1.5'))    # отклонение от VWAP в ATR для входа
 SA_ATR_DIST_MAX = float(os.getenv('SA_ATR_DIST_MAX', '99'))  # было 2.2 (v42)
@@ -347,10 +350,16 @@ _orb_last_day   = {}       # [v61] {(sym,mode): 'YYYY-MM-DD'} — один вх�
 _sa_shadow_last_ts = 0.0   # [v53] дедуп SA_SHADOW: не чаще 1 записи/60 мин по BTC
 # [v72] SMC_SHADOW: дедуп per-symbol (у SMC 80 символов, глобальный таймстамп
 # как у SA не подходит) + суточный потолок, см. _smc_shadow_record().
-_smc_shadow_last: dict = {}      # {sym: ts}
-_smc_shadow_day = {'date': '', 'n': 0}
+# [v74] Квоты по ДВУМ группам вместо одной общей 50/сутки: v72-квота
+# выедалась ранними отсевами 'choch'/'structure' (их большинство), поздние
+# причины (adx_flat/fvg/fvg_test…) не записывались вообще. Кулдаун 6ч — по
+# ключу (sym, группа), а не по sym.
+_smc_shadow_last: dict = {}      # {(sym, group): ts}
+_smc_shadow_day = {'date': '', 'early': 0, 'late': 0}
 SMC_SHADOW_COOLDOWN_SEC = 6 * 3600
-SMC_SHADOW_MAX_PER_DAY  = 50
+SMC_SHADOW_EARLY_REASONS = ('structure', 'choch')          # ранняя группа
+SMC_SHADOW_MAX_EARLY    = 10    # /сутки: structure, choch
+SMC_SHADOW_MAX_LATE     = 40    # /сутки: short_blocked, vwap, rsi_exhaustion, alt_high, adx_flat, fvg, fvg_test
 _rsi_disabled_log_ts = 0.0   # [v72] троттлинг debug-лога 'RSI_ENABLED=0' — не чаще раза в сутки
 markets_cache   = None
 markets_ts      = 0.0
@@ -1530,6 +1539,11 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     if avg_v <= 0 or v[-2] < avg_v * 1.5:
         return None, 'vol'
     vol_ratio = v[-2] / avg_v  # [v72] для SMC_SHADOW-сегментации (§4.6)
+    # [v74] rsi/adx вычисляются ДО первой точки записи в SMC_SHADOW (как atr в
+    # v72): чистые функции от h/l/c, на гейты не влияют. Раньше ранние отсевы
+    # писали rsi=0/adx=0 — срезы 'RSI lt45' и 'ADX lt18' были заглушками.
+    rsi = calc_rsi(c[:-1])
+    adx = calc_adx(h, l, c, 14)
 
     # CHoCH
     h_idx, l_idx = get_pivots(h, l, order=SMC_PIVOT_ORDER)
@@ -1539,8 +1553,8 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
         # здесь же (дёшево, без сетевых запросов).
         _sh_vwap = calc_vwap(h, l, c, v)
         _sh_mode = 'Long' if price >= _sh_vwap else 'Short'
-        _smc_shadow_record(sym, _sh_mode, price, 'structure', btc_ctx, h, l, atr,
-                            vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, _sh_mode, price, 'structure', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - _sh_vwap) / _sh_vwap * 100)
         return None, 'structure'
 
@@ -1556,8 +1570,8 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
         # тем же способом, что при 'structure'.
         _sh_vwap = calc_vwap(h, l, c, v)
         _sh_mode = 'Long' if price >= _sh_vwap else 'Short'
-        _smc_shadow_record(sym, _sh_mode, price, 'choch', btc_ctx, h, l, atr,
-                            vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, _sh_mode, price, 'choch', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - _sh_vwap) / _sh_vwap * 100)
         return None, 'choch'
 
@@ -1566,8 +1580,8 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
         # [v72] SMC_SHADOW: единственный способ проверить запрет Short без
         # реальных денег — n=8 (WR 25%, PF 0.66) была догадкой, не решением.
         _sh_vwap = calc_vwap(h, l, c, v)
-        _smc_shadow_record(sym, mode, price, 'short_blocked', btc_ctx, h, l, atr,
-                            vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, mode, price, 'short_blocked', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - _sh_vwap) / _sh_vwap * 100)
         return None, 'short_blocked'
 
@@ -1582,27 +1596,26 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # ЗАПРЕЩАЕМ: Long если цена > 1.5% над VWAP (растянуто, покупка на хае)
     # [AUDIT] 1.005 → 1.015: 0.5% слишком тесно для CHoCH импульса
     if mode == 'Long'  and price > vwap * 1.015:
-        _smc_shadow_record(sym, mode, price, 'vwap', btc_ctx, h, l, atr,
-                            vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, mode, price, 'vwap', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - vwap) / vwap * 100)
         return None, 'vwap'
     # ЗАПРЕЩАЕМ: Short если цена < 1.5% под VWAP
     if mode == 'Short' and price < vwap * 0.985:
-        _smc_shadow_record(sym, mode, price, 'vwap', btc_ctx, h, l, atr,
-                            vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, mode, price, 'vwap', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - vwap) / vwap * 100)
         return None, 'vwap'
 
     # RSI — защита от входа в конце тренда
-    rsi = calc_rsi(c[:-1])
     # [SMC-REVIVE v39] Частота упала до ~1 сд/день → расширяем RSI 50-65 → 45-68.
     # Низ 45: под-зона 45-55 маргинальна (40-55 PF 0.83, n=7), но не катастрофа —
     #   принимаем ради частоты, КОНТРОЛЬ PF под-зоны через ~15 сд.
     # Верх 68 (НЕ 70): bucket 65+ = PF 0.06, и LLM (RULE 2) всё равно жёстко
     #   режет RSI>68 — зона 68-70 впустую жгла бы LLM-вызовы.
     if not (45 <= rsi <= 68):
-        _smc_shadow_record(sym, mode, price, 'rsi_exhaustion', btc_ctx, h, l, atr,
-                            rsi=rsi, vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, mode, price, 'rsi_exhaustion', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - vwap) / vwap * 100)
         return None, 'rsi_exhaustion'
 
@@ -1611,16 +1624,15 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # ровно проигрышную зону. Частоту возвращает RSI-расширение выше (низ 45
     # исторически почти удваивает воронку: 7 сд было в 40-55 против 11 в 55-65).
     if btc_ctx.get('alt_score', 50) >= 45:
-        _smc_shadow_record(sym, mode, price, 'alt_high', btc_ctx, h, l, atr,
-                            rsi=rsi, vol_ratio=vol_ratio,
+        await _smc_shadow_record(sym, mode, price, 'alt_high', btc_ctx, h, l, atr,
+                            rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - vwap) / vwap * 100)
         return None, 'alt_high'
     # ── ADX фильтр для SMC: тренд должен быть выраженным ──
     # ADX < 18 = слабый рынок, CHoCH = ложный сигнал
     # ADX > 18 = направленное движение, CHoCH = реальный слом
-    adx = calc_adx(h, l, c, 14)
     if adx < 18:
-        _smc_shadow_record(sym, mode, price, 'adx_flat', btc_ctx, h, l, atr,
+        await _smc_shadow_record(sym, mode, price, 'adx_flat', btc_ctx, h, l, atr,
                             rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - vwap) / vwap * 100)
         return None, 'adx_flat'
@@ -1628,19 +1640,19 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
     # FVG
     fvg = find_fvg(h, l, mode)
     if not fvg:
-        _smc_shadow_record(sym, mode, price, 'fvg', btc_ctx, h, l, atr,
+        await _smc_shadow_record(sym, mode, price, 'fvg', btc_ctx, h, l, atr,
                             rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                             dist_pct=(price - vwap) / vwap * 100)
         return None, 'fvg'
     if mode == 'Long':
         if not (fvg['bottom'] * 0.992 <= price <= fvg['top'] * 1.008):  # [FIX-FVG] буфер ±0.8%
-            _smc_shadow_record(sym, mode, price, 'fvg_test', btc_ctx, h, l, atr,
+            await _smc_shadow_record(sym, mode, price, 'fvg_test', btc_ctx, h, l, atr,
                                 rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                                 dist_pct=(price - vwap) / vwap * 100)
             return None, 'fvg_test'
     else:
         if not (fvg['bottom'] * 0.992 <= price <= fvg['top'] * 1.008):  # [FIX-FVG] буфер ±0.8%
-            _smc_shadow_record(sym, mode, price, 'fvg_test', btc_ctx, h, l, atr,
+            await _smc_shadow_record(sym, mode, price, 'fvg_test', btc_ctx, h, l, atr,
                                 rsi=rsi, adx=adx, vol_ratio=vol_ratio,
                                 dist_pct=(price - vwap) / vwap * 100)
             return None, 'fvg_test'
@@ -2446,7 +2458,7 @@ async def single_asset_signal(btc_ctx: dict):
         # [v53] Нижняя граница 1.3 никогда не валидирована (BOT_SPEC §2.5) —
         # shadow-запись БЕЗ денег для зоны vol<1.3 (и vol>2.0 заодно).
         if _sa_setup_valid:
-            _sa_shadow_record(mode, price, _sa_hyp_sl, vwap, vol_ratio,
+            await _sa_shadow_record(mode, price, _sa_hyp_sl, vwap, vol_ratio,
                                dist_atr, _rr, rsi, btc_ctx, 'vol_climax',
                                atr_pct, dist_pct)
         return None, 'vol_climax', diag
@@ -2457,7 +2469,7 @@ async def single_asset_signal(btc_ctx: dict):
         # ~1% отклонений от VWAP, потолок 2.2 их режет. Проверяем на данных,
         # были бы такие входы прибыльны в текущем режиме (§2.4).
         if _sa_meaningful:
-            _sa_shadow_record(_sa_hyp_mode2, price, _sa_hyp_sl2, vwap, vol_ratio,
+            await _sa_shadow_record(_sa_hyp_mode2, price, _sa_hyp_sl2, vwap, vol_ratio,
                                dist_atr, _rr, rsi, btc_ctx, 'vwap_far',
                                atr_pct, dist_pct)
         return None, 'vwap_far', diag
@@ -2466,7 +2478,7 @@ async def single_asset_signal(btc_ctx: dict):
         # [v57] shadow: сетап без полного совпадения RSI+dist на одном
         # направлении, но осмысленный хотя бы по одному критерию.
         if _sa_meaningful:
-            _sa_shadow_record(_sa_hyp_mode2, price, _sa_hyp_sl2, vwap, vol_ratio,
+            await _sa_shadow_record(_sa_hyp_mode2, price, _sa_hyp_sl2, vwap, vol_ratio,
                                dist_atr, _rr, rsi, btc_ctx, 'no_setup',
                                atr_pct, dist_pct)
         return None, 'no_setup', diag
@@ -2485,7 +2497,7 @@ async def single_asset_signal(btc_ctx: dict):
     if _rr < SA_MIN_RR:
         # [v53] Форвард уже показал 0/7 при RR<0.7 (§2.2) — но shadow даёт
         # доп. точки без риска, если данные когда-то потребуются повторно.
-        _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
+        await _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
                            rsi, btc_ctx, 'low_rr', atr_pct, dist_pct)
         return None, 'low_rr', diag
 
@@ -2496,7 +2508,7 @@ async def single_asset_signal(btc_ctx: dict):
     # вместо этого уводим в shadow: денег не тратим, форвард-данные копим до
     # n>=30. Отключается SA_LONG_HTFUP_SHADOW=0.
     if mode == 'Long' and btc_ctx.get('htf_slope') == 'Up' and SA_LONG_HTFUP_SHADOW:
-        _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
+        await _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
                            rsi, btc_ctx, 'htfup_shadow', atr_pct, dist_pct)
         return None, 'htfup_shadow', diag
 
@@ -2508,7 +2520,7 @@ async def single_asset_signal(btc_ctx: dict):
     # по тому же принципу — деньги не тратим, форвард-данные копим до n>=30.
     # Отключается SA_SHORT_HTFUP_SHADOW=0.
     if mode == 'Short' and btc_ctx.get('htf_slope') == 'Up' and SA_SHORT_HTFUP_SHADOW:
-        _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
+        await _sa_shadow_record(mode, price, sl, tp, vol_ratio, dist_atr, _rr,
                            rsi, btc_ctx, 'htfup_short_shadow', atr_pct, dist_pct)
         return None, 'htfup_short_shadow', diag
 
@@ -2809,6 +2821,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         'entry_rr':    float(sig.get('entry_rr', 0)),  # [v44] RR входа (пока только SA)
         'funding_rate': float(sig.get('funding_rate', 0)),  # [v70] лог-only, пока только SA
         'btc_entry_price': btc_entry_price,  # [v73] для btc_move_pct при закрытии
+        'regime_4h':   '',  # [v74] заполняется фоново ниже (_fill_pos_regime) — без задержки регистрации
         # [v16] признаки для /stats_analyze
         'adx_val':     round(float(sig.get('adx', 0)), 1),
         'alt_score':   int(sig.get('alt_score', 0)),
@@ -2821,6 +2834,12 @@ async def execute(sym: str, sig: dict, strategy: str,
     pos_list.append(rec)
     daily_stats[f"{strategy.lower()}_trades"] = daily_stats.get(f"{strategy.lower()}_trades", 0) + 1
     save_all()
+    # [v74] Режим 4ч на входе — в ФОНЕ: позиция уже на бирже (SL выставлен), её
+    # регистрация в мониторинге не должна ждать сетевого запроса. Значение
+    # проставляется в rec на месте и уходит в БД через log_trade() при закрытии.
+    _t_reg = asyncio.create_task(_fill_pos_regime(rec, sym))
+    _bg_tasks.add(_t_reg)
+    _t_reg.add_done_callback(_bg_tasks.discard)
 
     wknd = ' (Weekend ½)' if is_weekend() else ''
     rr = abs(tp - price) / abs(price - sl)
@@ -3819,7 +3838,7 @@ async def scan_rb():
                         f"sweep:{rsig['sweep_depth_atr']:.2f}ATR range:{rsig['range_w_atr']:.1f}ATR "
                         f"Vol:{rsig['vol_ratio']:.1f}x RR:{rsig['entry_rr']:.2f}"
                     )
-                    shadow_record(sym, rsig['mode'], rsig['entry'], rsig, rb_btc_ctx, 'RB')
+                    await shadow_record(sym, rsig['mode'], rsig['entry'], rsig, rb_btc_ctx, 'RB')
                     rb_shadow_n += 1
         except Exception as _re:
             st_rb['error'] = st_rb.get('error', 0) + 1
@@ -3884,7 +3903,7 @@ async def scan_orb():
                     f"w:{osig['range_w_atr']:.1f}ATR Vol:{osig['vol_ratio']:.1f}x "
                     f"RR:{osig['entry_rr']:.2f}"
                 )
-                shadow_record(sym, osig['mode'], osig['entry'], osig, orb_btc_ctx, 'ORB')
+                await shadow_record(sym, osig['mode'], osig['entry'], osig, orb_btc_ctx, 'ORB')
                 orb_shadow_n += 1
         except Exception as _oe:
             st_orb['error'] = st_orb.get('error', 0) + 1
@@ -3970,7 +3989,7 @@ async def scan_rsi():
                         f"ADX:{psig['adx']:.0f} Vol:{psig['vol_ratio']:.1f}x "
                         f"near-EMA20 [{_alt} score:{_ascore} ETH/BTC:{_spread:+.1f}%]"
                     )
-                    shadow_record(sym, psig['mode'], psig['entry'], psig, btc_ctx, 'PB')
+                    await shadow_record(sym, psig['mode'], psig['entry'], psig, btc_ctx, 'PB')
 
                     # [PB GATED LIVE] микро-размер, только пока набираем n>=30.
                     # Фильтры уже жёсткие в pullback_signal: ADX>60, Vol 1.5-3x, alt<40, Long-only.
@@ -4269,7 +4288,12 @@ def _init_trades_db():
                   'dist_pct REAL DEFAULT 0', 'htf_trend TEXT DEFAULT \'\'',
                   'minutes_since_range_end REAL DEFAULT 0',
                   'funding_rate REAL DEFAULT 0',                   # [v70]
-                  "shadow_reason TEXT DEFAULT ''"]:                # [v72]
+                  "shadow_reason TEXT DEFAULT ''",                 # [v72]
+                  # [v74] 0 — исходная запись, 1 — пересчитана по пути цены
+                  # (/shadow_recalc), 2 — не пересчитываема (нет баров);
+                  # отчёты исключают recalc=2.
+                  'recalc INTEGER DEFAULT 0',
+                  "regime_4h TEXT DEFAULT ''"]:                    # [v74]
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -4284,7 +4308,8 @@ def _init_trades_db():
                  'entry_rr REAL DEFAULT 0',           # [v44] RR входа (SA)
                  'funding_rate REAL DEFAULT 0',       # [v70] funding rate BTC на входе
                  'btc_entry_price REAL DEFAULT 0',    # [v73] цена BTC на входе, для беты
-                 'btc_move_pct REAL DEFAULT 0']:      # [v73] движение BTC за сделку, % без плеча
+                 'btc_move_pct REAL DEFAULT 0',       # [v73] движение BTC за сделку, % без плеча
+                 "regime_4h TEXT DEFAULT ''"]:        # [v74] режим 4ч на входе (_regime_4h)
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
@@ -4724,8 +4749,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-09-24-v73'
+CODE_VERSION = '2026-10-01-v74'
 CHANGELOG = [
+    ('2026-10-01-v74', 'shadow-учёт и разметка, торговая логика не менялась: ШАГ0 — диагностика затянутых shadow-записей НА ПРОДЕ НЕ ВЫПОЛНЕНА (из среды разработки нет доступа к БД/ENV Render и к BingX), воспроизводится командой /shadow_recalc dry (таблица: стратегия | закрытых | затянутых | диапазон open_time | PF net затянутых vs остальных + значение MOMENTUM_ENABLED), числа внести в BOT_SPEC §2.15.0; выход shadow-позиций по ПУТИ цены: чистая _shadow_exit_eval для SA/SA_SHADOW/RB/ORB/SMC_SHADOW (приоритеты внутри бара без изменений, таймаут — по close бара таймаута), shadow_check запрашивает бары от open_time (since, limit<=200), число запросов прежнее — любая пауза цикла больше не теряет SL/TP и не исполняет таймаут по цене пробуждения; shadow_signals.recalc + /shadow_recalc [dry] (фон, Semaphore 2, прогресс каждые 100): пересчёт затянутых по пути цены, recalc=1/2, отчёты исключают recalc=2; режим 4ч (_regime_4h, EMA50 + наклон за 6 баров, кэш до закрытия свечи) в shadow_signals и trades.regime_4h (shadow_record стал async; живая позиция — фоновая задача, регистрацию не задерживает), /regime_backfill без look-ahead, срез Режим x Направление в /shadow_analyze и /stats_analyze (SMC), пре-коммит режимного фильтра зафиксирован в коде; квоты SMC_SHADOW: ранняя группа (structure, choch) 10/сутки + поздняя 40/сутки, кулдаун 6ч по (sym, группа), rsi/adx считаются до первой точки записи (раньше ранние отсевы писали 0); SA_ENABLED дефолт true->false (SA live 86 сд PF 1.12, SA_SHADOW 179 сд все сегменты PF net < 1)'),
     ('2026-09-24-v73', 'ШАГ0-фикс: shadow_check() был под "if MOMENTUM_ENABLED:" в главном цикле (миграция ещё до v37) — безвредно, пока MOMENTUM_ENABLED=true по умолчанию, но v72 переключил дефолт на false и тем самым заморозил закрытие ВСЕХ теневых стратегий (PB/RB/ORB/SA_SHADOW/SMC_SHADOW), не только SMC_SHADOW; shadow_check() теперь вызывается безусловно (сигнал-генерация MOM отдельно и независимо мертва с v37); SMC добавлен в _scan_summary_accum и пишет сводку скана по образцу ORB; "Причина закрытия" SMC — GROUP BY по факту вместо захардкоженного списка (сумма 44/51 → сходится по построению); новые trades.btc_entry_price/btc_move_pct (без нового сетевого запроса — из get_tickers_cached()) — измерение беты SMC Long (BTC за сделку, BTC-тренд × Long — btc_trend для SMC не пишется, задокументировано, не чинится в этой правке); SMC_FORWARD_FROM=2026-09-12 + пре-коммит контракта на SMC_RISK_MULT 0.5→1.0 (n>=30, PF net>=1.3, бета-группа PF net>=1.0 n>=10, Wilson lower>35%), строка ФОРВАРД в /stats_analyze (pnl_pct не включает комиссию — выяснено и подтверждено по всем 6 путям log_trade, PF net = pnl_pct - 2*FEE_RATE*100*LEVERAGE); ORB_ENABLED дефолт true→false — промоушен закрыт (форвард 60+ n=80 WR 35% PF net 0.80, разница 0-60 vs 60+ исчезла p=0.28), RB не тронут (единственная открытая shadow-гипотеза)'),
     ('2026-09-12-v72', 'SMC: SMC_PIVOT_ORDER 5→3 через ENV (доля символов с >=3 пивотами 61%→98% на симуляции 300 рядов, гейт struct: проходили 2-4 из 80); fvg/fvg_test счётчики в [SMC SCAN] разделены (были одной суммой); расчёт SL/TP вынесен в _smc_levels() без изменения формул; SMC_SHADOW — логирование отсеянных сетапов (structure/choch/short_blocked/vwap/rsi_exhaustion/alt_high/adx_flat/fvg/fvg_test) с той же моделью выхода, что live (SL/TP/таймаут MAX_TRADE_MIN_SMC), лимит 1/символ/6ч + 50/сутки; SMC_RISK_MULT=0.5 на время эксперимента с pivot (WR 29% n=34 → ожид. серия убытков ~13/100 сделок); PB_ENABLED и MOMENTUM_ENABLED дефолт false (224 и 222 shadow-сделки без edge), новый RSI_ENABLED=false (1 реальная сделка за всю историю, конструктивно мертва) — PB требует ОБА флага, т.к. живёт внутри scan_rsi()'),
     ('2026-09-10-v71', 'учёт/отчётность (без изменения торговой логики): единые единицы pnl_pct (ROE) во всех путях log_trade в monitor_all() — таймауты/TRAIL раньше писали сырой price-move% вместо ROE, занижая Timeout Avg в LEVERAGE раз против SL/TP; история до v71 в trades.pnl_pct смешанная, сегменты по причинам недействительны на старых строках; close_reason теперь механическая классификация по флагам позиции (TP100_TRAIL/TP50_BE вместо TP по pnl-порогу) — не смешивает трейл-выходы на плюсе с TP100; устранено расхождение Fisher p в /shadow_analyze ORB (0.012 vs 0.2109) — один хелпер _fisher_2x2, таблица сопряжённости печатается для ручной воспроизводимости'),
@@ -4849,8 +4875,8 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
                 ai_conf, ai_comment, tp_mult, be_moved, tp50_hit,
                 adx_val, alt_score, entry_hour, open_time,
                 htf_trend, mfe_time_min, entry_rr, funding_rate,
-                btc_entry_price, btc_move_pct
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                btc_entry_price, btc_move_pct, regime_4h
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
             pos.get('symbol', ''),
@@ -4884,6 +4910,7 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
             pos.get('funding_rate', 0),     # [v70]
             pos.get('btc_entry_price', 0),  # [v73]
             pos.get('btc_move_pct', 0),     # [v73]
+            pos.get('regime_4h', ''),       # [v74]
         ))
         con.commit()
         con.close()
@@ -4897,9 +4924,106 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
 #  Записывает сигнал, симулирует чандельер-трейл как в live,
 #  считает виртуальный PnL → реальный винрейт без риска.
 # ═══════════════════════════════════════════════════════
-def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
-    """Записывает shadow-сигнал, если по symbol+mode+strategy нет открытого."""
+
+# ───────────────────────────────────────────────────────
+#  [v74] РЕЖИМ 4ч (Up / Down / Flat) — разметка ВСЕХ сделок
+# ───────────────────────────────────────────────────────
+# ПРЕ-КОММИТ (зафиксирован 2026-10-01, ДО сбора данных по режиму):
+# режимный фильтр становится КАНДИДАТОМ на внедрение, если по данным ПОСЛЕ
+# /shadow_recalc (v74, пересчёт затянутых записей по пути цены) в >=3
+# стратегиях из RB / ORB / SMC_SHADOW / SA_SHADOW одновременно:
+#   1) «по режиму» (Long в Up + Short в Down): PF net >= 1.3 при n >= 100;
+#   2) «против режима» (Long в Down + Short в Up): PF net < 1.0.
+# Само внедрение фильтра — ОТДЕЛЬНЫМ деплоем, не этим. Порог не смягчать.
+# Определение режима (на момент записи, только закрытые 4ч-свечи):
+#   Up   — close последней закрытой 4ч-свечи > EMA50(4ч) И EMA50 сейчас >
+#          EMA50 шесть 4ч-баров назад;
+#   Down — зеркально;  Flat — иначе;  '' — нет данных (сбой/мало истории).
+# htf_trend НЕ используется — у SA другая семантика (EMA200 на 15m).
+_REGIME_TF_MS      = 4 * 3600 * 1000
+_REGIME_EMA_W      = 50
+_REGIME_SLOPE_BARS = 6
+_REGIME_MIN_BARS   = 100     # EMA сидится первой ценой — до прогрева режим не считаем ('')
+_regime_cache: dict = {}     # {sym: (expire_ts, regime)} — до закрытия текущей 4ч-свечи
+_bg_tasks: set = set()       # ссылки на фоновые задачи (иначе GC может их убить)
+
+
+def _ema_series(closes, w: int = _REGIME_EMA_W):
+    """EMA по всему ряду (сид — первая цена, как в calc_ema). Каузальна: значение
+    в точке i зависит только от closes[:i+1] — основа защиты от look-ahead."""
+    a = 2 / (w + 1)
+    e = float(closes[0])
+    out = [e]
+    for p in closes[1:]:
+        e = float(p) * a + e * (1 - a)
+        out.append(e)
+    return out
+
+
+def _regime_prepare(bars):
+    """bars — 4ч-свечи по возрастанию (формирующаяся/будущие допустимы).
+    → (ends_ms, closes, ema). end = ts + 4ч: свеча «закрыта» к моменту t, если end <= t."""
+    ends = [int(b[0]) + _REGIME_TF_MS for b in bars]
+    closes = [float(b[4]) for b in bars]
+    return ends, closes, (_ema_series(closes) if closes else [])
+
+
+def _regime_at(ends, closes, ema, t_ms) -> str:
+    """Режим на момент t_ms: берётся ТОЛЬКО последняя свеча, закрытая к t_ms.
+    Свечи после t_ms не участвуют ни в close, ни в EMA (EMA каузальна)."""
+    i = bisect.bisect_right(ends, t_ms) - 1
+    if i + 1 < _REGIME_MIN_BARS or i < _REGIME_SLOPE_BARS:
+        return ''
+    c, e, e_prev = closes[i], ema[i], ema[i - _REGIME_SLOPE_BARS]
+    if c > e and e > e_prev:
+        return 'Up'
+    if c < e and e < e_prev:
+        return 'Down'
+    return 'Flat'
+
+
+async def _regime_4h(sym: str) -> str:
+    """[v74] Режим 4ч символа: 'Up' | 'Down' | 'Flat' | '' (сбой/нет истории).
+    Кэш на символ до закрытия текущей 4ч-свечи → один запрос на символ раз в 4ч.
+    Вызывается ТОЛЬКО в момент записи сделки (shadow_record / открытие живой
+    позиции), НЕ в скане. Ошибка → '' и НИКОГДА не блокирует запись.
+    Контракт-пре-коммит режимного фильтра — см. комментарий выше."""
+    now = time.time()
+    hit = _regime_cache.get(sym)
+    if hit and now < hit[0]:
+        return hit[1]
     try:
+        bars = await asyncio.wait_for(exchange.fetch_ohlcv(sym, '4h', limit=300), 8)
+        ends, closes, ema = _regime_prepare(bars or [])
+        now_ms = int(now * 1000)
+        reg = _regime_at(ends, closes, ema, now_ms)
+        expire = ((now_ms // _REGIME_TF_MS) + 1) * _REGIME_TF_MS / 1000
+    except Exception as _e:
+        logging.debug(f'[REGIME] {sym}: {_e}')
+        _regime_cache[sym] = (now + 300, '')   # не долбить биржу при сбое
+        return ''
+    _regime_cache[sym] = (expire, reg)
+    return reg
+
+
+async def _fill_pos_regime(rec: dict, sym: str):
+    """[v74] Фоновое заполнение regime_4h живой позиции — НЕ задерживает
+    регистрацию позиции в execute() (позиция с SL на бирже должна попасть в
+    мониторинг без лишнего сетевого запроса). log_trade читает pos['regime_4h']
+    при закрытии; к тому моменту значение давно проставлено."""
+    try:
+        rec['regime_4h'] = await _regime_4h(sym)
+    except Exception:
+        pass
+
+
+async def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
+    """Записывает shadow-сигнал, если по symbol+mode+strategy нет открытого.
+    [v74] async: режим 4ч запрашивается здесь (момент записи), ДО блока
+    dedup+INSERT — чтобы проверка дубля и вставка остались атомарными (между
+    ними нет await)."""
+    try:
+        regime = await _regime_4h(sym)
         con = sqlite3.connect(TRADES_DB)
         cur = con.cursor()
         cur.execute(
@@ -4922,8 +5046,8 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
             "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend,"
-            "minutes_since_range_end,funding_rate,shadow_reason) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "minutes_since_range_end,funding_rate,shadow_reason,regime_4h) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(), sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
@@ -4940,16 +5064,17 @@ def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              str(btc_ctx.get('htf_slope', '')),  # [v64] SA_SHADOW htf_trend-сегментация
              float(msig.get('minutes_since_range_end', 0)),  # [v65] ORB
              float(btc_ctx.get('funding_rate', 0)),  # [v70] лог-only
-             str(msig.get('shadow_reason', ''))))  # [v72] SMC_SHADOW причина отсева
+             str(msig.get('shadow_reason', '')),  # [v72] SMC_SHADOW причина отсева
+             regime))  # [v74] режим 4ч на входе
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
 
 
-def _sa_shadow_record(mode: str, price: float, sl: float, tp: float,
-                       vol_ratio: float, dist_atr: float, rr: float,
-                       rsi: float, btc_ctx: dict, reason: str,
-                       atr_pct: float = 0.0, dist_pct: float = 0.0):
+async def _sa_shadow_record(mode: str, price: float, sl: float, tp: float,
+                            vol_ratio: float, dist_atr: float, rr: float,
+                            rsi: float, btc_ctx: dict, reason: str,
+                            atr_pct: float = 0.0, dist_pct: float = 0.0):
     """[v53] Shadow-логирование SA-сетапов, отсеянных 'vol_climax'/'low_rr', у
     которых остальные условия (направление + дистанция в торгуемой зоне)
     выполнены. Валидация зон vol<1.3 и RR<0.7 БЕЗ реальных денег — эти зоны
@@ -4963,47 +5088,206 @@ def _sa_shadow_record(mode: str, price: float, sl: float, tp: float,
     msig = {'sl': sl, 'tp': tp, 'atr': 0.0, 'adx': 0.0, 'rsi': rsi,
             'vol_ratio': vol_ratio, 'entry_rr': rr, 'dist_atr': dist_atr,
             'atr_pct': atr_pct, 'dist_pct': dist_pct}
-    shadow_record(SA_SYMBOL, mode, price, msig, btc_ctx, 'SA_SHADOW')
-    _sa_shadow_last_ts = time.time()
+    _sa_shadow_last_ts = time.time()   # [v74] до await — иначе конкурентный вызов пройдёт дедуп
+    await shadow_record(SA_SYMBOL, mode, price, msig, btc_ctx, 'SA_SHADOW')
     logging.info(f'👁 [SA_SHADOW] {mode} @ {price:.2f} отсеян по {reason} | '
                  f'vol:{vol_ratio:.2f} dist:{dist_atr:+.2f}ATR rr:{rr:.2f} '
                  f'atr%:{atr_pct:.3f} dist%:{dist_pct:.2f}')
 
 
-def _smc_shadow_record(sym, mode, price, reason, btc_ctx, h, l, atr,
-                       rsi=0.0, adx=0.0, vol_ratio=0.0, dist_pct=0.0):
+async def _smc_shadow_record(sym, mode, price, reason, btc_ctx, h, l, atr,
+                             rsi=0.0, adx=0.0, vol_ratio=0.0, dist_pct=0.0):
     """[v72] Shadow-логирование SMC-сетапов, прошедших vol-гейт и отсеянных
     дальше по цепочке. Уровни считаются _smc_levels() — той же формулой, что
     у живого входа, чтобы популяции были сопоставимы.
-    Лимиты: 1 запись на символ / 6ч + не более 50 записей в сутки. Причина
-    жёсткого потолка — shadow_check() опрашивает КАЖДУЮ открытую запись
-    отдельным последовательным fetch_ohlcv; сотни открытых строк добавили бы
-    минуты к циклу и создали бы риск rate-limit для управления ЖИВЫМИ
-    позициями. 50/сутки хватает для n>=30 по причине за 1-2 недели."""
+    [v74] Квоты — по ДВУМ группам: ранняя (structure, choch) 10/сутки, поздняя
+    (short_blocked, vwap, rsi_exhaustion, alt_high, adx_flat, fvg, fvg_test)
+    40/сутки; кулдаун 6ч — по ключу (sym, группа). v72-схема (50/сутки общих +
+    кулдаун по sym на все причины) выедалась ранними отсевами, поздние причины
+    не записывались вообще. Общий потолок 50/сутки сохранён — причина та же:
+    shadow_check() опрашивает КАЖДУЮ открытую запись отдельным fetch_ohlcv."""
     global _smc_shadow_day
     today = datetime.now(timezone.utc).date().isoformat()
     if _smc_shadow_day['date'] != today:
-        _smc_shadow_day = {'date': today, 'n': 0}  # [v72] суточный сброс по смене даты UTC
-    if _smc_shadow_day['n'] >= SMC_SHADOW_MAX_PER_DAY:
+        _smc_shadow_day = {'date': today, 'early': 0, 'late': 0}  # суточный сброс по смене даты UTC
+    group = 'early' if reason in SMC_SHADOW_EARLY_REASONS else 'late'
+    cap = SMC_SHADOW_MAX_EARLY if group == 'early' else SMC_SHADOW_MAX_LATE
+    if _smc_shadow_day[group] >= cap:
         return
-    # [v72] Кулдаун 6ч — ко ВСЕМ причинам одинаково (не только 'vol'), иначе
-    # один символ с устойчивым 'structure' выел бы всю дневную квоту.
-    last_ts = _smc_shadow_last.get(sym, 0.0)
-    if time.time() - last_ts < SMC_SHADOW_COOLDOWN_SEC:
+    key = (sym, group)
+    if time.time() - _smc_shadow_last.get(key, 0.0) < SMC_SHADOW_COOLDOWN_SEC:
         return
+    # Квота/кулдаун резервируются ДО await: shadow_record асинхронна (запрос
+    # режима 4ч), иначе конкурентные вызовы могли бы превысить потолок.
+    _smc_shadow_last[key] = time.time()
+    _smc_shadow_day[group] += 1
     sl, tp = _smc_levels(h, l, price, mode, atr)  # та же формула, что live-вход
     msig = {'sl': sl, 'tp': tp, 'atr': atr, 'adx': adx, 'rsi': rsi,
             'vol_ratio': vol_ratio, 'dist_pct': dist_pct,
             'shadow_reason': 'smc_' + reason}
-    shadow_record(sym, mode, price, msig, btc_ctx, 'SMC_SHADOW')
-    _smc_shadow_last[sym] = time.time()
-    _smc_shadow_day['n'] += 1
+    await shadow_record(sym, mode, price, msig, btc_ctx, 'SMC_SHADOW')
     logging.info(f'👁 [SMC_SHADOW] {sym} {mode} @ {price:.6f} отсеян по {reason} | '
                  f'rsi:{rsi:.1f} adx:{adx:.1f} vol:{vol_ratio:.2f} dist%:{dist_pct:.2f}')
 
 
+# ───────────────────────────────────────────────────────
+#  [v74] Выход shadow-позиций по ПУТИ цены (а не по последнему бару)
+# ───────────────────────────────────────────────────────
+# До v74 shadow_check() смотрел только последний бар (limit=3), а таймаут
+# закрывал по ТЕКУЩЕЙ цене: любая пауза цикла (деплой, заморозка v72-v73,
+# сбой биржи) теряла путь цены — SL/TP, случившиеся в пропущенных барах,
+# не видны, а таймаут исполнялся по цене момента «пробуждения». Теперь
+# правила выхода — в чистой функции _shadow_exit_eval, которой отдают ВСЕ бары
+# от бара входа; результат не зависит от того, как часто вызывали проверку.
+_SHADOW_PATH_STRATS = ('SA', 'SA_SHADOW', 'RB', 'ORB', 'SMC_SHADOW')
+_shadow_cov_warn_ts = 0.0
+
+
+def _shadow_tf_ms() -> int:
+    return (60 if RSI_TF == '1h' else 15) * 60_000
+
+
+def _shadow_open_dt(iso: str) -> datetime:
+    dt = datetime.fromisoformat(iso)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _shadow_timeout_dt(strat: str, open_dt: datetime):
+    """Момент таймаута shadow-записи (UTC). ЕДИНЫЙ источник для
+    _shadow_exit_eval и селектора «затянутых» записей в /shadow_recalc.
+    Семантика прежнего кода сохранена: SA — int(мин/tf)>=40 баров; RB —
+    int(мин/tf)>=RB_TIMEOUT_MIN/tf (с округлением вверх до целого бара);
+    SMC_SHADOW — MAX_TRADE_MIN_SMC минут; ORB — 18:00 UTC дня открытия."""
+    tf_m = _shadow_tf_ms() // 60_000
+    if strat in ('SA', 'SA_SHADOW'):
+        return open_dt + timedelta(minutes=40 * tf_m)
+    if strat == 'RB':
+        return open_dt + timedelta(minutes=math.ceil(RB_TIMEOUT_MIN / tf_m) * tf_m)
+    if strat == 'SMC_SHADOW':
+        return open_dt + timedelta(minutes=MAX_TRADE_MIN_SMC)
+    if strat == 'ORB':
+        end = open_dt.astimezone(timezone.utc).replace(hour=18, minute=0, second=0, microsecond=0)
+        return max(open_dt, end)
+    return None
+
+
+def _shadow_exit_eval(strat: str, row: dict, bars: list, now_ts: float = None):
+    """[v74] Чистая функция выхода shadow-позиции по ПУТИ цены.
+
+    row  — dict: direction, entry_price, tp_price, sl_price, tp2_price, open_time (ISO).
+    bars — список 15m-баров [ts_ms, o, h, l, c, v] по возрастанию, начиная с бара,
+           СОДЕРЖАЩЕГО open_time (бар входа участвует в проверке — как в прежнем
+           коде; бары, закончившиеся до open_time, отбрасываются, так что неточный
+           since биржи не портит результат). Последний бар может быть формирующимся.
+    now_ts — «сейчас» (unix сек.) — параметр, а не time.time() внутри, чтобы
+           функция оставалась чистой и тестируемой; по умолчанию текущее время.
+    Возвращает (closed, exit_p, reason, bars_held).
+
+    Бары перебираются ПО ПОРЯДКУ; внутри бара приоритет каждой стратегии —
+    БЕЗ изменений: SA/SA_SHADOW: TP-VWAP > SL; RB/ORB: SL > TP2 > TP1;
+    SMC_SHADOW: SL > TP. Таймаут — только если в баре нет SL/TP: выход по
+    close ТОГО бара, на который пришёлся момент таймаута (для формирующегося
+    бара close = текущая цена, как в прежнем коде при своевременной проверке).
+    Допущение: в баре таймаута SL/TP проверяются по всему бару (hi/lo бара
+    целиком, до 15 мин «после» момента таймаута) — как и раньше, когда
+    формирующийся бар учитывался целиком."""
+    if now_ts is None:
+        now_ts = time.time()
+    tf_ms = _shadow_tf_ms()
+    now_ms = now_ts * 1000
+    open_dt = _shadow_open_dt(row['open_time'])
+    open_ms = open_dt.timestamp() * 1000
+    entry_bar_ms = int(open_ms // tf_ms * tf_ms)
+    t_to = _shadow_timeout_dt(strat, open_dt)
+    t_to_ms = t_to.timestamp() * 1000 if t_to else None
+    is_long = (row['direction'] == 'Long')
+    tp_p = float(row.get('tp_price') or 0)
+    sl_p = float(row.get('sl_price') or 0)
+    tp2_p = float(row.get('tp2_price') or 0)
+    for b in bars:
+        ts = int(b[0])
+        if ts + tf_ms <= open_ms:
+            continue                      # бар целиком до входа
+        hi, lo, cl = float(b[2]), float(b[3]), float(b[4])
+        held = max(0, int((ts - entry_bar_ms) // tf_ms))
+        if is_long:
+            sl_hit, tp_hit, tp2_hit = lo <= sl_p, hi >= tp_p, hi >= tp2_p
+        else:
+            sl_hit, tp_hit, tp2_hit = hi >= sl_p, lo <= tp_p, lo <= tp2_p
+        if strat in ('SA', 'SA_SHADOW'):
+            if tp_hit:   return True, tp_p, 'TP-VWAP', held
+            if sl_hit:   return True, sl_p, 'SL', held
+        elif strat in ('RB', 'ORB'):
+            if sl_hit:   return True, sl_p, 'SL', held
+            if tp2_hit:  return True, tp2_p, 'TP2', held
+            if tp_hit:   return True, tp_p, 'TP1', held
+        elif strat == 'SMC_SHADOW':
+            if sl_hit:   return True, sl_p, 'SL', held
+            if tp_hit:   return True, tp_p, 'TP', held
+        if t_to_ms is not None and now_ms >= t_to_ms and ts + tf_ms > t_to_ms:
+            return True, cl, 'TIMEOUT', held
+    return False, None, None, None
+
+
+def _shadow_pnl(entry: float, exit_p: float, is_long: bool) -> float:
+    return ((exit_p - entry) / entry if is_long else (entry - exit_p) / entry) * 100
+
+
+def _shadow_close_iso(open_dt: datetime, held: int, upto_ts: float) -> str:
+    """close_time = min(upto, конец бара выхода): при своевременной проверке это
+    «сейчас», при выходе, найденном по пути после паузы, — момент закрытия бара."""
+    tf_ms = _shadow_tf_ms()
+    bar_end = (int(open_dt.timestamp() * 1000) // tf_ms * tf_ms + (held + 1) * tf_ms) / 1000
+    return datetime.fromtimestamp(min(upto_ts, bar_end), timezone.utc).isoformat()
+
+
+async def _shadow_fetch_path(sym: str, open_dt: datetime, upto_ts: float):
+    """Бары от бара входа до upto_ts одним запросом. limit = баров с момента
+    открытия + 2, не более 200. since = начало бара входа − 1 мс: BingX мог бы
+    трактовать startTime как эксклюзивный — тогда бар входа потерялся бы.
+    → (bars, covered); covered=True, если первый бар не позже бара входа."""
+    tf_ms = _shadow_tf_ms()
+    bar0 = int(open_dt.timestamp() * 1000) // tf_ms * tf_ms
+    n = int((upto_ts * 1000 - bar0) // tf_ms) + 1
+    limit = max(3, min(200, n + 2))
+    bars = await exchange.fetch_ohlcv(sym, RSI_TF, since=bar0 - 1, limit=limit)
+    bars = bars or []
+    return bars, bool(bars) and int(bars[0][0]) <= bar0
+
+
+async def _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p):
+    """Проверка одной открытой shadow-записи по пути цены (SA/RB/ORB/SMC_SHADOW)."""
+    global _shadow_cov_warn_ts
+    now_ts = time.time()
+    open_dt = _shadow_open_dt(open_t)
+    bars, covered = await _shadow_fetch_path(sym, open_dt, now_ts)
+    if not bars:
+        return
+    if not covered and time.time() - _shadow_cov_warn_ts > 3600:
+        _shadow_cov_warn_ts = time.time()
+        logging.warning(f'[SHADOW] {sym}: биржа не вернула бар входа (since не сработал?) — '
+                        f'путь цены неполный, оценка по доступным барам')
+    row = {'direction': mode, 'entry_price': entry, 'tp_price': tp_p,
+           'sl_price': sl_p, 'tp2_price': tp2_p, 'open_time': open_t}
+    closed, exit_p, rsn, held = _shadow_exit_eval(strat, row, bars, now_ts)
+    if not closed:
+        return
+    is_long = (mode == 'Long')
+    pnl = _shadow_pnl(entry, exit_p, is_long)
+    con = sqlite3.connect(TRADES_DB)
+    con.execute(
+        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
+        "pnl_pct=?,bars_held=? WHERE id=?",
+        (_shadow_close_iso(open_dt, held, now_ts), exit_p, round(pnl, 3), held, sid))
+    con.commit(); con.close()
+    logging.info(f"👁 [{strat} CLOSE] {sym} {mode} → {rsn} "
+                 f"PnL: {pnl:+.2f}% ({held} баров)")
+
+
 async def shadow_check():
-    """Симулирует чандельер-трейл по открытым shadow-сигналам, закрывает виртуально."""
+    """Симулирует выходы по открытым shadow-сигналам, закрывает виртуально.
+    [v74] SA/SA_SHADOW/RB/ORB/SMC_SHADOW — по ПУТИ цены (_shadow_exit_eval);
+    дефолтная ветка чандельер-трейла (PB/MOM, мертвы) — без изменений."""
     try:
         con = sqlite3.connect(TRADES_DB)
         cur = con.cursor()
@@ -5020,6 +5304,10 @@ async def shadow_check():
     MAX_HOLD_BARS = 100   # таймаут симуляции
     for (sid, sym, mode, entry, atr, mfe_p, trail_sl, open_t, strat, tp_p, sl_p, tp2_p) in rows:
         try:
+            if strat in _SHADOW_PATH_STRATS:
+                await _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p)
+                continue
+
             ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=3)
             if not ohlcv:
                 continue
@@ -5027,164 +5315,6 @@ async def shadow_check():
             hi, lo, curr = float(last[2]), float(last[3]), float(last[4])
             is_long = (mode == 'Long')
             atr = atr if atr > 0 else entry * 0.01
-
-            # [SA] mean-reversion: выход по TP (VWAP) или SL, без трейлинга.
-            # [v53] SA_SHADOW — те же уровни/логика, отдельная метка для отчёта.
-            if strat in ('SA', 'SA_SHADOW'):
-                bars_sa = 0
-                try:
-                    _ot = datetime.fromisoformat(open_t)
-                    tf_m = 60 if RSI_TF == '1h' else 15
-                    bars_sa = int((datetime.now(timezone.utc) - _ot).total_seconds()/60/tf_m)
-                except Exception:
-                    pass
-                if is_long:
-                    tp_hit = hi >= tp_p
-                    sl_hit = lo <= sl_p
-                else:
-                    tp_hit = lo <= tp_p
-                    sl_hit = hi >= sl_p
-                sa_timeout = bars_sa >= 40   # mean-rev должен сработать быстро
-                con = sqlite3.connect(TRADES_DB)
-                if tp_hit or sl_hit or sa_timeout:
-                    exit_p = tp_p if tp_hit else (sl_p if sl_hit else curr)
-                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
-                    rsn = 'TP-VWAP' if tp_hit else ('SL' if sl_hit else 'TIMEOUT')
-                    con.execute(
-                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
-                        "pnl_pct=?,bars_held=? WHERE id=?",
-                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl,3),
-                         bars_sa, sid))
-                    logging.info(f"👁 [{strat} CLOSE] {sym} {mode} → {rsn} "
-                                 f"PnL: {pnl:+.2f}% ({bars_sa} баров)")
-                con.commit(); con.close()
-                continue
-
-            # [RB v47] Range Bounce: TP1(середина диапазона)/TP2(противоположная
-            # граница)/SL/таймаут 240мин. Приоритет при пересечении в одном баре:
-            # SL (консервативно) > TP2 > TP1.
-            elif strat == 'RB':
-                bars_rb = 0
-                tf_m = 60 if RSI_TF == '1h' else 15
-                try:
-                    _ot = datetime.fromisoformat(open_t)
-                    bars_rb = int((datetime.now(timezone.utc) - _ot).total_seconds()/60/tf_m)
-                except Exception:
-                    pass
-                if is_long:
-                    sl_hit  = lo <= sl_p
-                    tp2_hit = hi >= tp2_p
-                    tp1_hit = hi >= tp_p
-                else:
-                    sl_hit  = hi >= sl_p
-                    tp2_hit = lo <= tp2_p
-                    tp1_hit = lo <= tp_p
-                rb_timeout = bars_rb >= (RB_TIMEOUT_MIN / tf_m)
-                con = sqlite3.connect(TRADES_DB)
-                if sl_hit or tp2_hit or tp1_hit or rb_timeout:
-                    if sl_hit:
-                        exit_p, rsn = sl_p, 'SL'
-                    elif tp2_hit:
-                        exit_p, rsn = tp2_p, 'TP2'
-                    elif tp1_hit:
-                        exit_p, rsn = tp_p, 'TP1'
-                    else:
-                        exit_p, rsn = curr, 'TIMEOUT'
-                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
-                    con.execute(
-                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
-                        "pnl_pct=?,bars_held=? WHERE id=?",
-                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl,3),
-                         bars_rb, sid))
-                    logging.info(f"👁 [RB CLOSE] {sym} {mode} → {rsn} "
-                                 f"PnL: {pnl:+.2f}% ({bars_rb} баров)")
-                con.commit(); con.close()
-                continue
-
-            # [ORB v61] Asia Range Breakout: TP1(1.0×ширины)/TP2(1.5×ширины)/
-            # SL(середина диапазона)/таймаут — по wall-clock 18:00 UTC ТОГО ЖЕ
-            # дня открытия (не по числу баров — сделка открывается в разное
-            # время окна 06-12 UTC, держим до конца евро-американской сессии).
-            # Приоритет при пересечении в одном баре: SL > TP2 > TP1.
-            elif strat == 'ORB':
-                _now_orb = datetime.now(timezone.utc)
-                bars_orb = 0
-                try:
-                    _ot = datetime.fromisoformat(open_t)
-                    tf_m = 60 if RSI_TF == '1h' else 15
-                    bars_orb = int((_now_orb - _ot).total_seconds()/60/tf_m)
-                except Exception:
-                    _ot = _now_orb
-                if is_long:
-                    sl_hit  = lo <= sl_p
-                    tp2_hit = hi >= tp2_p
-                    tp1_hit = hi >= tp_p
-                else:
-                    sl_hit  = hi >= sl_p
-                    tp2_hit = lo <= tp2_p
-                    tp1_hit = lo <= tp_p
-                orb_timeout = (_now_orb.date() > _ot.date()) or (_now_orb.hour >= 18)
-                con = sqlite3.connect(TRADES_DB)
-                if sl_hit or tp2_hit or tp1_hit or orb_timeout:
-                    if sl_hit:
-                        exit_p, rsn = sl_p, 'SL'
-                    elif tp2_hit:
-                        exit_p, rsn = tp2_p, 'TP2'
-                    elif tp1_hit:
-                        exit_p, rsn = tp_p, 'TP1'
-                    else:
-                        exit_p, rsn = curr, 'TIMEOUT'
-                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
-                    con.execute(
-                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
-                        "pnl_pct=?,bars_held=? WHERE id=?",
-                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl,3),
-                         bars_orb, sid))
-                    logging.info(f"👁 [ORB CLOSE] {sym} {mode} → {rsn} "
-                                 f"PnL: {pnl:+.2f}% ({bars_orb} баров)")
-                con.commit(); con.close()
-                continue
-
-            # [v72] SMC_SHADOW — зеркало выходов живого SMC: SL / TP / таймаут
-            # MAX_TRADE_MIN_SMC (минуты, НЕ бары — как у живых SMC-позиций).
-            # Приоритет при пересечении в одном баре: SL > TP (консервативно).
-            # ИЗВЕСТНОЕ УПРОЩЕНИЕ: TP50/БУ/трейлинг живого SMC здесь НЕ
-            # моделируются — shadow даёт верхнюю границу по SL (позиция была
-            # бы частично защищена раньше) и нижнюю по частичным выходам
-            # (реальная сделка фиксирует часть прибыли до полного TP).
-            elif strat == 'SMC_SHADOW':
-                mins_smc = 0
-                try:
-                    _ot = datetime.fromisoformat(open_t)
-                    mins_smc = (datetime.now(timezone.utc) - _ot).total_seconds() / 60
-                except Exception:
-                    pass
-                if is_long:
-                    sl_hit = lo <= sl_p
-                    tp_hit = hi >= tp_p
-                else:
-                    sl_hit = hi >= sl_p
-                    tp_hit = lo <= tp_p
-                smc_timeout = mins_smc >= MAX_TRADE_MIN_SMC
-                con = sqlite3.connect(TRADES_DB)
-                if sl_hit or tp_hit or smc_timeout:
-                    if sl_hit:
-                        exit_p, rsn = sl_p, 'SL'
-                    elif tp_hit:
-                        exit_p, rsn = tp_p, 'TP'
-                    else:
-                        exit_p, rsn = curr, 'TIMEOUT'
-                    pnl = ((exit_p-entry)/entry if is_long else (entry-exit_p)/entry) * 100
-                    bars_smc = int(mins_smc / (60 if RSI_TF == '1h' else 15))
-                    con.execute(
-                        "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
-                        "pnl_pct=?,bars_held=? WHERE id=?",
-                        (datetime.now(timezone.utc).isoformat(), exit_p, round(pnl, 3),
-                         bars_smc, sid))
-                    logging.info(f"👁 [SMC_SHADOW CLOSE] {sym} {mode} → {rsn} "
-                                 f"PnL: {pnl:+.2f}% ({mins_smc:.0f}мин)")
-                con.commit(); con.close()
-                continue
 
             # [BREATHING STOP] Трейлинг включается ТОЛЬКО после +1% профита.
             # До этого работает исходный широкий SL — сделка 'дышит',
@@ -5234,6 +5364,299 @@ async def shadow_check():
             logging.debug(f'[SHADOW] check {sym}: {_e}')
 
 
+# ───────────────────────────────────────────────────────
+#  [v74] /shadow_recalc — пересчёт «затянутых» shadow-записей по пути цены
+# ───────────────────────────────────────────────────────
+# «Затянутая» = закрытая запись (recalc=0), у которой close_time − open_time
+# превышает лимит стратегии (_shadow_timeout_dt) + 30 мин. Это следы пауз
+# shadow_check() (заморозка v72→v73 и любые другие): таймаут тогда исполнялся
+# по цене момента «пробуждения», а SL/TP пропущенных баров не видны.
+# recalc: 0 — исходная, 1 — пересчитана, 2 — не пересчитываема (нет баров);
+# отчёты (/shadow_analyze, /shadow) исключают recalc=2.
+_SHADOW_STALE_SLACK_MIN = 30
+_shadow_recalc_busy = False
+_regime_backfill_busy = False
+
+
+def _shadow_stale_rows(con):
+    """Затянутые закрытые записи с recalc=0 по стратегиям с путевым выходом."""
+    ph = ','.join('?' * len(_SHADOW_PATH_STRATS))
+    rows = con.execute(
+        "SELECT id,symbol,strategy,direction,entry_price,open_time,close_time,pnl_pct,"
+        "tp_price,sl_price,tp2_price FROM shadow_signals "
+        f"WHERE status='closed' AND COALESCE(recalc,0)=0 AND strategy IN ({ph})",
+        _SHADOW_PATH_STRATS).fetchall()
+    out = []
+    for r in rows:
+        try:
+            lim = _shadow_timeout_dt(r[2], _shadow_open_dt(r[5]))
+            if _shadow_open_dt(r[6]) > lim + timedelta(minutes=_SHADOW_STALE_SLACK_MIN):
+                out.append(r)
+        except Exception:
+            continue
+    return out
+
+
+def _shadow_pf_snapshot(con) -> dict:
+    """{strat: (n, pf_net)} по закрытым записям без recalc=2."""
+    fee = 2 * FEE_RATE * 100
+    out = {}
+    for strat in _SHADOW_PATH_STRATS:
+        rows = con.execute(
+            "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+            "AND COALESCE(recalc,0)!=2 AND strategy=?", (strat,)).fetchall()
+        n, _wr, _avg, pf = _bucket_stats([(r[0] - fee,) for r in rows])
+        out[strat] = (n, pf)
+    return out
+
+
+def _shadow_stale_report(con) -> str:
+    """ШАГ 0 v74: по каждой стратегии — закрытых | затянутых | даты open_time
+    затянутых (min/max) | PF net по затянутым vs по остальным."""
+    fee = 2 * FEE_RATE * 100
+    stale = _shadow_stale_rows(con)
+    stale_ids = {r[0] for r in stale}
+    lines = [f'🔎 Затянутые shadow-записи (close − open больше лимита стратегии + {_SHADOW_STALE_SLACK_MIN} мин)',
+             f'MOMENTUM_ENABLED сейчас: ENV={os.getenv("MOMENTUM_ENABLED")!r} → {MOMENTUM_ENABLED} '
+             f'(v73 снял гейт; заморозка могла идти с деплоя v72 до деплоя v73)']
+    for strat in _SHADOW_PATH_STRATS:
+        allr = con.execute(
+            "SELECT id,pnl_pct FROM shadow_signals WHERE status='closed' "
+            "AND COALESCE(recalc,0)!=2 AND strategy=?", (strat,)).fetchall()
+        if not allr:
+            continue
+        mine = [r for r in stale if r[2] == strat]
+        st_pnl = [(r[7] - fee,) for r in mine]
+        rest = [(p - fee,) for (i, p) in allr if i not in stale_ids]
+        _, _, _, pf_s = _bucket_stats(st_pnl)
+        _, _, _, pf_r = _bucket_stats(rest)
+        if mine:
+            ots = sorted(r[5][:10] for r in mine)
+            span = f'open {ots[0]}..{ots[-1]}'
+            lines.append(f'{strat} | закрытых {len(allr)} | затянутых {len(mine)} | {span} | '
+                         f'PF net затянутые {pf_s:.2f} (n={len(mine)}) vs остальные {pf_r:.2f} (n={len(rest)})')
+        else:
+            lines.append(f'{strat} | закрытых {len(allr)} | затянутых 0 | PF net остальные {pf_r:.2f} (n={len(rest)})')
+    if len(lines) == 2:
+        lines.append('закрытых shadow-записей нет')
+    return '\n'.join(lines)
+
+
+async def _shadow_recalc_one(r) -> str:
+    """Пересчёт одной записи. → 'ok' | 'unrec' (recalc=2) | 'err' (транзиентный сбой, recalc не тронут)."""
+    sid, sym, strat, mode, entry, open_t, close_t, pnl_old, tp_p, sl_p, tp2_p = r
+    open_dt = _shadow_open_dt(open_t)
+    old_close_ts = _shadow_open_dt(close_t).timestamp()
+    lim_ts = _shadow_timeout_dt(strat, open_dt).timestamp()
+    bars, covered = [], False
+    try:
+        bars, covered = await _shadow_fetch_path(sym, open_dt, lim_ts + _shadow_tf_ms() / 1000)
+    except ccxt_async.BadSymbol:
+        pass                      # символ снят с листинга — бары недоступны навсегда
+    except Exception as _e:
+        logging.warning(f'[RECALC] {sym} id={sid}: fetch error {_e}')
+        return 'err'
+    closed = False
+    if bars and covered:          # строго: бар входа должен быть в выборке
+        row = {'direction': mode, 'entry_price': entry, 'tp_price': tp_p,
+               'sl_price': sl_p, 'tp2_price': tp2_p, 'open_time': open_t}
+        closed, exit_p, rsn, held = _shadow_exit_eval(strat, row, bars, old_close_ts)
+    con = sqlite3.connect(TRADES_DB)
+    try:
+        if not closed:
+            con.execute("UPDATE shadow_signals SET recalc=2 WHERE id=?", (sid,))
+            con.commit()
+            return 'unrec'
+        pnl = _shadow_pnl(entry, exit_p, mode == 'Long')
+        con.execute(
+            "UPDATE shadow_signals SET close_time=?,exit_price=?,pnl_pct=?,bars_held=?,recalc=1 "
+            "WHERE id=?",
+            (_shadow_close_iso(open_dt, held, old_close_ts), exit_p, round(pnl, 3), held, sid))
+        con.commit()
+        logging.info(f'[RECALC] id={sid} {strat} {sym} {mode}: {pnl_old:+.3f}% → {pnl:+.3f}% ({rsn}, {held} баров)')
+        return 'ok'
+    finally:
+        con.close()
+
+
+async def shadow_recalc_run(dry: bool = False):
+    """Фоновая задача /shadow_recalc [dry]. dry — только отчёт ШАГА 0, без пересчёта."""
+    global _shadow_recalc_busy
+    if _shadow_recalc_busy:
+        await tg('⏳ /shadow_recalc уже выполняется')
+        return
+    _shadow_recalc_busy = True
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        report = _shadow_stale_report(con)
+        stale = _shadow_stale_rows(con)
+        before_all = _shadow_pf_snapshot(con)
+        con.close()
+        if dry:
+            await tg(report + '\n\nDry-run: пересчёт НЕ выполнялся. Запуск пересчёта: /shadow_recalc')
+            return
+        if not stale:
+            await tg(report + '\n\nПересчитывать нечего.')
+            return
+        old_pnl = {r[0]: r[7] for r in stale}
+        by_strat: dict = {}
+        for r in stale:
+            by_strat.setdefault(r[2], []).append(r[0])
+        await tg(report + f'\n\n▶️ Пересчёт {len(stale)} записей (параллельно 2)…')
+        sem = asyncio.Semaphore(2)
+        res = {'ok': 0, 'unrec': 0, 'err': 0}
+        done = 0
+
+        async def _one(r):
+            nonlocal done
+            async with sem:
+                try:
+                    out = await _shadow_recalc_one(r)
+                except Exception as _e:
+                    logging.warning(f'[RECALC] id={r[0]}: {_e}')
+                    out = 'err'
+            res[out] += 1
+            done += 1
+            if done % 100 == 0:
+                await tg(f'⏳ /shadow_recalc: {done}/{len(stale)} (ok {res["ok"]}, не пересчит. {res["unrec"]}, ошибок {res["err"]})')
+
+        await asyncio.gather(*[_one(r) for r in stale])
+
+        fee = 2 * FEE_RATE * 100
+        con = sqlite3.connect(TRADES_DB)
+        after_all = _shadow_pf_snapshot(con)
+        lines = [f'✅ /shadow_recalc завершён: пересчитано {res["ok"]}, не пересчитываемо (recalc=2) {res["unrec"]}, '
+                 f'ошибок {res["err"]}' + (' — повторите команду для ошибок' if res['err'] else ''),
+                 'PF net по стратегиям (до → после):']
+        for strat in _SHADOW_PATH_STRATS:
+            ids = by_strat.get(strat, [])
+            if not ids and before_all[strat][0] == 0:
+                continue
+            new_rows = []
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                new_rows += con.execute(
+                    f"SELECT id,pnl_pct FROM shadow_signals WHERE recalc=1 AND id IN ({','.join('?' * len(chunk))})",
+                    chunk).fetchall()
+            sub_before = _bucket_stats([(old_pnl[i] - fee,) for (i, _p) in new_rows])
+            sub_after = _bucket_stats([(p - fee,) for (_i, p) in new_rows])
+            lines.append(
+                f'  {strat}: все n={before_all[strat][0]}→{after_all[strat][0]} '
+                f'PF {before_all[strat][1]:.2f}→{after_all[strat][1]:.2f} | '
+                f'пересчитанные n={sub_after[0]} PF {sub_before[3]:.2f}→{sub_after[3]:.2f}')
+        con.close()
+        await tg('\n'.join(lines))
+    except Exception as _e:
+        logging.exception('[RECALC] fail')
+        await tg(f'❌ /shadow_recalc: {_e}')
+    finally:
+        _shadow_recalc_busy = False
+
+
+# ───────────────────────────────────────────────────────
+#  [v74] /regime_backfill — режим 4ч для закрытых записей без regime_4h
+# ───────────────────────────────────────────────────────
+async def regime_backfill_run():
+    """Фоновая задача. Один запрос 4ч-истории (limit=1000) на символ, Semaphore(2).
+    Режим на момент open_time считается ТОЛЬКО по свечам, закрытым ДО open_time
+    (_regime_at: bisect по end <= open_time, EMA каузальна) — без look-ahead."""
+    global _regime_backfill_busy
+    if _regime_backfill_busy:
+        await tg('⏳ /regime_backfill уже выполняется')
+        return
+    _regime_backfill_busy = True
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        todo: dict = {}   # sym -> [(table, id, open_time)]
+        for tbl, where in (('shadow_signals', "status='closed' AND COALESCE(regime_4h,'')='' AND COALESCE(open_time,'')!=''"),
+                           ('trades', "COALESCE(regime_4h,'')='' AND COALESCE(open_time,'')!=''")):
+            for rid, sym, ot in con.execute(f"SELECT id,symbol,open_time FROM {tbl} WHERE {where}").fetchall():
+                todo.setdefault(sym, []).append((tbl, rid, ot))
+        con.close()
+        n_rows = sum(len(v) for v in todo.values())
+        if not n_rows:
+            await tg('✅ /regime_backfill: записей без режима нет')
+            return
+        await tg(f'▶️ /regime_backfill: {n_rows} записей, {len(todo)} символов (параллельно 2)…')
+        sem = asyncio.Semaphore(2)
+        stat = {'filled': 0, 'empty': 0, 'sym_err': 0}
+
+        async def _sym(sym, items):
+            async with sem:
+                try:
+                    bars = await exchange.fetch_ohlcv(sym, '4h', limit=1000)
+                except Exception as _e:
+                    logging.warning(f'[REGIME_BF] {sym}: {_e}')
+                    stat['sym_err'] += 1
+                    return
+            ends, closes, ema = _regime_prepare(bars or [])
+            upd = {'shadow_signals': [], 'trades': []}
+            for tbl, rid, ot in items:
+                try:
+                    reg = _regime_at(ends, closes, ema, int(_shadow_open_dt(ot).timestamp() * 1000))
+                except Exception:
+                    reg = ''
+                if reg:
+                    upd[tbl].append((reg, rid))
+                else:
+                    stat['empty'] += 1
+            c = sqlite3.connect(TRADES_DB)
+            try:
+                for tbl, rows in upd.items():
+                    if rows:
+                        c.executemany(f"UPDATE {tbl} SET regime_4h=? WHERE id=?", rows)
+                        stat['filled'] += len(rows)
+                c.commit()
+            finally:
+                c.close()
+
+        await asyncio.gather(*[_sym(s, it) for s, it in todo.items()])
+
+        con = sqlite3.connect(TRADES_DB)
+        lines = [f'✅ /regime_backfill завершён: заполнено {stat["filled"]}, без данных {stat["empty"]} '
+                 f'(история 4ч короче записи / мало баров), символов с ошибкой {stat["sym_err"]}',
+                 'Покрытие режимом (закрытые):']
+        for strat, n, k in con.execute(
+                "SELECT strategy, COUNT(*), SUM(CASE WHEN COALESCE(regime_4h,'')!='' THEN 1 ELSE 0 END) "
+                "FROM shadow_signals WHERE status='closed' AND COALESCE(recalc,0)!=2 GROUP BY strategy").fetchall():
+            lines.append(f'  {strat}: {k or 0}/{n}')
+        for strat, n, k in con.execute(
+                "SELECT strategy, COUNT(*), SUM(CASE WHEN COALESCE(regime_4h,'')!='' THEN 1 ELSE 0 END) "
+                "FROM trades GROUP BY strategy").fetchall():
+            lines.append(f'  live {strat}: {k or 0}/{n}')
+        con.close()
+        await tg('\n'.join(lines))
+    except Exception as _e:
+        logging.exception('[REGIME_BF] fail')
+        await tg(f'❌ /regime_backfill: {_e}')
+    finally:
+        _regime_backfill_busy = False
+
+
+def _regime_split_lines(rows) -> list:
+    """[v74] Срез «Режим 4ч × Направление» + сводка «по режиму / против / Flat».
+    rows = [(pnl_net, direction, regime_4h)] — pnl УЖЕ за вычетом комиссии.
+    по режиму = Long в Up + Short в Down; против = Long в Down + Short в Up.
+    Критерий кандидата на режимный фильтр — комментарий-контракт у _regime_4h."""
+    have = [r for r in rows if r[2]]
+    if not have:
+        return []
+    out = [f'  Режим 4ч × направление (покрытие {len(have)}/{len(rows)}):']
+    for d in ('Long', 'Short'):
+        for reg in ('Up', 'Down', 'Flat'):
+            n, wr, avg, pf = _bucket_stats([(r[0],) for r in have if r[1] == d and r[2] == reg])
+            if n:
+                flag = ' ⭐' if (pf > 1.0 and n >= 15) else ''
+                out.append(f'   {reg}×{d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+    with_r = [(r[0],) for r in have if (r[1] == 'Long' and r[2] == 'Up') or (r[1] == 'Short' and r[2] == 'Down')]
+    against = [(r[0],) for r in have if (r[1] == 'Long' and r[2] == 'Down') or (r[1] == 'Short' and r[2] == 'Up')]
+    flat = [(r[0],) for r in have if r[2] == 'Flat']
+    s_with, s_ag, s_fl = _bucket_stats(with_r), _bucket_stats(against), _bucket_stats(flat)
+    out.append(f'   Сводка: по режиму n={s_with[0]} PF net {s_with[3]:.2f} | '
+               f'против n={s_ag[0]} PF net {s_ag[3]:.2f} | Flat n={s_fl[0]} PF net {s_fl[3]:.2f}')
+    return out
+
+
 def _fisher_2x2(a, b, c, d) -> float:
     """[v69] Двусторонний Fisher exact для [[a,b],[c,d]] без scipy.
     a/b = wins/losses группы 1, c/d = wins/losses группы 2.
@@ -5280,7 +5703,7 @@ def _analyze_feature(con, strategy, col, buckets):
     out = []
     for label, lo, hi in buckets:
         rows = con.execute(
-            f"SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+            f"SELECT pnl_pct FROM shadow_signals WHERE status='closed' AND recalc!=2 "
             f"AND strategy=? AND {col} >= ? AND {col} < ?",
             (strategy, lo, hi)).fetchall()
         n, wr, avg, pf = _bucket_stats(rows)
@@ -5316,7 +5739,7 @@ def shadow_analyze() -> str:
         out = []
         for label, lo, hi in buckets:
             rows = con.execute(
-                f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' "
+                f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' AND recalc!=2 "
                 f"AND strategy=? AND {col} >= ? AND {col} < ?",
                 (strat, lo, hi)).fetchall()
             line = _fmt(label, rows)
@@ -5333,14 +5756,14 @@ def shadow_analyze() -> str:
         for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('ORB', '🎯'), ('SA_SHADOW', '🎯'),
                              ('SMC_SHADOW', '🎯')]:  # [v72]
             total = con.execute(
-                "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND strategy=?",
+                "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=?",
                 (strat,)).fetchone()[0]
             if total == 0:
                 continue
             parts.append(f'\n{emoji} {strat} (всего {total}, net — после комиссий)')
             for d in ('Long', 'Short'):
                 rows = con.execute(
-                    f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' "
+                    f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' AND recalc!=2 "
                     "AND strategy=? AND direction=?", (strat, d)).fetchall()
                 line = _fmt(d, rows)
                 if line:
@@ -5427,7 +5850,7 @@ def shadow_analyze() -> str:
                 _d = ORB_MIN_DELAY_MIN
                 def _orb_rows(lo, hi, since=None):
                     q = (f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
-                         f"WHERE status='closed' AND strategy='ORB' "
+                         f"WHERE status='closed' AND recalc!=2 AND strategy='ORB' "
                          f"AND minutes_since_range_end >= ? AND minutes_since_range_end < ?")
                     args = [lo, hi]
                     if since:
@@ -5506,7 +5929,7 @@ def shadow_analyze() -> str:
                     for _d in ('Long', 'Short'):
                         rows = con.execute(
                             f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
-                            "WHERE status='closed' AND strategy=? AND htf_trend=? "
+                            "WHERE status='closed' AND recalc!=2 AND strategy=? AND htf_trend=? "
                             "AND direction=?", (strat, _htf, _d)).fetchall()
                         line = _fmt(f'{_htf}×{_d}', rows)
                         if line:
@@ -5527,12 +5950,12 @@ def shadow_analyze() -> str:
                 parts.append('  По причине отсева (shadow_reason):')
                 reasons = con.execute(
                     "SELECT DISTINCT shadow_reason FROM shadow_signals "
-                    "WHERE status='closed' AND strategy=? AND shadow_reason != ''",
+                    "WHERE status='closed' AND recalc!=2 AND strategy=? AND shadow_reason != ''",
                     (strat,)).fetchall()
                 for (reason,) in sorted(reasons):
                     rows = con.execute(
                         f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals "
-                        "WHERE status='closed' AND strategy=? AND shadow_reason=?",
+                        "WHERE status='closed' AND recalc!=2 AND strategy=? AND shadow_reason=?",
                         (strat, reason)).fetchall()
                     line = _fmt(reason, rows)
                     if line:
@@ -5546,6 +5969,13 @@ def shadow_analyze() -> str:
                 parts.append('  ADX:')
                 parts += _feature(con, strat, 'adx',
                     [('lt18', 0, 18), ('18-30', 18, 30), ('30+', 30, 99)])
+            # [v74] Режим 4ч × направление — для КАЖДОЙ стратегии (пре-коммит
+            # режимного фильтра — комментарий-контракт у _regime_4h). Данные
+            # «после recalc»: recalc=2 исключены, пересчитанные записи включены.
+            parts += _regime_split_lines(con.execute(
+                f"SELECT pnl_pct - {_SHADOW_FEE_PCT}, direction, COALESCE(regime_4h,'') "
+                "FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=?",
+                (strat,)).fetchall())
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
@@ -5584,11 +6014,11 @@ def _shadow_block(rows):
 def _shadow_strat(con, strat, epoch):
     """Возвращает (rows_last, rows_all, n_open) по стратегии."""
     rows_all = con.execute(
-        "SELECT pnl_pct FROM shadow_signals WHERE status='closed' AND strategy=?",
+        "SELECT pnl_pct FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=?",
         (strat,)).fetchall()
     if epoch:
         rows_last = con.execute(
-            "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+            "SELECT pnl_pct FROM shadow_signals WHERE status='closed' AND recalc!=2 "
             "AND strategy=? AND close_time > ?", (strat, epoch)).fetchall()
     else:
         rows_last = []
@@ -5858,6 +6288,14 @@ def stats_analyze() -> str:
             _ck = lambda b: '✅' if b else '❌'
             lines.append(f'  Ступень 1: n&gt;=30 {_ck(_c1)} | PF net&gt;=1.3 {_ck(_c2)} | '
                          f'бета PF net&gt;=1.0(n&gt;=10) {_ck(_c3)} | Wilson&gt;35% {_ck(_c4)}')
+
+            # [v74] Режим 4ч × направление для живых SMC-сделок (net: pnl_pct —
+            # валовой ROE, комиссия вычитается как в ФОРВАРДе выше).
+            lines.append('\n<b>Режим 4ч (SMC, net):</b>')
+            _rg = _regime_split_lines(con.execute(
+                f"SELECT pnl_pct - {_smc_fee_roe}, direction, COALESCE(regime_4h,'') "
+                "FROM trades WHERE strategy='SMC'").fetchall())
+            lines += _rg if _rg else ['  нет данных — запустите /regime_backfill']
 
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
 
@@ -6209,7 +6647,9 @@ async def check_tg_commands():
                     '<b>Shadow (виртуальные стратегии):</b>\n'
                     '/shadow — статистика Momentum/Pullback\n'
                     '/shadow_analyze — мина данных по признакам\n'
-                    '/shadow_reset — очистить shadow-статистику\n\n'
+                    '/shadow_reset — очистить shadow-статистику\n'
+                    '/shadow_recalc [dry] — пересчёт затянутых shadow-записей по пути цены (dry — только отчёт)\n'
+                    '/regime_backfill — режим 4ч для закрытых записей без режима\n\n'
                     '<b>Управление:</b>\n'
                     '/sync — синхронизация позиций с биржей\n'
                     '/reset — сброс дневной статистики\n'
@@ -6225,6 +6665,18 @@ async def check_tg_commands():
 
             elif cmd == '/shadow_analyze':
                 await tg(shadow_analyze())
+
+            elif cmd == '/shadow_recalc' or cmd.startswith('/shadow_recalc '):
+                # [v74] /shadow_recalc [dry] — пересчёт затянутых shadow-записей
+                # по пути цены; dry — только отчёт ШАГА 0 без пересчёта.
+                _dry = 'dry' in cmd.split()[1:]
+                _t = asyncio.create_task(shadow_recalc_run(_dry))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/regime_backfill':
+                # [v74] режим 4ч для закрытых записей без regime_4h (фон)
+                _t = asyncio.create_task(regime_backfill_run())
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/sync':
                 # Синхронизация локального списка позиций с реальными на BingX
@@ -6470,7 +6922,7 @@ async def main():
                                     )
                             else:
                                 # SHADOW режим: пишем виртуальную сделку
-                                shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
+                                await shadow_record(SA_SYMBOL, _sasig['mode'], _sasig['entry'],
                                               _sasig, _sa_ctx, 'SA')
                     except Exception as _e:
                         logging.warning(f'[SA] exception: {_e}')
