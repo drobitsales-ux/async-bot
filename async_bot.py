@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v75'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v76'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -312,7 +312,13 @@ MAX_TRADE_MIN_SA  = 150       # [v36] SA: возврат к дневному VWA
 # нормальные выигрышные сделки, но отсечёт зависания.
 MAX_TRADE_MIN_HARD = int(os.getenv('MAX_TRADE_MIN_HARD', '480'))
 FEE_RATE         = 0.0005
-DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [R-FIX-11] стоп торговли при -2.5% за день
+DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [v76] БОЛЬШЕ НЕ используется breaker-ом (старая метрика); оставлено для совместимости ENV
+DAILY_DD_LIMIT_PCT = float(os.getenv('DAILY_DD_LIMIT_PCT', '1.5'))
+# [v76] Лимит в % эквити на начало дня, с нереализованным PnL —
+# так дневной убыток считают проп-компании. 1.5% при риске 0.5%/сделку
+# = 3 полных стопа. После выбора проп-фирмы выставить СТРОЖЕ её
+# дневного лимита. Старая метрика (сумма движений цены) завышала
+# убыток примерно в SL_dist/риск ≈ 2.6 раза и не видела таймауты.
 SCAN_LIMIT       = 80       # [EXPAND] 60→80: больше монет, +33% шансов на сетап
 SCAN_SEM         = 60       # [EXPAND] 50→60: больше параллелизма для 80 символов
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
@@ -669,20 +675,157 @@ def is_news_now() -> bool:
 # ═══════════════════════════════════════════════════════
 #  CIRCUIT BREAKER  [R-FIX-11]
 # ═══════════════════════════════════════════════════════
+# [v76] Дневной DD по ЭКВИТИ счёта BingX (USDT, ВКЛЮЧАЯ нереализованный PnL).
+# Источник — fetch_balance(): ccxt==4.2.14 для BingX swap кладёт в
+# info.data.balance поля {balance, equity, unrealizedProfit, availableMargin,
+# usedMargin, freezedMargin}; unified-поле ['USDT']['total'] = free+used =
+# availableMargin+usedMargin (выводится, не равно equity при замороженной
+# марже и не показывает нереализованное явно). Поэтому берём
+# биржевое info.data.balance.equity (equity = balance + unrealizedProfit); запасной путь —
+# balance + unrealizedProfit; последний — ['USDT']['total'].
+# База дня — эквити в момент суточного сброса (daily_reset, первый цикл после
+# 00:00 UTC), хранится в meta и переживает рестарт процесса в тот же день.
+# Старая метрика daily_stats['pnl_pct'] продолжает считаться (отчёт/сравнение),
+# но из условия breaker убрана. ДЕЙСТВИЕ breaker (circuit_open, TG, остановка
+# скана) не менялось — только условие срабатывания.
+_dd = {'start_equity': 0.0, 'start_date': '', 'equity': 0.0, 'ok_ts': 0.0,
+       'fails': 0, 'min_dd': 0.0}
+
+
+def _extract_equity(bal) -> float:
+    """Эквити (USDT) из ответа fetch_balance(); 0.0 — не удалось."""
+    try:
+        b = (((bal or {}).get('info') or {}).get('data') or {}).get('balance')
+        if isinstance(b, dict):
+            v = b.get('equity')
+            if v not in (None, '') and float(v) > 0:
+                return float(v)
+            if b.get('balance') not in (None, ''):
+                x = float(b['balance']) + float(b.get('unrealizedProfit') or 0)
+                if x > 0:
+                    return x
+        t = ((bal or {}).get('USDT') or {}).get('total')
+        if t and float(t) > 0:
+            return float(t)
+    except Exception:
+        pass
+    return 0.0
+
+
+async def _fetch_equity():
+    try:
+        eq = _extract_equity(await asyncio.wait_for(exchange.fetch_balance(), 60))
+        return eq if eq > 0 else None
+    except Exception as _e:
+        logging.warning(f'[DD] эквити не получено: {type(_e).__name__}: {_e}')
+        return None
+
+
+def _dd_save():
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('dd_start_equity',?)", (str(_dd['start_equity']),))
+        con.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('dd_start_date',?)", (_dd['start_date'],))
+        con.commit(); con.close()
+    except Exception as _e:
+        logging.warning(f'[DD] save fail: {_e}')
+
+
+def dd_load():
+    """База дня из meta (рестарт в тот же день не должен «забывать» убыток)."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+        eq = con.execute("SELECT value FROM meta WHERE key='dd_start_equity'").fetchone()
+        dt = con.execute("SELECT value FROM meta WHERE key='dd_start_date'").fetchone()
+        con.close()
+        if eq and dt and dt[0] == datetime.now(timezone.utc).date().isoformat() and float(eq[0]) > 0:
+            _dd['start_equity'], _dd['start_date'] = float(eq[0]), dt[0]
+            logging.info(f"[DD] база дня восстановлена из БД: {_dd['start_equity']:.2f} USDT ({dt[0]})")
+    except Exception as _e:
+        logging.warning(f'[DD] load fail: {_e}')
+
+
+def dd_fraction():
+    """Текущий DD дня как доля (отрицательная = убыток); None — нет данных."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _dd['start_equity'] <= 0 or _dd['start_date'] != today or _dd['equity'] <= 0:
+        return None
+    return (_dd['equity'] - _dd['start_equity']) / _dd['start_equity']
+
+
+async def dd_update(force_rebase: bool = False) -> bool:
+    """Обновляет эквити (раз в цикл) и, при необходимости, базу дня. Никогда не
+    бросает исключений наружу. Сбой → последнее известное значение, breaker не
+    срабатывает и не сбрасывается; 3 сбоя подряд → один алерт в Telegram."""
+    try:
+        eq = await _fetch_equity()
+        if eq is None:
+            _dd['fails'] += 1
+            if _dd['fails'] == 3:
+                age = f"{(time.time() - _dd['ok_ts']) / 60:.0f} мин назад" if _dd['ok_ts'] else 'ни разу'
+                await tg(f"⚠️ <b>DD-контроль</b>: 3 сбоя подряд получения эквити BingX. Breaker использует "
+                         f"последнее известное значение (успешное обновление: {age}).")
+            return False
+        _dd['fails'] = 0
+        _dd['equity'] = eq
+        _dd['ok_ts'] = time.time()
+        today = datetime.now(timezone.utc).date().isoformat()
+        no_base = _dd['start_equity'] <= 0
+        if force_rebase or no_base or _dd['start_date'] != today:
+            _dd['start_equity'], _dd['start_date'], _dd['min_dd'] = eq, today, 0.0
+            _dd_save()
+            if no_base and not force_rebase:
+                logging.warning(f'[DD] старт процесса без сохранённой базы дня: база = текущее эквити {eq:.2f}')
+                await tg(f"⚠️ <b>DD-контроль</b>: процесс стартовал без сохранённой базы дня — база дня = "
+                         f"текущее эквити <code>{eq:.2f} USDT</code>. Убыток до этого момента в DD не учтён.")
+            else:
+                logging.info(f'[DD] база дня {today}: {eq:.2f} USDT')
+        else:
+            dd = (eq - _dd['start_equity']) / _dd['start_equity']
+            _dd['min_dd'] = min(_dd['min_dd'], dd)
+        return True
+    except Exception as _e:
+        logging.warning(f'[DD] update fail: {type(_e).__name__}: {_e}')
+        return False
+
+
 def check_circuit_breaker() -> bool:
-    """Возвращает True если торговля разрешена."""
+    """Возвращает True если торговля разрешена. [v76] Условие — DD по эквити
+    (_dd), а не сумма движений цены. Нет данных → состояние не меняется."""
     global circuit_open
-    if daily_stats['pnl_pct'] <= -DAILY_DD_LIMIT:
+    dd = dd_fraction()
+    if dd is None:
+        return not circuit_open
+    if dd <= -DAILY_DD_LIMIT_PCT / 100:
         if not circuit_open:
             circuit_open = True
-            logging.warning(f"🔴 [CIRCUIT BREAKER] Дневной DD {daily_stats['pnl_pct']*100:.2f}% → торговля остановлена")
+            logging.warning(f"🔴 [CIRCUIT BREAKER] Дневной DD по эквити {dd*100:.2f}% → торговля остановлена")
             asyncio.create_task(
-                tg(f"🔴 <b>CIRCUIT BREAKER</b>\nДневной убыток {daily_stats['pnl_pct']*100:.2f}% "
-                   f"превысил лимит {DAILY_DD_LIMIT*100:.1f}%\nТорговля остановлена до следующего дня.")
+                tg(f"🔴 <b>CIRCUIT BREAKER</b>\nДневной убыток по эквити {dd*100:.2f}% "
+                   f"превысил лимит {DAILY_DD_LIMIT_PCT:.1f}%\nТорговля остановлена до следующего дня.")
             )
         return False
     circuit_open = False
     return True
+
+
+def dd_status_text() -> str:
+    """[v76] Текст /dd_status и дневного отчёта."""
+    dd = dd_fraction()
+    old = daily_stats['pnl_pct'] * 100
+    if dd is None:
+        return (f"📉 <b>DD по эквити</b>: нет данных (база дня: {_dd['start_equity']:.2f}, "
+                f"дата базы: {_dd['start_date'] or '—'}, сбоев подряд: {_dd['fails']})\n"
+                f"Лимит: -{DAILY_DD_LIMIT_PCT:.1f}% | Breaker: {'🔴 СТОП' if circuit_open else '🟢 OK'}\n"
+                f"Старая метрика (сумма движений цены, только для сравнения): {old:+.2f}%")
+    ts = datetime.fromtimestamp(_dd['ok_ts'], timezone.utc).strftime('%H:%M:%S') if _dd['ok_ts'] else '—'
+    age = f"{(time.time() - _dd['ok_ts']) / 60:.0f} мин назад" if _dd['ok_ts'] else '—'
+    return (f"📉 <b>DD по эквити</b> (UTC {_dd['start_date']})\n"
+            f"Эквити на начало дня: <code>{_dd['start_equity']:.2f} USDT</code>\n"
+            f"Эквити сейчас: <code>{_dd['equity']:.2f} USDT</code> (обновлено {ts} UTC, {age})\n"
+            f"DD: <b>{dd*100:+.2f}%</b> | минимум за день: {_dd['min_dd']*100:+.2f}% | лимит: -{DAILY_DD_LIMIT_PCT:.1f}%\n"
+            f"Сбоев получения подряд: {_dd['fails']} | Breaker: {'🔴 СТОП' if circuit_open else '🟢 OK'}\n"
+            f"Старая метрика (сумма движений цены, только для сравнения): {old:+.2f}%")
 
 # ═══════════════════════════════════════════════════════
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -4039,23 +4182,47 @@ def _po3_eval(ts, o, h, l, c, v, O, T0_ms, mode, last_idx=None):
     }, 'ok'
 
 
+_PO3_NODATA = ('fetch_err', 'no_4h', 'no_4h_current', 'few_15m')
+_po3_o15_fallback_n = 0   # информационный счётчик: O взят из 15m, а не из 4ч-свечи
+
+
 async def po3_signal(sym: str):
     """[v75] → [(mode, sig|None, reason), ...] для Long и Short. 4ч-бары — из
     общего кэша (_get_4h_bars, без второго запроса), 15m limit=64, НЕЗАКРЫТЫЙ
-    последний 15m-бар отбрасывается. Режим 4ч НЕ фильтрует."""
+    последний 15m-бар отбрасывается. Режим 4ч НЕ фильтрует.
+    [v76] Подпричины отсутствия данных (одинаковы для обоих направлений):
+    fetch_err — сбой/таймаут запроса; no_4h — пустой 4ч-список; few_15m — меньше
+    20 закрытых 15m; no_4h_current — нет открытия текущей 4ч-свечи ни в 4ч-списке
+    (свеча, содержащая «сейчас»), ни среди 15m (бар с ts=T0). O — open ТЕКУЩЕЙ
+    4ч-свечи: берётся из 4ч-списка; если биржа не отдала незакрытую 4ч-свечу —
+    из первого 15m-бара окна (open 4ч-свечи == open её первой 15m-свечи)."""
+    global _po3_o15_fallback_n
     now_ms = int(time.time() * 1000)
     tf = 15 * 60_000
+    nodata = lambda why: [('Long', None, why), ('Short', None, why)]
     try:
         bars4 = await _get_4h_bars(sym)
+        if not bars4:
+            return nodata('no_4h')
         raw = await exchange.fetch_ohlcv(sym, RSI_TF, limit=64)
     except Exception:
-        return [('Long', None, 'no_data'), ('Short', None, 'no_data')]
-    t0 = now_ms // _REGIME_TF_MS * _REGIME_TF_MS
-    O = next((float(b[1]) for b in (bars4 or []) if int(b[0]) == t0), None)
+        return nodata('fetch_err')
     closed = [b for b in (raw or []) if int(b[0]) + tf <= now_ms]
-    if O is None or len(closed) < 20:
-        return [('Long', None, 'no_data'), ('Short', None, 'no_data')]
-    _po3_last_bar[sym] = int(closed[-1][0])
+    if closed:
+        _po3_last_bar[sym] = int(closed[-1][0])
+    if len(closed) < 20:
+        return nodata('few_15m')
+    cur = next((b for b in reversed(bars4)
+                if int(b[0]) <= now_ms < int(b[0]) + _REGIME_TF_MS), None)
+    if cur is not None:
+        t0, O = int(cur[0]), float(cur[1])
+    else:
+        t0 = now_ms // _REGIME_TF_MS * _REGIME_TF_MS
+        first = next((b for b in closed if int(b[0]) == t0), None)
+        if first is None:
+            return nodata('no_4h_current')
+        O = float(first[1])
+        _po3_o15_fallback_n += 1
     ts = np.array([int(b[0]) for b in closed]); o = np.array([float(b[1]) for b in closed])
     h = np.array([float(b[2]) for b in closed]); l = np.array([float(b[3]) for b in closed])
     c = np.array([float(b[4]) for b in closed]); v = np.array([float(b[5]) for b in closed])
@@ -4064,6 +4231,21 @@ async def po3_signal(sym: str):
         sig, why = _po3_eval(ts, o, h, l, c, v, O, t0, mode)
         out.append((mode, sig, why))
     return out
+
+
+_PO3_RANK = {'no_sweep': 0, 'no_bos': 1, 'no_retest': 2, 'sl_bounds': 3, 'invalid': 3, 'no_data': -1}
+
+
+def _po3_outcome(res) -> str:
+    """[v76] ОДИН исход на символ за скан: 'ok' если есть сигнал в любом
+    направлении; подпричина отсутствия данных (общая для обоих направлений);
+    иначе — наиболее продвинутый вердикт из двух направлений."""
+    if any(sig for _, sig, _ in res):
+        return 'ok'
+    why = [w for _, _, w in res]
+    if why[0] in _PO3_NODATA:
+        return why[0]
+    return max(why, key=lambda w: _PO3_RANK.get(w, -1))
 
 
 def _po3_exists(sym: str, mode: str, t0_ms: int) -> bool:
@@ -4082,7 +4264,8 @@ def _po3_exists(sym: str, mode: str, t0_ms: int) -> bool:
 async def scan_po3():
     """[v75] PO3 — shadow-сканер, круглосуточно. Вселенная: топ PO3_UNIVERSE_N по
     объёму из _scan_universe; символ обрабатывается только при появлении НОВОГО
-    закрытого 15m-бара. Реальной торговли нет."""
+    закрытого 15m-бара. Реальной торговли нет.
+    [v76] Один исход на символ за скан; сумма счётчиков == total (проверяется)."""
     if not PO3_ENABLED:
         return
     tf = 15 * 60_000
@@ -4092,9 +4275,12 @@ async def scan_po3():
                  key=lambda s: -float((tickers.get(s) or {}).get('quoteVolume', 0) or 0))[:PO3_UNIVERSE_N]
     po3_ctx = await get_btc_context()
     sem = asyncio.Semaphore(SCAN_SEM)
-    st = {k: 0 for k in ['no_data', 'no_sweep', 'no_bos', 'no_retest', 'invalid', 'sl_bounds', 'ok']}
-    st['skipped'] = 0
+    outcomes = ['skipped', 'error', 'fetch_err', 'no_4h', 'no_4h_current', 'few_15m',
+                'no_sweep', 'no_bos', 'no_retest', 'invalid', 'sl_bounds', 'ok']
+    st = {k: 0 for k in outcomes}
+    st['rec_err'] = 0          # информационный (НЕ исход): сбой записи после сигнала
     n_rec = 0
+    o15_before = _po3_o15_fallback_n
 
     async def check(sym):
         nonlocal n_rec
@@ -4104,8 +4290,15 @@ async def scan_po3():
         try:
             async with sem:
                 res = await po3_signal(sym)
-            for mode, sig, why in res:
-                st[why] = st.get(why, 0) + 1
+            outcome = _po3_outcome(res)
+        except Exception as _pe:
+            st['error'] += 1
+            if st['error'] <= 2:
+                logging.debug(f'[PO3] {sym} error: {type(_pe).__name__}: {_pe}')
+            return
+        st[outcome] += 1
+        try:
+            for mode, sig, _why in res:
                 if not sig:
                     continue
                 t0 = int(sig['bar_ts']) // _REGIME_TF_MS * _REGIME_TF_MS
@@ -4130,17 +4323,27 @@ async def scan_po3():
                              f"sweep:{sig['sweep_depth_atr']:.2f}ATR vol:{sig['vol_ratio']:.1f}x "
                              f"SL:{sig['sl']:.6g} TP:{sig['tp']:.6g}")
         except Exception as _pe:
-            st['error'] = st.get('error', 0) + 1
-            if st['error'] <= 2:
-                logging.debug(f'[PO3] {sym} error: {type(_pe).__name__}: {_pe}')
+            st['rec_err'] += 1
+            if st['rec_err'] <= 2:
+                logging.debug(f'[PO3] {sym} record error: {type(_pe).__name__}: {_pe}')
 
     await asyncio.gather(*[check(s) for s in uni])
-    logging.info(f"[PO3 SCAN] total:{len(uni)} skip:{st['skipped']} no_sweep:{st['no_sweep']} "
-                 f"no_bos:{st['no_bos']} no_retest:{st['no_retest']} invalid:{st['invalid']} "
-                 f"sl_bounds:{st['sl_bounds']} no_data:{st['no_data']} → SHADOW:{n_rec}")
-    _record_scan_summary('PO3', {'total': len(uni), 'no_sweep': st['no_sweep'], 'no_bos': st['no_bos'],
+    total_out = sum(st[k] for k in outcomes)
+    if total_out != len(uni):
+        logging.warning(f'[PO3 SCAN] сумма исходов {total_out} != total {len(uni)}')
+    logging.info(
+        f"[PO3 SCAN] total:{len(uni)} skip:{st['skipped']} fetch_err:{st['fetch_err']} "
+        f"no_4h:{st['no_4h']} no_4h_cur:{st['no_4h_current']} few_15m:{st['few_15m']} "
+        f"no_sweep:{st['no_sweep']} no_bos:{st['no_bos']} no_retest:{st['no_retest']} "
+        f"invalid:{st['invalid']} sl_bounds:{st['sl_bounds']} err:{st['error']} "
+        f"→ ok:{st['ok']} SHADOW:{n_rec} (O из 15m: {_po3_o15_fallback_n - o15_before})")
+    _record_scan_summary('PO3', {'total': len(uni), 'skipped': st['skipped'],
+                                 'fetch_err': st['fetch_err'], 'no_4h': st['no_4h'],
+                                 'no_4h_current': st['no_4h_current'], 'few_15m': st['few_15m'],
+                                 'no_sweep': st['no_sweep'], 'no_bos': st['no_bos'],
                                  'no_retest': st['no_retest'], 'invalid': st['invalid'],
-                                 'sl_bounds': st['sl_bounds'], 'ok': st['ok']})
+                                 'sl_bounds': st['sl_bounds'], 'error': st['error'],
+                                 'ok': st['ok']})
 
 
 async def scan_rsi():
@@ -4292,7 +4495,13 @@ async def send_daily_report():
         f"SMC: {daily_stats.get('smc_trades',0)} | RSI: {daily_stats.get('rsi_trades',0)} | "
         f"BE: {daily_stats.get('be_closes',0)}\n"
         f"PnL: <code>{day_pct:+.2f}%</code> | <code>{day_usdt:+.2f} USDT</code>\n"
-        f"Баланс: <code>{bal_usdt:.2f} USDT</code>"
+        f"Баланс: <code>{bal_usdt:.2f} USDT</code>\n"
+        # [v76] DD по эквити (условие breaker) рядом со старой метрикой — для сравнения
+        + (f"DD по эквити: <code>{dd_fraction()*100:+.2f}%</code> (мин за день {_dd['min_dd']*100:+.2f}%, "
+           f"лимит -{DAILY_DD_LIMIT_PCT:.1f}%) | старая метрика (движения цены): "
+           f"<code>{daily_stats['pnl_pct']*100:+.2f}%</code>"
+           if dd_fraction() is not None else
+           f"DD по эквити: нет данных | старая метрика (движения цены): <code>{daily_stats['pnl_pct']*100:+.2f}%</code>")
     )
     logging.info(f"📊 Итоги дня BingX отправлены: {day_pct:+.2f}% ({day_usdt:+.2f} USDT)")
 
@@ -4322,6 +4531,7 @@ async def daily_reset():
     _daily_report_sent = False  # сброс флага на новый день
     _digest_auto_sent  = False  # [v67] сброс флага авт. дайджеста на новый день
     save_all()
+    await dd_update(force_rebase=True)   # [v76] база дня по эквити — в тот же суточный сброс
     logging.info(f"📅 Daily stats reset for {today}")
 
 # ═══════════════════════════════════════════════════════
@@ -4973,8 +5183,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-01-v75'
+CODE_VERSION = '2026-10-01-v76'
 CHANGELOG = [
+    ('2026-10-01-v76', 'ЖИВАЯ ЗАЩИТА: circuit breaker теперь по ДНЕВНОМУ DD ЭКВИТИ BingX (info.data.balance.equity с нереализованным PnL; база — эквити на начало дня, снимок в суточном сбросе, хранится в meta и переживает рестарт), DAILY_DD_LIMIT_PCT=1.5 вместо суммы движений цены с лимитом 2.5% (метрика завышала убыток в SL_dist/риск ≈ 2.6 раза и не видела таймауты/TP50); действие breaker не менялось; сбой получения эквити не срабатывает и не сбрасывает breaker (3 сбоя подряд — алерт); /dd_status, /dd_reset (после пополнения/вывода), /reset дополнительно переснимает базу; старая метрика считается и выводится в отчёте рядом с новой; PO3 no_data: 4ч-запрос шёл под wait_for(8с), а ccxt==4.2.14 для BingX даёт ОДИН REST-запрос в секунду (rateLimit 1000, FIFO) — запрос PO3 стоял в очереди за SMC/RB и отменялся (на стенде с реальным ccxt-throttler воспроизведён точный прод-симптом no_data:40, SHADOW:0); таймаут 150с (тот же дефект у _regime_4h на горячем пути записи shadow), O текущей 4ч-свечи при её отсутствии в списке — из 15m, подпричины fetch_err/no_4h/no_4h_current/few_15m, один исход на символ, сумма == total; R-метрики (mean R net, t при n>=10, число исключённых sl=0) в первой строке и Long/Short каждой shadow-стратегии, t скрыт при n<10 во всех строках ФОРВАРД; для живого SMC R недоступен (нет sl в trades)'),
     ('2026-10-01-v75', 'shadow-only, живая торговля не менялась: PO3 (Power of Three: sweep -> слом -> ретест на закрытых 15m внутри текущей 4ч-свечи) — po3_signal/_po3_eval, scan_po3 (топ-20 по объёму, только новый закрытый 15m-бар), ветка PO3 в _shadow_exit_eval (SL > TP, таймаут 16 баров по close), секция PO3 в /shadow_analyze, пре-коммит контракта (Long и Short раздельно, все режимы, n>=100, PF net>=1.3, mean R net>0 при t>=2.5) в комментарии у PO3_*; общий кэш 4ч-баров _get_4h_bars для режима и PO3 (один запрос на символ); пре-коммит гипотезы Long против Down-режима (DOWNLONG_FORWARD_FROM) + строка ФОРВАРД Down x Long (n>=60, PF net>=1.3, mean R net>0 при t>=2.5) для RB и SMC_SHADOW — только отчёт; ШАГ0 — расчёт дневного DD для circuit breaker проанализирован, НЕ исправлялся (см. BOT_SPEC §2.16.0: метрика = сумма немасштабированных price-move закрытых сделок, не доля баланса — завышает DD в SL_dist/риск ≈ 2.6 раза); результаты v74 внесены в BOT_SPEC §2.15.0 (заморозка подтверждена, режимный фильтр: пре-коммит не выполнен, 1 из 4)'),
     ('2026-10-01-v74', 'shadow-учёт и разметка, торговая логика не менялась: ШАГ0 — диагностика затянутых shadow-записей НА ПРОДЕ НЕ ВЫПОЛНЕНА (из среды разработки нет доступа к БД/ENV Render и к BingX), воспроизводится командой /shadow_recalc dry (таблица: стратегия | закрытых | затянутых | диапазон open_time | PF net затянутых vs остальных + значение MOMENTUM_ENABLED), числа внести в BOT_SPEC §2.15.0; выход shadow-позиций по ПУТИ цены: чистая _shadow_exit_eval для SA/SA_SHADOW/RB/ORB/SMC_SHADOW (приоритеты внутри бара без изменений, таймаут — по close бара таймаута), shadow_check запрашивает бары от open_time (since, limit<=200), число запросов прежнее — любая пауза цикла больше не теряет SL/TP и не исполняет таймаут по цене пробуждения; shadow_signals.recalc + /shadow_recalc [dry] (фон, Semaphore 2, прогресс каждые 100): пересчёт затянутых по пути цены, recalc=1/2, отчёты исключают recalc=2; режим 4ч (_regime_4h, EMA50 + наклон за 6 баров, кэш до закрытия свечи) в shadow_signals и trades.regime_4h (shadow_record стал async; живая позиция — фоновая задача, регистрацию не задерживает), /regime_backfill без look-ahead, срез Режим x Направление в /shadow_analyze и /stats_analyze (SMC), пре-коммит режимного фильтра зафиксирован в коде; квоты SMC_SHADOW: ранняя группа (structure, choch) 10/сутки + поздняя 40/сутки, кулдаун 6ч по (sym, группа), rsi/adx считаются до первой точки записи (раньше ранние отсевы писали 0); SA_ENABLED дефолт true->false (SA live 86 сд PF 1.12, SA_SHADOW 179 сд все сегменты PF net < 1)'),
     ('2026-09-24-v73', 'ШАГ0-фикс: shadow_check() был под "if MOMENTUM_ENABLED:" в главном цикле (миграция ещё до v37) — безвредно, пока MOMENTUM_ENABLED=true по умолчанию, но v72 переключил дефолт на false и тем самым заморозил закрытие ВСЕХ теневых стратегий (PB/RB/ORB/SA_SHADOW/SMC_SHADOW), не только SMC_SHADOW; shadow_check() теперь вызывается безусловно (сигнал-генерация MOM отдельно и независимо мертва с v37); SMC добавлен в _scan_summary_accum и пишет сводку скана по образцу ORB; "Причина закрытия" SMC — GROUP BY по факту вместо захардкоженного списка (сумма 44/51 → сходится по построению); новые trades.btc_entry_price/btc_move_pct (без нового сетевого запроса — из get_tickers_cached()) — измерение беты SMC Long (BTC за сделку, BTC-тренд × Long — btc_trend для SMC не пишется, задокументировано, не чинится в этой правке); SMC_FORWARD_FROM=2026-09-12 + пре-коммит контракта на SMC_RISK_MULT 0.5→1.0 (n>=30, PF net>=1.3, бета-группа PF net>=1.0 n>=10, Wilson lower>35%), строка ФОРВАРД в /stats_analyze (pnl_pct не включает комиссию — выяснено и подтверждено по всем 6 путям log_trade, PF net = pnl_pct - 2*FEE_RATE*100*LEVERAGE); ORB_ENABLED дефолт true→false — промоушен закрыт (форвард 60+ n=80 WR 35% PF net 0.80, разница 0-60 vs 60+ исчезла p=0.28), RB не тронут (единственная открытая shadow-гипотеза)'),
@@ -5208,17 +5419,30 @@ def _regime_at(ends, closes, ema, t_ms) -> str:
 
 
 _bars4h_cache: dict = {}     # {sym: (expire_ts, bars)} — общий для _regime_4h и po3_signal
+# [v76] Таймаут ожидания 4ч-запроса. Было 8 с (v74/v75) — НЕВЕРНО: ccxt==4.2.14
+# для BingX имеет rateLimit=1000 мс при стоимости запроса 1 → ОДИН REST-запрос в
+# секунду на весь процесс, FIFO-очередь. Сканеры SMC/RB (≈160 запросов) стоят в
+# очереди раньше PO3, и 4ч-запрос ждал бы в очереди заведомо дольше 8 с →
+# wait_for отменял его → po3_signal молча возвращал no_data (40 при total=20, оба
+# скана подряд). Тот же дефект у _regime_4h на горячем пути записи shadow
+# (regime_4h='' у записей, сделанных во время скана; лечится /regime_backfill).
+# Таймаут здесь — только страховка от зависания; HTTP-таймаут самого запроса —
+# собственный у ccxt (10 с, считается уже ПОСЛЕ выхода из очереди).
+_BARS4H_TIMEOUT = 150
 
 
-async def _get_4h_bars(sym: str) -> list:
+async def _get_4h_bars(sym: str, timeout: float = None) -> list:
     """[v75] 4ч-свечи символа (limit=300) с кэшем до закрытия текущей 4ч-свечи —
     ОДИН запрос на символ раз в 4ч для всех потребителей (режим, PO3).
+    Список содержит и ТЕКУЩУЮ незакрытую свечу, если биржа её отдаёт: режим
+    фильтрует закрытые сам (_regime_prepare/_regime_at), PO3 берёт из неё open.
     Бросает исключение при сбое сети (потребитель решает, что делать)."""
     now = time.time()
     hit = _bars4h_cache.get(sym)
     if hit and now < hit[0]:
         return hit[1]
-    bars = await asyncio.wait_for(exchange.fetch_ohlcv(sym, '4h', limit=300), 8)
+    bars = await asyncio.wait_for(exchange.fetch_ohlcv(sym, '4h', limit=300),
+                                  _BARS4H_TIMEOUT if timeout is None else timeout)
     bars = bars or []
     _bars4h_cache[sym] = (((int(now * 1000) // _REGIME_TF_MS) + 1) * _REGIME_TF_MS / 1000, bars)
     return bars
@@ -5970,16 +6194,31 @@ def _forward_r_rows(con, strat, fee_pct, since, extra_sql='', args=()):
     return ok, excl
 
 
+def _t_str(n, t) -> str:
+    """[v76] t показывается только при n >= 10 (при малых n он вводит в заблуждение)."""
+    return f't {t:.2f}' if n >= 10 else 't: n&lt;10'
+
+
+def _r_suffix(con, strat, fee_pct, direction=None, show_excl=False) -> str:
+    """[v76] ' | mean R net X | t Y' по ВСЕМ closed-записям стратегии (recalc != 2),
+    формула как в строках ФОРВАРД: R = pnl_net / sl_dist_pct; sl_price=0 исключаются."""
+    ok, excl = _forward_r_rows(con, strat, fee_pct, '',
+                               'AND direction=?' if direction else '', (direction,) if direction else ())
+    n, mr, t = _mean_r_t([r for _, r in ok])
+    ex = f' (исключено sl=0: {excl})' if (show_excl or excl) else ''
+    return f' | mean R net {mr:+.3f} | {_t_str(n, t)} | R: n={n}{ex}'
+
+
 def _forward_status_line(label, since, ok, excl, n_min, show_excl=False):
     """[v75] Строка ФОРВАРД: n | WR | PF net | mean R net | t | статус по условиям
     контракта (n>=n_min, PF net>=1.3, mean R>0 при t>=2.5)."""
     n, wr, _avg, pf = _bucket_stats([(p,) for p, _ in ok])
     _n, mr, t = _mean_r_t([r for _, r in ok])
-    c1, c2, c3 = n >= n_min, pf >= 1.3, (mr > 0 and t >= 2.5)
+    c1, c2, c3 = n >= n_min, pf >= 1.3, (_n >= 10 and mr > 0 and t >= 2.5)
     ck = lambda b: '✅' if b else '❌'
     ex = f' | исключено (sl=0): {excl}' if (show_excl or excl) else ''
     return (f'  ФОРВАРД {label} с {since}: n={n} | WR {wr:.0f}% | PF net {pf:.2f} | '
-            f'mean R net {mr:+.3f} | t {t:.2f} | n&gt;={n_min} {ck(c1)} PF&gt;=1.3 {ck(c2)} '
+            f'mean R net {mr:+.3f} | {_t_str(_n, t)} | n&gt;={n_min} {ck(c1)} PF&gt;=1.3 {ck(c2)} '
             f't&gt;=2.5 {ck(c3)} → {"ВСЕ УСЛОВИЯ ✅" if (c1 and c2 and c3) else "не выполнен"}{ex}')
 
 
@@ -6047,13 +6286,21 @@ def shadow_analyze() -> str:
             if total == 0:
                 continue
             parts.append(f'\n{emoji} {strat} (всего {total}, net — после комиссий)')
+            # [v76] R-метрики: PF по % цены перевешивает сделки с широким стопом
+            # (ORB с SL 8.17% весит как 8 сделок со стопом 1%) — mean R и t по R.
+            _all_rows = con.execute(
+                f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' "
+                "AND recalc!=2 AND strategy=?", (strat,)).fetchall()
+            _l_all = _fmt('Все', _all_rows)
+            if _l_all:
+                parts.append(_l_all + _r_suffix(con, strat, _SHADOW_FEE_PCT, show_excl=True))
             for d in ('Long', 'Short'):
                 rows = con.execute(
                     f"SELECT pnl_pct - {_SHADOW_FEE_PCT} FROM shadow_signals WHERE status='closed' AND recalc!=2 "
                     "AND strategy=? AND direction=?", (strat, d)).fetchall()
                 line = _fmt(d, rows)
                 if line:
-                    parts.append(line)
+                    parts.append(line + _r_suffix(con, strat, _SHADOW_FEE_PCT, direction=d))
             if strat == 'PB':
                 parts.append('  ADX:')
                 parts += _feature(con, strat, 'adx',
@@ -6605,6 +6852,13 @@ def stats_analyze() -> str:
                 "FROM trades WHERE strategy='SMC'").fetchall())
             lines += _rg if _rg else ['  нет данных — запустите /regime_backfill']
 
+            # [v76] R-метрики для живого SMC: R = pnl_net / sl_dist_pct требует SL
+            # сделки, а в trades его НЕТ (log_trade не пишет sl_price/sl_dist) —
+            # mean R и t по живым сделкам посчитать нельзя. Нужна колонка в
+            # trades (отдельным деплоем: схема + INSERT), здесь — только отчёт.
+            lines.append('\n<b>R-метрики (SMC live):</b>')
+            lines.append('  недоступны: в trades нет sl_price/sl_dist (не пишется в log_trade)')
+
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
 
         # ── БЛОК 2: SA (live-сделки + SA_HIST_OFFSET) ────────────────
@@ -6866,12 +7120,26 @@ async def check_tg_commands():
                 daily_stats['pnl_pct'] = 0.0
                 daily_stats['be_closes'] = 0
                 save_all()
+                # [v76] ручной сброс сохраняет прежний смысл («DD обнулён»): база дня
+                # по эквити переснимается, иначе breaker тут же сработал бы снова.
+                _rb = await dd_update(force_rebase=True)
                 logging.info('✅ [CMD] /reset выполнен')
                 await tg(
-                    f'✅ <b>Circuit Breaker сброшен</b>\n'
-                    f'DD обнулён. Торговля возобновлена.\n'
-                    f'Лимит: {DAILY_DD_LIMIT*100:.1f}%/день'
+                    '✅ <b>Circuit Breaker сброшен</b>\n'
+                    'DD обнулён' + (f' (база дня переснята: {_dd["start_equity"]:.2f} USDT)' if _rb
+                                     else ' (эквити не получено — база НЕ переснята, breaker может сработать снова; /dd_reset)') + '. '
+                    f'Торговля возобновлена.\n'
+                    f'Лимит: {DAILY_DD_LIMIT_PCT:.1f}% эквити/день'
                 )
+
+            elif cmd == '/dd_status':
+                await tg(dd_status_text())
+
+            elif cmd == '/dd_reset':
+                # [v76] переснять базу дня — ОБЯЗАТЕЛЬНО после пополнения/вывода средств
+                # посреди дня (иначе пополнение маскирует убыток, а вывод имитирует его).
+                _ok = await dd_update(force_rebase=True)
+                await tg(('✅ База дня переснята.\n' if _ok else '❌ Эквити не получено — база НЕ изменена.\n') + dd_status_text())
 
             elif cmd == '/status':
                 all_pos = all_positions()
@@ -6879,8 +7147,8 @@ async def check_tg_commands():
                 await tg(
                     f'📊 <b>Статус</b>\n'
                     f'Circuit: {status_cb}\n'
-                    f'DD сегодня: {daily_stats["pnl_pct"]*100:+.2f}% '
-                    f'(лимит: {DAILY_DD_LIMIT*100:.1f}%)\n'
+                    f'DD по эквити: {("%+.2f%%" % (dd_fraction()*100)) if dd_fraction() is not None else "нет данных"} '
+                    f'(лимит: {DAILY_DD_LIMIT_PCT:.1f}%; старая метрика {daily_stats["pnl_pct"]*100:+.2f}%)\n'
                     f'Позиций: {len(all_pos)} '
                     f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
                     f'Баланс: проверьте на бирже\n'
@@ -6960,6 +7228,8 @@ async def check_tg_commands():
                     '/regime_backfill — режим 4ч для закрытых записей без режима\n\n'
                     '<b>Управление:</b>\n'
                     '/sync — синхронизация позиций с биржей\n'
+                    '/dd_status — DD по эквити (база дня, текущее, лимит)\n'
+                    '/dd_reset — переснять базу дня (после пополнения/вывода средств)\n'
                     '/reset — сброс дневной статистики\n'
                     '/stop — остановка торговли\n'
                     '/help — этот список'
@@ -7043,6 +7313,8 @@ async def main():
     logging.info(f"⚙️ [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info("=" * 60)
 
+    dd_load()   # [v76] база дня по эквити (рестарт в тот же день не обнуляет)
+
     # Инициализация баланса
     try:
         bal = await exchange.fetch_balance()
@@ -7057,7 +7329,7 @@ async def main():
         f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  "
         f"Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
         f"Сессия: 06:30–17:00 UTC (Киев 09:30–20:00)\n"
-        f"Circuit breaker: при DD >{DAILY_DD_LIMIT*100:.1f}%/день"
+        f"Circuit breaker: при DD по эквити >{DAILY_DD_LIMIT_PCT:.1f}%/день (v76)"
     )
     logging.info(f"🚀 Unified SMC+RSI+SA Bot {BOT_VERSION} started")
 
@@ -7068,6 +7340,7 @@ async def main():
             t0 = time.time()
             try:
                 await daily_reset()
+                await dd_update()   # [v76] эквити раз в цикл (до сканеров/мониторинга)
 
                 # Команды Telegram — вызывается ВСЕГДА (включая circuit breaker)
                 await check_tg_commands()
