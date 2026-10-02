@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v79'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v80'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -1533,6 +1533,71 @@ def _smc2_report_lines(con) -> list:
     return L
 
 
+def _shadow_entry_audit_lines() -> list:
+    """[v80] Аудит входа по shadow-записям SMC_SIG / SMC2_MKT / SMC2_RT (живой SMC на паузе — единственный источник
+    MFE/MAE и R после v79). ТОЛЬКО SELECT (mode=ro). Источник MFE/MAE — shadow_signals.mfe_pct/mae_pct, пишутся
+    при закрытии с v80 (_shadow_excursion); записи до v80 (NULL) в MFE-метрики не входят и считаются отдельно.
+    Тип выхода восстанавливается по exit_price: == sl_price → SL, == tp_price → TP, иначе TIMEOUT (причина в
+    shadow_signals не хранится). Net = pnl_pct − round-trip комиссия (% цены)."""
+    L = ['\n━━ <b>Shadow-аудит входа (с v80; живой SMC на паузе)</b> ━━']
+    try:
+        con = _open_trades_ro()
+    except Exception as _e:
+        return L + [f'ошибка открытия БД: {_e}']
+    try:
+        cols = {r[1] for r in con.execute('PRAGMA table_info(shadow_signals)').fetchall()}
+        if 'mfe_pct' not in cols:
+            return L + ['колонки mfe_pct/mae_pct ещё не созданы (миграция при старте v80) — данных нет']
+        fee = 2 * FEE_RATE * 100
+        for strat, since in (('SMC_SIG', SMC_SIG_FROM), ('SMC2_MKT', SMC2_FORWARD_FROM), ('SMC2_RT', SMC2_FORWARD_FROM)):
+            rows = con.execute(
+                "SELECT direction, entry_price, sl_price, tp_price, exit_price, pnl_pct - ?, mfe_pct, mae_pct, bars_held "
+                "FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?",
+                (fee, strat, since)).fetchall()
+            no_mfe = sum(1 for r in rows if r[6] is None)
+            have = [r for r in rows if r[6] is not None and r[7] is not None]
+            L.append(f'\n<b>{strat}</b> с {since}: закрыто {len(rows)}, с MFE/MAE {len(have)} (без — записи до v80: {no_mfe})')
+            if not have:
+                continue
+            def kind(r):
+                sl, tp, ex = r[2], r[3], r[4]
+                if sl and ex and abs(ex - sl) <= abs(sl) * 1e-9:
+                    return 'SL'
+                if tp and ex and abs(ex - tp) <= abs(tp) * 1e-9:
+                    return 'TP'
+                return 'TIMEOUT'
+            mf = [r[6] for r in have]
+            small = sum(1 for m in mf if m < 0.2)
+            L.append(f'  MFE&lt;0.2% цены: {small} из {len(have)} ({small / len(have) * 100:.0f}%) | медиана MFE {statistics.median(mf):.2f}%')
+            win = [r[6] for r in have if r[5] > 0]
+            sl_r = [r for r in have if kind(r) == 'SL']
+            L.append(f'  средняя MFE: победители (net&gt;0) {(sum(win) / len(win)) if win else 0:.2f}% (n={len(win)}) | '
+                     f'SL-записи {(sum(r[6] for r in sl_r) / len(sl_r)) if sl_r else 0:.2f}% (n={len(sl_r)}; для SL это НИЖНЯЯ оценка — бар выхода не учтён)')
+            tos = sum(1 for r in have if kind(r) == 'TIMEOUT'); tps = sum(1 for r in have if kind(r) == 'TP')
+            bh = [r[8] * 15 for r in sl_r if r[8] is not None]
+            L.append(f'  выходы: SL {len(sl_r)} | TP {tps} | TIMEOUT {tos}' + (f' | медиана минут до бара SL {statistics.median(bh):.0f} (n={len(bh)})' if bh else ''))
+            rr = []
+            for r in have:
+                e, sl = r[1], r[2]
+                if sl and e and abs(e - sl) > 0:
+                    sd = abs(e - sl) / e * 100
+                    rr.append((r[6] / sd, r[7] / sd))
+            if rr:
+                mr = [x[0] for x in rr]; ar = [x[1] for x in rr]
+                L.append(f'  в R (n={len(rr)}): MFE медиана {statistics.median(mr):.2f}R, среднее {sum(mr) / len(mr):.2f}R; доля MFE&lt;0.2R: '
+                         f'{sum(1 for x in mr if x < 0.2) / len(mr) * 100:.0f}% | доля MFE≥1R: {sum(1 for x in mr if x >= 1) / len(mr) * 100:.0f}% | MAE медиана {statistics.median(ar):.2f}R')
+        L.append('\nСравнение с живым SMC (форвард v72: MFE&lt;0.2% у 19%, медиана MFE 0.87%) — см. блок выше; SMC_SIG входит по тому же `c[-1]`, поэтому его MFE — прямой аналог.')
+        return L
+    except Exception as _e:
+        logging.exception('[SMC_ENTRY_AUDIT] shadow fail')
+        return L + [f'ошибка: {_e}']
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def smc_entry_audit_text() -> str:
     """[v79] /smc_entry_audit — ТОЛЬКО SELECT (соединение mode=ro). Диагностика «входа в погоне» живого SMC:
     доступность MFE/MAE в trades, распределение MFE, MFE/MAE в R, то же для форварда с SMC_FORWARD_FROM.
@@ -1590,7 +1655,8 @@ def smc_entry_audit_text() -> str:
                 L.append('  в R: нет сделок с sl_price&gt;0 (sl_price пишется с v77)')
         block('Все живые SMC', allr)
         block(f'ФОРВАРД с {SMC_FORWARD_FROM} (деплой v72)', [r for r in allr if str(r[1]) >= SMC_FORWARD_FROM])
-        L.append('\nНичего не удалено и не изменено (соединение SQLite mode=ro). Диагноз v79 (§2.20.0): вход на НЕзакрытой свече пробоя после всплеска объёма на ПРЕДЫДУЩЕЙ → покупка вершины импульса.')
+        L += _shadow_entry_audit_lines()   # [v80] SMC_SIG / SMC2 — MFE/MAE по shadow_signals
+        L.append('\nНичего не удалено и не изменено (соединение SQLite mode=ro). Диагноз v79 (§2.20.0) аудитом НЕ подтверждён как общий механизм: гипотеза, проверяется SMC_SIG/SMC2.')
         return '\n'.join(L)
     except Exception as _e:
         logging.exception('[SMC_ENTRY_AUDIT] fail')
@@ -5911,7 +5977,11 @@ def _init_trades_db():
                   # SMC2: идентификатор события пробоя (общий у MKT/RT/NF)
                   'btc_entry_price REAL DEFAULT 0',
                   'btc_move_pct REAL DEFAULT 0',
-                  "smc2_event TEXT DEFAULT ''"]:
+                  "smc2_event TEXT DEFAULT ''",
+                  # [v80] MFE/MAE пути цены до выхода, % цены входа, оба >= 0. NULL — запись до v80
+                  # или выход не по пути (дефолтная ветка). Пишется при закрытии в _shadow_check_path.
+                  'mfe_pct REAL',
+                  'mae_pct REAL']:
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -6376,8 +6446,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-02-v79'
+CODE_VERSION = '2026-10-02-v80'
 CHANGELOG = [
+    ('2026-10-02-v80', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика и логика входа/выхода shadow НЕ менялись (SMC_LIVE=false, SMC_SIG, SMC2, контракты, LEVERAGE, RISK_PER_TRADE, breaker-ы, PO3, RB, calc_adx, bybit_worker.py — как в v79). Бэклог п.10 (BOT_SPEC 2.20.0): аудит прода показал, что у shadow-записей MFE/MAE нигде не хранятся (mfe_price у path-стратегий остаётся ценой входа), поэтому: колонки shadow_signals.mfe_pct/mae_pct (NULL = запись до v80), чистая функция _shadow_excursion (MFE/MAE пути цены от бара входа до бара выхода, % цены; для SL бар выхода в MFE не входит — нижняя оценка), запись при закрытии в _shadow_check_path (UPDATE, INSERT не менялся: shadow_record 33 колонки, log_trade 35/35); /smc_entry_audit дополнен блоком по SMC_SIG/SMC2_MKT/SMC2_RT (доля MFE<0.2%, медиана MFE, MFE победителей и SL-записей, выходы SL/TP/TIMEOUT по exit_price, медиана минут до бара SL, MFE/MAE в R, записи до v80 отдельно) — только SELECT, mode=ro'),
     ('2026-10-02-v79', 'ПАУЗА ЖИВОГО SMC + замер вместо него + SMC2 (shadow). Живой вход SMC выключен: SMC_LIVE (ENV, дефолт false) — форвард PF net 0.88 (n=21), диагноз §2.20.0 (вход на НЕзакрытой свече пробоя после всплеска объёма на предыдущей = покупка вершины импульса; FVG-тест ±0.8% декоративен; SL под 3-свечным минимумом лежит в обычной зоне ретеста). При SMC_LIVE=false сигнал smc_signal() (логика НЕ менялась — проверено дифференциальным тестом на 30000 рядах) не идёт в execute(), а пишется в shadow_signals как SMC_SIG (те же sl/tp из _smc_levels, выход SL>TP/таймаут как у SMC_SHADOW, без TP50/BE/трейлинга); открытые живые позиции ведутся как раньше; breaker-ы v76/v77 не менялись. Контракты §2.14.4 (ступень 1), §2.18.5 (режим) и §2.19.1 (ADX) с даты деплоя оцениваются по записям SMC_SIG (смена измерения, не правил); живые сделки до паузы — отдельно, не критерий; блоки в /stats_analyze, /smc_regime_check, /shadow_analyze. SMC2 (только shadow): _smc2_eval, scan_smc2 — пробой структуры на ЗАКРЫТОМ баре с объёмом свечи пробоя >=1.5x медианы и анти-погоней по VWAP; два варианта на одном событии (MKT по close пробоя, RT — лимит на ретесте уровня), общий smc2_event, маркеры SMC2_NF для R_event(RT)=0, лимиты 60 записей/сутки и 1 событие на (sym, dir, 2 ч), контракт (А) промоушена и (Б) гипотезы «точка входа виновата», секция в /shadow_analyze. Новые колонки shadow_signals: btc_entry_price, btc_move_pct, smc2_event (shadow_record INSERT 31 -> 33 колонок, 32 ? + литерал). /smc_entry_audit — MFE/MAE живого SMC (только SELECT, mode=ro). get_btc_context: флаг ctx_ok (False в обеих fallback-ветках), счётчик циклов в дайджесте, ctx_fail в [SMC SCAN]; гейт alt_score не менялся (дефект §2.20.4). LEVERAGE, RISK_PER_TRADE, breaker-ы, замер задержек, PO3, RB, Down x Long, calc_adx и bybit_worker.py не тронуты'),
     ('2026-10-01-v78', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика НЕ менялась (фильтры SMC включая calc_adx и порог ADX, SL/TP/TP50/BE/трейлинг, риск, breaker-ы, PO3 — как в v77; форварды §2.14.4 и §2.18.5 НЕ сбрасываются): настоящий ADX Уайлдера calc_adx_wilder() рядом с прежним DX (calc_adx не тронут) — колонка adx_wilder в shadow_signals (SMC_SHADOW, PO3) и trades (живые SMC), счётчики «что было бы» would_block_adx_w / would_pass_adx_w в [SMC SCAN] и строка [ADX_W] (вход НЕ блокируется), срезы по adx_wilder в /stats_analyze и /shadow_analyze, пре-коммит решения по ADX-фильтру (n>=30 живых входов, доля заблокированных >30% -> вариант (а) не без отдельного анализа); /trades_dups — дубли в trades (только чтение, SQLite mode=ro): точные и близкие, месяцы, пометка СВЕЖИЕ, влияние на SMC; путь двойной записи закрытия описан в BOT_SPEC §2.19.2 (воспроизведён, не исправлен); форвард-блок контракта §2.18.5 в /smc_regime_check (пять условий, Fisher по сделкам и по дням, бета, доля выброса, дубли один раз), история ниже помечена in-sample'),
     ('2026-10-01-v77', 'ЖИВАЯ ЗАЩИТА: общий breaker по просадке от ПИКА эквити BingX (MAX_DD_LIMIT_PCT=6.0, пик и флаг в meta, то же действие что у дневного — новые входы запрещены, позиции со своими SL, БЕЗ автоснятия: суточный сброс и /reset его не снимают, только /maxdd_reset; сбой эквити не срабатывает), /dd_status показывает пик и общую просадку; замер задержки живых ордеров (только измерение): прозрачные обёртки методов exchange (entry/SL/закрытия/отмена/позиции/эквити), таблица latency_log, окно без стопа = ответ на вход -> ответ на SL, [LAT] в логе, алерт при > LAT_ALERT_SEC (10 с, информационный), /lat_status и блок в дневном отчёте (n/медиана/p95/макс), REST-запросов за цикл в логе цикла, глубина очереди throttler ccxt в каждом замере; trades.sl_price (исходный SL, INSERT 33->34) и mean R/t для живого SMC в /stats_analyze; read-only /smc_regime_check (шаг 5.0 — кучность Down+Flat по дням); исследование лимитов BingX/ccxt и вариантов развязки ордеров и сканеров — BOT_SPEC §2.18.2 (без изменений кода)'),
@@ -6950,6 +7021,36 @@ def _shadow_pnl(entry: float, exit_p: float, is_long: bool) -> float:
     return ((exit_p - entry) / entry if is_long else (entry - exit_p) / entry) * 100
 
 
+def _shadow_excursion(row: dict, bars: list, held: int, reason: str):
+    """[v80] MFE/MAE пути цены shadow-записи от бара входа до бара выхода (включительно), % цены входа, >= 0.
+    Те же бары и тот же отсев «бар целиком до входа», что в _shadow_exit_eval; held — индекс бара выхода.
+    MAE считается по всем барам до выхода включительно (в баре выхода экстремум мог быть раньше выхода —
+    верхняя оценка, для SL это и есть стоп). MFE: для SL бар выхода НЕ учитывается (порядок high/low внутри
+    бара неизвестен; при SL > TP в одном баре благоприятный ход мог быть как до, так и после) —
+    это НИЖНЯЯ оценка MFE у SL-записей; для TP и TIMEOUT бар выхода учитывается целиком.
+    Чистая функция, ничего не пишет. → (mfe_pct, mae_pct)."""
+    tf_ms = _shadow_tf_ms()
+    open_ms = _shadow_open_dt(row['open_time']).timestamp() * 1000
+    entry_bar_ms = int(open_ms // tf_ms * tf_ms)
+    entry = float(row['entry_price'])
+    is_long = (row['direction'] == 'Long')
+    mfe = mae = 0.0
+    for b in bars:
+        ts = int(b[0])
+        if ts + tf_ms <= open_ms:
+            continue
+        idx = max(0, int((ts - entry_bar_ms) // tf_ms))
+        if idx > held:
+            break
+        hi, lo = float(b[2]), float(b[3])
+        fav = (hi - entry) if is_long else (entry - lo)
+        adv = (entry - lo) if is_long else (hi - entry)
+        mae = max(mae, adv / entry * 100)
+        if not (reason == 'SL' and idx == held):
+            mfe = max(mfe, fav / entry * 100)
+    return round(max(mfe, 0.0), 3), round(max(mae, 0.0), 3)
+
+
 def _shadow_close_iso(open_dt: datetime, held: int, upto_ts: float) -> str:
     """close_time = min(upto, конец бара выхода): при своевременной проверке это
     «сейчас», при выходе, найденном по пути после паузы, — момент закрытия бара."""
@@ -6991,11 +7092,12 @@ async def _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, t
         return
     is_long = (mode == 'Long')
     pnl = _shadow_pnl(entry, exit_p, is_long)
+    _mfe, _mae = _shadow_excursion(row, bars, held, rsn)   # [v80] MFE/MAE пути цены (для /smc_entry_audit)
     con = sqlite3.connect(TRADES_DB)
     con.execute(
         "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
-        "pnl_pct=?,bars_held=? WHERE id=?",
-        (_shadow_close_iso(open_dt, held, now_ts), exit_p, round(pnl, 3), held, sid))
+        "pnl_pct=?,bars_held=?,mfe_pct=?,mae_pct=? WHERE id=?",
+        (_shadow_close_iso(open_dt, held, now_ts), exit_p, round(pnl, 3), held, _mfe, _mae, sid))
     if strat == 'SMC_SIG' and btc_entry and btc_entry > 0:
         # [v79] движение BTC от входа до ЗАКРЫТИЯ (для бета-группы §2.14.4), % без плеча. Цена BTC берётся
         # на момент обнаружения закрытия (shadow_check раз в цикл) — приближение; при отложенном
