@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v78'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v79'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -223,6 +223,40 @@ PO3_MAX_PER_DAY     = 40
 # (R и t — как в контракте PO3). ТОЛЬКО отчёт: никаких фильтров и изменений
 # сканеров; внедрение — отдельным деплоем. Пороги не смягчать.
 DOWNLONG_FORWARD_FROM = os.getenv('DOWNLONG_FORWARD_FROM', '2026-10-01')  # ISO-дата деплоя v75 (UTC)
+# ── [v79] ПАУЗА ЖИВОГО SMC → SMC_SIG (shadow) ───────────────────────────────
+SMC_LIVE = os.getenv('SMC_LIVE', 'false').lower() == 'true'
+# [v79] Пауза живого SMC: форвард PF net 0.88 (n=21), диагноз — вход в
+# погоне (см. §2.20.0). Возврат — ENV, но по правилам §2.20.3.
+# Логика сигнала smc_signal() НЕ менялась: при SMC_LIVE=false сигнал, прошедший ВСЕ
+# гейты, не передаётся в execute(), а пишется в shadow_signals как strategy='SMC_SIG'
+# (те же sl/tp из _smc_levels). С SMC_SIG_FROM (дата деплоя v79) контракты §2.14.4
+# (ступень 1), §2.18.5 (режимный фильтр) и §2.19.1 (ADX) оцениваются по записям
+# SMC_SIG с open_time >= SMC_SIG_FROM. Это смена способа измерения, а не правил:
+# условия и пороги не меняются. Живые сделки до паузы показываются отдельно и в
+# критерии не входят.
+SMC_SIG_FROM = os.getenv('SMC_SIG_FROM', '2026-10-02')   # ISO-дата деплоя v79 (UTC)
+# ── [v79] SMC2 — исправленный вход, ТОЛЬКО shadow ───────────────────────────
+SMC2_ENABLED        = os.getenv('SMC2_ENABLED', 'true').lower() == 'true'   # shadow
+SMC2_FORWARD_FROM   = os.getenv('SMC2_FORWARD_FROM', '2026-10-02')          # ISO-дата деплоя v79 (UTC)
+SMC2_BREAK_VOL_MULT = 1.5    # объём бара ПРОБОЯ >= 1.5 × медиана 20 баров до него
+SMC2_CHASE_MAX      = 1.015  # анти-погоня: close[b] <= VWAP × 1.015 (Long) / >= VWAP × 0.985 (Short)
+SMC2_RETEST_MAX_BARS = 8     # окно ретеста после пробоя
+SMC2_TP_R           = 2.0
+SMC2_TIMEOUT_BARS   = 16     # баров после входа
+SMC2_MAX_PER_DAY    = 60     # записей (MKT+RT) в сутки
+SMC2_EVENT_DEDUP_SEC = 2 * 3600   # одно событие на (sym, направление, 2 часа)
+SMC2_SL_BOUNDS      = (0.3, 3.0)  # дистанция SL, % цены входа
+# [v79] КОНТРАКТ SMC2 (пре-коммит, зафиксирован ДО данных; параметры НЕ меняются до решения).
+# Форвард с SMC2_FORWARD_FROM (дата деплоя v79).
+# (А) Промоушен варианта (RT или MKT) × направления в микро-live
+#     (риск 0.25%): n >= 100, PF net >= 1.3, mean R net > 0 при t >= 2.5.
+# (Б) Гипотеза «точка входа виновата»: на уровне СОБЫТИЙ сравнить
+#     R_event(RT) против R_event(MKT), где R_event(RT) = 0, если ретест
+#     не случился (упущенная сделка — это ноль, а не исключение).
+#     Подтверждена, если по >= 100 событиям средняя разность > 0 при
+#     парном t >= 2.0.
+# Признаки (rsi, alt_score, adx, adx_wilder, FVG за 15 баров, час UTC) — только
+# сегменты отчёта; любой фильтр по ним — отдельная гипотеза с отдельным пре-коммитом.
 # [SHADOW] кулдаун: не пересэмплировать тот же символ+стратегию+направление
 SHADOW_COOLDOWN_BARS = int(os.getenv('SHADOW_COOLDOWN_BARS', '6'))
 # [v18] час отправки 'Итоги дня' (UTC). 19 UTC = 22:00 Киев. Настраивается.
@@ -396,6 +430,7 @@ _sa_shadow_last_ts = 0.0   # [v53] дедуп SA_SHADOW: не чаще 1 зап�
 # выедалась ранними отсевами 'choch'/'structure' (их большинство), поздние
 # причины (adx_flat/fvg/fvg_test…) не записывались вообще. Кулдаун 6ч — по
 # ключу (sym, группа), а не по sym.
+_ctx_fail_cycles = 0      # [v79] циклов scan_smc с btc_ctx ctx_ok=False (за аптайм) — в дайджест
 _SMC_ADX_THR_REF = 18.0   # [v78] ТОЛЬКО для счётчика «что было бы»: тот же порог, что живой гейт `if adx < 18` в smc_signal (гейт не менялся)
 _adx_w_cycle = {'would_block': 0, 'would_pass_flat': 0}   # [v78] за цикл scan_smc (сбрасывается в scan_smc)
 _smc_shadow_last: dict = {}      # {(sym, group): ts}
@@ -1289,7 +1324,277 @@ def smc_regime_check_text() -> str:
              if len(hdays) <= 3 else f'✅ кучность не подтверждена: {len(hdays)} разных дней (шаг 5.0, v77)')
     L.append('Look-ahead: regime_4h живой сделки пишется _fill_pos_regime → _regime_4h(now≈open_time) '
              '(только закрытые 4ч-свечи) или /regime_backfill (_regime_at по свечам, закрытым ДО open_time).')
+    # [v79] Замер на записях SMC_SIG (SMC_LIVE=false): те же условия §2.18.5, источник — shadow
+    try:
+        con2 = _open_trades_ro()
+        L.append(f'\n━━ <b>SMC_SIG — ФОРВАРД с {SMC_SIG_FROM}</b> (с деплоя v79 контракт §2.18.5 оценивается здесь; живые сделки выше — история до паузы, НЕ критерий) ━━')
+        L += _smc_sig_contract_lines(con2)
+        con2.close()
+    except Exception as _e:
+        L.append(f'[SMC_SIG] ошибка: {_e}')
     return '\n'.join(L)
+
+
+# ───────────────────────────────────────────────────────
+#  [v79] Отчёты: контракты на записях SMC_SIG, секция SMC2, /smc_entry_audit
+# ───────────────────────────────────────────────────────
+def _sig_rows(con, strat, since, direction=None):
+    """[v79] Закрытые shadow-записи (recalc != 2, open_time >= since) → список dict.
+    net = pnl_pct − round-trip комиссия (% цены, shadow); R = net / sl_dist_pct (None при sl_price=0)."""
+    fee = 2 * FEE_RATE * 100
+    q = ("SELECT open_time, direction, COALESCE(regime_4h,''), pnl_pct - ?, entry_price, sl_price, "
+         "btc_move_pct, btc_entry_price, adx_wilder FROM shadow_signals "
+         "WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?")
+    args = [fee, strat, since]
+    if direction:
+        q += ' AND direction=?'; args.append(direction)
+    out = []
+    for ot, d, rg, net, e, sl, bm, be, aw in con.execute(q + ' ORDER BY open_time', args).fetchall():
+        r = None
+        if sl and e and sl > 0 and abs(e - sl) > 0:
+            r = net / (abs(e - sl) / e * 100)
+        out.append({'ot': str(ot), 'dir': d, 'reg': rg, 'net': net, 'r': r,
+                    'bm': bm or 0.0, 'be': be or 0.0, 'aw': aw or 0.0})
+    return out
+
+
+def _pf_net(nets) -> float:
+    gw = sum(x for x in nets if x > 0); gl = -sum(x for x in nets if x < 0)
+    return (gw / gl) if gl > 0 else (float('inf') if gw > 0 else 0.0)
+
+
+def _fpf(v) -> str:
+    return 'inf' if v == float('inf') else f'{v:.2f}'
+
+
+def _smc_sig_contract_lines(con, since=None) -> list:
+    """[v79] ФОРВАРД SMC_SIG: те же три контракта, что раньше считались на живых сделках SMC:
+    §2.14.4 ступень 1 (n>=30, PF net>=1.3, бета-группа PF>=1.0 n>=10, Wilson>35%),
+    §2.18.5 режимный фильтр (5 условий), §2.19.1 ADX (n>=30 с adx_wilder>0, доля блока >30%).
+    Условия и пороги НЕ менялись — изменён только источник измерения (SMC_SIG вместо живых сделок).
+    Живые сделки до паузы в критерии не входят (показываются отдельным блоком)."""
+    since = since or SMC_SIG_FROM
+    ck = lambda b: '✅' if b else '❌'
+    rows = _sig_rows(con, 'SMC_SIG', since, 'Long')
+    L = [f'  <b>ФОРВАРД SMC_SIG Long с {since}</b> (замер вместо живых сделок; записи shadow, net — после комиссий; условия §2.14.4 / §2.18.5 / §2.19.1 НЕ менялись)']
+    n = len(rows)
+    nets = [r['net'] for r in rows]
+    wins = sum(1 for x in nets if x > 0)
+    pf = _pf_net(nets)
+    rn, rm, rt = _mean_r_t([r['r'] for r in rows if r['r'] is not None])
+    L.append(f'  n={n} | WR {(wins / n * 100 if n else 0):.0f}% | PF net {_fpf(pf)} | ' +
+             (f'mean R net {rm:+.3f} | {_t_str(rn, rt)} (R: n={rn})' if rn else 'mean R: нет sl_price'))
+    beta = [r['net'] for r in rows if r['be'] > 0 and r['bm'] <= 0.5]
+    bpf = _pf_net(beta)
+    wl = _wilson_lower(wins, n)
+    c1, c2, c3, c4 = n >= 30, pf >= 1.3, (len(beta) >= 10 and bpf >= 1.0), wl > 35
+    L.append(f'  Бета-группа (BTC за сделку ≤ +0.5%): n={len(beta)} | PF net {_fpf(bpf)} | Wilson lower {wl:.0f}%')
+    L.append(f'  §2.14.4 ступень 1: n&gt;=30 {ck(c1)} | PF net&gt;=1.3 {ck(c2)} | бета PF net&gt;=1.0 (n&gt;=10) {ck(c3)} | Wilson&gt;35% {ck(c4)} → '
+             + ('ВСЕ УСЛОВИЯ ✅' if (c1 and c2 and c3 and c4) else 'не выполнен'))
+    # §2.18.5
+    reg = [r for r in rows if r['reg'] in ('Up', 'Down', 'Flat')]
+    up = [r for r in reg if r['reg'] == 'Up']
+    df = [r for r in reg if r['reg'] in ('Down', 'Flat')]
+    days = lambda g: {r['ot'][:10] for r in g}
+    def rst(g):
+        return _mean_r_t([r['r'] for r in g if r['r'] is not None])
+    un, um = rst(up)[:2]
+    dn_, dm = rst(df)[:2]
+    u_pf, d_pf = _pf_net([r['net'] for r in up]), _pf_net([r['net'] for r in df])
+    uw = sum(1 for r in up if r['net'] > 0); dw = sum(1 for r in df if r['net'] > 0)
+    p_tr = _fisher_2x2(uw, len(up) - uw, dw, len(df) - dw) if up and df else 1.0
+    def day_out(g):
+        d: dict = {}
+        for r in g:
+            d[r['ot'][:10]] = d.get(r['ot'][:10], 0.0) + r['net']
+        return d
+    du, dd_ = day_out(up), day_out(df)
+    udw = sum(1 for v in du.values() if v > 0); ddw = sum(1 for v in dd_.values() if v > 0)
+    p_day = _fisher_2x2(udw, len(du) - udw, ddw, len(dd_) - ddw) if du and dd_ else 1.0
+    ub = [r['net'] for r in up if r['be'] > 0 and r['bm'] <= 0.5]
+    ub_pf = _pf_net(ub)
+    pos = [r['net'] for r in up if r['net'] > 0]
+    share = (max(pos) / sum(pos)) if pos else None
+    k1 = len(df) >= 15 and len(days(df)) >= 5 and len(up) >= 20
+    k2 = (un > 0 and dn_ > 0 and u_pf >= 1.3 and um > 0 and d_pf < 1.0 and dm < 0)
+    k3 = (p_tr < 0.05 and p_day < 0.05)
+    k4 = (len(ub) >= 8 and ub_pf >= 1.0)
+    k5 = (share is not None and share <= 0.40)
+    L.append(f'  §2.18.5 режим: Up n={len(up)} ({len(days(up))} дн.) PF net {_fpf(u_pf)} | Down+Flat n={len(df)} ({len(days(df))} дн.) PF net {_fpf(d_pf)} | '
+             f'Fisher сделки p={p_tr:.4f}, дни p={p_day:.4f} | бета Up n={len(ub)}'
+             + (f' PF net {_fpf(ub_pf)}' if ub else '') + ' | крупнейшая в прибыли Up: ' + (f'{share * 100:.0f}%' if share is not None else 'нет'))
+    L.append(f'  условия: 1) DF n≥15 на ≥5 днях, Up n≥20 {ck(k1)} | 2) Up PF≥1.3 и R&gt;0, DF PF&lt;1.0 и R&lt;0 {ck(k2)} | 3) Fisher p&lt;0.05 по сделкам и дням {ck(k3)} | '
+             f'4) бета Up n≥8 PF≥1.0 {ck(k4)} | 5) крупнейшая ≤40% {ck(k5)} → '
+             + ('ВСЕ УСЛОВИЯ ✅ (кандидат; реализация — отдельным деплоем)' if (k1 and k2 and k3 and k4 and k5) else 'пре-коммит не выполнен'))
+    # §2.19.1
+    aw = [r for r in rows if r['aw'] > 0]
+    bl = sum(1 for r in aw if r['aw'] < 18)
+    L.append(f'  §2.19.1 ADX Уайлдера: записей с adx_wilder&gt;0: {len(aw)} (решение при n&gt;=30) | заблокировал бы (&lt;18): <b>{bl} из {len(aw)}</b>'
+             + (f' ({bl / len(aw) * 100:.0f}%)' if aw else '') + ' | порог доли 30%')
+    for lbl, lo, hi in [('&lt;18', 0.0001, 18), ('18-25', 18, 25), ('25+', 25, 999)]:
+        g = [r for r in aw if lo <= r['aw'] < hi]
+        if not g:
+            continue
+        gn, gwr, _a, gpf = _bucket_stats([(r['net'],) for r in g])
+        grn, grm, grt = _mean_r_t([r['r'] for r in g if r['r'] is not None])
+        L.append(f'    {lbl}: {gn} | WR {gwr:.0f}% | PF net {gpf:.2f} | ' +
+                 (f'mean R net {grm:+.3f} | {_t_str(grn, grt)}' if grn >= 10 else f'mean R: n&lt;10 (R: n={grn})'))
+    return L
+
+
+def _smc2_event_pairs(con, since):
+    """[v79] Пары по СОБЫТИЯМ для блока (Б): (event_id, R_mkt, R_rt). R_rt = 0, если ретеста не было
+    (маркер SMC2_NF — упущенная сделка это ноль, а не исключение). Берутся только события, где MKT закрыт
+    и RT либо закрыт, либо имеет маркер NF. Открытые/ожидающие события не участвуют."""
+    fee = 2 * FEE_RATE * 100
+    rr = con.execute(
+        "SELECT smc2_event, strategy, pnl_pct - ?, entry_price, sl_price FROM shadow_signals "
+        "WHERE status='closed' AND recalc!=2 AND strategy IN ('SMC2_MKT','SMC2_RT','SMC2_NF') "
+        "AND smc2_event!='' AND open_time>=?", (fee, since)).fetchall()
+    ev: dict = {}
+    for eid, st, net, e, sl in rr:
+        d = ev.setdefault(eid, {})
+        if st == 'SMC2_NF':
+            d['nf'] = True
+        elif sl and e and sl > 0 and abs(e - sl) > 0:
+            d[st] = net / (abs(e - sl) / e * 100)
+    pairs = []
+    for eid, d in ev.items():
+        if 'SMC2_MKT' not in d:
+            continue
+        if 'SMC2_RT' in d:
+            pairs.append((eid, d['SMC2_MKT'], d['SMC2_RT']))
+        elif d.get('nf'):
+            pairs.append((eid, d['SMC2_MKT'], 0.0))
+    return pairs
+
+
+def _smc2_report_lines(con) -> list:
+    """[v79] Секция SMC2 для /shadow_analyze: по каждому варианту (MKT/RT) × направление — ФОРВАРД-строка
+    контракта (А) (n>=100, PF net>=1.3, mean R>0 при t>=2.5), сегменты (rsi, alt_score, час, adx_wilder,
+    FVG, режим×направление) — ТОЛЬКО информационно; блок (Б) — R_event(RT) против R_event(MKT)."""
+    since = SMC2_FORWARD_FROM
+    fee = 2 * FEE_RATE * 100
+    L = [f'\n🎯 SMC2 (shadow, форвард с {since}; контракт — у констант SMC2_*)']
+    nf = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE strategy='SMC2_NF' AND open_time>=?", (since,)).fetchone()[0]
+    opn = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE status='open' AND strategy IN ('SMC2_MKT','SMC2_RT')").fetchone()[0]
+    L.append(f'  ⚠️ SMC2 НЕ фильтрует по alt_score (дефект/упрощение v79 — BOT_SPEC §2.20.4: при ctx_ok=False alt_score=50 — заглушка); NF-маркеров (ретест не состоялся): {nf}; открытых: {opn}')
+    seg_rows = {}
+    for strat in ('SMC2_MKT', 'SMC2_RT'):
+        total = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=?", (strat,)).fetchone()[0]
+        if total == 0:
+            L.append(f'\n  {strat}: закрытых 0')
+            continue
+        L.append(f'\n  <b>{strat}</b> (закрыто {total}):')
+        for d in ('Long', 'Short'):
+            ok, ex = _forward_r_rows(con, strat, fee, since, 'AND direction=?', (d,))
+            L.append(_forward_status_line(d, since, ok, ex, 100))
+        rows = con.execute(
+            "SELECT pnl_pct - ?, direction, COALESCE(regime_4h,''), entry_rsi, alt_score, entry_hour, adx_wilder, "
+            "shadow_reason, entry_price, sl_price FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?",
+            (fee, strat, since)).fetchall()
+        def seg(title, key, buckets):
+            L.append(f'  {title}:')
+            for lbl, f in buckets:
+                g = [r for r in rows if f(r)]
+                if not g:
+                    continue
+                n, wr, avg, pf = _bucket_stats([(r[0],) for r in g])
+                rs = [r[0] / (abs(r[8] - r[9]) / r[8] * 100) for r in g if r[9] and r[8] and r[9] > 0 and abs(r[8] - r[9]) > 0]
+                rn, rm, rt = _mean_r_t(rs)
+                L.append(f'    {lbl}: {n} | WR {wr:.0f}% | PF net {pf:.2f}' + (f' | mean R {rm:+.3f} ({_t_str(rn, rt)})' if rn else ''))
+        seg('RSI на пробое', 'rsi', [('&lt;45', lambda r: r[3] < 45), ('45-55', lambda r: 45 <= r[3] < 55),
+                                     ('55-68', lambda r: 55 <= r[3] < 68), ('68+', lambda r: r[3] >= 68)])
+        seg('alt_score', 'alt', [('&lt;35', lambda r: r[4] < 35), ('35-50', lambda r: 35 <= r[4] < 50), ('50+', lambda r: r[4] >= 50)])
+        seg('Час UTC', 'hour', [('00-06', lambda r: 0 <= r[5] < 6), ('06-12', lambda r: 6 <= r[5] < 12),
+                                ('12-18', lambda r: 12 <= r[5] < 18), ('18-24', lambda r: r[5] >= 18)])
+        seg('ADX Уайлдера', 'adx', [('&lt;18', lambda r: 0 < r[6] < 18), ('18-25', lambda r: 18 <= r[6] < 25), ('25+', lambda r: r[6] >= 25)])
+        seg('FVG за 15 баров', 'fvg', [('есть FVG', lambda r: 'fvg1' in (r[7] or '')), ('нет FVG', lambda r: 'fvg0' in (r[7] or ''))])
+        seg('Режим 4ч × направление', 'reg', [(f'{rg}×{d}', (lambda rg_, d_: (lambda r: r[2] == rg_ and r[1] == d_))(rg, d))
+                                              for rg in ('Up', 'Flat', 'Down') for d in ('Long', 'Short')])
+        seg_rows[strat] = rows
+    # Блок (Б)
+    pairs = _smc2_event_pairs(con, since)
+    n = len(pairs)
+    L.append('\n  <b>Блок (Б): «точка входа виновата» — R_event(RT) − R_event(MKT)</b> (RT без ретеста = 0; пары — только события с закрытым MKT и закрытым RT либо маркером NF)')
+    if n == 0:
+        L.append('  событий: 0')
+        return L
+    diffs = [rt - mk for _eid, mk, rt in pairs]
+    dn, dm, dt = _mean_r_t(diffs)
+    mk_m = sum(p[1] for p in pairs) / n; rt_m = sum(p[2] for p in pairs) / n
+    miss = sum(1 for p in pairs if p[2] == 0.0)
+    ck = lambda b: '✅' if b else '❌'
+    L.append(f'  событий n={n} | R_event(MKT) среднее {mk_m:+.3f} | R_event(RT) среднее {rt_m:+.3f} (из них без ретеста: {miss}) | '
+             f'средняя разность {dm:+.3f} | парный {_t_str(dn, dt)}')
+    c1, c2, c3 = n >= 100, dm > 0, (dn >= 10 and dt >= 2.0)
+    L.append(f'  (Б): n&gt;=100 {ck(c1)} | разность &gt;0 {ck(c2)} | парный t&gt;=2.0 {ck(c3)} → '
+             + ('ГИПОТЕЗА ПОДТВЕРЖДЕНА ✅' if (c1 and c2 and c3) else 'не подтверждена (рано / нет эффекта)'))
+    return L
+
+
+def smc_entry_audit_text() -> str:
+    """[v79] /smc_entry_audit — ТОЛЬКО SELECT (соединение mode=ro). Диагностика «входа в погоне» живого SMC:
+    доступность MFE/MAE в trades, распределение MFE, MFE/MAE в R, то же для форварда с SMC_FORWARD_FROM.
+    Дубли в trades (v78: точные копии) считаются один раз."""
+    try:
+        con = _open_trades_ro()
+    except Exception as _e:
+        return f'[SMC_ENTRY_AUDIT] ошибка открытия БД: {_e}'
+    try:
+        drop = _trades_dup_drop_ids(con)
+        cols = {r[1] for r in con.execute('PRAGMA table_info(trades)').fetchall()}
+        has_mfe = 'mfe_pct' in cols
+        has_mae = any(c in cols for c in ('mae_pct', 'mae'))
+        mae_col = 'mae_pct' if 'mae_pct' in cols else ('mae' if 'mae' in cols else None)
+        L = ['🔬 <b>SMC entry audit</b> (только чтение; дубли — один раз, убрано копий: ' + str(len(drop)) + ')']
+        L.append(f'Колонки trades: mfe_pct {"есть" if has_mfe else "НЕТ"} | MAE {("есть: " + mae_col) if has_mae else "НЕТ (не пишется — MAE оценивается только для SL-сделок как ≈ дистанция SL)"} | '
+                 f'mfe_time_min {"есть" if "mfe_time_min" in cols else "НЕТ"} | dur_min {"есть" if "dur_min" in cols else "НЕТ"} | sl_price {"есть" if "sl_price" in cols else "НЕТ"}')
+        if not has_mfe:
+            L.append('MFE в trades не пишется — аудит невозможен.')
+            con.close(); return '\n'.join(L)
+        sel = ("SELECT id, open_time, symbol, direction, close_reason, pnl_pct, net_usdt, entry_price, sl_price, mfe_pct, "
+               + ('dur_min' if 'dur_min' in cols else '0') + ', ' + (mae_col if mae_col else '0') + " FROM trades WHERE strategy='SMC' ")
+        allr = [r for r in con.execute(sel + 'ORDER BY open_time').fetchall() if r[0] not in drop]
+        con.close()
+        have_mfe = [r for r in allr if r[9] is not None]
+        L.append(f'SMC всего (без дублей): {len(allr)} | с записанным mfe_pct: {len(have_mfe)} | с sl_price&gt;0: {sum(1 for r in allr if r[8] and r[8] > 0)}')
+
+        def block(title, rows):
+            L.append(f'\n<b>{title}</b> — n={len(rows)}')
+            if not rows:
+                return
+            ms = [r[9] for r in rows if r[9] is not None]
+            if not ms:
+                L.append('  MFE не записан'); return
+            small = sum(1 for m in ms if m < 0.2)
+            win = [r[9] for r in rows if r[6] is not None and r[6] > 0 and r[9] is not None]
+            slr = [r for r in rows if r[4] and 'SL' in str(r[4]).upper() and r[9] is not None]
+            sl_m = [r[9] for r in slr]
+            L.append(f'  MFE&lt;0.2% цены: {small} из {len(ms)} ({small / len(ms) * 100:.0f}%) | медиана MFE {statistics.median(ms):.2f}%')
+            L.append(f'  средняя MFE: победители (net&gt;0) {(sum(win) / len(win)) if win else 0:.2f}% (n={len(win)}) | SL-сделки {(sum(sl_m) / len(sl_m)) if sl_m else 0:.2f}% (n={len(sl_m)})')
+            durs = [r[10] for r in slr if r[10]]
+            L.append('  медиана минут до SL: ' + (f'{statistics.median(durs):.0f} (n={len(durs)})' if durs else 'нет dur_min'))
+            rr = []
+            for r in rows:
+                e, sl, m = r[7], r[8], r[9]
+                if sl and sl > 0 and e and abs(e - sl) > 0 and m is not None:
+                    sd = abs(e - sl) / e * 100
+                    mae = abs(r[11]) if (mae_col and r[11] is not None) else None
+                    rr.append((m / sd, (mae / sd) if mae is not None else None))
+            if rr:
+                mf = [x[0] for x in rr]; ma = [x[1] for x in rr if x[1] is not None]
+                L.append(f'  в R (sl_price&gt;0, n={len(rr)}): MFE медиана {statistics.median(mf):.2f}R, среднее {sum(mf) / len(mf):.2f}R; доля MFE&lt;0.2R: '
+                         f'{sum(1 for x in mf if x < 0.2) / len(mf) * 100:.0f}%' + (f' | MAE медиана {statistics.median(ma):.2f}R (n={len(ma)})' if ma else ' | MAE в R: не записан'))
+            else:
+                L.append('  в R: нет сделок с sl_price&gt;0 (sl_price пишется с v77)')
+        block('Все живые SMC', allr)
+        block(f'ФОРВАРД с {SMC_FORWARD_FROM} (деплой v72)', [r for r in allr if str(r[1]) >= SMC_FORWARD_FROM])
+        L.append('\nНичего не удалено и не изменено (соединение SQLite mode=ro). Диагноз v79 (§2.20.0): вход на НЕзакрытой свече пробоя после всплеска объёма на ПРЕДЫДУЩЕЙ → покупка вершины импульса.')
+        return '\n'.join(L)
+    except Exception as _e:
+        logging.exception('[SMC_ENTRY_AUDIT] fail')
+        return f'[SMC_ENTRY_AUDIT] ошибка: {_e}'
 
 
 def mdd_status_text() -> str:
@@ -2171,7 +2476,8 @@ async def get_btc_context() -> dict:
         btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
         if not btc_ohlcv or len(btc_ohlcv) < 200:
             return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0,
-                    'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate}
+                    'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate,
+                    'ctx_ok': False}   # [v79] нехватка данных BTC: alt_score=50 — заглушка
         btc_c = np.array([x[4] for x in btc_ohlcv], dtype=float)
         ema200 = calc_ema(btc_c, 200)
         dist = (btc_c[-1] - ema200) / ema200 * 100
@@ -2212,10 +2518,12 @@ async def get_btc_context() -> dict:
         return {'btc_trend': trend, 'altseason': altseason,
                 'eth_btc_spread': eth_btc_spread, 'alt_score': alt_score,
                 'htf_slope': htf_slope,       # [v38]
-                'funding_rate': funding_rate}  # [v70]
+                'funding_rate': funding_rate,  # [v70]
+                'ctx_ok': True}               # [v79] контекст получен
     except Exception:
         return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0,
-                'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate}
+                'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate,
+                'ctx_ok': False}   # [v79] сбой: alt_score=50 — заглушка (гейт SMC режет при >= 45)
 
 # ═══════════════════════════════════════════════════════
 #  SMC СИГНАЛ
@@ -2399,6 +2707,9 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
         'sl': sl, 'tp': tp, 'atr': atr, 'rsi': rsi,
         'bingx_vol': float(np.sum(v[-1:]) * price),  # приблиз. USD объём последней свечи
         'adx_wilder': float(adx_w),   # [v78] только запись (trades.adx_wilder); на логику входа не влияет
+        # [v79] ТОЛЬКО для записи SMC_SIG (shadow). Отдельные ключи, а не 'adx'/'vol_ratio': иначе
+        # execute() начал бы писать их в trades.adx_val/vol_ratio (сейчас 0) — смена записи живого пути.
+        'adx_dx': float(adx), 'vol_ratio_sig': float(vol_ratio),
     }, 'ok'
 
 # ═══════════════════════════════════════════════════════
@@ -4472,12 +4783,18 @@ async def scan_smc():
     """Сканер SMC: запускается каждые 60 сек в торговые сессии."""
     if not is_session():
         return  # вне торговой сессии — молчим
-    if not check_circuit_breaker():
+    # [v79] breaker гейтит ЖИВЫЕ входы; при паузе (SMC_LIVE=false) скан ничего не открывает,
+    # и запись SMC_SIG не должна прерываться из-за breaker-ов. Логика breaker-ов не менялась.
+    if SMC_LIVE and not check_circuit_breaker():
         logging.debug('[SMC] Circuit breaker активен — скан пропущен')
         return
 
     # [v16.1] btc-контекст один раз на скан (для alt_score в /stats_analyze)
     smc_btc_ctx = await get_btc_context()
+    _ctx_fail = not smc_btc_ctx.get('ctx_ok', True)     # [v79] ctx_ok=False → alt_score=50 заглушка (§2.20.4)
+    if _ctx_fail:
+        global _ctx_fail_cycles
+        _ctx_fail_cycles += 1
 
     scan = await _scan_universe()
     sem  = asyncio.Semaphore(SCAN_SEM)
@@ -4493,11 +4810,15 @@ async def scan_smc():
                 sig, reason = await smc_signal(sym, smc_btc_ctx)
             st[reason] = st.get(reason, 0) + 1
             if sig:
-                notified[sym] = time.time()
                 # [v16] передаём alt_score для /stats_analyze
                 sig['alt_score'] = smc_btc_ctx.get('alt_score', 0)
-                await execute(sym, sig, 'SMC', smc_positions,
-                              f"RSI: {sig['rsi']:.1f}", risk_mult=SMC_RISK_MULT)
+                if SMC_LIVE:
+                    notified[sym] = time.time()
+                    await execute(sym, sig, 'SMC', smc_positions,
+                                  f"RSI: {sig['rsi']:.1f}", risk_mult=SMC_RISK_MULT)
+                else:
+                    # [v79] ПАУЗА живого SMC: сигнал (логика не менялась) → shadow SMC_SIG, не execute()
+                    await _smc_sig_record(sym, sig, smc_btc_ctx)
         except Exception as _e:
             st['error'] = st.get('error', 0) + 1
             if st['error'] <= 2:  # логируем только первые 2 (не спамим)
@@ -4520,7 +4841,8 @@ async def scan_smc():
         # [v78] только измерение (вход не блокируется): входы, которые заблокировал бы настоящий ADX,
         # и adx_flat-отсевы, которые прошли бы при настоящем ADX
         f"would_block_adx_w:{_adx_w_cycle['would_block']} would_pass_adx_w:{_adx_w_cycle['would_pass_flat']} "
-        f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}"
+        f"err:{st.get('error',0)} → ВХОДЫ:{st['ok']}" + ('' if SMC_LIVE else ' (SMC_LIVE=false → SMC_SIG)')
+        + (' | ctx_fail (alt_score=50 заглушка)' if _ctx_fail else '')
     )
     # [v73] SMC добавлена в сводку сканов дайджеста — раньше отсутствовала
     # (якорь _scan_summary_accum держал только SA/RB/ORB), по образцу ORB.
@@ -4532,6 +4854,7 @@ async def scan_smc():
         'fvg': st.get('fvg', 0), 'fvg_test': st.get('fvg_test', 0),
         'would_block_adx_w': _adx_w_cycle['would_block'],       # [v78]
         'would_pass_adx_w': _adx_w_cycle['would_pass_flat'],    # [v78]
+        'ctx_fail': 1 if _ctx_fail else 0,                       # [v79] цикл с ctx_ok=False (среднее = доля)
         'ok': st['ok'],
     })
 
@@ -4908,6 +5231,296 @@ async def scan_po3():
                                  'no_retest': st['no_retest'], 'invalid': st['invalid'],
                                  'sl_bounds': st['sl_bounds'], 'error': st['error'],
                                  'ok': st['ok']})
+
+
+# ═══════════════════════════════════════════════════════
+#  [v79] SMC2 — исправленный вход (shadow). Контракт — у констант SMC2_*.
+#  Все решения — ТОЛЬКО по закрытым 15m-барам; сессионного фильтра нет (24/7).
+#  Событие = пробой структуры (первое закрытие за L = последний pivot, при rh[-1] < rh[-2] для Long)
+#  на баре b с объёмом ЭТОГО бара >= 1.5 × медиана 20 баров до него и анти-погоней по VWAP.
+#  Два варианта входа на одном событии: MKT (по close[b]) и RT (лимит на ретесте уровня L).
+#  Логика БЕЗ состояния: каждый новый закрытый бар пересматривает последние 9 баров (b..b+8)
+#  — результаты переживают рестарты; запись идемпотентна по (smc2_event, strategy).
+# ═══════════════════════════════════════════════════════
+_SMC2_STAGES = ('no_struct', 'no_break', 'vol', 'vwap', 'sl_bounds')   # воронка: индекс = глубина
+_smc2_last_bar: dict = {}     # {sym: ts последнего обработанного закрытого 15m-бара}
+_smc2_day = {'date': '', 'n': 0}
+
+
+def _smc2_sl_ok(entry: float, sl: float, is_long: bool) -> bool:
+    d = ((entry - sl) if is_long else (sl - entry)) / entry * 100
+    return d > 0 and SMC2_SL_BOUNDS[0] <= d <= SMC2_SL_BOUNDS[1]
+
+
+def _smc2_rt_state(h, l, c, b: int, L: float, S: float, sl: float, is_long: bool, n: int):
+    """Состояние лимитки на ретесте уровня L после пробоя на баре b (только бары <= n-1):
+    ('filled', f) — первый бар f в (b, b+8] с low[f] < L (строго ниже; Short: high[f] > L);
+    ('cancel_2r', j) — цена ушла на 2R от L без ретеста (или бар заполнения одновременно достиг 2R —
+        порядок внутри бара неизвестен, консервативно = не заполнено);
+    ('invalid', j) — close за S до заполнения; ('expired', None) — 8 баров без заполнения;
+    ('pending', None) — окно ещё не закрыто."""
+    R = abs(L - sl)
+    tp = L + SMC2_TP_R * R if is_long else L - SMC2_TP_R * R
+    for j in range(b + 1, min(b + SMC2_RETEST_MAX_BARS, n - 1) + 1):
+        fill = (l[j] < L) if is_long else (h[j] > L)
+        reach = (h[j] >= tp) if is_long else (l[j] <= tp)
+        if fill:
+            return ('cancel_2r', j) if reach else ('filled', j)
+        if reach:
+            return ('cancel_2r', j)
+        if (c[j] < S) if is_long else (c[j] > S):
+            return ('invalid', j)
+    return ('expired', None) if b + SMC2_RETEST_MAX_BARS <= n - 1 else ('pending', None)
+
+
+def _smc2_eval(ts, o, h, l, c, v, mode: str, ph=None, pl=None):
+    """[v79] Чистая функция: события SMC2 одного направления по ЗАКРЫТЫМ барам (массивы по возрастанию;
+    последний бар — последний закрытый). Рассматриваются бары пробоя b в последних
+    SMC2_RETEST_MAX_BARS+1 барах; всё считается «как на момент b» (pivot-ы, VWAP, ATR — только бары <= b),
+    поэтому будущие бары на решение о событии не влияют.
+    → (events, stage): events — список событий (dict) с MKT/RT-параметрами и состоянием ретеста;
+    stage — глубина воронки среди всех кандидатов (-1 ... 4: no_struct,no_break,vol,vwap,sl_bounds)."""
+    n = len(c)
+    is_long = (mode == 'Long')
+    if ph is None or pl is None:
+        ph, pl = get_pivots(h, l, order=SMC_PIVOT_ORDER)
+    brk_piv, st_piv = (ph, pl) if is_long else (pl, ph)
+    ORD = SMC_PIVOT_ORDER
+    events, stage = [], -1
+    for b in range(max(20, n - 1 - SMC2_RETEST_MAX_BARS), n):
+        bi = [i for i in brk_piv if i <= b - ORD]     # pivot подтверждён к бару b
+        si = [i for i in st_piv if i <= b - ORD]
+        struct = len(bi) >= 2 and ((h[bi[-1]] < h[bi[-2]]) if is_long else (l[bi[-1]] > l[bi[-2]]))
+        if not struct or not si:
+            stage = max(stage, 0); continue
+        pi = bi[-1]
+        L = float(h[pi] if is_long else l[pi])
+        broke = (c[b] > L) if is_long else (c[b] < L)
+        if not broke or any((c[j] > L) if is_long else (c[j] < L) for j in range(pi + 1, b)):
+            stage = max(stage, 1); continue           # нет пробоя ИМЕННО на b (первое закрытие за L)
+        med = float(np.median(v[b - 20:b]))
+        if med <= 0 or v[b] < SMC2_BREAK_VOL_MULT * med:
+            stage = max(stage, 2); continue           # объём — на свече ПРОБОЯ, не на предыдущей
+        vwap = calc_vwap(h[:b + 1], l[:b + 1], c[:b + 1], v[:b + 1])
+        chase = (c[b] > vwap * SMC2_CHASE_MAX) if is_long else (c[b] < vwap * (2 - SMC2_CHASE_MAX))
+        if chase:
+            stage = max(stage, 3); continue           # анти-погоня
+        between = [i for i in si if i > pi]
+        sidx = between[-1] if between else si[-1]
+        S = float(l[sidx] if is_long else h[sidx])
+        atr = float(calc_atr(h[:b + 1], l[:b + 1], c[:b + 1]))
+        sl = S - 0.1 * atr if is_long else S + 0.1 * atr
+        entry_m = float(c[b])
+        mkt_ok = _smc2_sl_ok(entry_m, sl, is_long)
+        rt_ok = _smc2_sl_ok(L, sl, is_long)
+        if not (mkt_ok or rt_ok):
+            stage = max(stage, 4); continue           # sl_bounds
+        mkt = None
+        if mkt_ok:
+            d = abs(entry_m - sl)
+            mkt = {'entry': entry_m, 'sl': sl, 'tp': entry_m + SMC2_TP_R * d if is_long else entry_m - SMC2_TP_R * d}
+        rt = None
+        if rt_ok:
+            state, f = _smc2_rt_state(h, l, c, b, L, S, sl, is_long, n)
+            d = abs(L - sl)
+            rt = {'entry': L, 'sl': sl, 'tp': L + SMC2_TP_R * d if is_long else L - SMC2_TP_R * d,
+                  'state': state, 'f': f}
+        else:
+            rt = {'entry': L, 'sl': sl, 'tp': 0.0, 'state': 'rt_sl_bounds', 'f': None}
+        stage = max(stage, 5)
+        events.append({
+            'mode': mode, 'b': b, 'ts_b': int(ts[b]), 'L': L, 'S': S, 'atr': atr, 'vwap': float(vwap),
+            'vol_ratio': float(v[b]) / med, 'mkt': mkt, 'rt': rt,
+            'rsi': float(calc_rsi(c[:b + 1])), 'adx': float(calc_adx(h[:b + 1], l[:b + 1], c[:b + 1], 14)),
+            'adx_wilder': float(calc_adx_wilder(h[:b + 1], l[:b + 1], c[:b + 1], 14)),
+            'fvg': 1 if find_fvg(h[:b + 1], l[:b + 1], mode) else 0,
+        })
+    return events, stage
+
+
+def _smc2_event_id(sym: str, ts_b: int, mode: str) -> str:
+    return f'{sym}|{ts_b}|{mode}'
+
+
+def _smc2_existing(con, event_id: str) -> set:
+    return {r[0] for r in con.execute("SELECT strategy FROM shadow_signals WHERE smc2_event=?", (event_id,)).fetchall()}
+
+
+def _smc2_dedup_blocked(con, sym: str, mode: str, ts_b: int, event_id: str) -> bool:
+    """Одно событие на (sym, направление, 2 часа): блокирует НОВОЕ событие, если другое событие того же
+    символа/направления (любая запись MKT/RT/NF) было в пределах SMC2_EVENT_DEDUP_SEC."""
+    lo = datetime.fromtimestamp((ts_b / 1000) - 3 * 3600, timezone.utc).isoformat()
+    for (ev,) in con.execute(
+            "SELECT DISTINCT smc2_event FROM shadow_signals WHERE symbol=? AND direction=? AND smc2_event!='' "
+            "AND strategy IN ('SMC2_MKT','SMC2_RT','SMC2_NF') AND smc2_event!=? AND open_time>=?",
+            (sym, mode, event_id, lo)).fetchall():
+        try:
+            if abs(int(ev.split('|')[1]) - ts_b) < SMC2_EVENT_DEDUP_SEC * 1000:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _smc2_cap_take() -> bool:
+    """Суточный потолок записей (MKT+RT): счётчик резервируется ДО await записи; на смене даты UTC
+    пересчитывается из БД (переживает рестарт)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _smc2_day['date'] != today:
+        n = 0
+        try:
+            con = sqlite3.connect(TRADES_DB)
+            n = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE strategy IN ('SMC2_MKT','SMC2_RT') "
+                            "AND open_time >= ?", (today,)).fetchone()[0]
+            con.close()
+        except Exception:
+            n = 0
+        _smc2_day['date'], _smc2_day['n'] = today, n
+    if _smc2_day['n'] >= SMC2_MAX_PER_DAY:
+        return False
+    _smc2_day['n'] += 1
+    return True
+
+
+def _smc2_write_nf(sym: str, ev: dict, reason: str):
+    """Маркер «RT не состоялся» (strategy='SMC2_NF', status=closed, pnl=0): нужен блоку (Б) — R_event(RT)=0
+    для упущенной сделки. НЕ входит в статистику стратегий RT/MKT (отдельный strategy)."""
+    ot = datetime.fromtimestamp((ev['ts_b'] + 900_000) / 1000, timezone.utc).isoformat()
+    con = sqlite3.connect(TRADES_DB)
+    con.execute(
+        "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,sl_price,tp_price,atr,status,strategy,"
+        "close_time,exit_price,pnl_pct,bars_held,shadow_reason,smc2_event,recalc) "
+        "VALUES (?,?,?,?,?,?,?,'closed','SMC2_NF',?,?,0,0,?,?,0)",
+        (ot, sym, ev['mode'], ev['rt']['entry'], ev['rt']['sl'], ev['rt']['tp'], ev['atr'], ot, ev['rt']['entry'],
+         'smc2_nf_' + reason, _smc2_event_id(sym, ev['ts_b'], ev['mode'])))
+    con.commit(); con.close()
+
+
+async def _smc2_persist(sym: str, ev: dict, ts, btc_ctx: dict) -> list:
+    """Идемпотентная запись событий одного символа/направления. → список исходов этого вызова
+    (rt_fill, mkt_ok, no_fill, invalid, dedup, cap, rt_pending). Повтор на том же баре ничего не пишет."""
+    out = []
+    eid = _smc2_event_id(sym, ev['ts_b'], ev['mode'])
+    mode = ev['mode']; is_long = (mode == 'Long')
+    con = sqlite3.connect(TRADES_DB)
+    try:
+        have = _smc2_existing(con, eid)
+        new_event = not have
+        # что нужно записать сейчас
+        need_mkt = ev['mkt'] is not None and 'SMC2_MKT' not in have
+        rt = ev['rt']
+        need_rt = rt['state'] == 'filled' and 'SMC2_RT' not in have
+        need_nf = (rt['state'] in ('expired', 'cancel_2r', 'invalid', 'rt_sl_bounds')
+                   and 'SMC2_RT' not in have and 'SMC2_NF' not in have)
+        if new_event and (need_mkt or need_rt or need_nf):
+            if _smc2_dedup_blocked(con, sym, mode, ev['ts_b'], eid):
+                con.close(); return ['dedup']
+        if rt['state'] == 'pending':
+            out.append('rt_pending')
+    finally:
+        try: con.close()
+        except Exception: pass
+    base = {'atr': ev['atr'], 'rsi': ev['rsi'], 'adx': ev['adx'], 'adx_wilder': ev['adx_wilder'],
+            'vol_ratio': ev['vol_ratio'], 'entry_rr': SMC2_TP_R, 'smc2_event': eid}
+    suffix = f"{'long' if is_long else 'short'}_fvg{ev['fvg']}"
+    if need_mkt:
+        if _smc2_cap_take():
+            m = ev['mkt']
+            msig = dict(base, sl=m['sl'], tp=m['tp'], minutes_since_range_end=0.0,
+                        dist_pct=(m['entry'] - ev['vwap']) / ev['vwap'] * 100, shadow_reason=f'smc2_mkt_{suffix}')
+            ot = datetime.fromtimestamp((ev['ts_b'] + 900_000) / 1000, timezone.utc).isoformat()   # вход по close[b]
+            await shadow_record(sym, mode, m['entry'], msig, btc_ctx, 'SMC2_MKT', open_time=ot, dedup=False)
+            out.append('mkt_ok')
+        else:
+            out.append('cap')
+    if need_rt:
+        if _smc2_cap_take():
+            msig = dict(base, sl=rt['sl'], tp=rt['tp'], minutes_since_range_end=float((rt['f'] - ev['b']) * 15),
+                        dist_pct=(rt['entry'] - ev['vwap']) / ev['vwap'] * 100, shadow_reason=f'smc2_rt_{suffix}')
+            ot = datetime.fromtimestamp(int(ts[rt['f']]) / 1000, timezone.utc).isoformat()   # бар заполнения участвует в пути
+            await shadow_record(sym, mode, rt['entry'], msig, btc_ctx, 'SMC2_RT', open_time=ot, dedup=False)
+            out.append('rt_fill')
+        else:
+            out.append('cap')
+    if need_nf:
+        _smc2_write_nf(sym, ev, rt['state'])
+        out.append('invalid' if rt['state'] == 'invalid' else 'no_fill')
+    return out
+
+
+_SMC2_RANK = ('rt_fill', 'mkt_ok', 'dedup', 'cap', 'no_fill', 'invalid', 'rt_pending', 'sl_bounds', 'vwap', 'vol', 'no_break', 'no_struct')
+
+
+async def _smc2_process_symbol(sym: str, closed: list, btc_ctx: dict) -> str:
+    """Один исход на символ за скан (по приоритету _SMC2_RANK)."""
+    ts = np.array([int(b[0]) for b in closed]); o = np.array([float(b[1]) for b in closed])
+    h = np.array([float(b[2]) for b in closed]); l = np.array([float(b[3]) for b in closed])
+    c = np.array([float(b[4]) for b in closed]); v = np.array([float(b[5]) for b in closed])
+    ph, pl = get_pivots(h, l, order=SMC_PIVOT_ORDER)
+    seen = set(); best_stage = -1
+    for mode in ('Long', 'Short'):
+        events, stage = _smc2_eval(ts, o, h, l, c, v, mode, ph, pl)
+        best_stage = max(best_stage, stage)
+        for ev in sorted(events, key=lambda e: e['b']):
+            seen.update(await _smc2_persist(sym, ev, ts, btc_ctx))
+    for k in _SMC2_RANK:
+        if k in seen:
+            return k
+    return _SMC2_STAGES[best_stage] if 0 <= best_stage <= 4 else ('no_struct' if best_stage < 0 else 'no_break')
+
+
+async def scan_smc2():
+    """[v79] SMC2 — shadow-сканер, 24/7 (сессионного фильтра нет), вселенная = _scan_universe() (как у SMC).
+    Символ обрабатывается только при появлении НОВОГО закрытого 15m-бара. Новости (is_news_now) — оставлены.
+    Один исход на символ за скан; сумма исходов == total."""
+    if not SMC2_ENABLED:
+        return
+    tf = 900_000
+    now_ms = int(time.time() * 1000)
+    expected = (now_ms // tf) * tf - tf
+    uni = await _scan_universe()
+    outcomes = ['skipped', 'news', 'fetch_err', 'no_data', 'error'] + list(_SMC2_RANK)
+    st = {k: 0 for k in outcomes}
+    if is_news_now():
+        st['news'] = len(uni)
+        logging.info(f"[SMC2 SCAN] total:{len(uni)} news:{len(uni)}")
+        _record_scan_summary('SMC2', {'total': len(uni), 'news': len(uni)})
+        return
+    todo = [s_ for s_ in uni if _smc2_last_bar.get(s_) != expected]
+    st['skipped'] = len(uni) - len(todo)
+    ctx = await get_btc_context() if todo else {}
+    sem = asyncio.Semaphore(SCAN_SEM)
+
+    async def check(sym):
+        try:
+            async with sem:
+                raw = await exchange.fetch_ohlcv(sym, SMC_TF, limit=64)
+        except Exception:
+            st['fetch_err'] += 1
+            return
+        closed = [b for b in (raw or []) if int(b[0]) + tf <= now_ms]      # последний НЕЗАКРЫТЫЙ бар отбрасывается
+        if len(closed) < 30:
+            st['no_data'] += 1
+            return
+        try:
+            r = await _smc2_process_symbol(sym, closed, ctx)
+            _smc2_last_bar[sym] = int(closed[-1][0])
+            st[r] += 1
+        except Exception as _e:
+            st['error'] += 1
+            if st['error'] <= 2:
+                logging.warning(f'[SMC2] {sym} error: {type(_e).__name__}: {_e}')
+
+    await asyncio.gather(*[check(s_) for s_ in todo])
+    total_out = sum(st[k] for k in outcomes)
+    if total_out != len(uni):
+        logging.warning(f'[SMC2 SCAN] сумма исходов {total_out} != total {len(uni)}')
+    logging.info(
+        f"[SMC2 SCAN] total:{len(uni)} skip:{st['skipped']} no_struct:{st['no_struct']} no_break:{st['no_break']} "
+        f"vol:{st['vol']} vwap:{st['vwap']} sl_bounds:{st['sl_bounds']} mkt_ok:{st['mkt_ok']} "
+        f"rt_pending:{st['rt_pending']} rt_fill:{st['rt_fill']} no_fill:{st['no_fill']} invalid:{st['invalid']} "
+        f"dedup:{st['dedup']} cap:{st['cap']} fetch_err:{st['fetch_err']} no_data:{st['no_data']} err:{st['error']}")
+    _record_scan_summary('SMC2', {'total': len(uni), **{k: st[k] for k in outcomes if k != 'news'}})
 
 
 async def scan_rsi():
@@ -5293,7 +5906,12 @@ def _init_trades_db():
                   # отчёты исключают recalc=2.
                   'recalc INTEGER DEFAULT 0',
                   "regime_4h TEXT DEFAULT ''",                    # [v74]
-                  'adx_wilder REAL DEFAULT 0']:                   # [v78] настоящий ADX Уайлдера (рядом с adx = DX), только запись
+                  'adx_wilder REAL DEFAULT 0',                    # [v78] настоящий ADX Уайлдера (рядом с adx = DX), только запись
+                  # [v79] SMC_SIG: BTC на входе и движение BTC за сделку (для бета-группы §2.14.4);
+                  # SMC2: идентификатор события пробоя (общий у MKT/RT/NF)
+                  'btc_entry_price REAL DEFAULT 0',
+                  'btc_move_pct REAL DEFAULT 0',
+                  "smc2_event TEXT DEFAULT ''"]:
         try:
             con.execute(f'ALTER TABLE shadow_signals ADD COLUMN {_scol}')
         except Exception:
@@ -5364,7 +5982,7 @@ _init_trades_db()
 # памяти (не критично для целостности — теряется при рестарте, дайджест
 # просто покажет меньше циклов за день; сами anomalies/alert_history
 # персистентны в БД).
-_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': [], 'SMC': [], 'PO3': []}  # [v73] +SMC, [v75] +PO3
+_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': [], 'SMC': [], 'PO3': [], 'SMC2': []}  # [v73] +SMC, [v75] +PO3, [v79] +SMC2
 
 
 def _record_scan_summary(strategy: str, counts: dict):
@@ -5649,6 +6267,9 @@ async def build_daily_digest(date_str: str = None):
         avgs = {k: sum(s.get(k, 0) for s in samples) / len(samples) for k in keys}
         avgs_str = ', '.join(f'{k}:{v:.1f}' for k, v in sorted(avgs.items()))
         lines.append(f'{strat} ({len(samples)} циклов): {avgs_str}')
+    # [v79] циклы scan_smc с ctx_ok=False: get_btc_context() вернул заглушку (alt_score=50), а гейт SMC
+    # режет при alt_score >= 45 → сетевой сбой молча выключал SMC на цикл (BOT_SPEC §2.20.4)
+    lines.append(f'SMC: циклов с ctx_ok=False (alt_score=50 заглушка) за аптайм: {_ctx_fail_cycles}')
 
     text = '\n'.join(lines)
     fpath = ''
@@ -5755,8 +6376,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-01-v78'
+CODE_VERSION = '2026-10-02-v79'
 CHANGELOG = [
+    ('2026-10-02-v79', 'ПАУЗА ЖИВОГО SMC + замер вместо него + SMC2 (shadow). Живой вход SMC выключен: SMC_LIVE (ENV, дефолт false) — форвард PF net 0.88 (n=21), диагноз §2.20.0 (вход на НЕзакрытой свече пробоя после всплеска объёма на предыдущей = покупка вершины импульса; FVG-тест ±0.8% декоративен; SL под 3-свечным минимумом лежит в обычной зоне ретеста). При SMC_LIVE=false сигнал smc_signal() (логика НЕ менялась — проверено дифференциальным тестом на 30000 рядах) не идёт в execute(), а пишется в shadow_signals как SMC_SIG (те же sl/tp из _smc_levels, выход SL>TP/таймаут как у SMC_SHADOW, без TP50/BE/трейлинга); открытые живые позиции ведутся как раньше; breaker-ы v76/v77 не менялись. Контракты §2.14.4 (ступень 1), §2.18.5 (режим) и §2.19.1 (ADX) с даты деплоя оцениваются по записям SMC_SIG (смена измерения, не правил); живые сделки до паузы — отдельно, не критерий; блоки в /stats_analyze, /smc_regime_check, /shadow_analyze. SMC2 (только shadow): _smc2_eval, scan_smc2 — пробой структуры на ЗАКРЫТОМ баре с объёмом свечи пробоя >=1.5x медианы и анти-погоней по VWAP; два варианта на одном событии (MKT по close пробоя, RT — лимит на ретесте уровня), общий smc2_event, маркеры SMC2_NF для R_event(RT)=0, лимиты 60 записей/сутки и 1 событие на (sym, dir, 2 ч), контракт (А) промоушена и (Б) гипотезы «точка входа виновата», секция в /shadow_analyze. Новые колонки shadow_signals: btc_entry_price, btc_move_pct, smc2_event (shadow_record INSERT 31 -> 33 колонок, 32 ? + литерал). /smc_entry_audit — MFE/MAE живого SMC (только SELECT, mode=ro). get_btc_context: флаг ctx_ok (False в обеих fallback-ветках), счётчик циклов в дайджесте, ctx_fail в [SMC SCAN]; гейт alt_score не менялся (дефект §2.20.4). LEVERAGE, RISK_PER_TRADE, breaker-ы, замер задержек, PO3, RB, Down x Long, calc_adx и bybit_worker.py не тронуты'),
     ('2026-10-01-v78', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика НЕ менялась (фильтры SMC включая calc_adx и порог ADX, SL/TP/TP50/BE/трейлинг, риск, breaker-ы, PO3 — как в v77; форварды §2.14.4 и §2.18.5 НЕ сбрасываются): настоящий ADX Уайлдера calc_adx_wilder() рядом с прежним DX (calc_adx не тронут) — колонка adx_wilder в shadow_signals (SMC_SHADOW, PO3) и trades (живые SMC), счётчики «что было бы» would_block_adx_w / would_pass_adx_w в [SMC SCAN] и строка [ADX_W] (вход НЕ блокируется), срезы по adx_wilder в /stats_analyze и /shadow_analyze, пре-коммит решения по ADX-фильтру (n>=30 живых входов, доля заблокированных >30% -> вариант (а) не без отдельного анализа); /trades_dups — дубли в trades (только чтение, SQLite mode=ro): точные и близкие, месяцы, пометка СВЕЖИЕ, влияние на SMC; путь двойной записи закрытия описан в BOT_SPEC §2.19.2 (воспроизведён, не исправлен); форвард-блок контракта §2.18.5 в /smc_regime_check (пять условий, Fisher по сделкам и по дням, бета, доля выброса, дубли один раз), история ниже помечена in-sample'),
     ('2026-10-01-v77', 'ЖИВАЯ ЗАЩИТА: общий breaker по просадке от ПИКА эквити BingX (MAX_DD_LIMIT_PCT=6.0, пик и флаг в meta, то же действие что у дневного — новые входы запрещены, позиции со своими SL, БЕЗ автоснятия: суточный сброс и /reset его не снимают, только /maxdd_reset; сбой эквити не срабатывает), /dd_status показывает пик и общую просадку; замер задержки живых ордеров (только измерение): прозрачные обёртки методов exchange (entry/SL/закрытия/отмена/позиции/эквити), таблица latency_log, окно без стопа = ответ на вход -> ответ на SL, [LAT] в логе, алерт при > LAT_ALERT_SEC (10 с, информационный), /lat_status и блок в дневном отчёте (n/медиана/p95/макс), REST-запросов за цикл в логе цикла, глубина очереди throttler ccxt в каждом замере; trades.sl_price (исходный SL, INSERT 33->34) и mean R/t для живого SMC в /stats_analyze; read-only /smc_regime_check (шаг 5.0 — кучность Down+Flat по дням); исследование лимитов BingX/ccxt и вариантов развязки ордеров и сканеров — BOT_SPEC §2.18.2 (без изменений кода)'),
     ('2026-10-01-v76', 'ЖИВАЯ ЗАЩИТА: circuit breaker теперь по ДНЕВНОМУ DD ЭКВИТИ BingX (info.data.balance.equity с нереализованным PnL; база — эквити на начало дня, снимок в суточном сбросе, хранится в meta и переживает рестарт), DAILY_DD_LIMIT_PCT=1.5 вместо суммы движений цены с лимитом 2.5% (метрика завышала убыток в SL_dist/риск ≈ 2.6 раза и не видела таймауты/TP50); действие breaker не менялось; сбой получения эквити не срабатывает и не сбрасывает breaker (3 сбоя подряд — алерт); /dd_status, /dd_reset (после пополнения/вывода), /reset дополнительно переснимает базу; старая метрика считается и выводится в отчёте рядом с новой; PO3 no_data: 4ч-запрос шёл под wait_for(8с), а ccxt==4.2.14 для BingX даёт ОДИН REST-запрос в секунду (rateLimit 1000, FIFO) — запрос PO3 стоял в очереди за SMC/RB и отменялся (на стенде с реальным ccxt-throttler воспроизведён точный прод-симптом no_data:40, SHADOW:0); таймаут 150с (тот же дефект у _regime_4h на горячем пути записи shadow), O текущей 4ч-свечи при её отсутствии в списке — из 15m, подпричины fetch_err/no_4h/no_4h_current/few_15m, один исход на символ, сумма == total; R-метрики (mean R net, t при n>=10, число исключённых sl=0) в первой строке и Long/Short каждой shadow-стратегии, t скрыт при n<10 во всех строках ФОРВАРД; для живого SMC R недоступен (нет sl в trades)'),
@@ -6059,8 +6681,11 @@ async def _fill_pos_regime(rec: dict, sym: str):
         pass
 
 
-async def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
+async def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM', open_time=None, dedup=True):
     """Записывает shadow-сигнал, если по symbol+mode+strategy нет открытого.
+    [v79] open_time — ISO-время входа, если отличается от «сейчас» (SMC2: вход по закрытию
+    бара пробоя / по бару заполнения лимитки; путь цены считается от этого времени);
+    dedup=False — дедуп/кулдаун по (symbol, direction, strategy) отключён (SMC2 дедуплицирует сам).
     [v74] async: режим 4ч запрашивается здесь (момент записи), ДО блока
     dedup+INSERT — чтобы проверка дубля и вставка остались атомарными (между
     ними нет await)."""
@@ -6068,29 +6693,36 @@ async def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
         regime = await _regime_4h(sym)
         con = sqlite3.connect(TRADES_DB)
         cur = con.cursor()
-        cur.execute(
-            "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? "
-            "AND strategy=? AND status='open' LIMIT 1",
-            (sym, mode, strategy))
-        if cur.fetchone():
-            con.close(); return  # уже отслеживается — дубль не пишем
-        # [COOLDOWN] не пересэмплировать тот же сетап сразу после закрытия
-        tf_min = 60 if RSI_TF == '1h' else 15
-        cutoff = (datetime.now(timezone.utc)
-                  - timedelta(minutes=SHADOW_COOLDOWN_BARS * tf_min)).isoformat()
-        cur.execute(
-            "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? "
-            "AND strategy=? AND status='closed' AND close_time > ? LIMIT 1",
-            (sym, mode, strategy, cutoff))
-        if cur.fetchone():
-            con.close(); return  # недавно закрыт — ждём кулдаун
+        if dedup:
+            cur.execute(
+                "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? "
+                "AND strategy=? AND status='open' LIMIT 1",
+                (sym, mode, strategy))
+            if cur.fetchone():
+                con.close(); return  # уже отслеживается — дубль не пишем
+            # [COOLDOWN] не пересэмплировать тот же сетап сразу после закрытия
+            tf_min = 60 if RSI_TF == '1h' else 15
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(minutes=SHADOW_COOLDOWN_BARS * tf_min)).isoformat()
+            cur.execute(
+                "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? "
+                "AND strategy=? AND status='closed' AND close_time > ? LIMIT 1",
+                (sym, mode, strategy, cutoff))
+            if cur.fetchone():
+                con.close(); return  # недавно закрыт — ждём кулдаун
+        _open_iso = open_time or datetime.now(timezone.utc).isoformat()
+        try:
+            _open_hour = _shadow_open_dt(_open_iso).hour
+        except Exception:
+            _open_hour = datetime.now(timezone.utc).hour
         con.execute(
             "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,"
             "sl_price,atr,adx,vol_ratio,alt_score,eth_btc,mfe_price,trail_sl,status,strategy,entry_rsi,tp_price,"
             "entry_hour,btc_trend,entry_rr,range_w_atr,sweep_depth_atr,tp2_price,dist_atr,atr_pct,dist_pct,htf_trend,"
-            "minutes_since_range_end,funding_rate,shadow_reason,regime_4h,adx_wilder) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(), sym, mode, price,
+            "minutes_since_range_end,funding_rate,shadow_reason,regime_4h,adx_wilder,"
+            "btc_entry_price,smc2_event) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_open_iso, sym, mode, price,
              float(msig.get('sl', 0)), float(msig.get('atr', 0)),
              float(msig.get('adx', 0)), float(msig.get('vol_ratio', 0)),
              int(btc_ctx.get('alt_score', 50)), float(btc_ctx.get('eth_btc_spread', 0)),
@@ -6098,7 +6730,7 @@ async def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              float(msig.get('tp', 0)),
              # [v47] RB: доп. признаки для сегментации + вторая цель (TP2).
              # Для PB/MOM/SA не заданы в msig → дефолты 0/'' безвредны.
-             datetime.now(timezone.utc).hour, str(btc_ctx.get('btc_trend', '')),
+             _open_hour, str(btc_ctx.get('btc_trend', '')),
              float(msig.get('entry_rr', 0)), float(msig.get('range_w_atr', 0)),
              float(msig.get('sweep_depth_atr', 0)), float(msig.get('tp2', 0)),
              float(msig.get('dist_atr', 0)),   # [v53] SA_SHADOW
@@ -6108,7 +6740,9 @@ async def shadow_record(sym, mode, price, msig, btc_ctx, strategy='MOM'):
              float(btc_ctx.get('funding_rate', 0)),  # [v70] лог-only
              str(msig.get('shadow_reason', '')),  # [v72] SMC_SHADOW причина отсева
              regime,  # [v74] режим 4ч на входе
-             float(msig.get('adx_wilder', 0))))  # [v78] настоящий ADX (0 — нет данных)
+             float(msig.get('adx_wilder', 0)),  # [v78] настоящий ADX (0 — нет данных)
+             float(msig.get('btc_entry_price', 0)),  # [v79] SMC_SIG: BTC на входе (бета-группа)
+             str(msig.get('smc2_event', ''))))       # [v79] SMC2: id события пробоя
         con.commit(); con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] record fail {sym}: {_e}')
@@ -6174,6 +6808,41 @@ async def _smc_shadow_record(sym, mode, price, reason, btc_ctx, h, l, atr,
                  f'rsi:{rsi:.1f} adx:{adx:.1f} vol:{vol_ratio:.2f} dist%:{dist_pct:.2f}')
 
 
+_smc_sig_bars: set = set()   # {(sym, номер 15m-бара)} — дедуп SMC_SIG в памяти
+
+
+async def _smc_sig_record(sym: str, sig: dict, btc_ctx: dict):
+    """[v79] SMC_LIVE=false: сигнал smc_signal(), прошедший ВСЕ гейты, пишется в shadow_signals как
+    strategy='SMC_SIG' вместо execute(). Уровни sl/tp — ровно те, что вернул бы живой путь
+    (_smc_levels внутри smc_signal). Квоты SMC_SHADOW НЕ применяются. Дедуп: одна запись на
+    (sym, 15m-бар) здесь + встроенный дедуп shadow_record (открытая запись по символу/направлению +
+    кулдаун 6 баров) — он воспроизводит подавление повторов, которое в живом пути давали
+    notified (4 ч) и открытая позиция. ИЗВЕСТНЫЕ УПРОЩЕНИЯ (BOT_SPEC §2.20.1): в shadow нет
+    TP50/BE/трейлинга; ёмкостные ограничения execute() (MAX_TOTAL_POS, MAX_PER_DIR, риск-guard
+    qty/notional, AI-оракул) не моделируются — записей может быть больше, чем было бы живых входов."""
+    key = (sym, int(time.time() // 900))
+    if key in _smc_sig_bars:
+        return
+    _smc_sig_bars.add(key)
+    if len(_smc_sig_bars) > 5000:
+        cur_bar = int(time.time() // 900)
+        for k in [k for k in _smc_sig_bars if k[1] < cur_bar - 4]:
+            _smc_sig_bars.discard(k)
+    btc_p = 0.0
+    try:
+        btc_p = float(((await get_tickers_cached()).get('BTC/USDT:USDT') or {}).get('last', 0) or 0)
+    except Exception:
+        btc_p = 0.0
+    msig = {'sl': sig['sl'], 'tp': sig['tp'], 'atr': sig.get('atr', 0.0), 'rsi': sig.get('rsi', 0.0),
+            'adx': sig.get('adx_dx', 0.0), 'adx_wilder': sig.get('adx_wilder', 0.0),
+            'vol_ratio': sig.get('vol_ratio_sig', 0.0), 'entry_rr': 1.5,   # TP = 1.5R (_smc_levels)
+            'btc_entry_price': btc_p, 'shadow_reason': 'smc_sig'}
+    await shadow_record(sym, sig['mode'], sig['price'], msig, btc_ctx, 'SMC_SIG')
+    logging.info(f"👁 [SMC_SIG] {sym} {sig['mode']} @ {sig['price']:.6f} (SMC_LIVE=false) | "
+                 f"SL:{sig['sl']:.6f} TP:{sig['tp']:.6f} RSI:{sig.get('rsi', 0):.1f} "
+                 f"DX:{sig.get('adx_dx', 0):.1f} ADX_W:{sig.get('adx_wilder', 0):.1f}")
+
+
 # ───────────────────────────────────────────────────────
 #  [v74] Выход shadow-позиций по ПУТИ цены (а не по последнему бару)
 # ───────────────────────────────────────────────────────
@@ -6183,7 +6852,7 @@ async def _smc_shadow_record(sym, mode, price, reason, btc_ctx, h, l, atr,
 # не видны, а таймаут исполнялся по цене момента «пробуждения». Теперь
 # правила выхода — в чистой функции _shadow_exit_eval, которой отдают ВСЕ бары
 # от бара входа; результат не зависит от того, как часто вызывали проверку.
-_SHADOW_PATH_STRATS = ('SA', 'SA_SHADOW', 'RB', 'ORB', 'SMC_SHADOW', 'PO3')
+_SHADOW_PATH_STRATS = ('SA', 'SA_SHADOW', 'RB', 'ORB', 'SMC_SHADOW', 'PO3', 'SMC_SIG', 'SMC2_MKT', 'SMC2_RT')   # [v79] +SMC_SIG, SMC2
 _shadow_cov_warn_ts = 0.0
 
 
@@ -6207,8 +6876,10 @@ def _shadow_timeout_dt(strat: str, open_dt: datetime):
         return open_dt + timedelta(minutes=40 * tf_m)
     if strat == 'RB':
         return open_dt + timedelta(minutes=math.ceil(RB_TIMEOUT_MIN / tf_m) * tf_m)
-    if strat == 'SMC_SHADOW':
+    if strat in ('SMC_SHADOW', 'SMC_SIG'):   # [v79] SMC_SIG — та же модель выхода, что у живого SMC
         return open_dt + timedelta(minutes=MAX_TRADE_MIN_SMC)
+    if strat in ('SMC2_MKT', 'SMC2_RT'):    # [v79] SMC2_TIMEOUT_BARS баров после входа
+        return open_dt + timedelta(minutes=SMC2_TIMEOUT_BARS * tf_m)
     if strat == 'PO3':    # [v75] PO3_TIMEOUT_BARS баров (16 × 15m = одна 4ч-свеча)
         return open_dt + timedelta(minutes=PO3_TIMEOUT_BARS * tf_m)
     if strat == 'ORB':
@@ -6267,7 +6938,7 @@ def _shadow_exit_eval(strat: str, row: dict, bars: list, now_ts: float = None):
             if sl_hit:   return True, sl_p, 'SL', held
             if tp2_hit:  return True, tp2_p, 'TP2', held
             if tp_hit:   return True, tp_p, 'TP1', held
-        elif strat in ('SMC_SHADOW', 'PO3'):   # [v75] PO3: SL > TP, как у SMC_SHADOW
+        elif strat in ('SMC_SHADOW', 'PO3', 'SMC_SIG', 'SMC2_MKT', 'SMC2_RT'):   # [v75] PO3, [v79] SMC_SIG/SMC2: SL > TP, как у SMC_SHADOW
             if sl_hit:   return True, sl_p, 'SL', held
             if tp_hit:   return True, tp_p, 'TP', held
         if t_to_ms is not None and now_ms >= t_to_ms and ts + tf_ms > t_to_ms:
@@ -6301,7 +6972,7 @@ async def _shadow_fetch_path(sym: str, open_dt: datetime, upto_ts: float):
     return bars, bool(bars) and int(bars[0][0]) <= bar0
 
 
-async def _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p):
+async def _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p, btc_entry=0.0):
     """Проверка одной открытой shadow-записи по пути цены (SA/RB/ORB/SMC_SHADOW)."""
     global _shadow_cov_warn_ts
     now_ts = time.time()
@@ -6325,6 +6996,12 @@ async def _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, t
         "UPDATE shadow_signals SET status='closed',close_time=?,exit_price=?,"
         "pnl_pct=?,bars_held=? WHERE id=?",
         (_shadow_close_iso(open_dt, held, now_ts), exit_p, round(pnl, 3), held, sid))
+    if strat == 'SMC_SIG' and btc_entry and btc_entry > 0:
+        # [v79] движение BTC от входа до ЗАКРЫТИЯ (для бета-группы §2.14.4), % без плеча. Цена BTC берётся
+        # на момент обнаружения закрытия (shadow_check раз в цикл) — приближение; при отложенном
+        # обнаружении (пауза цикла) оно грубее. Нет цены → 0 (запись исключается бета-проверкой).
+        con.execute("UPDATE shadow_signals SET btc_move_pct=? WHERE id=?",
+                    (round(await _btc_move_pct(float(btc_entry)), 3), sid))
     con.commit(); con.close()
     logging.info(f"👁 [{strat} CLOSE] {sym} {mode} → {rsn} "
                  f"PnL: {pnl:+.2f}% ({held} баров)")
@@ -6339,7 +7016,7 @@ async def shadow_check():
         cur = con.cursor()
         rows = cur.execute(
             "SELECT id,symbol,direction,entry_price,atr,mfe_price,trail_sl,open_time,"
-            "strategy,tp_price,sl_price,tp2_price FROM shadow_signals WHERE status='open'").fetchall()
+            "strategy,tp_price,sl_price,tp2_price,btc_entry_price FROM shadow_signals WHERE status='open'").fetchall()
         con.close()
     except Exception as _e:
         logging.warning(f'[SHADOW] read fail: {_e}')
@@ -6348,10 +7025,10 @@ async def shadow_check():
         return
 
     MAX_HOLD_BARS = 100   # таймаут симуляции
-    for (sid, sym, mode, entry, atr, mfe_p, trail_sl, open_t, strat, tp_p, sl_p, tp2_p) in rows:
+    for (sid, sym, mode, entry, atr, mfe_p, trail_sl, open_t, strat, tp_p, sl_p, tp2_p, btc_e) in rows:
         try:
             if strat in _SHADOW_PATH_STRATS:
-                await _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p)
+                await _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p, btc_e or 0.0)
                 continue
 
             ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=3)
@@ -6865,7 +7542,7 @@ def shadow_analyze() -> str:
         # [v53] + SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr, БЕЗ денег)
         # [v61] + ORB (Asia Range Breakout, дополняет RB — пробой вместо возврата)
         for strat, emoji in [('PB', '🎯'), ('RB', '🎯'), ('ORB', '🎯'), ('SA_SHADOW', '🎯'),
-                             ('SMC_SHADOW', '🎯'), ('PO3', '🎯')]:  # [v72] SMC_SHADOW, [v75] PO3
+                             ('SMC_SHADOW', '🎯'), ('PO3', '🎯'), ('SMC_SIG', '🎯')]:  # [v72] SMC_SHADOW, [v75] PO3, [v79] SMC_SIG
             total = con.execute(
                 "SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=?",
                 (strat,)).fetchone()[0]
@@ -7092,6 +7769,16 @@ def shadow_analyze() -> str:
                 parts.append('  ADX Уайлдера (adx_wilder, записи с v78):')
                 parts += _feature(con, strat, 'adx_wilder',
                     [('&lt;18', 0.0001, 18), ('18-25', 18, 25), ('25+', 25, 999)])
+            elif strat == 'SMC_SIG':
+                # [v79] SMC_LIVE=false: замер вместо живых сделок. Контракты §2.14.4 / §2.18.5 / §2.19.1 —
+                # на записях SMC_SIG с open_time >= SMC_SIG_FROM (пороги не менялись).
+                parts += _smc_sig_contract_lines(con)
+                parts.append('  RSI на входе:')
+                parts += _feature(con, strat, 'entry_rsi',
+                    [('lt45', 0, 45), ('45-55', 45, 55), ('55-68', 55, 68), ('68+', 68, 100)])
+                parts.append('  Объём (vol_ratio сигнала):')
+                parts += _feature(con, strat, 'vol_ratio',
+                    [('lt1.5', 0, 1.5), ('1.5-2.5x', 1.5, 2.5), ('2.5x+', 2.5, 99)])
             elif strat == 'PO3':
                 # [v75] Контракт — у констант PO3_*. Срезы ниже — информационные;
                 # решение по направлению — ТОЛЬКО по строкам ФОРВАРД.
@@ -7125,6 +7812,7 @@ def shadow_analyze() -> str:
                 _ok, _ex = _forward_r_rows(con, strat, _SHADOW_FEE_PCT, DOWNLONG_FORWARD_FROM,
                                            "AND regime_4h='Down' AND direction='Long'")
                 parts.append(_forward_status_line('Down×Long', DOWNLONG_FORWARD_FROM, _ok, _ex, 60, show_excl=True))
+        parts += _smc2_report_lines(con)   # [v79] SMC2: MKT/RT, сегменты, блок (Б)
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
@@ -7487,6 +8175,12 @@ def stats_analyze() -> str:
                          + f' | решение по §2.19.1 — при n &gt;= 30 (сейчас {len(_aw)}); порог доли 30%')
             lines.append('  Старый срез «ADX входа» выше: adx = DX (до решения §2.17.4); у живых SMC-сделок adx_val = 0 (SMC не кладёт adx в sig)')
 
+        # [v79] ПАУЗА живого SMC (SMC_LIVE=false): контракты §2.14.4 / §2.18.5 / §2.19.1 оцениваются по записям
+        # SMC_SIG (shadow). Блок ВНЕ порога «мало живых сделок»: при паузе живых сделок больше не прибавляется.
+        # Живые сделки выше — история до паузы, в критерии не входят.
+        lines.append(f'\n<b>SMC_SIG (замер вместо живых сделок, SMC_LIVE={"true" if SMC_LIVE else "false"})</b>')
+        lines += _smc_sig_contract_lines(con)
+
         lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
 
         # ── БЛОК 2: SA (live-сделки + SA_HIST_OFFSET) ────────────────
@@ -7768,6 +8462,10 @@ async def check_tg_commands():
                 # [v78] ТОЛЬКО чтение (SQLite mode=ro): ничего не удаляет и не меняет
                 await tg(trades_dups_text())
 
+            elif cmd == '/smc_entry_audit':
+                # [v79] ТОЛЬКО SELECT (SQLite mode=ro): MFE/MAE живого SMC, диагностика «входа в погоне»
+                await tg(smc_entry_audit_text())
+
             elif cmd == '/lat_status':
                 await tg(lat_report_text(24))
 
@@ -7886,6 +8584,7 @@ async def check_tg_commands():
                     '/lat_status — латентность ордеров/мониторинга за сутки, окно без стопа\n'
                     '/trades_dups — дубли в trades (только чтение), влияние на SMC\n'
                     '/smc_regime_check — режимный фильтр SMC Long: форвард и история\n'
+                    '/smc_entry_audit — MFE/MAE живого SMC (только чтение), диагностика входа в погоне\n'
                     '/maxdd_reset — снять ОБЩИЙ breaker и переснять пик эквити (после вывода средств)\n'
                     '/reset — сброс дневной статистики\n'
                     '/stop — остановка торговли\n'
@@ -8186,12 +8885,13 @@ async def main():
                     scan_rb(),   # [v55] круглосуточно, не гейтится is_session()
                     scan_orb(),  # [v61] круглосуточно, самогейтится окном 06-12 UTC
                     scan_po3(),  # [v75] shadow, круглосуточно, топ-N по объёму, под PO3_ENABLED
+                    scan_smc2(), # [v79] shadow, 24/7, вселенная как у SMC, под SMC2_ENABLED
                     return_exceptions=True
                 )
                 # Логируем исключения из сканеров (ранее проглатывались молча)
                 for _i, _r in enumerate(results):
                     if isinstance(_r, Exception):
-                        _name = ['scan_smc', 'scan_rsi', 'scan_rb', 'scan_orb', 'scan_po3'][_i]
+                        _name = ['scan_smc', 'scan_rsi', 'scan_rb', 'scan_orb', 'scan_po3', 'scan_smc2'][_i]
                         logging.error(f'❌ {_name} exception: {_r}', exc_info=_r)
                 scan_elapsed = time.time() - scan_t0
                 cb_status = ('🔴CB' if circuit_open else '') + ('🔴MAXDD' if _mdd['tripped'] else '')
