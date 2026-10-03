@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v81'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v82'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -6557,8 +6557,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-03-v81'
+CODE_VERSION = '2026-10-03-v82'
 CHANGELOG = [
+    ('2026-10-03-v82', 'ТОЛЬКО ОТЧЁТЫ: net-версии PF/Avg живых сделок. Торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск и bybit_worker.py не менялись. Заголовочные PF/Avg в /stats_analyze были gross (trades.pnl_pct комиссию не включает): SMC показывал PF 1.39 при PF net 1.18 в /dups_impact на той же выборке (ранее 1.56 и 1.86 — тоже gross). Теперь во всех строках живых сделок /stats_analyze (заголовки SMC/RSI/SA, направление, причины закрытия, причина x направление, срезы ADX/RSI/alt-score/час/объём/BTC/HTF/RR/funding/AI conf, свод BTC-тренда) рядом с gross показан net: PF 1.39 (net 1.18), Avg +0.71% (net +x.xx%) — net = pnl_pct - 2*FEE_RATE*100*LEVERAGE, та же формула (_pf_net), что в /dups_impact; ⭐ ставится по PF net (n>=10); в шапке строка PF/Avg без пометки — до комиссий; решения — только по net; PF без убытков = inf вместо прежнего ложного 0.00. /stats и дневной отчёт: Avg с net (PF там нет); суточный дайджест PF/Avg живых сделок не содержит (WR и PnL в USDT — net). Блоки ФОРВАРД, ADX Уайлдера, режим 4ч (SMC, net), shadow-отчёты уже были net — не менялись. WR по-прежнему по pnl_pct > 0 (до комиссий)'),
     ('2026-10-03-v81', 'ЗАПИСЬ ЗАКРЫТИЙ: идемпотентный log_trade. Логика сигналов SMC/SMC_SIG/SMC2/PO3/RB, контракты, SMC_LIVE (false), риск, breaker-ы v76/v77, замер задержек, сопровождение живых позиций (SL/TP/BE/трейлинг) и bybit_worker.py НЕ менялись. Шаг 0: log_trade вызывается из 6 мест (MOM-трейл, жёсткий потолок, SMC/SA smart-timeout, обычный таймаут, закрытие на бирже); общая причина дублей — запись закрытия не атомарна с удалением позиции из списка и с диском (список усекается только после цикла, таймаут-пути save_all не зовут): W1 — неперехваченное исключение в process_pos любой позиции прерывает monitor_all до усечения, закрытая позиция пишется повторно каждый цикл (точные дубли); W2 — рестарт между записью и финальным save_all воскрешает позицию, второе закрытие пишется с иной причиной/pnl (близкие дубли); оба воспроизведены тестом на v80. Правка 1: DUP-GUARD в log_trade — ключ (strategy, symbol, direction, open_time), open_time ставится один раз при открытии (мкс) и хранится в JSON; перед INSERT проверка «есть строка с dup_of IS NULL» -> запись пропускается, [DUP-GUARD] в лог, счётчик в дайджест, сбой проверки не теряет сделку; колонка trades.dup_of INTEGER DEFAULT NULL (миграция) и представление trades_live (SELECT * WHERE dup_of IS NULL), все отчёты по живым сделкам читают его; /trades_dups_mark — одноразовая идемпотентная пометка копий точных дублей (dup_of = id первой строки группы, ничего не удаляется, повтор помечает 0, близкие дубли не помечаются); шапка /stats_analyze: исключено дублей N. INSERT log_trade не менялся (35/35). Правка 2: /dups_impact (только чтение) — SMC все/форвард, SA live, SMC Long x режим: n, WR, PF net до и после исключения дублей, Fisher'),
     ('2026-10-02-v80', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика и логика входа/выхода shadow НЕ менялись (SMC_LIVE=false, SMC_SIG, SMC2, контракты, LEVERAGE, RISK_PER_TRADE, breaker-ы, PO3, RB, calc_adx, bybit_worker.py — как в v79). Бэклог п.10 (BOT_SPEC 2.20.0): аудит прода показал, что у shadow-записей MFE/MAE нигде не хранятся (mfe_price у path-стратегий остаётся ценой входа), поэтому: колонки shadow_signals.mfe_pct/mae_pct (NULL = запись до v80), чистая функция _shadow_excursion (MFE/MAE пути цены от бара входа до бара выхода, % цены; для SL бар выхода в MFE не входит — нижняя оценка), запись при закрытии в _shadow_check_path (UPDATE, INSERT не менялся: shadow_record 33 колонки, log_trade 35/35); /smc_entry_audit дополнен блоком по SMC_SIG/SMC2_MKT/SMC2_RT (доля MFE<0.2%, медиана MFE, MFE победителей и SL-записей, выходы SL/TP/TIMEOUT по exit_price, медиана минут до бара SL, MFE/MAE в R, записи до v80 отдельно) — только SELECT, mode=ro'),
     ('2026-10-02-v79', 'ПАУЗА ЖИВОГО SMC + замер вместо него + SMC2 (shadow). Живой вход SMC выключен: SMC_LIVE (ENV, дефолт false) — форвард PF net 0.88 (n=21), диагноз §2.20.0 (вход на НЕзакрытой свече пробоя после всплеска объёма на предыдущей = покупка вершины импульса; FVG-тест ±0.8% декоративен; SL под 3-свечным минимумом лежит в обычной зоне ретеста). При SMC_LIVE=false сигнал smc_signal() (логика НЕ менялась — проверено дифференциальным тестом на 30000 рядах) не идёт в execute(), а пишется в shadow_signals как SMC_SIG (те же sl/tp из _smc_levels, выход SL>TP/таймаут как у SMC_SHADOW, без TP50/BE/трейлинга); открытые живые позиции ведутся как раньше; breaker-ы v76/v77 не менялись. Контракты §2.14.4 (ступень 1), §2.18.5 (режим) и §2.19.1 (ADX) с даты деплоя оцениваются по записям SMC_SIG (смена измерения, не правил); живые сделки до паузы — отдельно, не критерий; блоки в /stats_analyze, /smc_regime_check, /shadow_analyze. SMC2 (только shadow): _smc2_eval, scan_smc2 — пробой структуры на ЗАКРЫТОМ баре с объёмом свечи пробоя >=1.5x медианы и анти-погоней по VWAP; два варианта на одном событии (MKT по close пробоя, RT — лимит на ретесте уровня), общий smc2_event, маркеры SMC2_NF для R_event(RT)=0, лимиты 60 записей/сутки и 1 событие на (sym, dir, 2 ч), контракт (А) промоушена и (Б) гипотезы «точка входа виновата», секция в /shadow_analyze. Новые колонки shadow_signals: btc_entry_price, btc_move_pct, smc2_event (shadow_record INSERT 31 -> 33 колонок, 32 ? + литерал). /smc_entry_audit — MFE/MAE живого SMC (только SELECT, mode=ro). get_btc_context: флаг ctx_ok (False в обеих fallback-ветках), счётчик циклов в дайджесте, ctx_fail в [SMC SCAN]; гейт alt_score не менялся (дефект §2.20.4). LEVERAGE, RISK_PER_TRADE, breaker-ы, замер задержек, PO3, RB, Down x Long, calc_adx и bybit_worker.py не тронуты'),
@@ -8161,17 +8162,46 @@ def _trades_line(r):
     total, wins = r[0], r[1]
     wr = wins/total*100 if total else 0
     return (f'{total} сделок | WR {wr:.1f}% ({wins}/{total}) | '
-            f'Avg {r[2]:+.2f}% | MFE {r[3]:.2f}% | '
+            f'{_live_avg_txt(r[2])} | MFE {r[3]:.2f}% | '   # [v82] + net (после комиссии round-trip)
             f'SMC:{r[5]} RSI:{r[6]} TO:{r[7]}')
 
 
 # ═══════════════════════════════════════════════════════
 #  АНАЛИЗАТОР РЕАЛЬНЫХ СДЕЛОК SMC/RSI
 #  Та же логика что /shadow_analyze, но по реальным trades.
-#  ⭐ = PF>1 при n>=10 — с реальными сделками порог ниже.
+#  ⭐ = PF net>1 при n>=10 (v82: по PF после комиссий, не gross) — с реальными сделками порог ниже.
 #  ВАЖНО: выводы делать только при n>=30 по каждому сегменту.
 #  При n<30 — ориентировочно, не менять фильтры.
 # ═══════════════════════════════════════════════════════
+def _live_fee_roe() -> float:
+    """[v82] Round-trip комиссия в единицах trades.pnl_pct (ROE = движение цены × LEVERAGE). Та же формула, что в
+    /dups_impact и ФОРВАРД-блоках: trades.pnl_pct комиссию НЕ включает (выяснено v73)."""
+    return 2 * FEE_RATE * 100 * LEVERAGE
+
+
+def _live_stats(rows):
+    """[v82] rows = [(pnl_pct,)] (gross) → (n, wr, avg, pf, avg_net, pf_net). WR — по pnl_pct > 0 (до комиссий, как и
+    раньше). net = pnl_pct − _live_fee_roe() (та же формула, что в /dups_impact: _pf_net). PF без убытков = inf
+    (прежний _bucket_stats отдавал 0.0 — ложное «PF 0.00» при одних победах)."""
+    n = len(rows)
+    if n == 0:
+        return (0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    fee = _live_fee_roe()
+    g = [r[0] for r in rows]
+    return (n, sum(1 for x in g if x > 0) / n * 100, sum(g) / n, _pf_net(g),
+            sum(g) / n - fee, _pf_net([x - fee for x in g]))
+
+
+def _live_avgpf(avg, pf, avg_n, pf_n) -> str:
+    """[v82] «Avg +0.71% (net +x.xx%) | PF 1.39 (net 1.18)»."""
+    return f'Avg {avg:+.2f}% (net {avg_n:+.2f}%) | PF {_fpf(pf)} (net {_fpf(pf_n)})'
+
+
+def _live_avg_txt(avg) -> str:
+    """[v82] «Avg +0.71% (net +x.xx%)» для строк, где показывается только средний результат."""
+    return f'Avg {avg:+.2f}% (net {avg - _live_fee_roe():+.2f}%)'
+
+
 def _trades_bucket(con, col, lo, hi, strategy=None, since=None):
     """Статистика по диапазону признака в реальных trades."""
     where = f"WHERE {col} >= ? AND {col} < ?"
@@ -8184,7 +8214,7 @@ def _trades_bucket(con, col, lo, hi, strategy=None, since=None):
         args.append(since)
     rows = con.execute(
         f"SELECT pnl_pct FROM trades_live {where}", args).fetchall()
-    return _bucket_stats(rows)
+    return _live_stats(rows)
 
 
 def _trades_bucket_strat(con, strategies: tuple, col, lo, hi):
@@ -8194,7 +8224,7 @@ def _trades_bucket_strat(con, strategies: tuple, col, lo, hi):
         f"SELECT pnl_pct FROM trades_live "
         f"WHERE strategy IN ({placeholders}) AND {col} >= ? AND {col} < ?",
         (*strategies, lo, hi)).fetchall()
-    return _bucket_stats(rows)
+    return _live_stats(rows)
 
 
 def stats_analyze() -> str:
@@ -8214,6 +8244,8 @@ def stats_analyze() -> str:
 
         lines = [f'🔬 <b>Анализ реальных сделок SMC/RSI</b>']
         lines.append(f'Всего: {total_smc_rsi} | С деплоя: {total_last_smc_rsi}')
+        # [v82] PF/Avg без пометки — gross: trades.pnl_pct комиссию не включает; net = pnl_pct − 2×FEE_RATE×100×LEVERAGE
+        lines.append('PF/Avg без пометки — до комиссий; решения — только по net')
         # [v81] строки с dup_of исключены из всех блоков (представление trades_live)
         try:
             _marked = con.execute("SELECT COUNT(*) FROM trades WHERE dup_of IS NOT NULL").fetchone()[0]
@@ -8230,21 +8262,21 @@ def stats_analyze() -> str:
                 rows = con.execute(
                     "SELECT pnl_pct FROM trades_live WHERE strategy=?",
                     (strat,)).fetchall()
-                n, wr, avg, pf = _bucket_stats(rows)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows)
                 if n == 0:
                     continue
-                flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                lines.append(f'<b>{strat}</b>: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                lines.append(f'<b>{strat}</b>: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Направление:</b>')
             for d in ('Long', 'Short'):
                 rows = con.execute(
                     "SELECT pnl_pct FROM trades_live WHERE strategy IN ('SMC','RSI') AND direction=?",
                     (d,)).fetchall()
-                n, wr, avg, pf = _bucket_stats(rows)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Причина закрытия:</b>')
             # [v73] Фиксированный список причин расходился с факт. значениями
@@ -8257,7 +8289,7 @@ def stats_analyze() -> str:
                 "WHERE strategy IN ('SMC','RSI') GROUP BY close_reason"
             ).fetchall()
             for reason, n, avg in sorted(_reason_rows, key=lambda r: -r[1]):
-                lines.append(f'  {reason}: {n} сд | Avg {avg:+.2f}%')
+                lines.append(f'  {reason}: {n} сд | {_live_avg_txt(avg)}')
 
             lines.append('\n<b>Причина × Направление:</b>')
             _reason_dir_rows = con.execute(
@@ -8265,48 +8297,48 @@ def stats_analyze() -> str:
                 "WHERE strategy IN ('SMC','RSI') GROUP BY direction, close_reason"
             ).fetchall()
             for d, reason, n, avg in sorted(_reason_dir_rows, key=lambda r: (r[0] or '', -r[2])):
-                lines.append(f'  {d}+{reason}: {n} сд | Avg {avg:+.2f}%')
+                lines.append(f'  {d}+{reason}: {n} сд | {_live_avg_txt(avg)}')
 
             def _sr_bucket(col, lo, hi):
                 return _trades_bucket_strat(con, ('SMC', 'RSI'), col, lo, hi)
 
             lines.append('\n<b>ADX входа:</b>')
             for lbl, lo, hi in [('25-40', 25, 40), ('40-60', 40, 60), ('60+', 60, 999)]:
-                n, wr, avg, pf = _sr_bucket('adx_val', lo, hi)
+                n, wr, avg, pf, avg_n, pf_n = _sr_bucket('adx_val', lo, hi)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>RSI входа:</b>')
             for lbl, lo, hi in [('lt40', 0, 40), ('40-55', 40, 55), ('55-65', 55, 65), ('65+', 65, 100)]:
                 safe = lbl.replace('<', '&lt;')
-                n, wr, avg, pf = _sr_bucket('rsi_val', lo, hi)
+                n, wr, avg, pf, avg_n, pf_n = _sr_bucket('rsi_val', lo, hi)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {safe}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {safe}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Alt-score:</b>')
             for lbl, lo, hi in [('lt40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)]:
                 safe = lbl.replace('<', '&lt;')
-                n, wr, avg, pf = _sr_bucket('alt_score', lo, hi)
+                n, wr, avg, pf, avg_n, pf_n = _sr_bucket('alt_score', lo, hi)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {safe}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {safe}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Час входа (UTC):</b>')
             for lbl, lo, hi in [('06-10', 6, 10), ('10-14', 10, 14),
                                  ('14-17', 14, 17), ('17-22', 17, 22)]:
-                n, wr, avg, pf = _sr_bucket('entry_hour', lo, hi)
+                n, wr, avg, pf, avg_n, pf_n = _sr_bucket('entry_hour', lo, hi)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}h: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}h: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Объём:</b>')
             for lbl, lo, hi in [('1-2x', 1.0, 2.0), ('2-4x', 2.0, 4.0), ('4x+', 4.0, 99)]:
-                n, wr, avg, pf = _sr_bucket('vol_ratio', lo, hi)
+                n, wr, avg, pf, avg_n, pf_n = _sr_bucket('vol_ratio', lo, hi)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             # [v73] Измерение беты SMC Long — есть ли edge независимо от
             # роста самого BTC (§2.14). btc_entry_price>0 отсекает строки
@@ -8317,10 +8349,10 @@ def stats_analyze() -> str:
                     "SELECT pnl_pct FROM trades_live WHERE strategy='SMC' AND direction='Long' "
                     "AND btc_entry_price > 0 AND btc_move_pct >= ? AND btc_move_pct < ?",
                     (lo, hi)).fetchall()
-                n, wr, avg, pf = _bucket_stats(rows_btc)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_btc)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             # [v73] btc_trend на входе для SMC СЕЙЧАС НЕ ПИШЕТСЯ — smc_signal()
             # не кладёт его в sig (в отличие от SA/single_asset_signal). Сегмент
@@ -8333,7 +8365,7 @@ def stats_analyze() -> str:
                 "GROUP BY btc_trend").fetchall()
             if _bt_rows:
                 for bt, n, avg in _bt_rows:
-                    lines.append(f'  {bt}: {n} сд | Avg {avg:+.2f}%')
+                    lines.append(f'  {bt}: {n} сд | {_live_avg_txt(avg)}')
             else:
                 lines.append('  нет данных — btc_trend не пишется для SMC (см. BOT_SPEC §2.14)')
 
@@ -8423,7 +8455,7 @@ def stats_analyze() -> str:
         lines.append(f'\n<b>SMC_SIG (замер вместо живых сделок, SMC_LIVE={"true" if SMC_LIVE else "false"})</b>')
         lines += _smc_sig_contract_lines(con)
 
-        lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
+        lines.append('\n⭐ = PF net&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
 
         # ── БЛОК 2: SA (live-сделки + SA_HIST_OFFSET) ────────────────
         sa_new = con.execute(
@@ -8442,41 +8474,41 @@ def stats_analyze() -> str:
         lines.append(f'(включает {SA_HIST_OFFSET} исторических shadow + {len(sa_new)} live)')
 
         if len(sa_new) >= 5:
-            n_sa, wr_sa, avg_sa, pf_sa = _bucket_stats([(r[0],) for r in sa_new])
-            flag_sa = ' ⭐' if (pf_sa > 1.0 and n_sa >= 10) else ''
-            lines.append(f'\nLive: {n_sa} сд | WR {wr_sa:.0f}% | Avg {avg_sa:+.2f}% | PF {pf_sa:.2f}{flag_sa}')
+            n_sa, wr_sa, avg_sa, pf_sa, avg_sa_n, pf_sa_n = _live_stats([(r[0],) for r in sa_new])
+            flag_sa = ' ⭐' if (pf_sa_n > 1.0 and n_sa >= 10) else ''
+            lines.append(f'\nLive: {n_sa} сд | WR {wr_sa:.0f}% | {_live_avgpf(avg_sa, pf_sa, avg_sa_n, pf_sa_n)}{flag_sa}')
 
             lines.append('\n<b>Направление:</b>')
             for d in ('Long', 'Short'):
                 rows_d = [(r[0],) for r in sa_new if r[1] == d]
-                n, wr, avg, pf = _bucket_stats(rows_d)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_d)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {d}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Entry RSI:</b>')
             for lbl, lo, hi in [('lt35', 0, 35), ('35-50', 35, 50), ('50-65', 50, 65), ('65+', 65, 100)]:
                 rows_r = [(r[0],) for r in sa_new if lo <= (r[2] or 50) < hi]
-                n, wr, avg, pf = _bucket_stats(rows_r)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_r)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Alt-score:</b>')
             for lbl, lo, hi in [('lt40', 0, 40), ('40-55', 40, 55), ('55+', 55, 999)]:
                 rows_a = [(r[0],) for r in sa_new if lo <= (r[3] or 0) < hi]
-                n, wr, avg, pf = _bucket_stats(rows_a)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_a)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             lines.append('\n<b>Объём:</b>')
             for lbl, lo, hi in [('1.3-2.0x', 1.3, 2.0001), ('2-4x', 2.0001, 4.0), ('4x+', 4.0, 99)]:
                 rows_v = [(r[0],) for r in sa_new if lo <= (r[4] or 0) < hi]
-                n, wr, avg, pf = _bucket_stats(rows_v)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_v)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             # [v38] Причина закрытия: avg MFE + длительность = диагностика висяков.
             # MFE таймаутов >=0.5% → проблема выхода; ~0.1-0.2% → проблема входа.
@@ -8489,7 +8521,7 @@ def stats_analyze() -> str:
                     _avg = sum(x[0] for x in rows_c) / _n
                     _mfe = sum((x[8] or 0) for x in rows_c) / _n
                     _dur = sum((x[9] or 0) for x in rows_c) / _n
-                    lines.append(f'  {reas}: {_n} сд | Avg {_avg:+.2f}% | '
+                    lines.append(f'  {reas}: {_n} сд | {_live_avg_txt(_avg)} | '
                                  f'MFE {_mfe:.2f}% | {_dur:.0f}мин')
 
             # [v38] Причина × Направление — где именно вязнут шорты
@@ -8501,7 +8533,7 @@ def stats_analyze() -> str:
                         _n = len(rows_cd)
                         _avg = sum(x[0] for x in rows_cd) / _n
                         _mfe = sum((x[8] or 0) for x in rows_cd) / _n
-                        lines.append(f'  {d}+{reas}: {_n} сд | Avg {_avg:+.2f}% | MFE {_mfe:.2f}%')
+                        lines.append(f'  {d}+{reas}: {_n} сд | {_live_avg_txt(_avg)} | MFE {_mfe:.2f}%')
 
             # [v38] Час входа UTC (сессии: Азия / EU / US / вечер)
             lines.append('\n<b>Час входа (UTC):</b>')
@@ -8509,19 +8541,19 @@ def stats_analyze() -> str:
                                  ('12-18h', 12, 18), ('18-24h', 18, 24)]:
                 rows_h = [(r[0],) for r in sa_new
                           if r[6] is not None and lo <= r[6] < hi]
-                n, wr, avg, pf = _bucket_stats(rows_h)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_h)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             # [v38] |VWAP-дист| в ATR на входе: не слишком ли близко заходим
             lines.append('\n<b>VWAP-дист (ATR):</b>')
             for lbl, lo, hi in [('1.5-1.8', 1.5, 1.8), ('1.8-2.2', 1.8, 2.2), ('2.2+', 2.2, 99)]:
                 rows_vd = [(r[0],) for r in sa_new if lo <= abs(r[7] or 0) < hi]
-                n, wr, avg, pf = _bucket_stats(rows_vd)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_vd)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             # [v38] HTF-наклон EMA200 (копится с v38, старые сделки = пусто)
             _htf_rows = [r for r in sa_new if r[10]]
@@ -8530,10 +8562,10 @@ def stats_analyze() -> str:
                 for d in ('Long', 'Short'):
                     for hs in ('Up', 'Flat', 'Down'):
                         rows_hd = [(r[0],) for r in _htf_rows if r[1] == d and r[10] == hs]
-                        n, wr, avg, pf = _bucket_stats(rows_hd)
+                        n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_hd)
                         if n:
                             lines.append(f'  {d}+{hs}: {n} сд | WR {wr:.0f}% | '
-                                         f'Avg {avg:+.2f}% | PF {pf:.2f}')
+                                         f'{_live_avgpf(avg, pf, avg_n, pf_n)}')
 
             # [v41] BTC-тренд × Направление: контртренд-вход = вязнет?
             # btc_trend ∈ {Long,Short,Flat} (совпадает со словарём direction).
@@ -8544,13 +8576,13 @@ def stats_analyze() -> str:
                 for d in ('Long', 'Short'):
                     for bt in ('Long', 'Short', 'Flat'):
                         rows_bt = [r for r in _bt_rows if r[1] == d and r[12] == bt]
-                        n, wr, avg, pf = _bucket_stats([(r[0],) for r in rows_bt])
+                        n, wr, avg, pf, avg_n, pf_n = _live_stats([(r[0],) for r in rows_bt])
                         if n:
                             _to = sum(1 for r in rows_bt if r[5] == 'Timeout')
                             _mfe = sum((r[8] or 0) for r in rows_bt) / n
                             _ct = ' ⚠️контртренд' if (d != bt and bt != 'Flat') else ''
                             lines.append(f'  {d}/BTC-{bt}: {n} сд | WR {wr:.0f}% | '
-                                         f'Avg {avg:+.2f}% | PF {pf:.2f} | '
+                                         f'{_live_avgpf(avg, pf, avg_n, pf_n)} | '
                                          f'TO {_to} | MFE {_mfe:.2f}%{_ct}')
 
                 # Свод: контртренд vs по тренду BTC (Flat исключён как нейтраль)
@@ -8560,11 +8592,11 @@ def stats_analyze() -> str:
                 for lbl, grp in [('Контртренд', _counter), ('По тренду BTC', _aligned)]:
                     if grp:
                         _n = len(grp)
-                        _, _wr, _avg, _pf = _bucket_stats([(r[0],) for r in grp])
+                        _, _wr, _avg, _pf, _avg_n, _pf_n = _live_stats([(r[0],) for r in grp])
                         _to_pct = sum(1 for r in grp if r[5] == 'Timeout') / _n * 100
                         _mfe = sum((r[8] or 0) for r in grp) / _n
                         lines.append(f'  {lbl}: {_n} сд | WR {_wr:.0f}% | '
-                                     f'Avg {_avg:+.2f}% | PF {_pf:.2f} | '
+                                     f'{_live_avgpf(_avg, _pf, _avg_n, _pf_n)} | '
                                      f'Timeout {_to_pct:.0f}% | MFE {_mfe:.2f}%')
 
             # [v44] RR входа: гейт SA_MIN_RR введён в v44, старые сделки = 0 (нет данных) —
@@ -8575,10 +8607,10 @@ def stats_analyze() -> str:
                 for lbl, lo, hi in [('lt0.7', 0, 0.7), ('0.7-1.0', 0.7, 1.0),
                                      ('1.0-1.5', 1.0, 1.5), ('1.5+', 1.5, 99)]:
                     rows_rr = [(r[0],) for r in _rr_rows if lo <= r[13] < hi]
-                    n, wr, avg, pf = _bucket_stats(rows_rr)
+                    n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_rr)
                     if n:
-                        flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                        lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                        flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                        lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
             # [v70] Funding rate BTC на входе — ЛОГ-ONLY гипотеза, не фильтр.
             # Критерий будущего решения (см. комментарий-контракт у
@@ -8593,10 +8625,10 @@ def stats_analyze() -> str:
                 for lbl, lo, hi in [('&lt;-0.05%', -99, -0.0005), ('-0.05..0', -0.0005, 0),
                                      ('0..0.05%', 0, 0.0005), ('0.05%+', 0.0005, 99)]:
                     rows_fr = [(r[0],) for r in _fr_rows if lo <= r[14] < hi]
-                    n, wr, avg, pf = _bucket_stats(rows_fr)
+                    n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_fr)
                     if n:
-                        flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                        lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                        flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                        lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
         else:
             lines.append(f'⚠️ Мало live-данных ({len(sa_new)} сд). Нужно 5+ для анализа.')
 
@@ -8610,12 +8642,12 @@ def stats_analyze() -> str:
             for lbl, lo, hi in [('0 (оракул недоступен/выключен)', 0, 1),
                                  ('1-54', 1, 55), ('55-69', 55, 70), ('70-100', 70, 101)]:
                 rows_ai = [(r[0],) for r in ai_rows if lo <= (r[1] or 0) < hi]
-                n, wr, avg, pf = _bucket_stats(rows_ai)
+                n, wr, avg, pf, avg_n, pf_n = _live_stats(rows_ai)
                 if n:
-                    flag = ' ⭐' if (pf > 1.0 and n >= 10) else ''
-                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | Avg {avg:+.2f}% | PF {pf:.2f}{flag}')
+                    flag = ' ⭐' if (pf_n > 1.0 and n >= 10) else ''
+                    lines.append(f'  {lbl}: {n} сд | WR {wr:.0f}% | {_live_avgpf(avg, pf, avg_n, pf_n)}{flag}')
 
-        lines.append('\n⭐ = PF&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
+        lines.append('\n⭐ = PF net&gt;1 при n&gt;=10 | Доверять при n&gt;=30')
         con.close()
     except Exception as _e:
         logging.exception('[STATS_ANALYZE] fail')   # [v48] полный traceback в лог
