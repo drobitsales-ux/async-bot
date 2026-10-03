@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v80'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v81'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -431,6 +431,7 @@ _sa_shadow_last_ts = 0.0   # [v53] дедуп SA_SHADOW: не чаще 1 зап�
 # причины (adx_flat/fvg/fvg_test…) не записывались вообще. Кулдаун 6ч — по
 # ключу (sym, группа), а не по sym.
 _ctx_fail_cycles = 0      # [v79] циклов scan_smc с btc_ctx ctx_ok=False (за аптайм) — в дайджест
+_dup_guard = {'n': 0, 'last': ''}   # [v81] повторных записей закрытия, пропущенных DUP-GUARD за аптайм (в дайджест)
 _SMC_ADX_THR_REF = 18.0   # [v78] ТОЛЬКО для счётчика «что было бы»: тот же порог, что живой гейт `if adx < 18` в smc_signal (гейт не менялся)
 _adx_w_cycle = {'would_block': 0, 'would_pass_flat': 0}   # [v78] за цикл scan_smc (сбрасывается в scan_smc)
 _smc_shadow_last: dict = {}      # {(sym, group): ts}
@@ -1125,10 +1126,16 @@ def _trades_dup_groups(con):
 
 
 def _trades_dup_drop_ids(con) -> set:
-    """[v78] id «лишних» копий точных дублей (первая копия — min id — остаётся). Дубль считается один раз."""
+    """[v78] id «лишних» копий точных дублей (первая копия — min id — остаётся). Дубль считается один раз.
+    [v81] + строки с проставленным dup_of (/trades_dups_mark): после пометки множества совпадают, до пометки
+    защита от дублей в отчётах остаётся динамической."""
     drop = set()
     for grp in _trades_dup_groups(con):
         drop |= {r[0] for r in grp[1:]}
+    try:
+        drop |= {r[0] for r in con.execute("SELECT id FROM trades WHERE dup_of IS NOT NULL").fetchall()}
+    except Exception:
+        pass   # старая схема без dup_of
     return drop
 
 
@@ -1183,8 +1190,10 @@ def trades_dups_text() -> str:
         no_ot = con.execute("SELECT COUNT(*) FROM trades WHERE COALESCE(open_time,'')=''").fetchone()[0]
         groups = _trades_dup_groups(con)
         near = _trades_near_dups(con)
+        marked = con.execute("SELECT COUNT(*) FROM trades WHERE dup_of IS NOT NULL").fetchone()[0]   # [v81]
         drop = {r[0] for g in groups for r in g[1:]}
         L = [f'🔎 <b>Дубли в trades</b> (только чтение). Строк: {total}, без open_time (не сравниваются): {no_ot}']
+        L.append(f'Помечено dup_of (/trades_dups_mark): <b>{marked}</b> — отчёты их исключают; DUP-GUARD пропустил за аптайм: {_dup_guard["n"]}')
         L.append(f'\n<b>Точные дубли</b> (strategy, symbol, open_time, close_reason, pnl_pct): групп <b>{len(groups)}</b>, лишних копий {len(drop)}')
         shown = 0
         for g in groups:
@@ -1232,6 +1241,99 @@ def trades_dups_text() -> str:
         return f'[TRADES_DUPS] ошибка: {_e}'
 
 
+def trades_dups_mark_text() -> str:
+    """[v81] /trades_dups_mark — ОДНОРАЗОВАЯ, ИДЕМПОТЕНТНАЯ пометка: каждой лишней копии точного дубля проставляется
+    dup_of = id первой строки группы (min id; те же группы, что /trades_dups и _trades_dup_drop_ids — точные дубли
+    по (strategy, symbol, open_time, close_reason, pnl_pct)). НИЧЕГО НЕ УДАЛЯЕТСЯ: меняется только колонка dup_of,
+    и только у строк, где она ещё NULL → повторный запуск помечает 0. Близкие дубли (тот же open_time, другая
+    причина/pnl) НЕ помечаются — это решение владельца (/trades_dups показывает их список)."""
+    try:
+        con = sqlite3.connect(TRADES_DB)
+    except Exception as _e:
+        return f'[TRADES_DUPS_MARK] ошибка открытия БД: {_e}'
+    try:
+        before = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        groups = _trades_dup_groups(con)
+        by_strat: dict = {}
+        new_marked = 0
+        for grp in groups:
+            orig = grp[0][0]
+            for r in grp[1:]:
+                cur = con.execute("UPDATE trades SET dup_of=? WHERE id=? AND dup_of IS NULL", (orig, r[0]))
+                if cur.rowcount:
+                    new_marked += 1
+                    by_strat[r[1]] = by_strat.get(r[1], 0) + 1
+        con.commit()
+        after = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        total_marked = con.execute("SELECT COUNT(*) FROM trades WHERE dup_of IS NOT NULL").fetchone()[0]
+        near = len(_trades_near_dups(con))
+        con.close()
+        L = [f'🏷 <b>/trades_dups_mark</b>: групп точных дублей {len(groups)}, помечено сейчас <b>{new_marked}</b>, всего помечено {total_marked}']
+        if by_strat:
+            L.append('По стратегиям (помечено сейчас): ' + ', '.join(f'{k}: {v}' for k, v in sorted(by_strat.items())))
+        L.append(f'Строк в trades: {before} → {after} ' + ('(не изменилось ✅, ничего не удалено)' if before == after else '⚠️ ЧИСЛО СТРОК ИЗМЕНИЛОСЬ'))
+        if new_marked == 0:
+            L.append('Повторный запуск: новых копий нет (идемпотентно).')
+        L.append(f'Близких дублей (тот же open_time, другая причина/pnl) НЕ помечено: {near} — см. /trades_dups; решение владельца.')
+        L.append('Отчёты по живым сделкам исключают строки с dup_of. Сравнение «до/после» — /dups_impact.')
+        return '\n'.join(L)
+    except Exception as _e:
+        try:
+            con.rollback(); con.close()
+        except Exception:
+            pass
+        logging.exception('[TRADES_DUPS_MARK] fail')
+        return f'[TRADES_DUPS_MARK] ошибка: {_e} (изменения отменены)'
+
+
+def dups_impact_text() -> str:
+    """[v81] /dups_impact — ТОЛЬКО SELECT (mode=ro): числа ДО и ПОСЛЕ исключения дублей (помеченные dup_of + точные
+    копии, найденные динамически) для SMC (все и форвард с SMC_FORWARD_FROM), SA live (все) и SMC Long × режим
+    (как в /smc_regime_check: Up против Down+Flat, история до SMC_REGIME_FORWARD_FROM и форвард). Контракты НЕ меняются."""
+    try:
+        con = _open_trades_ro()
+    except Exception as _e:
+        return f'[DUPS_IMPACT] ошибка открытия БД: {_e}'
+    try:
+        fee = 2 * FEE_RATE * 100 * LEVERAGE
+        drop = _trades_dup_drop_ids(con)
+        def rows_of(where, args=()):
+            return con.execute(
+                "SELECT id, pnl_pct, net_usdt, entry_price, sl_price, regime_4h FROM trades WHERE " + where, args).fetchall()
+        def pair(label, where, args=()):
+            allr = rows_of(where, args)
+            clean = [r for r in allr if r[0] not in drop]
+            f = lambda g: _smc_stats_line([(r[1], r[2], r[3], r[4]) for r in g], fee)
+            return [f'<b>{label}</b> (копий убрано: {len(allr) - len(clean)})', '  до:    ' + f(allr), '  после: ' + f(clean)]
+        L = [f'🔎 <b>/dups_impact</b> (только чтение; win = net_usdt &gt; 0; PF/R — net; «после» = без dup_of и точных копий; всего лишних строк: {len(drop)})']
+        L += pair('SMC — все', "strategy='SMC'")
+        L += pair(f'SMC — форвард с {SMC_FORWARD_FROM}', "strategy='SMC' AND open_time >= ?", (SMC_FORWARD_FROM,))
+        L += pair('SA live — все', "strategy='SA'")
+        # SMC Long × режим
+        reg = "strategy='SMC' AND direction='Long' AND regime_4h IN ('Up','Down','Flat') "
+        L.append(f'\n<b>SMC Long × режим 4ч</b> (граница форварда {SMC_REGIME_FORWARD_FROM}, как в /smc_regime_check)')
+        for per, cond in (('история', "open_time < ?"), ('форвард', "open_time >= ?")):
+            allr = rows_of(reg + 'AND ' + cond, (SMC_REGIME_FORWARD_FROM,))
+            clean = [r for r in allr if r[0] not in drop]
+            def grp(rs, names):
+                return [(r[1], r[2], r[3], r[4]) for r in rs if r[5] in names]
+            def fisher(rs):
+                up = [r for r in rs if r[5] == 'Up']; dfl = [r for r in rs if r[5] in ('Down', 'Flat')]
+                uw = sum(1 for r in up if r[2] > 0); dw = sum(1 for r in dfl if r[2] > 0)
+                return _fisher_2x2(uw, len(up) - uw, dw, len(dfl) - dw) if up and dfl else 1.0
+            L.append(f'  {per} (копий убрано: {len(allr) - len(clean)}):')
+            for names, title in ((('Up',), 'Up'), (('Down', 'Flat'), 'Down+Flat')):
+                L.append(f'    {title} до:    ' + _smc_stats_line(grp(allr, names), fee))
+                L.append(f'    {title} после: ' + _smc_stats_line(grp(clean, names), fee))
+            L.append(f'    Fisher Up vs Down+Flat по сделкам: до p={fisher(allr):.4f} | после p={fisher(clean):.4f}')
+        L.append('\nКонтракты (§2.14.4, §2.18.5, §2.19.1, §2.20.x) не менялись — это только показ. Пометка копий: /trades_dups_mark.')
+        con.close()
+        return '\n'.join(L)
+    except Exception as _e:
+        logging.exception('[DUPS_IMPACT] fail')
+        return f'[DUPS_IMPACT] ошибка: {_e}'
+
+
 def smc_regime_check_text() -> str:
     """[v78] Режимный фильтр SMC Long (BOT_SPEC §2.18.5) — ТОЛЬКО чтение.
     1) ФОРВАРД с SMC_REGIME_FORWARD_FROM (2026-10-01): статус пяти условий контракта-пре-коммита
@@ -1246,12 +1348,12 @@ def smc_regime_check_text() -> str:
         fee = 2 * FEE_RATE * 100 * LEVERAGE
         drop = _trades_dup_drop_ids(con)
         sel = ("SELECT id, open_time, symbol, regime_4h, close_reason, pnl_pct, net_usdt, entry_price, sl_price, "
-               "btc_move_pct, btc_entry_price FROM trades WHERE strategy='SMC' AND direction='Long' "
+               "btc_move_pct, btc_entry_price FROM trades_live WHERE strategy='SMC' AND direction='Long' "
                "AND regime_4h IN ('Up','Down','Flat') ")
         fwd = [r for r in con.execute(sel + "AND open_time >= ? ORDER BY open_time", (SMC_REGIME_FORWARD_FROM,)).fetchall()
                if r[0] not in drop]
         hist = con.execute(sel + "AND open_time < ? ORDER BY open_time", (SMC_REGIME_FORWARD_FROM,)).fetchall()
-        tot_hist = con.execute("SELECT COUNT(*) FROM trades WHERE strategy='SMC' AND direction='Long' AND open_time < ?",
+        tot_hist = con.execute("SELECT COUNT(*) FROM trades_live WHERE strategy='SMC' AND direction='Long' AND open_time < ?",
                                (SMC_REGIME_FORWARD_FROM,)).fetchone()[0]
         con.close()
     except Exception as _e:
@@ -1319,7 +1421,7 @@ def smc_regime_check_text() -> str:
     hu = sum(1 for r in hup if r[6] > 0); hd = sum(1 for r in hdn if r[6] > 0)
     hp = _fisher_2x2(hu, len(hup) - hu, hd, len(hdn) - hd) if hup and hdn else 1.0
     L.append(f'\nРазных календарных дней у Down+Flat: <b>{len(hdays)}</b> ({", ".join(sorted(hdays))})')
-    L.append(f'Up {hu}W/{len(hup)-hu}L vs Down+Flat {hd}W/{len(hdn)-hd}L | Fisher p={hp:.4f} (с дублями, in-sample)')
+    L.append(f'Up {hu}W/{len(hup)-hu}L vs Down+Flat {hd}W/{len(hdn)-hd}L | Fisher p={hp:.4f} (помеченные dup_of исключены, in-sample)')
     L.append('🛑 СТОП: Down+Flat на ≤3 дней — эффективная выборка слишком мала'
              if len(hdays) <= 3 else f'✅ кучность не подтверждена: {len(hdays)} разных дней (шаг 5.0, v77)')
     L.append('Look-ahead: regime_4h живой сделки пишется _fill_pos_regime → _regime_4h(now≈open_time) '
@@ -1619,7 +1721,7 @@ def smc_entry_audit_text() -> str:
             L.append('MFE в trades не пишется — аудит невозможен.')
             con.close(); return '\n'.join(L)
         sel = ("SELECT id, open_time, symbol, direction, close_reason, pnl_pct, net_usdt, entry_price, sl_price, mfe_pct, "
-               + ('dur_min' if 'dur_min' in cols else '0') + ', ' + (mae_col if mae_col else '0') + " FROM trades WHERE strategy='SMC' ")
+               + ('dur_min' if 'dur_min' in cols else '0') + ', ' + (mae_col if mae_col else '0') + " FROM trades_live WHERE strategy='SMC' ")
         allr = [r for r in con.execute(sel + 'ORDER BY open_time').fetchall() if r[0] not in drop]
         con.close()
         have_mfe = [r for r in allr if r[9] is not None]
@@ -5999,11 +6101,18 @@ def _init_trades_db():
                  'btc_move_pct REAL DEFAULT 0',       # [v73] движение BTC за сделку, % без плеча
                  "regime_4h TEXT DEFAULT ''",         # [v74] режим 4ч на входе (_regime_4h)
                  'sl_price REAL DEFAULT 0',           # [v77] ИСХОДНЫЙ SL при открытии (не перенесённый BE/трейлингом) — для R
-                 'adx_wilder REAL DEFAULT 0']:        # [v78] настоящий ADX Уайлдера на входе (adx_val = DX/0), только запись
+                 'adx_wilder REAL DEFAULT 0',         # [v78] настоящий ADX Уайлдера на входе (adx_val = DX/0), только запись
+                 'dup_of INTEGER DEFAULT NULL']:      # [v81] id первой строки группы, если эта строка — дубль закрытия (НЕ удаляется)
         try:
             con.execute(f'ALTER TABLE trades ADD COLUMN {_col}')
         except Exception:
             pass
+    # [v81] Представление «сделки без помеченных дублей» — ВСЕ отчёты по живым сделкам читают его, а не trades.
+    # (SQLite раскрывает SELECT * при каждом обращении — новые колонки подхватываются сами.)
+    try:
+        con.execute("CREATE VIEW IF NOT EXISTS trades_live AS SELECT * FROM trades WHERE dup_of IS NULL")
+    except Exception as _ve:
+        logging.error(f'[v81] trades_live view: {_ve}')
     # [EPOCH] таблица meta: время последнего деплоя (для статистики 'Последнее')
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     # [v77] замеры задержки живых вызовов биржи (lat_install/lat_flush)
@@ -6264,7 +6373,7 @@ async def build_daily_digest(date_str: str = None):
     # ── Сделки за день ──
     lines.append('── СДЕЛКИ ──')
     rows = con.execute(
-        "SELECT strategy, close_reason, net_usdt FROM trades WHERE close_time LIKE ?",
+        "SELECT strategy, close_reason, net_usdt FROM trades_live WHERE close_time LIKE ?",
         (like,)
     ).fetchall()
     if not rows:
@@ -6340,6 +6449,8 @@ async def build_daily_digest(date_str: str = None):
     # [v79] циклы scan_smc с ctx_ok=False: get_btc_context() вернул заглушку (alt_score=50), а гейт SMC
     # режет при alt_score >= 45 → сетевой сбой молча выключал SMC на цикл (BOT_SPEC §2.20.4)
     lines.append(f'SMC: циклов с ctx_ok=False (alt_score=50 заглушка) за аптайм: {_ctx_fail_cycles}')
+    lines.append(f'DUP-GUARD: пропущено повторных записей закрытия за аптайм: {_dup_guard["n"]}'
+                 + (f' (последняя: {_dup_guard["last"]})' if _dup_guard['last'] else ''))   # [v81]
 
     text = '\n'.join(lines)
     fpath = ''
@@ -6446,8 +6557,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-02-v80'
+CODE_VERSION = '2026-10-03-v81'
 CHANGELOG = [
+    ('2026-10-03-v81', 'ЗАПИСЬ ЗАКРЫТИЙ: идемпотентный log_trade. Логика сигналов SMC/SMC_SIG/SMC2/PO3/RB, контракты, SMC_LIVE (false), риск, breaker-ы v76/v77, замер задержек, сопровождение живых позиций (SL/TP/BE/трейлинг) и bybit_worker.py НЕ менялись. Шаг 0: log_trade вызывается из 6 мест (MOM-трейл, жёсткий потолок, SMC/SA smart-timeout, обычный таймаут, закрытие на бирже); общая причина дублей — запись закрытия не атомарна с удалением позиции из списка и с диском (список усекается только после цикла, таймаут-пути save_all не зовут): W1 — неперехваченное исключение в process_pos любой позиции прерывает monitor_all до усечения, закрытая позиция пишется повторно каждый цикл (точные дубли); W2 — рестарт между записью и финальным save_all воскрешает позицию, второе закрытие пишется с иной причиной/pnl (близкие дубли); оба воспроизведены тестом на v80. Правка 1: DUP-GUARD в log_trade — ключ (strategy, symbol, direction, open_time), open_time ставится один раз при открытии (мкс) и хранится в JSON; перед INSERT проверка «есть строка с dup_of IS NULL» -> запись пропускается, [DUP-GUARD] в лог, счётчик в дайджест, сбой проверки не теряет сделку; колонка trades.dup_of INTEGER DEFAULT NULL (миграция) и представление trades_live (SELECT * WHERE dup_of IS NULL), все отчёты по живым сделкам читают его; /trades_dups_mark — одноразовая идемпотентная пометка копий точных дублей (dup_of = id первой строки группы, ничего не удаляется, повтор помечает 0, близкие дубли не помечаются); шапка /stats_analyze: исключено дублей N. INSERT log_trade не менялся (35/35). Правка 2: /dups_impact (только чтение) — SMC все/форвард, SA live, SMC Long x режим: n, WR, PF net до и после исключения дублей, Fisher'),
     ('2026-10-02-v80', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика и логика входа/выхода shadow НЕ менялись (SMC_LIVE=false, SMC_SIG, SMC2, контракты, LEVERAGE, RISK_PER_TRADE, breaker-ы, PO3, RB, calc_adx, bybit_worker.py — как в v79). Бэклог п.10 (BOT_SPEC 2.20.0): аудит прода показал, что у shadow-записей MFE/MAE нигде не хранятся (mfe_price у path-стратегий остаётся ценой входа), поэтому: колонки shadow_signals.mfe_pct/mae_pct (NULL = запись до v80), чистая функция _shadow_excursion (MFE/MAE пути цены от бара входа до бара выхода, % цены; для SL бар выхода в MFE не входит — нижняя оценка), запись при закрытии в _shadow_check_path (UPDATE, INSERT не менялся: shadow_record 33 колонки, log_trade 35/35); /smc_entry_audit дополнен блоком по SMC_SIG/SMC2_MKT/SMC2_RT (доля MFE<0.2%, медиана MFE, MFE победителей и SL-записей, выходы SL/TP/TIMEOUT по exit_price, медиана минут до бара SL, MFE/MAE в R, записи до v80 отдельно) — только SELECT, mode=ro'),
     ('2026-10-02-v79', 'ПАУЗА ЖИВОГО SMC + замер вместо него + SMC2 (shadow). Живой вход SMC выключен: SMC_LIVE (ENV, дефолт false) — форвард PF net 0.88 (n=21), диагноз §2.20.0 (вход на НЕзакрытой свече пробоя после всплеска объёма на предыдущей = покупка вершины импульса; FVG-тест ±0.8% декоративен; SL под 3-свечным минимумом лежит в обычной зоне ретеста). При SMC_LIVE=false сигнал smc_signal() (логика НЕ менялась — проверено дифференциальным тестом на 30000 рядах) не идёт в execute(), а пишется в shadow_signals как SMC_SIG (те же sl/tp из _smc_levels, выход SL>TP/таймаут как у SMC_SHADOW, без TP50/BE/трейлинга); открытые живые позиции ведутся как раньше; breaker-ы v76/v77 не менялись. Контракты §2.14.4 (ступень 1), §2.18.5 (режим) и §2.19.1 (ADX) с даты деплоя оцениваются по записям SMC_SIG (смена измерения, не правил); живые сделки до паузы — отдельно, не критерий; блоки в /stats_analyze, /smc_regime_check, /shadow_analyze. SMC2 (только shadow): _smc2_eval, scan_smc2 — пробой структуры на ЗАКРЫТОМ баре с объёмом свечи пробоя >=1.5x медианы и анти-погоней по VWAP; два варианта на одном событии (MKT по close пробоя, RT — лимит на ретесте уровня), общий smc2_event, маркеры SMC2_NF для R_event(RT)=0, лимиты 60 записей/сутки и 1 событие на (sym, dir, 2 ч), контракт (А) промоушена и (Б) гипотезы «точка входа виновата», секция в /shadow_analyze. Новые колонки shadow_signals: btc_entry_price, btc_move_pct, smc2_event (shadow_record INSERT 31 -> 33 колонок, 32 ? + литерал). /smc_entry_audit — MFE/MAE живого SMC (только SELECT, mode=ro). get_btc_context: флаг ctx_ok (False в обеих fallback-ветках), счётчик циклов в дайджесте, ctx_fail в [SMC SCAN]; гейт alt_score не менялся (дефект §2.20.4). LEVERAGE, RISK_PER_TRADE, breaker-ы, замер задержек, PO3, RB, Down x Long, calc_adx и bybit_worker.py не тронуты'),
     ('2026-10-01-v78', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика НЕ менялась (фильтры SMC включая calc_adx и порог ADX, SL/TP/TP50/BE/трейлинг, риск, breaker-ы, PO3 — как в v77; форварды §2.14.4 и §2.18.5 НЕ сбрасываются): настоящий ADX Уайлдера calc_adx_wilder() рядом с прежним DX (calc_adx не тронут) — колонка adx_wilder в shadow_signals (SMC_SHADOW, PO3) и trades (живые SMC), счётчики «что было бы» would_block_adx_w / would_pass_adx_w в [SMC SCAN] и строка [ADX_W] (вход НЕ блокируется), срезы по adx_wilder в /stats_analyze и /shadow_analyze, пре-коммит решения по ADX-фильтру (n>=30 живых входов, доля заблокированных >30% -> вариант (а) не без отдельного анализа); /trades_dups — дубли в trades (только чтение, SQLite mode=ro): точные и близкие, месяцы, пометка СВЕЖИЕ, влияние на SMC; путь двойной записи закрытия описан в BOT_SPEC §2.19.2 (воспроизведён, не исправлен); форвард-блок контракта §2.18.5 в /smc_regime_check (пять условий, Fisher по сделкам и по дням, бета, доля выброса, дубли один раз), история ниже помечена in-sample'),
@@ -6569,6 +6681,27 @@ def log_trade(pos: dict, exit_p: float, pnl_pct: float,
     """
     try:
         con = sqlite3.connect(TRADES_DB)
+        # [v81] DUP-GUARD: одно закрытие позиции — одна строка. Ключ (strategy, symbol, direction, open_time):
+        # open_time задаётся один раз при открытии (datetime.now().isoformat(), мкс), сохраняется в JSON позиций
+        # и после рестарта не переснимается — устойчивый идентификатор позиции (id входного ордера в rec не хранится,
+        # sl_order_id меняется при BE/трейлинге). Пустой open_time (позиции до v16) — ключа нет, guard не применяется.
+        # Сбой самой проверки НЕ блокирует запись (лучше дубль, чем потерянная сделка).
+        try:
+            _ot = pos.get('open_time', '') or ''
+            if _ot:
+                _prev = con.execute(
+                    "SELECT id FROM trades WHERE strategy=? AND symbol=? AND direction=? AND open_time=? "
+                    "AND dup_of IS NULL LIMIT 1",
+                    (pos.get('strategy', ''), pos.get('symbol', ''), pos.get('direction', ''), _ot)).fetchone()
+                if _prev:
+                    _dup_guard['n'] += 1
+                    _dup_guard['last'] = f"{pos.get('symbol', '')} {_ot[:19]} {close_reason}"
+                    logging.warning(f"[DUP-GUARD] пропущена повторная запись {pos.get('symbol', '')} {_ot} {close_reason} "
+                                    f"(уже есть id={_prev[0]})")
+                    con.close()
+                    return
+        except Exception as _ge:
+            logging.error(f'[DUP-GUARD] проверка не выполнена, запись продолжается: {_ge}')
         con.execute("""
             INSERT INTO trades (
                 close_time, symbol, strategy, direction, close_reason,
@@ -7447,7 +7580,7 @@ async def regime_backfill_run():
             lines.append(f'  {strat}: {k or 0}/{n}')
         for strat, n, k in con.execute(
                 "SELECT strategy, COUNT(*), SUM(CASE WHEN COALESCE(regime_4h,'')!='' THEN 1 ELSE 0 END) "
-                "FROM trades GROUP BY strategy").fetchall():
+                "FROM trades_live GROUP BY strategy").fetchall():
             lines.append(f'  live {strat}: {k or 0}/{n}')
         con.close()
         await tg('\n'.join(lines))
@@ -8017,7 +8150,7 @@ def _trades_row(con, since=None):
             SUM(CASE WHEN strategy='SMC' THEN 1 ELSE 0 END) smc_cnt,
             SUM(CASE WHEN strategy='RSI' THEN 1 ELSE 0 END) rsi_cnt,
             SUM(CASE WHEN close_reason='Timeout' THEN 1 ELSE 0 END) timeout_cnt
-        FROM trades {where}
+        FROM trades_live {where}
     """, args).fetchone()
 
 
@@ -8050,7 +8183,7 @@ def _trades_bucket(con, col, lo, hi, strategy=None, since=None):
         where += " AND close_time > ?"
         args.append(since)
     rows = con.execute(
-        f"SELECT pnl_pct FROM trades {where}", args).fetchall()
+        f"SELECT pnl_pct FROM trades_live {where}", args).fetchall()
     return _bucket_stats(rows)
 
 
@@ -8058,7 +8191,7 @@ def _trades_bucket_strat(con, strategies: tuple, col, lo, hi):
     """Статистика по диапазону признака для набора стратегий (tuple)."""
     placeholders = ','.join('?' * len(strategies))
     rows = con.execute(
-        f"SELECT pnl_pct FROM trades "
+        f"SELECT pnl_pct FROM trades_live "
         f"WHERE strategy IN ({placeholders}) AND {col} >= ? AND {col} < ?",
         (*strategies, lo, hi)).fetchall()
     return _bucket_stats(rows)
@@ -8073,14 +8206,21 @@ def stats_analyze() -> str:
 
         # ── БЛОК 1: SMC / RSI ────────────────────────────────────────
         total_smc_rsi = con.execute(
-            "SELECT COUNT(*) FROM trades WHERE strategy IN ('SMC','RSI')"
+            "SELECT COUNT(*) FROM trades_live WHERE strategy IN ('SMC','RSI')"
         ).fetchone()[0]
         total_last_smc_rsi = con.execute(
-            "SELECT COUNT(*) FROM trades WHERE strategy IN ('SMC','RSI') AND close_time > ?",
+            "SELECT COUNT(*) FROM trades_live WHERE strategy IN ('SMC','RSI') AND close_time > ?",
             (epoch,)).fetchone()[0] if epoch else 0
 
         lines = [f'🔬 <b>Анализ реальных сделок SMC/RSI</b>']
         lines.append(f'Всего: {total_smc_rsi} | С деплоя: {total_last_smc_rsi}')
+        # [v81] строки с dup_of исключены из всех блоков (представление trades_live)
+        try:
+            _marked = con.execute("SELECT COUNT(*) FROM trades WHERE dup_of IS NOT NULL").fetchone()[0]
+            _unmarked = len(_trades_dup_drop_ids(con)) - _marked
+            lines.append(f'исключено дублей: {_marked}' + (f' (ещё {_unmarked} точных копий не помечено — /trades_dups_mark)' if _unmarked > 0 else ''))
+        except Exception:
+            pass
         if total_smc_rsi < 15:
             lines.append('\n⚠️ Мало данных (нужно 30+ по сегменту).')
             lines.append('Признаки уже копятся — анализ улучшится.')
@@ -8088,7 +8228,7 @@ def stats_analyze() -> str:
             lines.append('')
             for strat in ('SMC', 'RSI'):
                 rows = con.execute(
-                    "SELECT pnl_pct FROM trades WHERE strategy=?",
+                    "SELECT pnl_pct FROM trades_live WHERE strategy=?",
                     (strat,)).fetchall()
                 n, wr, avg, pf = _bucket_stats(rows)
                 if n == 0:
@@ -8099,7 +8239,7 @@ def stats_analyze() -> str:
             lines.append('\n<b>Направление:</b>')
             for d in ('Long', 'Short'):
                 rows = con.execute(
-                    "SELECT pnl_pct FROM trades WHERE strategy IN ('SMC','RSI') AND direction=?",
+                    "SELECT pnl_pct FROM trades_live WHERE strategy IN ('SMC','RSI') AND direction=?",
                     (d,)).fetchall()
                 n, wr, avg, pf = _bucket_stats(rows)
                 if n:
@@ -8113,7 +8253,7 @@ def stats_analyze() -> str:
             # строк не сходилась с "Всего" (44 из 51). GROUP BY по факт.
             # значениям гарантирует точную сумму по построению.
             _reason_rows = con.execute(
-                "SELECT close_reason, COUNT(*), AVG(pnl_pct) FROM trades "
+                "SELECT close_reason, COUNT(*), AVG(pnl_pct) FROM trades_live "
                 "WHERE strategy IN ('SMC','RSI') GROUP BY close_reason"
             ).fetchall()
             for reason, n, avg in sorted(_reason_rows, key=lambda r: -r[1]):
@@ -8121,7 +8261,7 @@ def stats_analyze() -> str:
 
             lines.append('\n<b>Причина × Направление:</b>')
             _reason_dir_rows = con.execute(
-                "SELECT direction, close_reason, COUNT(*), AVG(pnl_pct) FROM trades "
+                "SELECT direction, close_reason, COUNT(*), AVG(pnl_pct) FROM trades_live "
                 "WHERE strategy IN ('SMC','RSI') GROUP BY direction, close_reason"
             ).fetchall()
             for d, reason, n, avg in sorted(_reason_dir_rows, key=lambda r: (r[0] or '', -r[2])):
@@ -8174,7 +8314,7 @@ def stats_analyze() -> str:
             lines.append('\n<b>BTC за время сделки (SMC Long):</b>')
             for lbl, lo, hi in [('&lt;-1%', -99, -1), ('-1..+1%', -1, 1), ('&gt;+1%', 1, 99)]:
                 rows_btc = con.execute(
-                    "SELECT pnl_pct FROM trades WHERE strategy='SMC' AND direction='Long' "
+                    "SELECT pnl_pct FROM trades_live WHERE strategy='SMC' AND direction='Long' "
                     "AND btc_entry_price > 0 AND btc_move_pct >= ? AND btc_move_pct < ?",
                     (lo, hi)).fetchall()
                 n, wr, avg, pf = _bucket_stats(rows_btc)
@@ -8188,7 +8328,7 @@ def stats_analyze() -> str:
             # (не в этой правке — см. BOT_SPEC §2.14 находки шага 0/§4).
             lines.append('\n<b>BTC-тренд на входе × Long:</b>')
             _bt_rows = con.execute(
-                "SELECT btc_trend, COUNT(*), AVG(pnl_pct) FROM trades "
+                "SELECT btc_trend, COUNT(*), AVG(pnl_pct) FROM trades_live "
                 "WHERE strategy='SMC' AND direction='Long' AND btc_trend != '' "
                 "GROUP BY btc_trend").fetchall()
             if _bt_rows:
@@ -8207,7 +8347,7 @@ def stats_analyze() -> str:
             _smc_fee_roe = 2 * FEE_RATE * 100 * LEVERAGE
             _fwd_rows = con.execute(
                 f"SELECT pnl_pct - {_smc_fee_roe}, btc_move_pct, btc_entry_price "
-                "FROM trades WHERE strategy='SMC' AND direction='Long' "
+                "FROM trades_live WHERE strategy='SMC' AND direction='Long' "
                 "AND open_time >= ?", (SMC_FORWARD_FROM,)).fetchall()
             _fn, _fwr, _favg, _fpf = _bucket_stats([(r[0],) for r in _fwd_rows])
             lines.append(f'\n<b>ФОРВАРД SMC Long с {SMC_FORWARD_FROM}:</b>')
@@ -8233,7 +8373,7 @@ def stats_analyze() -> str:
             lines.append('\n<b>Режим 4ч (SMC, net):</b>')
             _rg = _regime_split_lines(con.execute(
                 f"SELECT pnl_pct - {_smc_fee_roe}, direction, COALESCE(regime_4h,'') "
-                "FROM trades WHERE strategy='SMC'").fetchall())
+                "FROM trades_live WHERE strategy='SMC'").fetchall())
             lines += _rg if _rg else ['  нет данных — запустите /regime_backfill']
 
             # [v76] R-метрики для живого SMC: R = pnl_net / sl_dist_pct требует SL
@@ -8242,7 +8382,7 @@ def stats_analyze() -> str:
             # trades (отдельным деплоем: схема + INSERT), здесь — только отчёт.
             lines.append('\n<b>R-метрики (SMC live):</b>')
             _lr = con.execute(
-                "SELECT pnl_pct, entry_price, sl_price FROM trades WHERE strategy='SMC'").fetchall()
+                "SELECT pnl_pct, entry_price, sl_price FROM trades_live WHERE strategy='SMC'").fetchall()
             _lok = [((p - _smc_fee_roe) / (abs(e - sl) / e * 100 * LEVERAGE))
                     for p, e, sl in _lr if sl and sl > 0 and e and abs(e - sl) > 0]
             _lex = len(_lr) - len(_lok)
@@ -8259,7 +8399,7 @@ def stats_analyze() -> str:
             # без отдельного анализа вариант (а) не применяется).
             lines.append('\n<b>ADX Уайлдера на входе (SMC live, adx_wilder, с v78):</b>')
             _aw = con.execute(
-                "SELECT pnl_pct, entry_price, sl_price, adx_wilder FROM trades "
+                "SELECT pnl_pct, entry_price, sl_price, adx_wilder FROM trades_live "
                 "WHERE strategy='SMC' AND adx_wilder > 0").fetchall()
             for lbl, lo, hi in [('&lt;18', 0.0001, 18), ('18-25', 18, 25), ('25+', 25, 999)]:
                 _g = [r for r in _aw if lo <= r[3] < hi]
@@ -8289,11 +8429,11 @@ def stats_analyze() -> str:
         sa_new = con.execute(
             "SELECT pnl_pct, direction, rsi_val, alt_score, vol_ratio, "
             "close_reason, entry_hour, vwap_dist, mfe_pct, dur_min, "
-            "htf_trend, mfe_time_min, btc_trend, entry_rr, funding_rate FROM trades "
+            "htf_trend, mfe_time_min, btc_trend, entry_rr, funding_rate FROM trades_live "
             "WHERE strategy='SA'"
         ).fetchall()
         sa_deploy = con.execute(
-            "SELECT COUNT(*) FROM trades WHERE strategy='SA' AND close_time > ?",
+            "SELECT COUNT(*) FROM trades_live WHERE strategy='SA' AND close_time > ?",
             (epoch,)).fetchone()[0] if epoch else len(sa_new)
 
         lines.append(f'\n\n📈 <b>Анализ реальных сделок SA</b>')
@@ -8464,7 +8604,7 @@ def stats_analyze() -> str:
         # AI-оракул ценность. ai_conf уже логируется в trades для каждой
         # реальной сделки; conf=0 = оракул был недоступен/выключен/зафейлил
         # ВСЕ модели (fail-open), не реальный низкий вердикт.
-        ai_rows = con.execute("SELECT pnl_pct, ai_conf FROM trades").fetchall()
+        ai_rows = con.execute("SELECT pnl_pct, ai_conf FROM trades_live").fetchall()
         if ai_rows:
             lines.append('\n📡 <b>AI conf входа (все стратегии):</b>')
             for lbl, lo, hi in [('0 (оракул недоступен/выключен)', 0, 1),
@@ -8563,6 +8703,14 @@ async def check_tg_commands():
             elif cmd == '/trades_dups':
                 # [v78] ТОЛЬКО чтение (SQLite mode=ro): ничего не удаляет и не меняет
                 await tg(trades_dups_text())
+
+            elif cmd == '/trades_dups_mark':
+                # [v81] ОДНОРАЗОВАЯ идемпотентная пометка копий (dup_of); ничего не удаляет
+                await tg(trades_dups_mark_text())
+
+            elif cmd == '/dups_impact':
+                # [v81] ТОЛЬКО чтение: числа до/после исключения дублей
+                await tg(dups_impact_text())
 
             elif cmd == '/smc_entry_audit':
                 # [v79] ТОЛЬКО SELECT (SQLite mode=ro): MFE/MAE живого SMC, диагностика «входа в погоне»
@@ -8687,6 +8835,8 @@ async def check_tg_commands():
                     '/trades_dups — дубли в trades (только чтение), влияние на SMC\n'
                     '/smc_regime_check — режимный фильтр SMC Long: форвард и история\n'
                     '/smc_entry_audit — MFE/MAE живого SMC (только чтение), диагностика входа в погоне\n'
+                    '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
+                    '/dups_impact — SMC/SA/режим: числа до и после исключения дублей (только чтение)\n'
                     '/maxdd_reset — снять ОБЩИЙ breaker и переснять пик эквити (после вывода средств)\n'
                     '/reset — сброс дневной статистики\n'
                     '/stop — остановка торговли\n'
