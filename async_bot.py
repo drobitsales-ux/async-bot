@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v82'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v83'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -246,6 +246,9 @@ SMC2_TIMEOUT_BARS   = 16     # баров после входа
 SMC2_MAX_PER_DAY    = 60     # записей (MKT+RT) в сутки
 SMC2_EVENT_DEDUP_SEC = 2 * 3600   # одно событие на (sym, направление, 2 часа)
 SMC2_SL_BOUNDS      = (0.3, 3.0)  # дистанция SL, % цены входа
+# [v83] Измерение гипотезы H1 (пре-коммит BOT_SPEC §2.24, 2026-10-06): события SMC2_MKT с adx_wilder >= 25 против < 25,
+# ТОЛЬКО open_time >= SMC2_H1_FROM. Только строка отчёта — критерий и порог 25 не менялись (подбирать нельзя).
+SMC2_H1_FROM        = os.getenv('SMC2_H1_FROM', '2026-10-07')
 # [v79] КОНТРАКТ SMC2 (пре-коммит, зафиксирован ДО данных; параметры НЕ меняются до решения).
 # Форвард с SMC2_FORWARD_FROM (дата деплоя v79).
 # (А) Промоушен варианта (RT или MKT) × направления в микро-live
@@ -1571,6 +1574,50 @@ def _smc2_event_pairs(con, since):
     return pairs
 
 
+def _welch_t(a, b) -> float:
+    """[v83] Welch t для разности средних (a − b); при n<2 в любой группе или нулевой дисперсии → 0.0."""
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    va = sum((x - ma) ** 2 for x in a) / (len(a) - 1)
+    vb = sum((x - mb) ** 2 for x in b) / (len(b) - 1)
+    se = math.sqrt(va / len(a) + vb / len(b))
+    return (ma - mb) / se if se > 0 else 0.0
+
+
+def _smc2_h1_lines(con) -> list:
+    """[v83] ФОРВАРД H1 (пре-коммит BOT_SPEC §2.24): SMC2_MKT, open_time >= SMC2_H1_FROM, adx_wilder > 0, оба направления.
+    Критерий (все условия): n(ADX>=25) >= 30; PF net >= 1.3; mean R net > 0 при t >= 2.0; разность средних R net
+    (>=25 минус <25) > 0 при Welch t >= 2.0. SMC2_RT — справочно (решения по нему нет). Ничего не фильтрует."""
+    ck = lambda b: '✅' if b else '❌'
+    fee = 2 * FEE_RATE * 100
+    L = [f'\n  <b>ФОРВАРД H1 (пре-коммит §2.24): adx_wilder ≥ 25, только open_time ≥ {SMC2_H1_FROM}</b>']
+    def grp(strat):
+        rows = con.execute(
+            "SELECT pnl_pct - ?, entry_price, sl_price, adx_wilder FROM shadow_signals WHERE status='closed' AND recalc!=2 "
+            "AND strategy=? AND open_time>=? AND adx_wilder>0", (fee, strat, SMC2_H1_FROM)).fetchall()
+        hi, lo = [], []
+        for net, e, sl, aw in rows:
+            if not sl or not e or sl <= 0 or abs(e - sl) <= 0:
+                continue
+            (hi if aw >= 25 else lo).append((net, net / (abs(e - sl) / e * 100)))
+        return hi, lo
+    for strat, main in (('SMC2_MKT', True), ('SMC2_RT', False)):
+        hi, lo = grp(strat)
+        hn, ln = len(hi), len(lo)
+        _n, hm, ht = _mean_r_t([r for _, r in hi])
+        _n2, lm, _lt = _mean_r_t([r for _, r in lo])
+        hpf, lpf = _pf_net([x for x, _ in hi]), _pf_net([x for x, _ in lo])
+        wt = _welch_t([r for _, r in hi], [r for _, r in lo])
+        L.append(f'  {strat}{"" if main else " (справочно, решения нет)"}: ADX≥25 n={hn} PF net {_fpf(hpf)} mean R {hm:+.3f} ({_t_str(hn, ht)}) | '
+                 f'ADX&lt;25 n={ln} PF net {_fpf(lpf)} mean R {lm:+.3f} | разность R {hm - lm:+.3f} (Welch t {wt:.2f})')
+        if main:
+            c1, c2, c3, c4 = hn >= 30, hpf >= 1.3, (hn >= 10 and hm > 0 and ht >= 2.0), (hn >= 10 and ln >= 10 and hm - lm > 0 and wt >= 2.0)
+            L.append(f'  H1: n&gt;=30 {ck(c1)} | PF net&gt;=1.3 {ck(c2)} | mean R&gt;0 при t&gt;=2.0 {ck(c3)} | разность&gt;0 при Welch t&gt;=2.0 {ck(c4)} → '
+                     + ('ПОДТВЕРЖДЕНА ✅ (не допуск в live — §2.24)' if (c1 and c2 and c3 and c4) else 'не подтверждена (рано / нет эффекта)'))
+    return L
+
+
 def _smc2_report_lines(con) -> list:
     """[v79] Секция SMC2 для /shadow_analyze: по каждому варианту (MKT/RT) × направление — ФОРВАРД-строка
     контракта (А) (n>=100, PF net>=1.3, mean R>0 при t>=2.5), сегменты (rsi, alt_score, час, adx_wilder,
@@ -1615,6 +1662,7 @@ def _smc2_report_lines(con) -> list:
         seg('Режим 4ч × направление', 'reg', [(f'{rg}×{d}', (lambda rg_, d_: (lambda r: r[2] == rg_ and r[1] == d_))(rg, d))
                                               for rg in ('Up', 'Flat', 'Down') for d in ('Long', 'Short')])
         seg_rows[strat] = rows
+    L += _smc2_h1_lines(con)
     # Блок (Б)
     pairs = _smc2_event_pairs(con, since)
     n = len(pairs)
@@ -6520,6 +6568,78 @@ async def send_digest_now(date_str: str = None):
         await tg('⚠️ [DIGEST] не удалось записать файл дайджеста (см. логи) — вердикт выше по данным из БД.')
 
 
+# ───────────────────────────────────────────────────────
+#  [v83] ОТЧЁТЫ ФАЙЛОМ ПО КОМАНДЕ — как дайджест
+#  Длинные отчёты (/shadow_analyze, /stats_analyze, пакет /analysis_pack) в чате режутся на куски по 4000 символов
+#  и теряются при копировании. Теперь они пишутся в текстовый файл (DIGEST_DIR, рядом с дайджестами) и уходят
+#  документом (sendDocument). Содержимое отчёта не меняется — только доставка; HTML-теги Telegram убираются,
+#  &lt; &gt; &amp; возвращаются в обычные символы. При сбое файла/отправки отчёт уходит в чат, как раньше.
+# ───────────────────────────────────────────────────────
+REPORT_KEEP = int(os.getenv('REPORT_KEEP', '10'))   # файлов каждого вида (shadow_analyze_*, stats_analyze_*, analysis_pack_*)
+
+
+def _report_plain(text: str) -> str:
+    """[v83] Текст отчёта Telegram-HTML → обычный текст для файла."""
+    import html as _html
+    import re as _re
+    t = _re.sub(r'</?(?:b|i|u|s|code|pre|a)(?:\s[^>]*)?>', '', text)
+    return _html.unescape(t)
+
+
+def _report_header(title: str) -> str:
+    return (f'# {title}\n'
+            f'# сформирован: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")} UTC | код {CODE_VERSION} | аптайм {(time.time() - _PROCESS_START_TS) / 3600:.1f} ч\n'
+            f'# параметры: SMC_LIVE={SMC_LIVE} SMC_SIG_FROM={SMC_SIG_FROM} SMC2_FORWARD_FROM={SMC2_FORWARD_FROM} '
+            f'SMC2_H1_FROM={SMC2_H1_FROM} FEE_RATE={FEE_RATE} LEVERAGE={LEVERAGE}\n'
+            f'# PF/Avg без пометки — до комиссий (live); shadow-отчёты — net; решения — только по net\n'
+            f'{"=" * 78}\n')
+
+
+def _write_report_file(prefix: str, title: str, body: str) -> str:
+    """[v83] Пишет отчёт в DIGEST_DIR/{prefix}_YYYY-MM-DD_HHMM.txt, хранит REPORT_KEEP последних файлов вида.
+    → путь или '' при ошибке. Исключений наружу нет."""
+    try:
+        os.makedirs(DIGEST_DIR, exist_ok=True)
+        fpath = os.path.join(DIGEST_DIR, f'{prefix}_{datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")}.txt')
+        with open(fpath, 'w', encoding='utf-8') as f:
+            f.write(_report_header(title) + _report_plain(body) + '\n')
+        for old in sorted(glob.glob(os.path.join(DIGEST_DIR, f'{prefix}_*.txt')))[:-REPORT_KEEP]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+        return fpath
+    except Exception as _e:
+        logging.warning(f'[REPORT] запись файла {prefix} не удалась: {_e}')
+        return ''
+
+
+async def send_report_file(prefix: str, title: str, body: str) -> bool:
+    """[v83] Отправляет отчёт файлом; при любом сбое — прежним способом (текст в чат, режется по 4000)."""
+    fpath = _write_report_file(prefix, title, body)
+    if fpath and await tg_send_document(fpath, caption=f'{title} | {os.path.basename(fpath)} | {len(body.splitlines())} строк'):
+        return True
+    await tg('⚠️ [REPORT] файл не удалось записать/отправить — отчёт текстом ниже (может быть разбит на части)')
+    await tg(body)
+    return False
+
+
+async def send_analysis_pack() -> bool:
+    """[v83] /analysis_pack — ОДИН файл для разбора: shadow_analyze + stats_analyze + smc_regime_check + smc_entry_audit
+    + dups_impact (всё только чтение). Сбой одной секции не роняет остальные."""
+    parts = []
+    for title, fn in (('SHADOW_ANALYZE', shadow_analyze), ('STATS_ANALYZE (живые сделки)', stats_analyze),
+                      ('SMC_REGIME_CHECK', smc_regime_check_text), ('SMC_ENTRY_AUDIT', smc_entry_audit_text),
+                      ('DUPS_IMPACT', dups_impact_text)):
+        try:
+            body = fn()
+        except Exception as _e:
+            logging.exception(f'[REPORT] секция {title} упала')
+            body = f'[ошибка секции: {_e}]'
+        parts.append(f'\n{"#" * 78}\n## {title}\n{"#" * 78}\n{body}\n')
+    return await send_report_file('analysis_pack', 'Пакет отчётов для анализа', ''.join(parts))
+
+
 async def maybe_send_daily_digest():
     """[v67] Автоотправка суточного дайджеста в DIGEST_HOUR UTC — за ПРЕДЫДУЩИЕ
     полные сутки (в 09:00 UTC текущий день только начался, отчёт о нём был
@@ -6557,8 +6677,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-03-v82'
+CODE_VERSION = '2026-10-06-v83'
 CHANGELOG = [
+    ('2026-10-06-v83', 'ТОЛЬКО ОТЧЁТЫ И ИХ ДОСТАВКА (торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск, bybit_worker.py не менялись). Отчёты файлом по команде, как дайджест: /shadow_analyze теперь по умолчанию присылается ТЕКСТОВЫМ ФАЙЛОМ (sendDocument; чат режет отчёт на куски по 4000 символов и при копировании часть терялась), /shadow_analyze text — прежний вывод в чат; /stats_analyze file — то же для живых сделок; /analysis_pack — один файл со всеми аналитическими отчётами (shadow_analyze, stats_analyze, smc_regime_check, smc_entry_audit, dups_impact; сбой секции не роняет остальные). Содержимое отчётов не менялось: HTML-теги Telegram убираются, &lt; &gt; &amp; возвращаются в обычные символы; в шапке файла — время, версия кода, аптайм, параметры (SMC_LIVE, SMC_SIG_FROM, SMC2_FORWARD_FROM, SMC2_H1_FROM, FEE_RATE, LEVERAGE) и пометка gross/net; файлы пишутся в DIGEST_DIR (/data/logs) как prefix_YYYY-MM-DD_HHMM.txt, хранится REPORT_KEEP=10 последних каждого вида (дайджесты не затрагиваются); при сбое записи/отправки отчёт уходит в чат, как раньше. Секция SMC2 /shadow_analyze дополнена строкой ФОРВАРД H1 по пре-коммиту BOT_SPEC 2.24 (SMC2_MKT, adx_wilder >= 25 против < 25, только open_time >= SMC2_H1_FROM=2026-10-07; критерий не менялся, ничего не фильтрует)'),
     ('2026-10-03-v82', 'ТОЛЬКО ОТЧЁТЫ: net-версии PF/Avg живых сделок. Торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск и bybit_worker.py не менялись. Заголовочные PF/Avg в /stats_analyze были gross (trades.pnl_pct комиссию не включает): SMC показывал PF 1.39 при PF net 1.18 в /dups_impact на той же выборке (ранее 1.56 и 1.86 — тоже gross). Теперь во всех строках живых сделок /stats_analyze (заголовки SMC/RSI/SA, направление, причины закрытия, причина x направление, срезы ADX/RSI/alt-score/час/объём/BTC/HTF/RR/funding/AI conf, свод BTC-тренда) рядом с gross показан net: PF 1.39 (net 1.18), Avg +0.71% (net +x.xx%) — net = pnl_pct - 2*FEE_RATE*100*LEVERAGE, та же формула (_pf_net), что в /dups_impact; ⭐ ставится по PF net (n>=10); в шапке строка PF/Avg без пометки — до комиссий; решения — только по net; PF без убытков = inf вместо прежнего ложного 0.00. /stats и дневной отчёт: Avg с net (PF там нет); суточный дайджест PF/Avg живых сделок не содержит (WR и PnL в USDT — net). Блоки ФОРВАРД, ADX Уайлдера, режим 4ч (SMC, net), shadow-отчёты уже были net — не менялись. WR по-прежнему по pnl_pct > 0 (до комиссий)'),
     ('2026-10-03-v81', 'ЗАПИСЬ ЗАКРЫТИЙ: идемпотентный log_trade. Логика сигналов SMC/SMC_SIG/SMC2/PO3/RB, контракты, SMC_LIVE (false), риск, breaker-ы v76/v77, замер задержек, сопровождение живых позиций (SL/TP/BE/трейлинг) и bybit_worker.py НЕ менялись. Шаг 0: log_trade вызывается из 6 мест (MOM-трейл, жёсткий потолок, SMC/SA smart-timeout, обычный таймаут, закрытие на бирже); общая причина дублей — запись закрытия не атомарна с удалением позиции из списка и с диском (список усекается только после цикла, таймаут-пути save_all не зовут): W1 — неперехваченное исключение в process_pos любой позиции прерывает monitor_all до усечения, закрытая позиция пишется повторно каждый цикл (точные дубли); W2 — рестарт между записью и финальным save_all воскрешает позицию, второе закрытие пишется с иной причиной/pnl (близкие дубли); оба воспроизведены тестом на v80. Правка 1: DUP-GUARD в log_trade — ключ (strategy, symbol, direction, open_time), open_time ставится один раз при открытии (мкс) и хранится в JSON; перед INSERT проверка «есть строка с dup_of IS NULL» -> запись пропускается, [DUP-GUARD] в лог, счётчик в дайджест, сбой проверки не теряет сделку; колонка trades.dup_of INTEGER DEFAULT NULL (миграция) и представление trades_live (SELECT * WHERE dup_of IS NULL), все отчёты по живым сделкам читают его; /trades_dups_mark — одноразовая идемпотентная пометка копий точных дублей (dup_of = id первой строки группы, ничего не удаляется, повтор помечает 0, близкие дубли не помечаются); шапка /stats_analyze: исключено дублей N. INSERT log_trade не менялся (35/35). Правка 2: /dups_impact (только чтение) — SMC все/форвард, SA live, SMC Long x режим: n, WR, PF net до и после исключения дублей, Fisher'),
     ('2026-10-02-v80', 'ТОЛЬКО ИЗМЕРЕНИЕ, живая логика и логика входа/выхода shadow НЕ менялись (SMC_LIVE=false, SMC_SIG, SMC2, контракты, LEVERAGE, RISK_PER_TRADE, breaker-ы, PO3, RB, calc_adx, bybit_worker.py — как в v79). Бэклог п.10 (BOT_SPEC 2.20.0): аудит прода показал, что у shadow-записей MFE/MAE нигде не хранятся (mfe_price у path-стратегий остаётся ценой входа), поэтому: колонки shadow_signals.mfe_pct/mae_pct (NULL = запись до v80), чистая функция _shadow_excursion (MFE/MAE пути цены от бара входа до бара выхода, % цены; для SL бар выхода в MFE не входит — нижняя оценка), запись при закрытии в _shadow_check_path (UPDATE, INSERT не менялся: shadow_record 33 колонки, log_trade 35/35); /smc_entry_audit дополнен блоком по SMC_SIG/SMC2_MKT/SMC2_RT (доля MFE<0.2%, медиана MFE, MFE победителей и SL-записей, выходы SL/TP/TIMEOUT по exit_price, медиана минут до бара SL, MFE/MAE в R, записи до v80 отдельно) — только SELECT, mode=ro'),
@@ -8814,8 +8935,12 @@ async def check_tg_commands():
                 stats_text = get_trades_stats()
                 await tg(stats_text)
 
-            elif cmd == '/stats_analyze':
-                await tg(stats_analyze())
+            elif cmd == '/stats_analyze' or cmd.startswith('/stats_analyze '):
+                # [v83] '/stats_analyze file' — файлом; без аргумента — в чат, как раньше
+                if 'file' in cmd.split()[1:]:
+                    await send_report_file('stats_analyze', 'Анализ живых сделок (/stats_analyze)', stats_analyze())
+                else:
+                    await tg(stats_analyze())
 
             elif cmd == '/report':
                 # ручной вызов итогов дня (сбрасываем гард чтобы отправить сейчас)
@@ -8867,6 +8992,9 @@ async def check_tg_commands():
                     '/trades_dups — дубли в trades (только чтение), влияние на SMC\n'
                     '/smc_regime_check — режимный фильтр SMC Long: форвард и история\n'
                     '/smc_entry_audit — MFE/MAE живого SMC (только чтение), диагностика входа в погоне\n'
+                    '/shadow_analyze — shadow-отчёт ФАЙЛОМ (без обрезки); /shadow_analyze text — в чат\n'
+                    '/stats_analyze file — отчёт по живым сделкам файлом\n'
+                    '/analysis_pack — один файл: shadow + живые + режим + аудит входа + дубли\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
                     '/dups_impact — SMC/SA/режим: числа до и после исключения дублей (только чтение)\n'
                     '/maxdd_reset — снять ОБЩИЙ breaker и переснять пик эквити (после вывода средств)\n'
@@ -8881,8 +9009,16 @@ async def check_tg_commands():
             elif cmd == '/shadow_reset':
                 await tg(shadow_reset())
 
-            elif cmd == '/shadow_analyze':
-                await tg(shadow_analyze())
+            elif cmd == '/shadow_analyze' or cmd.startswith('/shadow_analyze '):
+                # [v83] по умолчанию — ФАЙЛОМ (ничего не режется); '/shadow_analyze text' — как раньше, в чат
+                if 'text' in cmd.split()[1:]:
+                    await tg(shadow_analyze())
+                else:
+                    await send_report_file('shadow_analyze', 'Shadow-анализ (/shadow_analyze)', shadow_analyze())
+
+            elif cmd == '/analysis_pack':
+                # [v83] один файл: shadow + live + режим + аудит входа + дубли (только чтение)
+                await send_analysis_pack()
 
             elif cmd == '/shadow_recalc' or cmd.startswith('/shadow_recalc '):
                 # [v74] /shadow_recalc [dry] — пересчёт затянутых shadow-записей
