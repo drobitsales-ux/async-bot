@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v84'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v85'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -79,16 +79,13 @@ def _parse_chat_id() -> int:
 CHAT_ID = _parse_chat_id()
 BINGX_KEY     = os.getenv('BINGX_API_KEY')
 BINGX_SECRET  = os.getenv('BINGX_SECRET')
-GEMINI_KEY    = os.getenv('GEMINI_API_KEY')
-# [v68] модель Gemini в ENV — 08.2026 gemini-2.0-flash перестала быть
-# доступна ('no longer available'), хардкод-имя означал деплой на любую
-# смену модели у провайдера.
-GEMINI_MODEL  = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
-OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY', '')  # https://openrouter.ai (бесплатно)
 
 # ── Риск-параметры (оба алгоритма) ─────────────────────
-RISK_PER_TRADE   = 0.01     # [USER] 1% на сделку (тест; для проп → 0.0075)
-RISK_WEEKEND     = 0.01     # [USER] 1% в выходные (тест; для проп → 0.00375)
+# [v85] Риск задаётся ОДНОЙ константой: доля эквити на сделку, 0.0025 = 0.25%. Все *_RISK_MULT = 1.0.
+# Старт блокируется, если эффективный риск вне (0, RISK_MAX_EFFECTIVE] (защита от ошибки единиц: 0.25 вместо 0.0025).
+RISK_PER_TRADE   = 0.0025
+RISK_WEEKEND     = RISK_PER_TRADE   # выходные — тот же риск (раньше равнялся 1%, как и будни)
+RISK_MAX_EFFECTIVE = 0.01
 MAX_TOTAL_POS    = 3        # [R-FIX-2] суммарно SMC+RSI
 MAX_PER_DIR      = 2        # макс 2 лонга или 2 шорта
 # ── [MOMENTUM] режим тренд-следования (shadow по умолчанию) ──
@@ -110,7 +107,7 @@ MOM_RSI_LONG_MIN  = float(os.getenv('MOM_RSI_LONG_MIN', '65'))
 # возврата PB нужны оба флага.
 PB_ENABLED   = os.getenv('PB_ENABLED', 'false').lower() == 'true'   # shadow-детект pullback
 PB_LIVE      = os.getenv('PB_LIVE', 'false').lower() == 'true'      # [PB] gated live (микро-размер)
-PB_RISK_MULT = float(os.getenv('PB_RISK_MULT', '0.25'))            # [PB] 25% риска до накопления n>=30
+PB_RISK_MULT = float(os.getenv('PB_RISK_MULT', '1.0'))            # [PB] 25% риска до накопления n>=30
 PB_NEAR_PCT  = float(os.getenv('PB_NEAR_PCT', '0.012'))  # близость к EMA20 (1.2%)
 PB_RSI_LO    = float(os.getenv('PB_RSI_LO', '40'))       # RSI reset зона: низ
 PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: верх   # лонг только если RSI < этого
@@ -250,6 +247,23 @@ SMC2_SL_BOUNDS      = (0.3, 3.0)  # дистанция SL, % цены входа
 # [v83] Измерение гипотезы H1 (пре-коммит BOT_SPEC §2.24, 2026-10-06): события SMC2_MKT с adx_wilder >= 25 против < 25,
 # ТОЛЬКО open_time >= SMC2_H1_FROM. Только строка отчёта — критерий и порог 25 не менялись (подбирать нельзя).
 SMC2_H1_FROM        = os.getenv('SMC2_H1_FROM', '2026-10-07')
+# ── [v85] ORB_RT — ТОЛЬКО shadow: пробой диапазона ORB (00-06 UTC) закрытием + вход по рынку (ORB_MKT2) или лимитом
+# на пробитой границе (ORB_RT). Диапазон/окно/вселенная — как у ORB (_orb_range_bars); БЕЗ фильтров RSI/VWAP/alt_score/ADX/режима.
+# КОНТРАКТ (зафиксирован ДО данных; параметры НЕ меняются до решения; форвард с ORB_RT_FORWARD_FROM — дата деплоя v85):
+# (А) Промоушен варианта × направления: n >= 100, PF net >= 1.3, mean R net > 0 при t >= 2.5 (net — по модели комиссий
+#     _fee_pct: RT — вход и TP по FEE_MAKER, SL/TIMEOUT по FEE_TAKER).
+# (Б) RT против MKT2 на уровне событий (RT без заполнения = 0): подтверждено при n >= 100 событий, средняя разность > 0,
+#     парный t >= 2.0.
+# Срезы по режиму, часу, ATR — только информационные. Перевод в live — только по правилу BOT_SPEC §2.27.5.
+ORB_RT_ENABLED       = os.getenv('ORB_RT_ENABLED', 'true').lower() == 'true'   # shadow
+ORB_RT_FORWARD_FROM  = os.getenv('ORB_RT_FORWARD_FROM', '2026-10-08')           # ISO-дата деплоя v85 (UTC)
+ORB_RT_VOL_MULT      = 1.5     # объём бара пробоя >= 1.5 × медиана 20 баров до него
+ORB_RT_RETEST_BARS   = 8       # окно ретеста после пробоя
+ORB_RT_SL_ATR        = 1.0     # SL = L (или close[b]) ∓ 1.0 × ATR14(15m) на баре пробоя
+ORB_RT_TP_R          = 2.0
+ORB_RT_TIMEOUT_BARS  = 16      # баров после входа
+ORB_RT_MAX_PER_DAY   = 40      # событий в сутки
+ORB_RT_SL_BOUNDS     = (0.3, 3.0)   # дистанция SL, % цены входа
 # [v79] КОНТРАКТ SMC2 (пре-коммит, зафиксирован ДО данных; параметры НЕ меняются до решения).
 # Форвард с SMC2_FORWARD_FROM (дата деплоя v79).
 # (А) Промоушен варианта (RT или MKT) × направления в микро-live
@@ -296,8 +310,8 @@ SA_TIMEOUT_MFE = float(os.getenv('SA_TIMEOUT_MFE', '0.40'))  # [v42] smart-timeo
 # live (сбор реальных данных с реальным проскальзыванием), но риск на сделку
 # снижен вдвое (1%→0.5% от RISK_PER_TRADE), чтобы вдвое медленнее жечь депозит
 # на время сбора статистики. По образцу PB_RISK_MULT.
-SA_RISK_MULT   = float(os.getenv('SA_RISK_MULT', '0.5'))
-SMC_RISK_MULT = float(os.getenv('SMC_RISK_MULT', '0.5'))
+SA_RISK_MULT   = float(os.getenv('SA_RISK_MULT', '1.0'))   # [v85] было 0.5 (риск теперь одной константой)
+SMC_RISK_MULT = float(os.getenv('SMC_RISK_MULT', '1.0'))   # [v85] было 0.5 при RISK_PER_TRADE=1% (эффективно 0.5% → теперь 0.25%)
 # [v72] Риск SMC урезан вдвое на время эксперимента с пропускной способностью
 # (правка 1, pivot 5→3). WR 29% при n=34 → ожидаемая макс. серия убытков ~13
 # на 100 сделок. Возврат к 1.0 — при n>=30 НОВЫХ сделок с PF net >= 1.3.
@@ -351,6 +365,31 @@ MAX_TRADE_MIN_SA  = 150       # [v36] SA: возврат к дневному VWA
 # нормальные выигрышные сделки, но отсечёт зависания.
 MAX_TRADE_MIN_HARD = int(os.getenv('MAX_TRADE_MIN_HARD', '480'))
 FEE_RATE         = 0.0005
+# [v85] Модель комиссий maker/taker для SHADOW-расчётов net (живая торговля и живые отчёты по-прежнему используют FEE_RATE).
+# Значения — из актуальной сетки комиссий BingX аккаунта владельца (вносит владелец через ENV); по умолчанию
+# maker = taker = FEE_RATE (консервативно, net совпадает с прежним).
+FEE_TAKER        = float(os.getenv('FEE_TAKER', str(FEE_RATE)))
+FEE_MAKER        = float(os.getenv('FEE_MAKER', str(FEE_RATE)))
+_LIMIT_ENTRY_STRATS = ('SMC2_RT', 'ORB_RT')   # вход лимитным ордером на ретесте → FEE_MAKER
+
+
+def _fee_pct(strategy: str, exit_reason: str) -> float:
+    """[v85] Комиссия сделки в shadow, % цены: вход + выход. Вход: лимитный (SMC2_RT, ORB_RT) → FEE_MAKER, иначе
+    (по рынку / по закрытию бара) → FEE_TAKER. Выход: TP (лимитный тейк) → FEE_MAKER; SL и TIMEOUT → FEE_TAKER."""
+    entry = FEE_MAKER if strategy in _LIMIT_ENTRY_STRATS else FEE_TAKER
+    exit_ = FEE_MAKER if str(exit_reason).upper().startswith('TP') else FEE_TAKER
+    return (entry + exit_) * 100
+
+
+def _fee_sql() -> str:
+    """[v85] SQL-выражение той же комиссии _fee_pct для запроса к shadow_signals (колонки strategy, exit_price,
+    tp_price, tp2_price). Выход считается TP, если exit_price == tp_price / tp2_price (причина выхода в таблице
+    не хранится); SL и TIMEOUT → taker. Единый источник для всех net-расчётов shadow-отчётов и контрактов."""
+    ents = ','.join(f"'{x}'" for x in _LIMIT_ENTRY_STRATS)
+    tp = ("((COALESCE(tp_price,0)>0 AND ABS(exit_price-tp_price)<=ABS(tp_price)*1e-9) OR "
+          "(COALESCE(tp2_price,0)>0 AND ABS(exit_price-tp2_price)<=ABS(tp2_price)*1e-9))")
+    return (f"(((CASE WHEN strategy IN ({ents}) THEN {FEE_MAKER!r} ELSE {FEE_TAKER!r} END) + "
+            f"(CASE WHEN {tp} THEN {FEE_MAKER!r} ELSE {FEE_TAKER!r} END))*100)")
 DAILY_DD_LIMIT   = float(os.getenv('DAILY_DD_LIMIT', '0.025'))    # [v76] БОЛЬШЕ НЕ используется breaker-ом (старая метрика); оставлено для совместимости ENV
 DAILY_DD_LIMIT_PCT = float(os.getenv('DAILY_DD_LIMIT_PCT', '1.5'))
 # [v76] Лимит в % эквити на начало дня, с нереализованным PnL —
@@ -361,17 +400,6 @@ DAILY_DD_LIMIT_PCT = float(os.getenv('DAILY_DD_LIMIT_PCT', '1.5'))
 SCAN_LIMIT       = 80       # [EXPAND] 60→80: больше монет, +33% шансов на сетап
 SCAN_SEM         = 60       # [EXPAND] 50→60: больше параллелизма для 80 символов
 MIN_LOT_USDT     = 1.0      # Минимальный размер позиции в USDT (ниже → force close)
-# [v58] Защита от блокировки входов галлюцинацией AI-оракула (Groq выдавал
-# дословно один текст на разных символах независимо от реальных чисел —
-# для SA/RSI при conf<thr это блокировало реальный вход). AI_BLOCK=0 → оракул
-# всегда advisory (только логируется). Дефолт '1' — поведение не меняется.
-AI_BLOCK_ENABLED = os.getenv('AI_BLOCK', '1') == '1'
-# [v68] Аварийный рубильник каскада целиком — если ВСЕ модели мертвы (см.
-# GROQ_MODELS/GEMINI_MODEL выше), нет смысла тратить время цикла на 3
-# заведомо неудачных HTTP-запроса и засорять логи 404. AI_ORACLE_ENABLED=0 →
-# оракул не вызывается вообще, сигнал идёт как advisory 'oracle disabled'.
-AI_ORACLE_ENABLED = os.getenv('AI_ORACLE_ENABLED', '1') == '1'
-
 # ── Webhook для копи-трейдинга (Bybit Worker и другие) ──────────
 # Когда BingX открывает сделку → POST на воркеры со структурой сигнала
 # Добавьте в Render Environment: WORKER_URLS=https://bybit-worker.onrender.com/signal
@@ -1447,11 +1475,10 @@ def smc_regime_check_text() -> str:
 def _sig_rows(con, strat, since, direction=None):
     """[v79] Закрытые shadow-записи (recalc != 2, open_time >= since) → список dict.
     net = pnl_pct − round-trip комиссия (% цены, shadow); R = net / sl_dist_pct (None при sl_price=0)."""
-    fee = 2 * FEE_RATE * 100
-    q = ("SELECT open_time, direction, COALESCE(regime_4h,''), pnl_pct - ?, entry_price, sl_price, "
+    q = ("SELECT open_time, direction, COALESCE(regime_4h,''), pnl_pct - " + _fee_sql() + ", entry_price, sl_price, "
          "btc_move_pct, btc_entry_price, adx_wilder FROM shadow_signals "
          "WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?")
-    args = [fee, strat, since]
+    args = [strat, since]
     if direction:
         q += ' AND direction=?'; args.append(direction)
     out = []
@@ -1548,30 +1575,29 @@ def _smc_sig_contract_lines(con, since=None) -> list:
     return L
 
 
-def _smc2_event_pairs(con, since):
+def _smc2_event_pairs(con, since, mkt_s='SMC2_MKT', rt_s='SMC2_RT', nf_s='SMC2_NF'):
     """[v79] Пары по СОБЫТИЯМ для блока (Б): (event_id, R_mkt, R_rt). R_rt = 0, если ретеста не было
     (маркер SMC2_NF — упущенная сделка это ноль, а не исключение). Берутся только события, где MKT закрыт
     и RT либо закрыт, либо имеет маркер NF. Открытые/ожидающие события не участвуют."""
-    fee = 2 * FEE_RATE * 100
     rr = con.execute(
-        "SELECT smc2_event, strategy, pnl_pct - ?, entry_price, sl_price FROM shadow_signals "
-        "WHERE status='closed' AND recalc!=2 AND strategy IN ('SMC2_MKT','SMC2_RT','SMC2_NF') "
-        "AND smc2_event!='' AND open_time>=?", (fee, since)).fetchall()
+        "SELECT smc2_event, strategy, pnl_pct - " + _fee_sql() + ", entry_price, sl_price FROM shadow_signals "
+        f"WHERE status='closed' AND recalc!=2 AND strategy IN ('{mkt_s}','{rt_s}','{nf_s}') "
+        "AND smc2_event!='' AND open_time>=?", (since,)).fetchall()
     ev: dict = {}
     for eid, st, net, e, sl in rr:
         d = ev.setdefault(eid, {})
-        if st == 'SMC2_NF':
+        if st == nf_s:
             d['nf'] = True
         elif sl and e and sl > 0 and abs(e - sl) > 0:
             d[st] = net / (abs(e - sl) / e * 100)
     pairs = []
     for eid, d in ev.items():
-        if 'SMC2_MKT' not in d:
+        if mkt_s not in d:
             continue
-        if 'SMC2_RT' in d:
-            pairs.append((eid, d['SMC2_MKT'], d['SMC2_RT']))
+        if rt_s in d:
+            pairs.append((eid, d[mkt_s], d[rt_s]))
         elif d.get('nf'):
-            pairs.append((eid, d['SMC2_MKT'], 0.0))
+            pairs.append((eid, d[mkt_s], 0.0))
     return pairs
 
 
@@ -1591,12 +1617,11 @@ def _smc2_h1_lines(con) -> list:
     Критерий (все условия): n(ADX>=25) >= 30; PF net >= 1.3; mean R net > 0 при t >= 2.0; разность средних R net
     (>=25 минус <25) > 0 при Welch t >= 2.0. SMC2_RT — справочно (решения по нему нет). Ничего не фильтрует."""
     ck = lambda b: '✅' if b else '❌'
-    fee = 2 * FEE_RATE * 100
     L = [f'\n  <b>ФОРВАРД H1 (пре-коммит §2.24): adx_wilder ≥ 25, только open_time ≥ {SMC2_H1_FROM}</b>']
     def grp(strat):
         rows = con.execute(
-            "SELECT pnl_pct - ?, entry_price, sl_price, adx_wilder FROM shadow_signals WHERE status='closed' AND recalc!=2 "
-            "AND strategy=? AND open_time>=? AND adx_wilder>0", (fee, strat, SMC2_H1_FROM)).fetchall()
+            "SELECT pnl_pct - " + _fee_sql() + ", entry_price, sl_price, adx_wilder FROM shadow_signals WHERE status='closed' AND recalc!=2 "
+            "AND strategy=? AND open_time>=? AND adx_wilder>0", (strat, SMC2_H1_FROM)).fetchall()
         hi, lo = [], []
         for net, e, sl, aw in rows:
             if not sl or not e or sl <= 0 or abs(e - sl) <= 0:
@@ -1624,7 +1649,7 @@ def _smc2_report_lines(con) -> list:
     контракта (А) (n>=100, PF net>=1.3, mean R>0 при t>=2.5), сегменты (rsi, alt_score, час, adx_wilder,
     FVG, режим×направление) — ТОЛЬКО информационно; блок (Б) — R_event(RT) против R_event(MKT)."""
     since = SMC2_FORWARD_FROM
-    fee = 2 * FEE_RATE * 100
+    fee = _fee_sql()   # [v85] комиссия по типу ордера (SQL-выражение)
     L = [f'\n🎯 SMC2 (shadow, форвард с {since}; контракт — у констант SMC2_*)']
     nf = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE strategy='SMC2_NF' AND open_time>=?", (since,)).fetchone()[0]
     opn = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE status='open' AND strategy IN ('SMC2_MKT','SMC2_RT')").fetchone()[0]
@@ -1640,9 +1665,9 @@ def _smc2_report_lines(con) -> list:
             ok, ex = _forward_r_rows(con, strat, fee, since, 'AND direction=?', (d,))
             L.append(_forward_status_line(d, since, ok, ex, 100))
         rows = con.execute(
-            "SELECT pnl_pct - ?, direction, COALESCE(regime_4h,''), entry_rsi, alt_score, entry_hour, adx_wilder, "
+            f"SELECT pnl_pct - {fee}, direction, COALESCE(regime_4h,''), entry_rsi, alt_score, entry_hour, adx_wilder, "
             "shadow_reason, entry_price, sl_price FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?",
-            (fee, strat, since)).fetchall()
+            (strat, since)).fetchall()
         def seg(title, key, buckets):
             L.append(f'  {title}:')
             for lbl, f in buckets:
@@ -1699,12 +1724,11 @@ def _shadow_entry_audit_lines() -> list:
         cols = {r[1] for r in con.execute('PRAGMA table_info(shadow_signals)').fetchall()}
         if 'mfe_pct' not in cols:
             return L + ['колонки mfe_pct/mae_pct ещё не созданы (миграция при старте v80) — данных нет']
-        fee = 2 * FEE_RATE * 100
         for strat, since in (('SMC_SIG', SMC_SIG_FROM), ('SMC2_MKT', SMC2_FORWARD_FROM), ('SMC2_RT', SMC2_FORWARD_FROM)):
             rows = con.execute(
-                "SELECT direction, entry_price, sl_price, tp_price, exit_price, pnl_pct - ?, mfe_pct, mae_pct, bars_held "
+                "SELECT direction, entry_price, sl_price, tp_price, exit_price, pnl_pct - " + _fee_sql() + ", mfe_pct, mae_pct, bars_held "
                 "FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?",
-                (fee, strat, since)).fetchall()
+                (strat, since)).fetchall()
             no_mfe = sum(1 for r in rows if r[6] is None)
             have = [r for r in rows if r[6] is not None and r[7] is not None]
             L.append(f'\n<b>{strat}</b> с {since}: закрыто {len(rows)}, с MFE/MAE {len(have)} (без — записи до v80: {no_mfe})')
@@ -1863,6 +1887,33 @@ def is_session() -> bool:
 
 def is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
+
+def risk_config_errors() -> list:
+    """[v85] Эффективный риск каждой стратегии = базовый риск (будни/выходные) × её множитель. Должен быть в
+    (0, RISK_MAX_EFFECTIVE]. → список сообщений об ошибках (пусто — конфигурация допустима)."""
+    errs = []
+    for base_name, base in (('RISK_PER_TRADE', RISK_PER_TRADE), ('RISK_WEEKEND', RISK_WEEKEND)):
+        for name, mult in (('база', 1.0), ('SMC_RISK_MULT', SMC_RISK_MULT), ('SA_RISK_MULT', SA_RISK_MULT), ('PB_RISK_MULT', PB_RISK_MULT)):
+            eff = base * mult
+            if not (0 < eff <= RISK_MAX_EFFECTIVE):
+                errs.append(f'{base_name}={base} × {name}={mult} → эффективный риск {eff:.6g} ({eff * 100:.4g}% эквити) вне (0, {RISK_MAX_EFFECTIVE}]')
+    return errs
+
+
+async def verify_risk_config_or_exit():
+    """[v85] Проверка при старте: недопустимый риск → ERROR в лог, сообщение в Telegram с фактическим значением,
+    процесс НЕ стартует (SystemExit)."""
+    errs = risk_config_errors()
+    if errs:
+        msg = '🛑 <b>СТАРТ ЗАБЛОКИРОВАН: недопустимый риск</b>\n' + '\n'.join(errs) + \
+              f'\nОжидается доля эквити, например RISK_PER_TRADE = 0.0025 (0.25%), максимум {RISK_MAX_EFFECTIVE}.'
+        logging.critical(msg.replace('<b>', '').replace('</b>', ''))
+        try:
+            await tg(msg)
+        except Exception:
+            pass
+        raise SystemExit(1)
+
 
 def current_risk() -> float:
     return RISK_WEEKEND if is_weekend() else RISK_PER_TRADE
@@ -2086,577 +2137,12 @@ async def oracle_volume(sym: str, bingx_vol: float = 0) -> bool:
         return bingx_vol >= 100_000
 
 
-# ══════════════════════════════════════════════════════════════
-#  AI ORACLE  —  Groq (primary) → Gemini (fallback) → Score (local)
-#
-#  Groq:   бесплатно, 14 400 req/day, стабильно, регистрация на groq.com
-#  Gemini: резерв при ошибке Groq, 1500 req/day
-#  Score:  локальный скоринг — всегда работает без API
-#
-#  Добавьте в Render Environment:
-#    GROQ_API_KEY = gsk_xxxxxxxxxxxxxxxxxxxx
-#    (GEMINI_API_KEY и OPENROUTER_API_KEY можно оставить как резервы)
-# ══════════════════════════════════════════════════════════════
-
-# ── Groq ─────────────────────────────────────────────────────
-_groq_req_times: list = []
-_groq_quota_ok  = True
-_groq_quota_reset: float = 0.0
-GROQ_RPM        = 25    # запас от лимита 30/min
-# [v66] Основная модель вынесена в ENV — 08.2026 llama-3.1-8b-instant начала
-# возвращать 404 на всех запросах (Groq деприкейтил/переименовал модель),
-# оракул молча работал fail-open несколько суток без единого алерта (см.
-# детектор устойчивого отказа ниже). Актуальное имя задаётся без деплоя.
-# [v68] ВЕСЬ каскад моделей — в ENV (не только первая). 08.2026 дайджесты
-# 26-27.08 зафиксировали ВСЕ три модели каскада мёртвыми одновременно:
-# gemma2-9b-it (decommissioned Groq), llama-3.1-8b-instant (404),
-# llama-3.3-70b-versatile (404) — оракул месяцами отдавал conf=0 fail-open
-# без единого валидного вердикта. Дефолт ниже — те же имена, что были
-# хардкодом до v68 (сохраняет текущее поведение); новые имена задаются
-# через ENV после ручной проверки актуального списка у провайдера —
-# бот сам их не подбирает.
-GROQ_MODELS = [m.strip() for m in os.getenv(
-    'GROQ_MODELS', 'llama-3.1-8b-instant,llama-3.3-70b-versatile,gemma2-9b-it'
-).split(',') if m.strip()]
-
-# [v58] Детектор шаблонных ответов оракула: LLM иногда возвращает дословно
-# один и тот же comment на разных символах независимо от факт. чисел сетапа
-# (задокументировано: ADA @ RSI 66.1, XLM, DASH — все получили
-# 'REJECT (100/100) | RSI > 68'). Храним последние 10 (sym, comment).
-_ai_recent_verdicts: list = []
-
-
-def _ai_template_repeat(sym: str, comment: str) -> bool:
-    """[v58] True, если ПОСЛЕДНИЕ 3 вердикта оракула (включая текущий) несут
-    дословно одинаковый comment на >=2 РАЗНЫХ символах — признак шаблонной
-    галлюцинации, а не реального анализа. Пустой comment не считается."""
-    global _ai_recent_verdicts
-    _ai_recent_verdicts.append((sym, comment))
-    del _ai_recent_verdicts[:-10]  # храним последние 10
-    if not comment or not comment.strip():
-        return False
-    if len(_ai_recent_verdicts) < 3:
-        return False
-    last3 = _ai_recent_verdicts[-3:]
-    same_comment = len({c for _, c in last3}) == 1
-    diff_syms    = len({s for s, _ in last3}) >= 2
-    return same_comment and diff_syms
-
-
-def _ai_apply_template_guard(sym: str, result: dict) -> dict:
-    """[v58] Если ответ оракула — шаблонная галлюцинация (см.
-    _ai_template_repeat), помечает result['advisory']=True: вердикт
-    остаётся в логе как есть, но execute() трактует его как НЕ блокирующий
-    для ВСЕХ стратегий (не только SMC)."""
-    comment = str(result.get('comment', ''))
-    if _ai_template_repeat(sym, comment):
-        logging.warning(
-            f'[AI] шаблонный ответ N раз подряд — вердикт понижен до advisory | '
-            f'"{comment}"'
-        )
-        result['advisory'] = True
-    return result
-
-async def oracle_groq(sym: str, strategy: str, mode: str,
-                      price: float, extra: dict = None) -> dict:
-    """
-    Groq — основной AI Oracle.
-    Бесплатно, 14 400 req/day, стабильные модели без :free суффикса.
-    Регистрация: https://console.groq.com/keys
-    """
-    global _groq_quota_ok, _groq_quota_reset
-
-    groq_key = os.getenv('GROQ_API_KEY', '')
-    if not groq_key or not http:
-        return {'ok': True, 'conf': 0, 'comment': 'groq_not_set'}
-
-    # Quota check
-    if not _groq_quota_ok:
-        if time.time() < _groq_quota_reset:
-            return {'ok': True, 'conf': 0, 'comment': 'groq_quota_wait'}
-        _groq_quota_ok = True
-
-    # Rate limit
-    now_t = time.time()
-    _groq_req_times[:] = [t for t in _groq_req_times if now_t - t < 60]
-    if len(_groq_req_times) >= GROQ_RPM:
-        wait = 61 - (now_t - _groq_req_times[0])
-        await asyncio.sleep(max(0, wait))
-
-    context = {'symbol': sym, 'strategy': strategy,
-               'direction': mode, 'price': round(price, 6)}
-    if extra:
-        ctx_keys = ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')
-        context.update({k: v for k, v in extra.items() if k in ctx_keys})
-
-    # Добавляем контекст BTC + числовые альт-метрики (факты из биржи, не выдумка AI)
-    btc_ctx_str = context.get('btc_trend', 'Flat')
-    _spread = context.get('eth_btc_spread', 0.0)
-    _ascore = context.get('alt_score', 50)
-    alt_ctx_str = (
-        f"altseason ACTIVE (ETH/BTC spread {_spread:+.1f}%, alt_score {_ascore}/100)"
-        if context.get('altseason')
-        else f"no altseason (ETH/BTC spread {_spread:+.1f}%, alt_score {_ascore}/100)"
-    )
-
-    prompt = (
-        'You are a crypto futures risk manager specializing in SMC and RSI mean reversion. '
-        'Evaluate this trade and respond ONLY with valid JSON: '
-        '{"decision":"approve"|"reject","confidence":0-100,"comment":"brief reason"}. '
-        'HARD RULES — proven losses when violated: '
-        # [v29] Разделяем правила по стратегиям — LLM путал SMC Short с SA Long
-        'RULE 1 (SMC ONLY — Short): RSI < 32 → REJECT. TIA(28)SL, XMR(30)SL at absolute floor. '
-        'IMPORTANT: RSI 32-45 after CHoCH is NORMAL — the bearish candle pulls RSI down naturally. Do NOT reject RSI 32-45 for SMC. '
-        'RULE 2 (SMC ONLY — Long): RSI > 68 → REJECT. Overbought late entry. '
-        'RULE 3 (SA STRATEGY — Mean Reversion / Counter-trend): '
-        'If direction is SHORT: High RSI (> 65) means the asset is OVERBOUGHT. This is EXCELLENT for a Short. You MUST APPROVE. NEVER reject a Short because RSI is high. '
-        'If direction is LONG: Low RSI (< 35) means the asset is OVERSOLD. This is EXCELLENT for a Long. You MUST APPROVE. NEVER reject a Long because RSI is low. '
-        'SMC trend rules DO NOT APPLY to SA. SA explicitly trades against the local trend. '
-        'RULE 4 (RSI MR): volume > 3.5x AND sma_dist < 3.5% → REJECT (trend impulse, not MR). '
-        'RULE 5: volume > 3.5x AND sma_dist > 3.5% → consider APPROVE (blow-off top exhaustion). '
-        'High volume = momentum impulse, NOT mean reversion opportunity. '
-        'NEAR Vol=10.8x MFE=0.60%, IMX Vol=3.5x MFE=0.53%, DASH Vol=2.9x MFE=0.07%. '
-        'RULE 6 (RSI MR): If RSI > 88 → REJECT even if volume normal. '
-        'Extreme RSI values with any volume = strong momentum, not reversion. '
-        'SOFT RULES (use judgement): '
-        'BTC:Flat does NOT invalidate altcoin setups. '
-        'During altseason, long setups on altcoins are more valid. '
-        'RSI 40-60 neutral zone for SMC = valid structural trade. '
-        # [v44] Оракул выдал "RSI > 68 for SMC Long" при факт. RSI 66.1 — выдуманная цифра.
-        'ANTI-HALLUCINATION: your comment must cite ONLY numbers present in this request. '
-        'Do not assert numeric facts (thresholds, values) absent from the input data. '
-        'If the data is insufficient to judge, return confidence<50 with comment "insufficient data". '
-        f'Market context: BTC={btc_ctx_str}, {alt_ctx_str}. '
-        f'Setup: {json.dumps(context)}'
-    )
-
-    url = 'https://api.groq.com/openai/v1/chat/completions'
-    headers = {
-        'Authorization': f'Bearer {groq_key}',
-        'Content-Type': 'application/json',
-    }
-
-    _groq_req_times.append(time.time())
-
-    for model in GROQ_MODELS:
-        try:
-            payload = {
-                'model': model,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'temperature': 0.1,
-                'max_tokens': 120,
-            }
-            async with http.post(url, headers=headers, json=payload,
-                                 timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                data = await resp.json()
-
-                if resp.status == 429:
-                    err_msg = str(data.get('error', {}).get('message', ''))
-                    if 'day' in err_msg.lower() or 'daily' in err_msg.lower():
-                        _groq_quota_ok = False
-                        _groq_quota_reset = time.time() + 86400
-                        logging.warning(f'🤖 [GROQ] Daily quota — резерв на 24ч')
-                    else:
-                        logging.warning(f'🤖 [GROQ] {model} 429 rate limit — следующая модель')
-                    continue
-
-                if resp.status != 200 or 'choices' not in data:
-                    err = str(data.get('error', ''))[:80]
-                    logging.warning(f'🤖 [GROQ] {model} {resp.status}: {err}')
-                    continue
-
-                raw = data['choices'][0]['message']['content'].strip()
-                clean = raw
-                if '```' in clean:
-                    clean = clean.split('```')[1].lstrip('json').strip()
-
-                try:
-                    parsed = json.loads(clean)
-                except json.JSONDecodeError:
-                    ok_fb = 'approve' in raw.lower()
-                    logging.info(f'🤖 [GROQ/{model[:12]}] {sym} text→{ok_fb}')
-                    return {'ok': ok_fb, 'conf': 50, 'comment': 'text_fallback'}
-
-                ok   = str(parsed.get('decision', '')).lower() == 'approve'
-                conf = int(parsed.get('confidence', 50))
-                comment = parsed.get('comment', '')
-                if conf < 55:
-                    ok = False
-                verdict = 'APPROVE' if ok else 'REJECT'
-                logging.info(
-                    f'🤖 [GROQ/{model[:12]}] {sym} {strategy} {mode} '
-                    f'→ {verdict} ({conf}/100) | {comment}'
-                )
-                return {'ok': ok, 'conf': conf, 'comment': comment}
-
-        except Exception as e:
-            logging.warning(f'🤖 [GROQ] {model} exception: {e}')
-            continue
-
-    logging.warning(f'🤖 [GROQ] все модели недоступны для {sym}')
-    return {'ok': True, 'conf': 0, 'comment': 'groq_all_failed'}
-
-
-# ── Локальный скоринг (резерв без API) ───────────────────────
-def score_setup_local(strategy: str, mode: str, extra: dict) -> dict:
-    """
-    Алгоритмический скоринг сетапа без LLM.
-    Работает всегда, не зависит от внешних API.
-    """
-    score = 50  # базовый балл
-    reasons = []
-
-    rsi = float(extra.get('rsi', 50))
-    vol_ratio = float(extra.get('vol_ratio', 1.0))
-    btc_trend = str(extra.get('btc_trend', 'Flat'))
-    sma_dist = float(extra.get('sma_dist', 0))
-    vwap_dist = float(extra.get('vwap_dist', 0))
-
-    # [v26] SA — mean-reversion: логика ПРОТИВОПОЛОЖНА трендовой.
-    # Вход ПРОТИВ тренда — это и есть суть стратегии, штрафовать нельзя.
-    if strategy == 'SA':
-        # RSI экстремум = основной сигнал
-        if mode == 'Long' and rsi <= 30:
-            score += 20; reasons.append('RSI deeply oversold')
-        elif mode == 'Long' and rsi <= 35:
-            score += 12; reasons.append('RSI oversold')
-        elif mode == 'Short' and rsi >= 70:
-            score += 20; reasons.append('RSI deeply overbought')
-        elif mode == 'Short' and rsi >= 65:
-            score += 12; reasons.append('RSI overbought')
-        # Volume climax уже отфильтрован в single_asset_signal (>=2.0)
-        # Здесь дополнительно поощряем экстремальный объём
-        if vol_ratio >= 3.0:
-            score += 10; reasons.append('volume climax')
-        elif vol_ratio >= 2.0:
-            score += 5; reasons.append('volume spike')
-        # VWAP отклонение = мера растянутости (чем дальше — тем лучше для MR)
-        if mode == 'Long' and vwap_dist <= -2.0:
-            score += 10; reasons.append('deep below VWAP')
-        elif mode == 'Short' and vwap_dist >= 2.0:
-            score += 10; reasons.append('deep above VWAP')
-        score = max(0, min(100, score))
-        ok = score >= 55
-        comment = ', '.join(reasons) if reasons else 'neutral'
-        logging.info(
-            f'📊 [LOCAL] {strategy} {mode} → {"APPROVE" if ok else "REJECT"} '
-            f'({score}/100) | {comment}'
-        )
-        return {'ok': ok, 'conf': score, 'comment': f'local:{comment}'}
-
-    # RSI alignment
-    if mode == 'Long' and rsi < 35:
-        score += 15; reasons.append('RSI oversold')
-    elif mode == 'Short' and rsi > 65:
-        score += 15; reasons.append('RSI overbought')
-    elif mode == 'Long' and rsi > 70:
-        score -= 20; reasons.append('RSI too high for long')
-    elif mode == 'Short' and rsi < 30:
-        score -= 20; reasons.append('RSI too low for short')
-
-    # Volume
-    if vol_ratio >= 3.0:
-        score += 10; reasons.append('strong volume')
-    elif vol_ratio >= 2.0:
-        score += 5
-    elif vol_ratio < 1.5:
-        score -= 10; reasons.append('weak volume')
-
-    # BTC trend alignment
-    if (mode == 'Long' and btc_trend == 'Long') or        (mode == 'Short' and btc_trend == 'Short'):
-        score += 10; reasons.append('BTC aligned')
-    elif (mode == 'Long' and btc_trend == 'Short') or          (mode == 'Short' and btc_trend == 'Long'):
-        score -= 15; reasons.append('BTC opposed')
-
-    # VWAP alignment for RSI
-    if strategy == 'RSI':
-        if mode == 'Long' and vwap_dist < -1.5:
-            score += 8; reasons.append('below VWAP pullback')
-        elif mode == 'Short' and vwap_dist > 1.5:
-            score += 8; reasons.append('above VWAP extension')
-
-    score = max(0, min(100, score))
-    ok = score >= 55
-    comment = ', '.join(reasons) if reasons else 'neutral'
-    logging.info(
-        f'📊 [LOCAL] {strategy} {mode} → {"APPROVE" if ok else "REJECT"} '
-        f'({score}/100) | {comment}'
-    )
-    return {'ok': ok, 'conf': score, 'comment': f'local:{comment}'}
-
-
-# ── Единый каскадный AI Oracle ───────────────────────────────
-# [v66] Детектор устойчивого отказа оракула. Технические ошибки Gemini
-# ('no candidates: code=404', 'daily_quota_bypass') возвращаются с ok=True
-# (fail-open — намеренно, чтобы не останавливать торговлю целиком), из-за
-# чего execute() их не отличает от реального одобрения: сигналы месяцами
-# могли не фильтроваться ИИ БЕЗ единого уведомления (задокументировано:
-# 'AI(Groq): 0/100 | no candidates: code=404' на всех сделках подряд).
-# Сама fail-open логика НЕ меняется — только видимость её причины.
-_AI_FAIL_STREAK_N = 5
-_ai_error_streak = 0
-_ai_error_alerted = False
-
-
-async def _ai_finalize(sym: str, result: dict) -> dict:
-    """Считает подряд идущие технические отказы оракула (не реальные
-    вердикты). При N подряд — ERROR в лог + ОДНО TG-уведомление (не на
-    каждый скан). Сбрасывается первым же нормальным ответом (реальный
-    вердикт Groq/Gemini ИЛИ рабочий LocalScore-фолбэк — оба не 'ошибка')."""
-    global _ai_error_streak, _ai_error_alerted
-    comment = str(result.get('comment', ''))
-    is_error = comment.startswith('no candidates:') or comment == 'daily_quota_bypass'
-    if is_error:
-        _ai_error_streak += 1
-        if _ai_error_streak >= _AI_FAIL_STREAK_N and not _ai_error_alerted:
-            _ai_error_alerted = True
-            _msg = (f'🚨 [AI] Оракул недоступен {_ai_error_streak} запросов подряд '
-                    f'({comment}). Работает fail-open — сигналы НЕ фильтруются ИИ.')
-            logging.error(_msg)
-            await tg(_msg)
-    else:
-        _ai_error_streak = 0
-        _ai_error_alerted = False
-    return result
-
-
-async def oracle_ai(sym: str, strategy: str, mode: str,
-                    price: float, extra: dict = None) -> dict:
-    """
-    Каскад: Groq → Gemini → Local Score
-    Приоритет 1: Groq (стабильно, бесплатно, 14400/day)
-    Приоритет 2: Gemini (если Groq недоступен)
-    Приоритет 3: Локальный скоринг (всегда работает)
-    """
-    # [v68] Полное отключение каскада — см. AI_ORACLE_ENABLED выше.
-    if not AI_ORACLE_ENABLED:
-        return {'ok': True, 'conf': 0, 'comment': 'oracle disabled', 'advisory': True}
-
-    ctx = extra or {}
-    result = None
-
-    # 1. Groq
-    groq_key = os.getenv('GROQ_API_KEY', '')
-    if groq_key and _groq_quota_ok:
-        result = await oracle_groq(sym, strategy, mode, price, ctx)
-        if result['comment'] not in ('groq_not_set', 'groq_quota_wait', 'groq_all_failed'):
-            return await _ai_finalize(sym, _ai_apply_template_guard(sym, result))
-        result = None
-
-    # 2. Gemini
-    if GEMINI_KEY and _gemini_quota_ok:
-        result = await oracle_gemini(sym, strategy, mode, price, ctx)
-        if result['comment'] not in ('API not set', 'quota_wait'):
-            return await _ai_finalize(sym, _ai_apply_template_guard(sym, result))
-        result = None
-
-    # 3. Локальный скоринг
-    logging.info(f'📊 [{strategy}] {sym} — AI недоступен, используем локальный скоринг')
-    return await _ai_finalize(sym, _ai_apply_template_guard(sym, score_setup_local(strategy, mode, ctx)))
-
-
-
-# Кэш решений Gemini: {sym_strategy_mode: (timestamp, result)}
-_gemini_cache: dict = {}
-GEMINI_CACHE_TTL = 3600  # 1 час — не спрашиваем повторно
-
-# Rate limiter Gemini: free plan = 15 req/min
-_gemini_req_times: list = []   # timestamps последних запросов
-GEMINI_RPM_LIMIT  = 12         # оставляем запас (из 15)
-_gemini_quota_ok  = True       # False когда 429 получен
-_gemini_quota_reset: float = 0 # когда снова пробовать
+# [v85] AI-оракулы (Groq/Gemini/LocalScore) удалены из кода — LLM вне торговли (BOT_SPEC §2.27.1).
 
 # Кэш тикеров (5 минут) — общий для SMC и RSI, избегаем двойного fetch
 _tickers_cache: dict = {}
 _tickers_cache_ts: float = 0.0
 TICKERS_CACHE_TTL = 300  # 5 минут
-
-# OpenRouter модели (в порядке приоритета)
-# Бесплатные: без daily cap, 20 req/min
-# Подключить: https://openrouter.ai/keys (бесплатная регистрация)
-# Актуальные free-модели OpenRouter (проверены май 2026)
-# Источник актуального списка: https://openrouter.ai/models?q=free
-OPENROUTER_MODELS = [
-    'meta-llama/llama-3.2-3b-instruct:free',     # llama 3.2, быстро
-    'mistralai/mistral-7b-instruct:free',          # mistral, надёжно
-    'google/gemma-2-9b-it:free',                   # Google gemma
-    'microsoft/phi-3-mini-128k-instruct:free',     # Microsoft phi-3
-    'qwen/qwen-2-7b-instruct:free',                # Alibaba Qwen
-    'nousresearch/hermes-3-llama-3.1-405b:free',  # NousResearch
-]
-
-async def oracle_gemini(sym: str, strategy: str, mode: str,
-                        price: float, extra: dict = None) -> dict:
-    """
-    [R-FIX-5] Возвращает {'ok': bool, 'conf': int, 'comment': str}.
-    decision == 'reject' → ok=False → сделка блокируется.
-    """
-    global _gemini_quota_ok, _gemini_quota_reset
-
-    if not GEMINI_KEY or not http:
-        return {'ok': True, 'conf': 0, 'comment': 'API not set'}
-
-    # Если квота исчерпана — пропускаем до времени сброса
-    if not _gemini_quota_ok:
-        if time.time() < _gemini_quota_reset:
-            logging.debug(f'🧠 [GEMINI] {sym} — пропуск (quota wait {_gemini_quota_reset - time.time():.0f}с)')
-            return {'ok': True, 'conf': 0, 'comment': 'quota_wait'}
-        else:
-            _gemini_quota_ok = True  # пробуем снова
-
-    # Rate limiter: не более GEMINI_RPM_LIMIT запросов в минуту
-    now_t = time.time()
-    _gemini_req_times[:] = [t for t in _gemini_req_times if now_t - t < 60]
-    if len(_gemini_req_times) >= GEMINI_RPM_LIMIT:
-        oldest = _gemini_req_times[0]
-        wait_s = 60 - (now_t - oldest)
-        logging.info(f'🧠 [GEMINI] {sym} — rate limit, ждём {wait_s:.0f}с')
-        await asyncio.sleep(wait_s + 1)
-        _gemini_req_times[:] = [t for t in _gemini_req_times if time.time() - t < 60]
-
-    # Проверяем кэш — не тратим квоту на повторный запрос
-    cache_key = f'{sym}_{strategy}_{mode}'
-    if cache_key in _gemini_cache:
-        ts, cached = _gemini_cache[cache_key]
-        if time.time() - ts < GEMINI_CACHE_TTL:
-            logging.info(
-                f'🧠 [GEMINI] {sym} — из кэша: '
-                f'{"APPROVE" if cached["ok"] else "REJECT"} (conf={cached["conf"]})'
-            )
-            return cached
-
-    context = {
-        'symbol': sym, 'strategy': strategy, 'direction': mode,
-        'price': round(price, 6),
-    }
-    if extra:
-        context.update(extra)
-
-    system = (
-        "Ты риск-менеджер крипто-хедж-фонда. Анализируй сетап и верни ТОЛЬКО "
-        'валидный JSON: {"decision": "approve"|"reject", "confidence": 0-100, '
-        '"comment": "краткий вывод на русском"}. '
-        "SMC: ищем CHoCH+FVG в сессию. RSI MR: перепроданность/перекупленность+паттерн. "
-        "ВАЖНО: стратегии имеют РАЗНЫЕ правила RSI. "
-        "SMC Short: RSI < 32 → REJECT. SMC Long: RSI > 68 → REJECT. "
-        "SA (Mean Reversion): ПРОТИВОПОЛОЖНАЯ логика — SA Long требует RSI < 35 (перепродан), "
-        "FOR SA STRATEGY (Mean Reversion / Counter-trend): "
-        "If direction is SHORT: High RSI (> 65) means OVERBOUGHT — EXCELLENT for Short, you MUST APPROVE, NEVER reject because RSI is high. "
-        "If direction is LONG: Low RSI (< 35) means OVERSOLD — EXCELLENT for Long, you MUST APPROVE, NEVER reject because RSI is low. "
-        "SMC trend rules DO NOT APPLY to SA. SA explicitly trades against the local trend. "
-        # [v44] Оракул выдал "RSI > 68 for SMC Long" при факт. RSI 66.1 — выдуманная цифра.
-        "ANTI-HALLUCINATION: обоснование должно ссылаться ТОЛЬКО на числа, переданные в этом запросе. "
-        "Не утверждай числовых фактов, которых нет во входных данных. "
-        "Если данных недостаточно — верни confidence<50 с комментарием 'insufficient data'."
-    )
-    prompt = f"{system}\nДанные: {json.dumps(context, ensure_ascii=False)}"
-
-    url = (f"https://generativelanguage.googleapis.com/v1beta/"
-           f"models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"},
-    }
-    _gemini_req_times.append(time.time())  # регистрируем запрос
-    try:
-        async with http.post(url, json=payload,
-                             timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            data = await resp.json()
-
-            # Диагностика: логируем если нет 'candidates'
-            if 'candidates' not in data:
-                # Типичные причины: quota exceeded, safety block, wrong key
-                err_info = data.get('error', data)
-                err_code = err_info.get('code', '?') if isinstance(err_info, dict) else '?'
-                err_msg  = err_info.get('message', str(data))[:200] if isinstance(err_info, dict) else str(data)[:200]
-                err_status = err_info.get('status', '') if isinstance(err_info, dict) else ''
-                logging.warning(
-                    f'🧠 [GEMINI] {sym} — нет candidates в ответе!\n'
-                    f'    HTTP status: {resp.status}\n'
-                    f'    Error code: {err_code} | status: {err_status}\n'
-                    f'    Message: {err_msg}\n'
-                    f'    Вероятные причины:\n'
-                    f'    • QUOTA_EXCEEDED — исчерпан лимит Gemini API\n'
-                    f'    • SAFETY — запрос заблокирован фильтром безопасности\n'
-                    f'    • INVALID_ARGUMENT — неверный формат запроса\n'
-                    f'    • Проверьте GEMINI_API_KEY на https://aistudio.google.com'
-                )
-                if err_code == 429 or err_status == 'RESOURCE_EXHAUSTED':
-                    # Дневная квота исчерпана — отключаем Gemini на 23 часа
-                    _gemini_quota_ok = False
-                    _gemini_quota_reset = time.time() + 82800  # 23 часа
-                    logging.warning(
-                        '🧠 [GEMINI] 429 DAILY QUOTA — Gemini отключён до утра.\n'
-                        '    Все сделки будут одобряться без AI фильтра.\n'
-                        '    Для снятия лимита: https://aistudio.google.com'
-                    )
-                    return {'ok': True, 'conf': 0, 'comment': 'daily_quota_bypass'}
-                return {'ok': True, 'conf': 0, 'comment': f'no candidates: code={err_code}'}
-
-            # Нормальный путь: парсим ответ
-            raw_text = data['candidates'][0]['content']['parts'][0]['text']
-
-            # Gemini может вернуть как чистый JSON так и текст с ```json блоком
-            clean = raw_text.strip()
-            if clean.startswith('```'):
-                clean = clean.split('```')[1]
-                if clean.startswith('json'):
-                    clean = clean[4:]
-                clean = clean.strip()
-
-            try:
-                parsed = json.loads(clean)
-            except json.JSONDecodeError:
-                # Fallback: если JSON не распарсился — ищем YES/NO в тексте
-                logging.warning(f'🧠 [GEMINI] {sym} — не JSON, fallback: {clean[:100]}')
-                ok_fb = 'YES' in clean.upper() or 'APPROVE' in clean.upper()
-                return {'ok': ok_fb, 'conf': 50, 'comment': f'text fallback: {clean[:80]}'}
-
-            decision = str(parsed.get('decision', '')).lower()
-            conf     = int(parsed.get('confidence', 0))
-            comment  = parsed.get('comment', '')
-
-            # Логика одобрения зависит от стратегии:
-            # SMC: CHoCH+FVG — RSI нейтрален по природе (импульс, не экстремум)
-            #   → если conf ≥ 70: approve (высокая уверенность важнее decision)
-            #   → если conf ≥ 55 AND decision=approve: approve
-            #   → иначе: reject
-            # RSI MR: требует RSI экстремум — decision=approve AND conf ≥ 55
-            if conf == 0:
-                ok = False  # мусорный ответ
-            elif strategy == 'SMC':
-                # conf >= 70 или approve + conf >= 55 → одобряем
-                ok = conf >= 70 or (decision == 'approve' and conf >= 55)
-                # HARD OVERRIDE: если Groq видит RSI < 40 в comment → reject
-                comment_lower = comment.lower()
-                if ok and ('oversold' in comment_lower or
-                           'rsi' in comment_lower and
-                           any(w in comment_lower
-                               for w in ['below 40', 'below 35', 'below 30',
-                                         'extreme oversold', 'heavily oversold'])):
-                    if mode == 'Short':
-                        ok = False  # Groq сам говорит oversold для шорта → блок
-            else:  # RSI
-                ok = decision == 'approve' and conf >= 55
-                # Для RSI: если Groq упоминает volume spike → reject
-                comment_lower = comment.lower()
-                if ok and any(w in comment_lower
-                              for w in ['high volume', 'volume spike',
-                                        'high volatility', 'momentum',
-                                        'strong overbought' if mode == 'Short'
-                                        else 'strong oversold']):
-                    pass  # высокая уверенность с этими факторами — ок
-            verdict = 'APPROVE' if ok else 'REJECT'
-            logging.info(
-                f'🧠 [GEMINI] {sym} {strategy} {mode} -> {verdict} '
-                f'(conf={conf}/100) | {comment}'
-            )
-            result = {'ok': ok, 'conf': conf, 'comment': comment}
-            _gemini_cache[cache_key] = (time.time(), result)  # сохраняем в кэш
-            return result
-    except Exception as _ge:
-        logging.warning(f'🧠 [GEMINI] {sym} — ошибка: {_ge}')
-        return {'ok': True, 'conf': 0, 'comment': 'oracle error'}
 
 # ═══════════════════════════════════════════════════════
 #  ЗАГРУЗКА РЫНКОВ (кэш 1 час)
@@ -3490,6 +2976,14 @@ def _orb_in_window() -> bool:
     return 6 <= h < 12
 
 
+def _orb_range_bars(ohlcv, day) -> list:
+    """[v85] Бары диапазона ORB: закрытые бары суток `day` (UTC) с часом открытия < 6 (00:00-06:00 UTC). Единая функция
+    для orb_signal и ORB_RT (правила диапазона не менялись — выделено из orb_signal без изменения логики)."""
+    return [x for x in ohlcv
+            if datetime.fromtimestamp(x[0] / 1000, timezone.utc).date() == day
+            and datetime.fromtimestamp(x[0] / 1000, timezone.utc).hour < 6]
+
+
 async def orb_signal(sym: str, btc_ctx: dict):
     """Asia Range Breakout: пробой диапазона 00-06 UTC закрытием (не фитилём)
     в окне 06-12 UTC, с подтверждением объёмом."""
@@ -3514,9 +3008,7 @@ async def orb_signal(sym: str, btc_ctx: dict):
 
     # Диапазон 00:00-06:00 UTC ТЕКУЩИХ суток, только закрытые бары этого окна
     today = datetime.now(timezone.utc).date()
-    range_bars = [x for x in ohlcv
-                  if datetime.fromtimestamp(x[0] / 1000, timezone.utc).date() == today
-                  and datetime.fromtimestamp(x[0] / 1000, timezone.utc).hour < 6]
+    range_bars = _orb_range_bars(ohlcv, today)
     if len(range_bars) < 20:   # ждём 24 бара на 15m — допускаем небольшой недобор
         return None, 'no_data'
 
@@ -3882,29 +3374,7 @@ async def execute(sym: str, sig: dict, strategy: str,
         logging.info(f"[{strategy}] {sym}: volume oracle reject (bingx:{bingx_vol:.0f})")
         return
 
-    extra_ctx = {k: v for k, v in sig.items()
-                 if k in ('rsi', 'vol_ratio', 'sma_dist', 'vwap_dist', 'btc_trend')}
-    groq_key = os.getenv('GROQ_API_KEY', '')
-    provider = ('Groq' if groq_key and _groq_quota_ok else
-                'Gemini' if (GEMINI_KEY and _gemini_quota_ok) else 'LocalScore')
-    logging.info(
-        f'🔔 [{strategy}] {sym} {mode} @ {price:.6f} → AI Oracle [{provider}]'
-    )
-    ai = await oracle_ai(sym, strategy, mode, price, extra_ctx)
-    if not ai['ok']:
-        thr = 70 if strategy == 'SMC' else 55
-        # [v58] Блокирующий вердикт обходится: (а) SMC-приоритет CHoCH как раньше,
-        # (б) детектор шаблонных ответов пометил ai['advisory'] для ЛЮБОЙ стратегии,
-        # (в) AI_BLOCK=0 — оракул полностью advisory (защита от галлюцинаций).
-        if strategy == 'SMC' and ai['conf'] >= 30:
-            logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — CHoCH приоритет")
-        elif ai.get('advisory'):
-            logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — шаблонный ответ, не блокирует")
-        elif not AI_BLOCK_ENABLED:
-            logging.info(f"[{strategy}] {sym}: AI advisory (conf={ai['conf']}) — AI_BLOCK=0")
-        else:
-            logging.info(f"[{strategy}] {sym}: AI reject (conf={ai['conf']}/{thr})")
-            return
+    logging.info(f'🔔 [{strategy}] {sym} {mode} @ {price:.6f}')
 
     # Баланс
     try:
@@ -4090,8 +3560,8 @@ async def execute(sym: str, sig: dict, strategy: str,
         'alt_score':   int(sig.get('alt_score', 0)),
         'entry_hour':  datetime.now(timezone.utc).hour,
         'open_time':   datetime.now(timezone.utc).isoformat(),
-        'ai_conf':     int(ai.get('conf', 0)),
-        'ai_comment':  str(ai.get('comment', '')).replace(',', ';')[:120],
+        'ai_conf':     0,    # [v85] оракул удалён; колонки trades.ai_conf/ai_comment остаются (история)
+        'ai_comment':  '',
         'tp_mult':     float(sig.get('tp_mult', 1.5)),
     }
     pos_list.append(rec)
@@ -4113,11 +3583,6 @@ async def execute(sym: str, sig: dict, strategy: str,
         # [v39] Qty/Notional/Риск — от РЕАЛЬНОГО округлённого объёма (= биржа)
         f"Qty: <code>{qty}</code>  Notional: <b>${qty * price:.2f}</b>\n"
         f"RR: <b>1:{rr:.2f}</b>  Риск: <b>${risk_usdt:.2f}</b>\n"
-        # [v52] ai['comment'] — свободный текст от AI-оракула (Groq/Gemini),
-        # может содержать '<','>','&' (напр. "RSI > 68") — ломало parse_mode=HTML
-        # → Telegram отклонял ВСЁ сообщение (400), уведомление об открытии терялось.
-        + (f"🤖 AI: bypass\n" if 'bypass' in ai['comment']
-           else f"🧠 AI({_esc(provider)}): {ai['conf']}/100 | {_esc(ai['comment'])}\n")
         + extra_tg
     )
     await tg(msg)
@@ -5740,6 +5205,312 @@ async def scan_smc2():
     _record_scan_summary('SMC2', {'total': len(uni), **{k: st[k] for k in outcomes if k != 'news'}})
 
 
+# ═══════════════════════════════════════════════════════
+#  [v85] ORB_RT — shadow: пробой диапазона ORB закрытием → ORB_MKT2 (по close пробоя) и ORB_RT (лимит на границе).
+#  Контракт — у констант ORB_RT_*. Только закрытые 15m-бары; незакрытый бар отбрасывается. Без состояния: каждый
+#  новый закрытый бар пересматривает последние ORB_RT_RETEST_BARS+1 баров (результаты переживают рестарты,
+#  запись идемпотентна по (event_id, strategy)).
+# ═══════════════════════════════════════════════════════
+_ORB_RT_STAGES = ('no_range', 'no_break', 'vol', 'sl_bounds')    # воронка: индекс = глубина
+_orb_rt_last_bar: dict = {}     # {sym: ts последнего обработанного закрытого 15m-бара}
+_orb_rt_day = {'date': '', 'n': 0, 'ids': set()}
+
+
+def _orb_rt_event_id(sym: str, ts_b: int, mode: str) -> str:
+    return f'ORB|{sym}|{ts_b}|{mode}'
+
+
+def _orb_rt_state(h, l, c, b: int, L: float, mid: float, tp: float, is_long: bool, n: int):
+    """Состояние лимитки на границе L после пробоя на баре b (только бары <= n-1):
+    ('filled', f) — первый бар f в (b, b+8] с low[f] < L (строго; Short: high[f] > L), вход = L;
+    ('cancel_2r', j) — цена ушла на 2R от L без заполнения (или бар заполнения одновременно достиг 2R —
+        порядок внутри бара неизвестен, консервативно = не заполнено);
+    ('invalid', j) — close ушёл внутрь диапазона за его середину БЕЗ заполнения (при штатной геометрии mid < L для
+        Long недостижимо: close < mid влечёт low < L, т.е. заполнение, которое имеет приоритет — консервативно);
+    ('expired', None) — 8 баров без заполнения; ('pending', None) — окно ещё не закрыто."""
+    for j in range(b + 1, min(b + ORB_RT_RETEST_BARS, n - 1) + 1):
+        fill = (l[j] < L) if is_long else (h[j] > L)
+        reach = (h[j] >= tp) if is_long else (l[j] <= tp)
+        if fill:
+            return ('cancel_2r', j) if reach else ('filled', j)
+        if reach:
+            return ('cancel_2r', j)
+        if (c[j] < mid) if is_long else (c[j] > mid):
+            return ('invalid', j)
+    return ('expired', None) if b + ORB_RT_RETEST_BARS <= n - 1 else ('pending', None)
+
+
+def _orb_sl_ok(entry: float, sl: float, is_long: bool) -> bool:
+    d = ((entry - sl) if is_long else (sl - entry)) / entry * 100
+    return d > 0 and ORB_RT_SL_BOUNDS[0] <= d <= ORB_RT_SL_BOUNDS[1]
+
+
+def _orb_rt_eval(rows, mode: str):
+    """[v85] Чистая функция: события ORB_RT одного направления по ЗАКРЫТЫМ барам rows (ccxt-строки по возрастанию;
+    последний — последний закрытый). Рассматриваются бары пробоя b в последних ORB_RT_RETEST_BARS+1 барах;
+    всё считается «как на момент b» (диапазон — бары суток b с часом < 6; ATR/объём — бары <= b), будущее на
+    решение о событии не влияет. Событие: b в окне ORB (час открытия 6..11 UTC), b — ПЕРВОЕ закрытие за границей
+    диапазона в этот день (в этом направлении), объём b >= 1.5 × медиана 20 баров до него.
+    → (events, stage): stage — глубина воронки (-1 ... 3: no_range, no_break, vol, sl_bounds)."""
+    n = len(rows)
+    ts = [int(r[0]) for r in rows]
+    h = np.array([float(r[2]) for r in rows]); l = np.array([float(r[3]) for r in rows])
+    c = np.array([float(r[4]) for r in rows]); v = np.array([float(r[5]) for r in rows])
+    is_long = (mode == 'Long')
+    events, stage = [], -1
+    for b in range(max(20, n - 1 - ORB_RT_RETEST_BARS), n):
+        dt = datetime.fromtimestamp(ts[b] / 1000, timezone.utc)
+        if not (6 <= dt.hour < 12):
+            continue                                   # вне окна ORB — события нет
+        rbars = _orb_range_bars(rows[:b + 1], dt.date())
+        if len(rbars) < 20:                            # то же правило недобора, что у orb_signal
+            stage = max(stage, 0); continue
+        hi = float(max(x[2] for x in rbars)); lo = float(min(x[3] for x in rbars))
+        if hi - lo <= 0:
+            stage = max(stage, 0); continue
+        beyond = (lambda j: c[j] > hi) if is_long else (lambda j: c[j] < lo)
+        first_win = next((j for j in range(n) if datetime.fromtimestamp(ts[j] / 1000, timezone.utc).date() == dt.date()
+                          and datetime.fromtimestamp(ts[j] / 1000, timezone.utc).hour >= 6), b)
+        if not beyond(b) or any(beyond(j) for j in range(first_win, b)):
+            stage = max(stage, 1); continue            # нет пробоя ИМЕННО на b (первое закрытие за границей)
+        med = float(np.median(v[b - 20:b]))
+        if med <= 0 or v[b] < ORB_RT_VOL_MULT * med:
+            stage = max(stage, 2); continue            # объём — на баре ПРОБОЯ
+        atr = float(calc_atr(h[:b + 1], l[:b + 1], c[:b + 1]))
+        if atr <= 0:
+            stage = max(stage, 2); continue
+        L = hi if is_long else lo
+        mid = (hi + lo) / 2
+        sgn = 1 if is_long else -1
+        m_entry = float(c[b]); m_sl = m_entry - sgn * ORB_RT_SL_ATR * atr; m_tp = m_entry + sgn * ORB_RT_TP_R * abs(m_entry - m_sl)
+        r_sl = L - sgn * ORB_RT_SL_ATR * atr; r_tp = L + sgn * ORB_RT_TP_R * abs(L - r_sl)
+        mkt_ok, rt_ok = _orb_sl_ok(m_entry, m_sl, is_long), _orb_sl_ok(L, r_sl, is_long)
+        if not mkt_ok and not rt_ok:
+            stage = max(stage, 3); continue
+        st, j = (_orb_rt_state(h, l, c, b, L, mid, r_tp, is_long, n) if rt_ok else ('rt_sl_bounds', None))
+        vol_ratio = float(v[b] / med)
+        events.append({
+            'mode': mode, 'b': b, 'ts_b': ts[b], 'L': L, 'mid': mid, 'atr': atr, 'vol_ratio': vol_ratio,
+            'range_w_atr': (hi - lo) / atr, 'rsi': float(calc_rsi(c[:b + 1])),
+            'adx_wilder': float(calc_adx_wilder(h[:b + 1], l[:b + 1], c[:b + 1], 14)),
+            'mkt': {'entry': m_entry, 'sl': m_sl, 'tp': m_tp} if mkt_ok else None,
+            'rt': {'entry': L, 'sl': r_sl, 'tp': r_tp, 'state': st, 'f': j},
+        })
+    return events, stage
+
+
+def _orb_rt_cap_take(eid: str) -> bool:
+    """Суточный потолок СОБЫТИЙ: резервируется до await записи; на смене даты UTC пересчитывается из БД."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _orb_rt_day['date'] != today:
+        ids = set()
+        try:
+            con = sqlite3.connect(TRADES_DB)
+            ids = {r[0] for r in con.execute(
+                "SELECT DISTINCT smc2_event FROM shadow_signals WHERE strategy IN ('ORB_MKT2','ORB_RT','ORB_NF') "
+                "AND open_time >= ?", (today,)).fetchall()}
+            con.close()
+        except Exception:
+            ids = set()
+        _orb_rt_day.update(date=today, ids=ids, n=len(ids))
+    if eid in _orb_rt_day['ids']:
+        return True
+    if _orb_rt_day['n'] >= ORB_RT_MAX_PER_DAY:
+        return False
+    _orb_rt_day['ids'].add(eid); _orb_rt_day['n'] += 1
+    return True
+
+
+def _orb_rt_write_nf(sym: str, ev: dict, reason: str):
+    """Маркер «RT не состоялся» (strategy='ORB_NF', closed, pnl=0): нужен блоку (Б)."""
+    ot = datetime.fromtimestamp((ev['ts_b'] + 900_000) / 1000, timezone.utc).isoformat()
+    con = sqlite3.connect(TRADES_DB)
+    con.execute(
+        "INSERT INTO shadow_signals (open_time,symbol,direction,entry_price,sl_price,tp_price,atr,status,strategy,"
+        "close_time,exit_price,pnl_pct,bars_held,shadow_reason,smc2_event,recalc) "
+        "VALUES (?,?,?,?,?,?,?,'closed','ORB_NF',?,?,0,0,?,?,0)",
+        (ot, sym, ev['mode'], ev['rt']['entry'], ev['rt']['sl'], ev['rt']['tp'], ev['atr'], ot, ev['rt']['entry'],
+         'orb_nf_' + reason, _orb_rt_event_id(sym, ev['ts_b'], ev['mode'])))
+    con.commit(); con.close()
+
+
+async def _orb_rt_persist(sym: str, ev: dict, ts, btc_ctx: dict) -> list:
+    """Идемпотентная запись события. → исходы вызова (rt_fill, mkt_ok, no_fill, invalid, dedup, cap, rt_pending)."""
+    out = []
+    eid = _orb_rt_event_id(sym, ev['ts_b'], ev['mode'])
+    mode = ev['mode']
+    rt = ev['rt']
+    con = sqlite3.connect(TRADES_DB)
+    try:
+        have = _smc2_existing(con, eid)
+        need_mkt = ev['mkt'] is not None and 'ORB_MKT2' not in have
+        need_rt = rt['state'] == 'filled' and 'ORB_RT' not in have
+        need_nf = (rt['state'] in ('expired', 'cancel_2r', 'invalid', 'rt_sl_bounds')
+                   and 'ORB_RT' not in have and 'ORB_NF' not in have)
+        if not have and (need_mkt or need_rt or need_nf):
+            day0 = datetime.fromtimestamp(ev['ts_b'] / 1000, timezone.utc).date().isoformat()
+            other = con.execute(
+                "SELECT 1 FROM shadow_signals WHERE symbol=? AND direction=? AND strategy IN ('ORB_MKT2','ORB_RT','ORB_NF') "
+                "AND smc2_event!=? AND substr(open_time,1,10)=? LIMIT 1", (sym, mode, eid, day0)).fetchone()
+            if other:
+                return ['dedup']           # один пробой на символ, направление и день
+            if not _orb_rt_cap_take(eid):
+                return ['cap']
+        if rt['state'] == 'pending':
+            out.append('rt_pending')
+    finally:
+        try: con.close()
+        except Exception: pass
+    base = {'atr': ev['atr'], 'atr_pct': ev['atr'] / (ev['mkt']['entry'] if ev['mkt'] else rt['entry']) * 100,
+            'rsi': ev['rsi'], 'adx': 0.0, 'adx_wilder': ev['adx_wilder'], 'vol_ratio': ev['vol_ratio'],
+            'entry_rr': ORB_RT_TP_R, 'range_w_atr': ev['range_w_atr'], 'smc2_event': eid}
+    d = 'long' if mode == 'Long' else 'short'
+    day_start = datetime.fromtimestamp(ev['ts_b'] / 1000, timezone.utc).replace(hour=6, minute=0, second=0, microsecond=0)
+    if need_mkt:
+        m = ev['mkt']
+        ot = datetime.fromtimestamp((ev['ts_b'] + 900_000) / 1000, timezone.utc)
+        msig = dict(base, sl=m['sl'], tp=m['tp'], minutes_since_range_end=(ot - day_start).total_seconds() / 60,
+                    shadow_reason=f'orb_mkt2_{d}')
+        await shadow_record(sym, mode, m['entry'], msig, btc_ctx, 'ORB_MKT2', open_time=ot.isoformat(), dedup=False)
+        out.append('mkt_ok')
+    if need_rt:
+        ot = datetime.fromtimestamp(int(ts[rt['f']]) / 1000, timezone.utc)
+        msig = dict(base, sl=rt['sl'], tp=rt['tp'], minutes_since_range_end=(ot - day_start).total_seconds() / 60,
+                    shadow_reason=f'orb_rt_{d}')
+        await shadow_record(sym, mode, rt['entry'], msig, btc_ctx, 'ORB_RT', open_time=ot.isoformat(), dedup=False)
+        out.append('rt_fill')
+    if need_nf:
+        _orb_rt_write_nf(sym, ev, rt['state'])
+        out.append('invalid' if rt['state'] == 'invalid' else 'no_fill')
+    return out
+
+
+_ORB_RT_RANK = ('rt_fill', 'mkt_ok', 'dedup', 'cap', 'no_fill', 'invalid', 'rt_pending', 'sl_bounds', 'vol', 'no_break', 'no_range')
+
+
+async def _orb_rt_process_symbol(sym: str, closed: list, btc_ctx: dict) -> str:
+    """Один исход на символ за скан (по приоритету _ORB_RT_RANK)."""
+    ts = np.array([int(b[0]) for b in closed])
+    seen = set(); best = -1
+    for mode in ('Long', 'Short'):
+        events, stage = _orb_rt_eval(closed, mode)
+        best = max(best, stage)
+        for ev in sorted(events, key=lambda e: e['b']):
+            seen.update(await _orb_rt_persist(sym, ev, ts, btc_ctx))
+    for k in _ORB_RT_RANK:
+        if k in seen:
+            return k
+    return _ORB_RT_STAGES[best] if 0 <= best <= 3 else 'no_break'
+
+
+async def scan_orb_rt():
+    """[v85] ORB_RT — shadow-сканер. Вселенная = _scan_universe() (как у ORB). Работает только в окне
+    06:00-14:00 UTC (окно пробоя 06-12 + 8 баров ретеста); вне окна — одна строка no_window. Символ обрабатывается
+    только при появлении НОВОГО закрытого 15m-бара. Сумма исходов == total."""
+    if not ORB_RT_ENABLED:
+        return
+    tf = 900_000
+    now_ms = int(time.time() * 1000)
+    expected = (now_ms // tf) * tf - tf
+    uni = await _scan_universe()
+    hr = datetime.now(timezone.utc).hour
+    outcomes = ['skipped', 'no_window', 'fetch_err', 'no_data', 'error'] + list(_ORB_RT_RANK)
+    st = {k: 0 for k in outcomes}
+    if not (6 <= hr < 14):
+        st['no_window'] = len(uni)
+        _record_scan_summary('ORB_RT', {'total': len(uni), 'no_window': len(uni)})
+        return
+    todo = [s_ for s_ in uni if _orb_rt_last_bar.get(s_) != expected]
+    st['skipped'] = len(uni) - len(todo)
+    ctx = await get_btc_context() if todo else {}
+    sem = asyncio.Semaphore(SCAN_SEM)
+
+    async def check(sym):
+        try:
+            async with sem:
+                raw = await exchange.fetch_ohlcv(sym, RSI_TF, limit=64)
+        except Exception:
+            st['fetch_err'] += 1
+            return
+        closed = [b for b in (raw or []) if int(b[0]) + tf <= now_ms]      # незакрытый бар отбрасывается
+        if len(closed) < 30:
+            st['no_data'] += 1
+            return
+        try:
+            r = await _orb_rt_process_symbol(sym, closed, ctx)
+            _orb_rt_last_bar[sym] = int(closed[-1][0])
+            st[r] += 1
+        except Exception as _e:
+            st['error'] += 1
+            if st['error'] <= 2:
+                logging.warning(f'[ORB_RT] {sym} error: {type(_e).__name__}: {_e}')
+
+    await asyncio.gather(*[check(s_) for s_ in todo])
+    total_out = sum(st[k] for k in outcomes)
+    if total_out != len(uni):
+        logging.warning(f'[ORB_RT SCAN] сумма исходов {total_out} != total {len(uni)}')
+    logging.info(
+        f"[ORB_RT SCAN] total:{len(uni)} skip:{st['skipped']} no_range:{st['no_range']} no_break:{st['no_break']} "
+        f"vol:{st['vol']} sl_bounds:{st['sl_bounds']} mkt_ok:{st['mkt_ok']} rt_pending:{st['rt_pending']} "
+        f"rt_fill:{st['rt_fill']} no_fill:{st['no_fill']} invalid:{st['invalid']} dedup:{st['dedup']} cap:{st['cap']} "
+        f"fetch_err:{st['fetch_err']} no_data:{st['no_data']} err:{st['error']}")
+    _record_scan_summary('ORB_RT', {'total': len(uni), **{k: st[k] for k in outcomes}})
+
+
+def _orb_rt_report_lines(con) -> list:
+    """[v85] Секция ORB_RT для /shadow_analyze: ФОРВАРД по вариантам × направлениям (контракт (А)), блок (Б),
+    доля no_fill, информационные срезы (режим × направление, час входа, ATR%)."""
+    since = ORB_RT_FORWARD_FROM
+    fee = _fee_sql()
+    L = [f'\n🎯 ORB_RT (shadow, форвард с {since}; контракт — у констант ORB_RT_*)']
+    nf = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE strategy='ORB_NF' AND open_time>=?", (since,)).fetchone()[0]
+    opn = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE status='open' AND strategy IN ('ORB_MKT2','ORB_RT')").fetchone()[0]
+    ev_n = con.execute("SELECT COUNT(DISTINCT smc2_event) FROM shadow_signals WHERE strategy IN ('ORB_MKT2','ORB_RT','ORB_NF') AND open_time>=?", (since,)).fetchone()[0]
+    L.append(f'  событий (с записью): {ev_n} | no_fill-маркеров (ретест не состоялся): {nf}'
+             + (f' ({nf / ev_n * 100:.0f}% событий)' if ev_n else '') + f' | открытых: {opn}')
+    for strat in ('ORB_MKT2', 'ORB_RT'):
+        total = con.execute("SELECT COUNT(*) FROM shadow_signals WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?", (strat, since)).fetchone()[0]
+        if total == 0:
+            L.append(f'\n  {strat}: закрыто 0')
+            continue
+        L.append(f'\n  <b>{strat}</b> (закрыто {total}):')
+        for d in ('Long', 'Short'):
+            ok, ex = _forward_r_rows(con, strat, fee, since, 'AND direction=?', (d,))
+            L.append(_forward_status_line(d, since, ok, ex, 100))
+        rows = con.execute(
+            f"SELECT pnl_pct - {fee}, direction, COALESCE(regime_4h,''), entry_hour, atr_pct FROM shadow_signals "
+            "WHERE status='closed' AND recalc!=2 AND strategy=? AND open_time>=?", (strat, since)).fetchall()
+        def seg(title, buckets):
+            L.append(f'  {title} (информационно):')
+            for lbl, f in buckets:
+                g = [r for r in rows if f(r)]
+                if not g:
+                    continue
+                n, wr, avg, pf = _bucket_stats([(r[0],) for r in g])
+                L.append(f'    {lbl}: {n} | WR {wr:.0f}% | Avg {avg:+.2f}% | PF net {pf:.2f}{_star_flag([r[0] for r in g], 15)}')
+        seg('Режим 4ч × направление', [(f'{rg}×{d}', (lambda rg_, d_: (lambda r: r[2] == rg_ and r[1] == d_))(rg, d))
+                                        for rg in ('Up', 'Flat', 'Down') for d in ('Long', 'Short')])
+        seg('Час входа UTC', [('06-09', lambda r: 6 <= r[3] < 9), ('09-12', lambda r: 9 <= r[3] < 12), ('12-15', lambda r: 12 <= r[3] < 15)])
+        seg('ATR, % цены', [('&lt;0.3', lambda r: r[4] < 0.3), ('0.3-0.6', lambda r: 0.3 <= r[4] < 0.6), ('0.6+', lambda r: r[4] >= 0.6)])
+    pairs = _smc2_event_pairs(con, since, 'ORB_MKT2', 'ORB_RT', 'ORB_NF')
+    n = len(pairs)
+    L.append('\n  <b>Блок (Б): RT против MKT2</b> — R_event(RT) − R_event(MKT2) (RT без заполнения = 0; пары — только события с закрытым MKT2 и закрытым RT либо маркером NF)')
+    if n == 0:
+        L.append('  событий: 0')
+        return L
+    diffs = [rt - mk for _eid, mk, rt in pairs]
+    dn, dm, dt = _mean_r_t(diffs)
+    mk_m = sum(p[1] for p in pairs) / n; rt_m = sum(p[2] for p in pairs) / n
+    miss = sum(1 for p in pairs if p[2] == 0.0)
+    ck = lambda b: '✅' if b else '❌'
+    L.append(f'  событий n={n} | R_event(MKT2) среднее {mk_m:+.3f} | R_event(RT) среднее {rt_m:+.3f} (без заполнения: {miss}, {miss / n * 100:.0f}%) | '
+             f'средняя разность {dm:+.3f} | парный {_t_str(dn, dt)}')
+    c1, c2, c3 = n >= 100, dm > 0, (dn >= 10 and dt >= 2.0)
+    L.append(f'  (Б): n&gt;=100 {ck(c1)} | разность &gt;0 {ck(c2)} | парный t&gt;=2.0 {ck(c3)} → '
+             + ('ПОДТВЕРЖДЕНА ✅' if (c1 and c2 and c3) else 'не подтверждена (рано / нет эффекта)'))
+    return L
+
+
 async def scan_rsi():
     """Сканер RSI MR: запускается каждые 60 сек."""
     # [v72] RSI конструктивно мертва (1 сделка за всю историю) — гейт до
@@ -6210,7 +5981,7 @@ _init_trades_db()
 # памяти (не критично для целостности — теряется при рестарте, дайджест
 # просто покажет меньше циклов за день; сами anomalies/alert_history
 # персистентны в БД).
-_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': [], 'SMC': [], 'PO3': [], 'SMC2': []}  # [v73] +SMC, [v75] +PO3, [v79] +SMC2
+_scan_summary_accum = {'SA': [], 'RB': [], 'ORB': [], 'SMC': [], 'PO3': [], 'SMC2': [], 'ORB_RT': []}  # [v73] +SMC, [v75] +PO3, [v79] +SMC2
 
 
 def _record_scan_summary(strategy: str, counts: dict):
@@ -6678,8 +6449,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-06-v84'
+CODE_VERSION = '2026-10-08-v85'
 CHANGELOG = [
+    ('2026-10-08-v85', 'АУДИТ ЭКСПЕРТА: LLM вне торговли, риск 0.25%, модель комиссий maker/taker, ORB_RT (shadow). Сигналы SMC/SMC_SIG/SMC2/PO3/RB, их контракты, breaker-ы v76/v77, замер задержек, SMC_LIVE (false), bybit_worker.py НЕ менялись. (1) Удалены ВСЕ LLM-оракулы: oracle_ai/oracle_groq/oracle_gemini/score_setup_local и их кэши, лимиты, шаблонный детектор, константы GROQ_*/GEMINI_*/OPENROUTER_*/AI_ORACLE_ENABLED/AI_BLOCK, проверки ключей и строки на старте, строка AI(...) в Telegram-сообщении о сделке (в execute() оракул мог БЛОКИРОВАТЬ вход при AI_ORACLE_ENABLED=1 и AI_BLOCK=1); oracle_volume — НЕ LLM (проверка объёма по тикерам BingX и binance/bybit/mexc, влияет на вход) — оставлен без изменений; trades.ai_conf/ai_comment остаются (история), новые сделки пишут 0/пусто; срез AI conf в /stats_analyze помечен историческим. (2) RISK_PER_TRADE = 0.0025 (доля эквити), RISK_WEEKEND = RISK_PER_TRADE, SMC/SA/PB_RISK_MULT = 1.0; при старте risk_config_errors(): эффективный риск каждой стратегии должен быть в (0, 0.01], иначе ERROR + Telegram с фактическим значением + SystemExit (пример: RISK_PER_TRADE = 0.25). (3) FEE_TAKER/FEE_MAKER (ENV, по умолчанию = FEE_RATE): _fee_pct(strategy, exit_reason) и SQL-эквивалент _fee_sql() — вход лимитом (SMC2_RT, ORB_RT) и TP по maker, прочие входы и SL/TIMEOUT по taker; используется всеми shadow-расчётами net (отчёты, контракты, H1, блок Б, аудит входа); при maker = taker net побитово совпадает с v84; живые отчёты по-прежнему FEE_RATE. (4) ORB_RT (shadow): первый закрытый бар окна ORB (06-12 UTC) с close за границей диапазона 00-06 UTC и объёмом >= 1.5 x медиана 20 баров -> ORB_MKT2 (по close пробоя) и ORB_RT (лимит на границе, заполнение low[f] < L в 8 барах), SL = 1.0 x ATR14, TP = 2R, таймаут 16 баров, ORB_NF-маркеры, 40 событий/сутки, сканер scan_orb_rt (окно 06-14 UTC, сумма исходов == total), контракт (А)/(Б) в константах ORB_RT_*, секция в /shadow_analyze; диапазон ORB вынесен в _orb_range_bars без изменения логики orb_signal. (5) Правила проекта в BOT_SPEC 2.27'),
     ('2026-10-06-v84', 'ТОЛЬКО ОТЧЁТЫ (торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск, bybit_worker.py не менялись). (1) ⭐ в отчётах: раньше при PF > 1 (RB Short с PF 1.00 получал ⭐, вводило в заблуждение), теперь _star_flag: n >= n_min (shadow 15, живые 10), PF net >= 1.3 И t >= 2.0 по net-результатам сделок; это только пометка кандидата, не решение; легенды обновлены в /shadow_analyze и /stats_analyze, _live_stats возвращает t. (2) PO3 НЕ выключается (дефолт true): владелец набирает данные пре-коммита §2.18.4 через ENV PO3_UNIVERSE_N=60. (3) Документация: статус SA (live n=71 после дедупликации PF net 0.75, gross 1.34; SA_SHADOW n=183 PF 0.62 t -2.32), результаты analysis_pack 2026-10-06 в BOT_SPEC 2.26, CLAUDE.md обновлён (был от v40)'),
     ('2026-10-06-v83', 'ТОЛЬКО ОТЧЁТЫ И ИХ ДОСТАВКА (торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск, bybit_worker.py не менялись). Отчёты файлом по команде, как дайджест: /shadow_analyze теперь по умолчанию присылается ТЕКСТОВЫМ ФАЙЛОМ (sendDocument; чат режет отчёт на куски по 4000 символов и при копировании часть терялась), /shadow_analyze text — прежний вывод в чат; /stats_analyze file — то же для живых сделок; /analysis_pack — один файл со всеми аналитическими отчётами (shadow_analyze, stats_analyze, smc_regime_check, smc_entry_audit, dups_impact; сбой секции не роняет остальные). Содержимое отчётов не менялось: HTML-теги Telegram убираются, &lt; &gt; &amp; возвращаются в обычные символы; в шапке файла — время, версия кода, аптайм, параметры (SMC_LIVE, SMC_SIG_FROM, SMC2_FORWARD_FROM, SMC2_H1_FROM, FEE_RATE, LEVERAGE) и пометка gross/net; файлы пишутся в DIGEST_DIR (/data/logs) как prefix_YYYY-MM-DD_HHMM.txt, хранится REPORT_KEEP=10 последних каждого вида (дайджесты не затрагиваются); при сбое записи/отправки отчёт уходит в чат, как раньше. Секция SMC2 /shadow_analyze дополнена строкой ФОРВАРД H1 по пре-коммиту BOT_SPEC 2.24 (SMC2_MKT, adx_wilder >= 25 против < 25, только open_time >= SMC2_H1_FROM=2026-10-07; критерий не менялся, ничего не фильтрует)'),
     ('2026-10-03-v82', 'ТОЛЬКО ОТЧЁТЫ: net-версии PF/Avg живых сделок. Торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск и bybit_worker.py не менялись. Заголовочные PF/Avg в /stats_analyze были gross (trades.pnl_pct комиссию не включает): SMC показывал PF 1.39 при PF net 1.18 в /dups_impact на той же выборке (ранее 1.56 и 1.86 — тоже gross). Теперь во всех строках живых сделок /stats_analyze (заголовки SMC/RSI/SA, направление, причины закрытия, причина x направление, срезы ADX/RSI/alt-score/час/объём/BTC/HTF/RR/funding/AI conf, свод BTC-тренда) рядом с gross показан net: PF 1.39 (net 1.18), Avg +0.71% (net +x.xx%) — net = pnl_pct - 2*FEE_RATE*100*LEVERAGE, та же формула (_pf_net), что в /dups_impact; ⭐ ставится по PF net (n>=10); в шапке строка PF/Avg без пометки — до комиссий; решения — только по net; PF без убытков = inf вместо прежнего ложного 0.00. /stats и дневной отчёт: Avg с net (PF там нет); суточный дайджест PF/Avg живых сделок не содержит (WR и PnL в USDT — net). Блоки ФОРВАРД, ADX Уайлдера, режим 4ч (SMC, net), shadow-отчёты уже были net — не менялись. WR по-прежнему по pnl_pct > 0 (до комиссий)'),
@@ -7180,7 +6952,7 @@ async def _smc_sig_record(sym: str, sig: dict, btc_ctx: dict):
 # не видны, а таймаут исполнялся по цене момента «пробуждения». Теперь
 # правила выхода — в чистой функции _shadow_exit_eval, которой отдают ВСЕ бары
 # от бара входа; результат не зависит от того, как часто вызывали проверку.
-_SHADOW_PATH_STRATS = ('SA', 'SA_SHADOW', 'RB', 'ORB', 'SMC_SHADOW', 'PO3', 'SMC_SIG', 'SMC2_MKT', 'SMC2_RT')   # [v79] +SMC_SIG, SMC2
+_SHADOW_PATH_STRATS = ('SA', 'SA_SHADOW', 'RB', 'ORB', 'SMC_SHADOW', 'PO3', 'SMC_SIG', 'SMC2_MKT', 'SMC2_RT', 'ORB_MKT2', 'ORB_RT')   # [v85] +ORB_MKT2/ORB_RT   # [v79] +SMC_SIG, SMC2
 _shadow_cov_warn_ts = 0.0
 
 
@@ -7208,6 +6980,8 @@ def _shadow_timeout_dt(strat: str, open_dt: datetime):
         return open_dt + timedelta(minutes=MAX_TRADE_MIN_SMC)
     if strat in ('SMC2_MKT', 'SMC2_RT'):    # [v79] SMC2_TIMEOUT_BARS баров после входа
         return open_dt + timedelta(minutes=SMC2_TIMEOUT_BARS * tf_m)
+    if strat in ('ORB_MKT2', 'ORB_RT'):     # [v85] ORB_RT_TIMEOUT_BARS баров после входа
+        return open_dt + timedelta(minutes=ORB_RT_TIMEOUT_BARS * tf_m)
     if strat == 'PO3':    # [v75] PO3_TIMEOUT_BARS баров (16 × 15m = одна 4ч-свеча)
         return open_dt + timedelta(minutes=PO3_TIMEOUT_BARS * tf_m)
     if strat == 'ORB':
@@ -7266,7 +7040,7 @@ def _shadow_exit_eval(strat: str, row: dict, bars: list, now_ts: float = None):
             if sl_hit:   return True, sl_p, 'SL', held
             if tp2_hit:  return True, tp2_p, 'TP2', held
             if tp_hit:   return True, tp_p, 'TP1', held
-        elif strat in ('SMC_SHADOW', 'PO3', 'SMC_SIG', 'SMC2_MKT', 'SMC2_RT'):   # [v75] PO3, [v79] SMC_SIG/SMC2: SL > TP, как у SMC_SHADOW
+        elif strat in ('SMC_SHADOW', 'PO3', 'SMC_SIG', 'SMC2_MKT', 'SMC2_RT', 'ORB_MKT2', 'ORB_RT'):   # [v75] PO3, [v79] SMC_SIG/SMC2: SL > TP, как у SMC_SHADOW
             if sl_hit:   return True, sl_p, 'SL', held
             if tp_hit:   return True, tp_p, 'TP', held
         if t_to_ms is not None and now_ms >= t_to_ms and ts + tf_ms > t_to_ms:
@@ -7481,13 +7255,12 @@ def _shadow_stale_rows(con):
 
 def _shadow_pf_snapshot(con) -> dict:
     """{strat: (n, pf_net)} по закрытым записям без recalc=2."""
-    fee = 2 * FEE_RATE * 100
     out = {}
     for strat in _SHADOW_PATH_STRATS:
         rows = con.execute(
-            "SELECT pnl_pct FROM shadow_signals WHERE status='closed' "
+            "SELECT pnl_pct - " + _fee_sql() + " FROM shadow_signals WHERE status='closed' "
             "AND COALESCE(recalc,0)!=2 AND strategy=?", (strat,)).fetchall()
-        n, _wr, _avg, pf = _bucket_stats([(r[0] - fee,) for r in rows])
+        n, _wr, _avg, pf = _bucket_stats([(r[0],) for r in rows])
         out[strat] = (n, pf)
     return out
 
@@ -7871,7 +7644,7 @@ def shadow_analyze() -> str:
     есть в реальности зона убыточна). Вычитается ПРИ РАСЧЁТЕ отчёта (в
     SQL-запросе), БД не переписывается — исторические записи не искажены,
     /stats_analyze по реальным сделкам (таблица trades) не затронут."""
-    _SHADOW_FEE_PCT = 2 * FEE_RATE * 100  # round-trip комиссия, % цены
+    _SHADOW_FEE_PCT = _fee_sql()  # [v85] round-trip комиссия по типу ордера (SQL-выражение, % цены); при maker == taker = 2×FEE_RATE×100
 
     def _fmt(label, rows):
         n, wr, avg, pf = _bucket_stats(rows)
@@ -7897,6 +7670,7 @@ def shadow_analyze() -> str:
     try:
         con = sqlite3.connect(TRADES_DB)
         parts = [f'🔬 Анализ {RSI_TF} (closed shadow, net — после комиссий)']
+        parts.append(f'Комиссии shadow (v85): FEE_TAKER={FEE_TAKER} FEE_MAKER={FEE_MAKER} (лимитный вход SMC2_RT/ORB_RT и TP — maker; SL/TIMEOUT и прочие входы — taker)')
         # [v37] MOM отключён; SA в live — в shadow PB. [v47] + RB (Range Bounce).
         # [v53] + SA_SHADOW (отсеянные SA-сетапы vol_climax/low_rr, БЕЗ денег)
         # [v61] + ORB (Asia Range Breakout, дополняет RB — пробой вместо возврата)
@@ -8172,6 +7946,7 @@ def shadow_analyze() -> str:
                                            "AND regime_4h='Down' AND direction='Long'")
                 parts.append(_forward_status_line('Down×Long', DOWNLONG_FORWARD_FROM, _ok, _ex, 60, show_excl=True))
         parts += _smc2_report_lines(con)   # [v79] SMC2: MKT/RT, сегменты, блок (Б)
+        parts += _orb_rt_report_lines(con)   # [v85] ORB_RT: MKT2/RT, блок (Б)
         con.close()
     except Exception as _e:
         logging.exception('[ANALYZE] fail')   # [v48] полный traceback в лог
@@ -8772,7 +8547,7 @@ def stats_analyze() -> str:
         # ВСЕ модели (fail-open), не реальный низкий вердикт.
         ai_rows = con.execute("SELECT pnl_pct, ai_conf FROM trades_live").fetchall()
         if ai_rows:
-            lines.append('\n📡 <b>AI conf входа (все стратегии):</b>')
+            lines.append('\n📡 <b>AI conf входа (ИСТОРИЧЕСКИЙ срез; оракул удалён в v85, новые сделки пишут 0):</b>')
             for lbl, lo, hi in [('0 (оракул недоступен/выключен)', 0, 1),
                                  ('1-54', 1, 55), ('55-69', 55, 70), ('70-100', 70, 101)]:
                 rows_ai = [(r[0],) for r in ai_rows if lo <= (r[1] or 0) < hi]
@@ -9093,15 +8868,11 @@ async def main():
         )
     logging.info(f"🔑 BINGX_API_KEY:   {'✅ задан' if BINGX_KEY else '❌ НЕ ЗАДАН'}")
     logging.info(f"🔑 BINGX_SECRET:    {'✅ задан' if BINGX_SECRET else '❌ НЕ ЗАДАН'}")
-    logging.info(f"🔑 GEMINI_API_KEY:  {'✅ задан' if GEMINI_KEY else '⚠️ не задан (AI oracle выключен)'}")
-    logging.info(
-        f"🤖 [v68] AI oracle: {'ENABLED' if AI_ORACLE_ENABLED else 'DISABLED (AI_ORACLE_ENABLED=0)'} | "
-        f"GROQ_MODELS={GROQ_MODELS} | GEMINI_MODEL={GEMINI_MODEL}"
-    )
     logging.info(f"📐 [v69] ORB форвард с {ORB_GATE_FORWARD_FROM}, бакет {ORB_MIN_DELAY_MIN}+ мин | SA_LIVE={SA_LIVE}")
     logging.info(f"⚙️ [v45] Маржа/сделку: SA={MARGIN_PCT_SA:.0%} ALT={MARGIN_PCT_ALT:.0%}")
     logging.info("=" * 60)
 
+    await verify_risk_config_or_exit()   # [v85] недопустимый риск → старт блокируется
     lat_install()   # [v77] замер задержки живых вызовов биржи + счётчик REST
     dd_load()   # [v76] база дня по эквити (рестарт в тот же день не обнуляет)
     mdd_load()  # [v77] пик эквити и флаг общего breaker
@@ -9145,12 +8916,6 @@ async def main():
                 expired = [k for k, v in list(notified.items()) if now_t - v > 14400]
                 for k in expired:
                     del notified[k]
-
-                # Чистка кэша Gemini (устаревшие записи)
-                gem_expired = [k for k, (ts, _) in list(_gemini_cache.items())
-                               if now_t - ts > GEMINI_CACHE_TTL]
-                for k in gem_expired:
-                    del _gemini_cache[k]
 
                 # Чистка кэша объёмов
                 vol_expired = [k for k, (ts, _) in list(_vol_cache.items())
@@ -9319,6 +9084,7 @@ async def main():
                     scan_orb(),  # [v61] круглосуточно, самогейтится окном 06-12 UTC
                     scan_po3(),  # [v75] shadow, круглосуточно, топ-N по объёму, под PO3_ENABLED
                     scan_smc2(), # [v79] shadow, 24/7, вселенная как у SMC, под SMC2_ENABLED
+                    scan_orb_rt(),  # [v85] shadow, окно 06-14 UTC, вселенная как у ORB, под ORB_RT_ENABLED
                     return_exceptions=True
                 )
                 # Логируем исключения из сканеров (ранее проглатывались молча)
