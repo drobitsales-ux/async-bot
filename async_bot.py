@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v85'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v86'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -128,7 +128,14 @@ PB_RSI_HI    = float(os.getenv('PB_RSI_HI', '60'))       # RSI reset зона: �
 # (P=0.50, монета). Траектория gross 2.75→2.66→2.51 → net 1.03 — профиль PB.
 # RB СНЯТА с рассмотрения как кандидат в live. Остаётся в shadow только как источник
 # данных. Возврат к вопросу — не ранее n=300 и только при PF net >= 1.3 устойчиво.
-RB_ENABLED       = os.getenv('RB_ENABLED', 'true').lower() == 'true'
+# [v86] RB_ENABLED дефолт true→false. Основание: 2026-10-11 ~3500 shadow-сделок по 8 стратегиям на 15m-альтах — ни одна не
+# показала edge после комиссий; RB Down×Long закрыта по контракту (n=60, PF net 0.85, t -1.36); RB n=1202, PF 1.07, t 0.71.
+# На 15m комиссия ≈0.10R/сделку. Возврат — только через ENV RB_ENABLED=true. Открытые записи RB закрываются штатно
+# (shadow_check не зависит от флага).
+RB_ENABLED       = os.getenv('RB_ENABLED', 'false').lower() == 'true'
+# [v86] SMC_SHADOW (запись ОТСЕЯННЫХ SMC-сетапов) дефолт false: Down×Long n=70 PF 0.78; весь SMC_SHADOW n=632 PF 0.72, t -2.84
+# (значимо убыточен), гипотеза закрыта. SMC_SIG (вход как у живого SMC) НЕ затронут. Возврат — ENV SMC_SHADOW_ENABLED=true.
+SMC_SHADOW_ENABLED = os.getenv('SMC_SHADOW_ENABLED', 'false').lower() == 'true'
 RB_RANGE_BARS    = int(os.getenv('RB_RANGE_BARS', '48'))       # окно диапазона, закрытых баров
 RB_MAX_RANGE_ATR = float(os.getenv('RB_MAX_RANGE_ATR', '8.0')) # гейт флэта: ширина диапазона в ATR [v56] 5.0→8.0: было тише случайного блуждания (мед. range/ATR≈11.7 на 48 барах), отсекало ~85% символов — временно, ждём эмпирической калибровки по [RB SCAN] логам
 RB_SWEEP_MIN_ATR = float(os.getenv('RB_SWEEP_MIN_ATR', '0.15'))
@@ -6449,8 +6456,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-08-v85'
+CODE_VERSION = '2026-10-11-v86'
 CHANGELOG = [
+    ('2026-10-11-v86', 'СМЕНА ВЕКТОРА: СТАРШИЕ ТФ (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, модель комиссий, bybit_worker.py не менялись). (1) RB_ENABLED и новый SMC_SHADOW_ENABLED дефолт false (возврат через ENV; SMC_SIG не тронут; открытые записи RB/SMC_SHADOW закрываются штатно). (2) research_htf.py + /htf_backtest: фоновый исторический бэктест T1 Donchian-55, T2 TSMOM-28, T3 MTF-pullback на BTC/ETH/SOL (1D/4h, фандинг, IS/OOS, критерии BOT_SPEC Смена вектора, проп-бутстрап); параметры зафиксированы пре-коммитом'),
     ('2026-10-08-v85', 'АУДИТ ЭКСПЕРТА: LLM вне торговли, риск 0.25%, модель комиссий maker/taker, ORB_RT (shadow). Сигналы SMC/SMC_SIG/SMC2/PO3/RB, их контракты, breaker-ы v76/v77, замер задержек, SMC_LIVE (false), bybit_worker.py НЕ менялись. (1) Удалены ВСЕ LLM-оракулы: oracle_ai/oracle_groq/oracle_gemini/score_setup_local и их кэши, лимиты, шаблонный детектор, константы GROQ_*/GEMINI_*/OPENROUTER_*/AI_ORACLE_ENABLED/AI_BLOCK, проверки ключей и строки на старте, строка AI(...) в Telegram-сообщении о сделке (в execute() оракул мог БЛОКИРОВАТЬ вход при AI_ORACLE_ENABLED=1 и AI_BLOCK=1); oracle_volume — НЕ LLM (проверка объёма по тикерам BingX и binance/bybit/mexc, влияет на вход) — оставлен без изменений; trades.ai_conf/ai_comment остаются (история), новые сделки пишут 0/пусто; срез AI conf в /stats_analyze помечен историческим. (2) RISK_PER_TRADE = 0.0025 (доля эквити), RISK_WEEKEND = RISK_PER_TRADE, SMC/SA/PB_RISK_MULT = 1.0; при старте risk_config_errors(): эффективный риск каждой стратегии должен быть в (0, 0.01], иначе ERROR + Telegram с фактическим значением + SystemExit (пример: RISK_PER_TRADE = 0.25). (3) FEE_TAKER/FEE_MAKER (ENV, по умолчанию = FEE_RATE): _fee_pct(strategy, exit_reason) и SQL-эквивалент _fee_sql() — вход лимитом (SMC2_RT, ORB_RT) и TP по maker, прочие входы и SL/TIMEOUT по taker; используется всеми shadow-расчётами net (отчёты, контракты, H1, блок Б, аудит входа); при maker = taker net побитово совпадает с v84; живые отчёты по-прежнему FEE_RATE. (4) ORB_RT (shadow): первый закрытый бар окна ORB (06-12 UTC) с close за границей диапазона 00-06 UTC и объёмом >= 1.5 x медиана 20 баров -> ORB_MKT2 (по close пробоя) и ORB_RT (лимит на границе, заполнение low[f] < L в 8 барах), SL = 1.0 x ATR14, TP = 2R, таймаут 16 баров, ORB_NF-маркеры, 40 событий/сутки, сканер scan_orb_rt (окно 06-14 UTC, сумма исходов == total), контракт (А)/(Б) в константах ORB_RT_*, секция в /shadow_analyze; диапазон ORB вынесен в _orb_range_bars без изменения логики orb_signal. (5) Правила проекта в BOT_SPEC 2.27'),
     ('2026-10-06-v84', 'ТОЛЬКО ОТЧЁТЫ (торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск, bybit_worker.py не менялись). (1) ⭐ в отчётах: раньше при PF > 1 (RB Short с PF 1.00 получал ⭐, вводило в заблуждение), теперь _star_flag: n >= n_min (shadow 15, живые 10), PF net >= 1.3 И t >= 2.0 по net-результатам сделок; это только пометка кандидата, не решение; легенды обновлены в /shadow_analyze и /stats_analyze, _live_stats возвращает t. (2) PO3 НЕ выключается (дефолт true): владелец набирает данные пре-коммита §2.18.4 через ENV PO3_UNIVERSE_N=60. (3) Документация: статус SA (live n=71 после дедупликации PF net 0.75, gross 1.34; SA_SHADOW n=183 PF 0.62 t -2.32), результаты analysis_pack 2026-10-06 в BOT_SPEC 2.26, CLAUDE.md обновлён (был от v40)'),
     ('2026-10-06-v83', 'ТОЛЬКО ОТЧЁТЫ И ИХ ДОСТАВКА (торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск, bybit_worker.py не менялись). Отчёты файлом по команде, как дайджест: /shadow_analyze теперь по умолчанию присылается ТЕКСТОВЫМ ФАЙЛОМ (sendDocument; чат режет отчёт на куски по 4000 символов и при копировании часть терялась), /shadow_analyze text — прежний вывод в чат; /stats_analyze file — то же для живых сделок; /analysis_pack — один файл со всеми аналитическими отчётами (shadow_analyze, stats_analyze, smc_regime_check, smc_entry_audit, dups_impact; сбой секции не роняет остальные). Содержимое отчётов не менялось: HTML-теги Telegram убираются, &lt; &gt; &amp; возвращаются в обычные символы; в шапке файла — время, версия кода, аптайм, параметры (SMC_LIVE, SMC_SIG_FROM, SMC2_FORWARD_FROM, SMC2_H1_FROM, FEE_RATE, LEVERAGE) и пометка gross/net; файлы пишутся в DIGEST_DIR (/data/logs) как prefix_YYYY-MM-DD_HHMM.txt, хранится REPORT_KEEP=10 последних каждого вида (дайджесты не затрагиваются); при сбое записи/отправки отчёт уходит в чат, как раньше. Секция SMC2 /shadow_analyze дополнена строкой ФОРВАРД H1 по пре-коммиту BOT_SPEC 2.24 (SMC2_MKT, adx_wilder >= 25 против < 25, только open_time >= SMC2_H1_FROM=2026-10-07; критерий не менялся, ничего не фильтрует)'),
@@ -6679,6 +6687,27 @@ _REGIME_EMA_W      = 50
 _REGIME_SLOPE_BARS = 6
 _REGIME_MIN_BARS   = 100     # EMA сидится первой ценой — до прогрева режим не считаем ('')
 _regime_cache: dict = {}     # {sym: (expire_ts, regime)} — до закрытия текущей 4ч-свечи
+_htf_running = [False]
+
+
+async def htf_backtest_run():
+    """[v86] /htf_backtest: загрузка истории через общий exchange (~100 запросов, с кэшем) и расчёт в потоке."""
+    if _htf_running[0]:
+        return
+    _htf_running[0] = True
+    try:
+        import research_htf
+        await tg('📈 /htf_backtest запущен (загрузка истории BTC/ETH/SOL 1D/4h, расчёт в фоне)…')
+        text, info, _res, _boot = await research_htf.run_backtest(exchange, TRADES_DB, FEE_TAKER)
+        await tg(text[:3900] if len(text) > 3900 else text)
+        await send_report_file('htf_backtest', 'HTF-бэктест (/htf_backtest)', text)
+    except Exception as e:
+        logging.exception('htf_backtest')
+        await tg(f'❌ /htf_backtest: {type(e).__name__}: {e}')
+    finally:
+        _htf_running[0] = False
+
+
 _bg_tasks: set = set()       # ссылки на фоновые задачи (иначе GC может их убить)
 
 
@@ -6883,6 +6912,8 @@ async def _smc_shadow_record(sym, mode, price, reason, btc_ctx, h, l, atr,
     кулдаун по sym на все причины) выедалась ранними отсевами, поздние причины
     не записывались вообще. Общий потолок 50/сутки сохранён — причина та же:
     shadow_check() опрашивает КАЖДУЮ открытую запись отдельным fetch_ohlcv."""
+    if not SMC_SHADOW_ENABLED:   # [v86] запись отсеянных сетапов выключена (закрытие открытых записей не затронуто)
+        return
     global _smc_shadow_day
     today = datetime.now(timezone.utc).date().isoformat()
     if _smc_shadow_day['date'] != today:
@@ -8783,6 +8814,7 @@ async def check_tg_commands():
                     '/shadow_analyze — shadow-отчёт ФАЙЛОМ (без обрезки); /shadow_analyze text — в чат\n'
                     '/stats_analyze file — отчёт по живым сделкам файлом\n'
                     '/analysis_pack — один файл: shadow + живые + режим + аудит входа + дубли\n'
+                    '/htf_backtest — исторический бэктест трендследования 1D/4h (BTC/ETH/SOL), фоном, отчёт файлом\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
                     '/dups_impact — SMC/SA/режим: числа до и после исключения дублей (только чтение)\n'
                     '/maxdd_reset — снять ОБЩИЙ breaker и переснять пик эквити (после вывода средств)\n'
@@ -8803,6 +8835,14 @@ async def check_tg_commands():
                     await tg(shadow_analyze())
                 else:
                     await send_report_file('shadow_analyze', 'Shadow-анализ (/shadow_analyze)', shadow_analyze())
+
+            elif cmd == '/htf_backtest':
+                # [v86] исторический бэктест старших ТФ (research_htf.py), фоном; только чтение рынка, торговлю не трогает
+                if _htf_running[0]:
+                    await tg('⏳ /htf_backtest уже выполняется — дождись отчёта')
+                else:
+                    _t = asyncio.create_task(htf_backtest_run())
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/analysis_pack':
                 # [v83] один файл: shadow + live + режим + аудит входа + дубли (только чтение)
