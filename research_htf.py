@@ -343,7 +343,7 @@ def trade_features(t, d_close_by_day):
             'max_first': imax < imin, 'days': len(cs)}
 
 
-def prop_bootstrap(feats, risk, params, runs=BOOT_RUNS, block=BOOT_BLOCK, seed=12345):
+def prop_bootstrap(feats, risk, params, runs=BOOT_RUNS, block=BOOT_BLOCK, seed=12345, max_steps=None):
     """Блочный бутстрап последовательностей сделок. Проверки (в % от начального баланса, аддитивно):
     дневной — по худшему дневному ΔR сделки × риск; общий DD — внутри сделки по экстремумам пути (static: от
     начального баланса; trailing: от пика); цель — по итогу сделки (закрытая прибыль) и при days ≥ min_days;
@@ -354,7 +354,7 @@ def prop_bootstrap(feats, risk, params, runs=BOOT_RUNS, block=BOOT_BLOCK, seed=1
     if n == 0:
         return out
     rng = np.random.default_rng(seed)
-    max_steps = max(500, 5 * n)
+    max_steps = max_steps or max(500, 5 * n)
     days_to_target = []
     for _ in range(runs):
         eq, peak, days, steps, res = 1.0, 1.0, 0, 0, None
@@ -371,7 +371,7 @@ def prop_bootstrap(feats, risk, params, runs=BOOT_RUNS, block=BOOT_BLOCK, seed=1
                 if lo <= floor:
                     res = 'fail_maxdd'; break
                 eq += risk * f['R']; peak = max(peak, eq, hi if f['max_first'] else peak); days += f['days']
-                if params['limit'] and days > params['limit'] and eq < 1 + params['target']:
+                if params['limit'] and days > params['limit']:       # цель, достигнутая позже лимита, не засчитывается
                     res = 'fail_time'; break
                 if eq >= 1 + params['target'] and days >= params['min_days']:
                     res = 'pass'; days_to_target.append(days); break
@@ -379,6 +379,7 @@ def prop_bootstrap(feats, risk, params, runs=BOOT_RUNS, block=BOOT_BLOCK, seed=1
             res = 'unfinished'
         out[res] += 1
     out['median_days'] = float(np.median(days_to_target)) if days_to_target else None
+    out['p90_days'] = float(np.percentile(days_to_target, 90)) if days_to_target else None
     for k in ('pass', 'fail_maxdd', 'fail_daily', 'fail_time', 'unfinished'):
         out['p_' + k] = out[k] / runs
     return out
@@ -517,7 +518,41 @@ def _date(ms):
     return f'{datetime.fromtimestamp(ms / 1000, timezone.utc):%Y-%m-%d}'
 
 
-async def load_data(exchange, db_path, symbols=SYMBOLS, now_ms=None, since_ms=None, progress=None):
+async def deepen_funding(exchange, db_path, sym, since_ms, info, max_pages=60):
+    """[v88] Попытка получить фандинг ГЛУБЖЕ последних ~1000 событий: пагинация назад через endTime (сырой параметр BingX
+    quote/fundingRate; ccxt 4.2.14 'until' кладёт в startTime, поэтому endTime передаётся напрямую). Остановка: страница
+    без более ранних записей (API игнорирует endTime или история закончилась), достигнут since, ошибка после повторов.
+    Результат — info['funding_depth'][sym] = {'earliest': мс, 'status': ...}. Критерии не затрагивает."""
+    depth = info.setdefault('funding_depth', {})
+    fund = cache_funding(db_path, sym)
+    if not fund:
+        depth[sym] = {'earliest': None, 'status': 'нет данных'}
+        return
+    earliest = fund[0][0]
+    status = 'достигнут предел страниц'
+    for _ in range(max_pages):
+        if earliest <= since_ms:
+            status = 'дошли до начала запрошенного периода'; break
+        end = earliest - 1
+
+        async def go(end=end):
+            r = await exchange.fetch_funding_rate_history(sym, since=since_ms, limit=1000, params={'endTime': end})
+            return [[int(x['timestamp']), float(x.get('fundingRate') or 0.0)] for x in (r or []) if x.get('timestamp') is not None]
+        try:
+            batch = await call_with_retry(f'{sym} funding<{_date(end)}', since_ms, go, info)
+        except HtfFetchError as e:
+            status = f'ошибка: {e.short()}'; break
+        older = [b for b in batch if b[0] < earliest]
+        if not older:
+            status = 'API не отдаёт более раннюю историю (endTime не дал новых записей)'; break
+        con = sqlite3.connect(db_path)
+        con.executemany("INSERT OR REPLACE INTO htf_funding VALUES (?,?,?)", [(sym, int(a), float(b)) for a, b in older])
+        con.commit(); con.close()
+        earliest = min(b[0] for b in older)
+    depth[sym] = {'earliest': earliest, 'status': status}
+
+
+async def load_data(exchange, db_path, symbols=SYMBOLS, now_ms=None, since_ms=None, progress=None, tfs=('1d', '4h'), deep_funding=True):
     """Догружает кэш и возвращает {sym: {'1d': bars, '4h': bars, 'funding': [...]}} + служебную информацию.
     Только ЗАКРЫТЫЕ бары. Сбой набора (символ×ТФ или фандинг символа) после всех повторов НЕ прерывает загрузку:
     info['failed'][(sym, tf)] / info['funding_failed'][sym]; такой набор в данных пуст (фандинг = 0, «фандинг не учтён»).
@@ -539,7 +574,7 @@ async def load_data(exchange, db_path, symbols=SYMBOLS, now_ms=None, since_ms=No
     for sym in symbols:
         short = sym.split('/')[0]
         entry = {'1d': [], '4h': [], 'funding': []}
-        for tf in ('1d', '4h'):
+        for tf in tfs:
             have = cache_bars(db_path, sym, tf)
             start = (have[-1][0] + TF_MS[tf]) if have else since_ms
 
@@ -582,6 +617,9 @@ async def load_data(exchange, db_path, symbols=SYMBOLS, now_ms=None, since_ms=No
                 fund = cache_funding(db_path, sym)
                 if not fund:
                     why = 'история фандинга пуста'
+                elif deep_funding:
+                    await deepen_funding(exchange, db_path, sym, since_ms, info)
+                    fund = cache_funding(db_path, sym)
             except HtfFetchError as e:
                 why = e.short(); fund = []
         if why:
@@ -661,6 +699,8 @@ def build_report(data, info, results, fee, boot=None, params=None) -> str:
         def span(b):
             return (f'{datetime.fromtimestamp(b[0][0] / 1000, timezone.utc):%Y-%m-%d}…{datetime.fromtimestamp(b[-1][0] / 1000, timezone.utc):%Y-%m-%d} ({len(b)})') if b else 'нет данных'
         L.append(f'  {sym}: 1D {span(d["1d"])} | 4h {span(d["4h"])} | фандинг: {len(d["funding"])} событий')
+    L.append('Фандинг (глубина и оценка вклада по доступному периоду, на примере T2):')
+    L.extend(funding_coverage_text(data, results.get('T2', {}), info))
     flags = history_flags(data, info)
     for (sym, tf), r in info.get('failed', {}).items():
         L.append(f'⚠️ {sym.split("/")[0]} {tf.upper()}: НЕ ЗАГРУЖЕН ({r}) — набор исключён из расчёта; повторный запуск продолжит с кэша')
@@ -729,3 +769,302 @@ async def run_backtest(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
     data, info = await load_data(exchange, db_path, progress=progress)
     text, results, boot = await asyncio.to_thread(compute, data, info, fee, SLIP, runs)
     return text, info, results, boot
+
+
+# ══ [v88] H-T2W: T2 (правила §2.28 БЕЗ изменений) на широкой корзине USDT-перпетуалов BingX ══════════════════════
+# ПРЕ-КОММИТ — BOT_SPEC §2.30 (записан ДО запуска). Вселенная формируется ПРАВИЛОМ, без ручного списка.
+STABLE_BASES = frozenset({'USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDE', 'USDD', 'PYUSD', 'USDP', 'GUSD', 'LUSD', 'SUSD',
+                          'USD1', 'USDS', 'FRAX', 'UST', 'USTC', 'USDX', 'EUR', 'EURC', 'EURT', 'EURS', 'GBP', 'TRY', 'AUD', 'BRL',
+                          'RUB', 'JPY', 'CNH', 'CHF', 'CAD'})
+WIDE_TOP_N = 30                    # топ-N по 30-дневному объёму
+WIDE_CAND_N = 60                   # предотбор по 24ч-объёму (тикеры одним запросом) → 30-дневный объём считается по 1D-барам
+WIDE_HIST_MAX = '2023-01-01'       # 1D-история должна начинаться не позже
+WIDE_CRIT_MIN_N = 30               # OOS: недельных значений и сделок не меньше (иначе «недостаточно данных»)
+BOOT_BLOCK_WEEKS = 4
+MAIN3 = frozenset(SYMBOLS)
+
+
+def portf_risk() -> float:
+    """PORTF_RISK_PCT (ENV, по умолчанию 1.0%) → доля. Суммарный риск на неделю, делится поровну между открытыми позициями."""
+    try:
+        return max(0.0, float(os.getenv('PORTF_RISK_PCT', '1.0'))) / 100
+    except ValueError:
+        return 0.01
+
+
+def is_stable_base(base) -> bool:
+    return str(base or '').upper() in STABLE_BASES
+
+
+def _ms(date_str):
+    return int(datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+async def select_universe(exchange, info, progress=None, now_ms=None, top_n=WIDE_TOP_N, cand_n=WIDE_CAND_N):
+    """Вселенная правилом 1.2: USDT-перпетуалы (swap, quote=USDT, активные), без стейблкоинов и фиат-пар; предотбор cand_n
+    по 24ч-объёму (fetch_tickers, 1 запрос), затем 30-дневный объём = Σ close·volume по 30 последним ЗАКРЫТЫМ 1D-барам;
+    топ-top_n. → [{'sym','vol30','vol24'}] по убыванию vol30. Ручного списка нет."""
+    now_ms = now_ms or int(time.time() * 1000)
+    await call_with_retry('markets', 0, lambda: exchange.load_markets(), info)
+    perp = {s: m for s, m in (exchange.markets or {}).items()
+            if m.get('swap') and m.get('quote') == 'USDT' and m.get('active', True) is not False and not is_stable_base(m.get('base'))}
+    tick = await call_with_retry('tickers', 0, lambda: exchange.fetch_tickers(list(perp)), info) or {}
+    rows = []
+    for s in perp:
+        t = tick.get(s) or {}
+        v = t.get('quoteVolume')
+        if v is None and t.get('baseVolume') and t.get('last'):
+            v = float(t['baseVolume']) * float(t['last'])
+        rows.append((float(v or 0.0), s))
+    rows.sort(reverse=True)
+    cands = [s for v, s in rows[:cand_n] if v > 0]
+    vol24 = {s: v for v, s in rows}
+    out = []
+    for s in cands:
+        try:
+            bars = await call_with_retry(f'{s} vol30', 0, lambda s=s: exchange.fetch_ohlcv(s, '1d', limit=35), info)
+        except HtfFetchError:
+            info.setdefault('universe_skipped', []).append(s)
+            continue
+        closed = [b for b in (bars or []) if b[0] + DAY_MS <= now_ms][-30:]
+        if len(closed) < 20:
+            info.setdefault('universe_skipped', []).append(s)
+            continue
+        out.append({'sym': s, 'vol30': float(sum(b[4] * b[5] for b in closed)), 'vol24': vol24.get(s, 0.0)})
+    out.sort(key=lambda r: -r['vol30'])
+    top = out[:top_n]
+    if progress:
+        try:
+            await progress(f'Вселенная H-T2W: топ-{len(top)} по 30-дн. объёму из {len(out)} кандидатов')
+        except Exception:
+            pass
+    return top
+
+
+def filter_history(data, info, hist_max=WIDE_HIST_MAX):
+    """Правило 1.2: 1D-история начинается не позже hist_max. → (kept[list sym], excluded[{sym, reason}])."""
+    cut = _ms(hist_max)
+    kept, excluded = [], []
+    for sym, d in data.items():
+        if (sym, '1d') in info.get('failed', {}) or not d['1d']:
+            excluded.append({'sym': sym, 'reason': 'не загружен'})
+        elif d['1d'][0][0] > cut:
+            excluded.append({'sym': sym, 'reason': f'история с {_date(d["1d"][0][0])}'})
+        else:
+            kept.append(sym)
+    return kept, excluded
+
+
+def week_of_day(d):
+    """Номер недели (Пн–Вс) по порядковому дню от 1970-01-01 (четверг): (d+3)//7."""
+    return (d + 3) // 7
+
+
+def week_start_ms(w):
+    return (w * 7 - 3) * DAY_MS
+
+
+def portfolio_series(trades, d_close_maps):
+    """Недельный портфель T2: для каждой недели k_w = число символов, у которых в неделе была позиция; дневная доходность
+    портфеля в R = Σ_sym ΔR_{sym,d} / k_w; недельное значение W_w = Σ_d (среднее R по активным символам). Дневной ΔR — по переоценке
+    на close дня (trade_daily_path; издержки/фандинг — как в сделках), Σ ΔR по сделке = итоговый R сделки.
+    → {'daily': {d: R_d}, 'weekly': {w: W_w}, 'k': {w: k_w}, 'sym_days': {d: {sym: ΔR}}}."""
+    sd = {}
+    for t in trades:
+        for d, dr in trade_daily_path(t, d_close_maps[t['sym']]).items():
+            sd.setdefault(d, {}); sd[d][t['sym']] = sd[d].get(t['sym'], 0.0) + dr
+    wk_syms = {}
+    for d, m in sd.items():
+        wk_syms.setdefault(week_of_day(d), set()).update(m)
+    k = {w: len(v) for w, v in wk_syms.items()}
+    daily = {d: sum(m.values()) / k[week_of_day(d)] for d, m in sd.items()}
+    weekly = {}
+    for d, r in daily.items():
+        w = week_of_day(d); weekly[w] = weekly.get(w, 0.0) + r
+    return {'daily': daily, 'weekly': weekly, 'k': k, 'sym_days': sd}
+
+
+def portfolio_week_risks(trades, d_close_maps, risk):
+    """Риск на позицию по неделям: {w: {sym: risk/k_w}} — суммарный риск открытых позиций недели = risk."""
+    ps = portfolio_series(trades, d_close_maps)
+    out = {}
+    for d, m in ps['sym_days'].items():
+        w = week_of_day(d)
+        for sym in m:
+            out.setdefault(w, {})[sym] = risk / ps['k'][w]
+    return out
+
+
+def weekly_stats(vals) -> dict:
+    """n, mean, t (стандартная ошибка по недельному ряду, ddof=1)."""
+    n = len(vals)
+    if n == 0:
+        return {'n': 0, 'mean': 0.0, 't': 0.0}
+    m = sum(vals) / n
+    t = 0.0
+    if n >= 2:
+        sd = math.sqrt(sum((v - m) ** 2 for v in vals) / (n - 1))
+        t = m / (sd / math.sqrt(n)) if sd > 0 else 0.0
+    return {'n': n, 'mean': m, 't': t}
+
+
+def equity_from_daily(ret_by_day, from_day=None) -> dict:
+    """Эквити по дневным доходностям портфеля (доля): макс. просадка от пика, худший день, доля положительных месяцев, итог."""
+    days = sorted(d for d in ret_by_day if from_day is None or d >= from_day)
+    if not days:
+        return {'max_dd': 0.0, 'worst_day': 0.0, 'pos_months': 0, 'n_months': 0, 'total_ret': 0.0}
+    eq, peak, maxdd, worst, months = 1.0, 1.0, 0.0, 0.0, {}
+    for d in range(days[0], days[-1] + 1):
+        r = ret_by_day.get(d, 0.0)
+        worst = min(worst, r)
+        prev = eq; eq *= (1 + r)
+        peak = max(peak, eq); maxdd = max(maxdd, (peak - eq) / peak)
+        dt = datetime.fromordinal(d + 719163)
+        months[(dt.year, dt.month)] = months.get((dt.year, dt.month), 1.0) * (eq / prev)
+    return {'max_dd': maxdd, 'worst_day': worst, 'pos_months': sum(1 for v in months.values() if v > 1.0), 'n_months': len(months), 'total_ret': eq - 1.0}
+
+
+def week_features(daily_ret, weeks):
+    """Для бутстрапа по неделям: доходность недели (доля), экстремумы накопленного пути, худший день, порядок max/min. Недели без позиции — нули."""
+    out = []
+    for w in weeks:
+        cum, cs, ds = 0.0, [], []
+        for d in range(w * 7 - 3, w * 7 + 4):
+            r = daily_ret.get(d, 0.0); cum += r; cs.append(cum); ds.append(r)
+        imin, imax = int(np.argmin(cs)), int(np.argmax(cs))
+        out.append({'R': cum, 'min_c': min(0.0, min(cs)), 'max_c': max(0.0, max(cs)), 'min_day': min(ds), 'max_first': imax < imin, 'days': 7})
+    return out
+
+
+def wide_verdict(trades_new: list, d_close_maps: dict) -> dict:
+    """ГЛАВНЫЙ критерий H-T2W (§2.30.3) — только НОВЫЕ символы (без BTC/ETH/SOL). Значимость — по недельному портфелю:
+    OOS недельный mean R > 0 при t ≥ 2.4; PF net по сделкам OOS ≥ 1.3; полный период — недельный mean R > 0;
+    OOS mean R (по сделкам) > 0 минимум у половины символов. n(OOS недель) < 30 или n(OOS сделок) < 30 → «недостаточно данных»."""
+    ps = portfolio_series(trades_new, d_close_maps)
+    oos_w0 = week_of_day(_ms(OOS_START) // DAY_MS)           # первая неделя (Пн–Вс), начинающаяся не раньше OOS_START
+    if week_start_ms(oos_w0) < _ms(OOS_START):
+        oos_w0 += 1
+    full_w = list(ps['weekly'].values())
+    oos_w = [v for w, v in ps['weekly'].items() if w >= oos_w0]
+    _is, oos_t = split_period(trades_new)
+    st_oos, st_all = trade_stats(oos_t), trade_stats(trades_new)
+    ws_oos, ws_full = weekly_stats(oos_w), weekly_stats(full_w)
+    per_sym = {}
+    for sym in sorted({t['sym'] for t in trades_new}):
+        per_sym[sym] = {'all': trade_stats([t for t in trades_new if t['sym'] == sym]), 'oos': trade_stats([t for t in oos_t if t['sym'] == sym])}
+    with_oos = [s for s, v in per_sym.items() if v['oos']['n'] > 0]
+    pos = sum(1 for s in with_oos if per_sym[s]['oos']['mean_r'] > 0)
+    res = {'ps': ps, 'oos_w0': oos_w0, 'ws_oos': ws_oos, 'ws_full': ws_full, 'st_oos': st_oos, 'st_all': st_all,
+           'per_sym': per_sym, 'pos_syms': pos, 'n_syms_oos': len(with_oos)}
+    if ws_oos['n'] < WIDE_CRIT_MIN_N or st_oos['n'] < WIDE_CRIT_MIN_N:
+        res.update(status='NODATA', text=f'недостаточно данных (OOS недель {ws_oos["n"]}, сделок {st_oos["n"]}; нужно ≥ {WIDE_CRIT_MIN_N} и ≥ {WIDE_CRIT_MIN_N})', checks={})
+        return res
+    checks = {
+        f'OOS недельный mean R&gt;0 при t≥{CRIT_T}': ws_oos['mean'] > 0 and ws_oos['t'] >= CRIT_T,
+        f'PF net (сделки OOS)≥{CRIT_PF}': st_oos['pf'] >= CRIT_PF,
+        'полный период: недельный mean R&gt;0': ws_full['mean'] > 0,
+        'OOS mean R&gt;0 минимум у половины символов': len(with_oos) > 0 and 2 * pos >= len(with_oos),
+    }
+    ok = all(checks.values())
+    res.update(status='PASS' if ok else 'FAIL', text='ПРОЙДЕНО' if ok else 'не пройдено', checks=checks)
+    return res
+
+
+def run_wide_trades(data, fee, slip=SLIP, syms=None):
+    """T2 (правила §2.28 без изменений) по символам. → {sym: trades}."""
+    return {sym: run_t2(data[sym]['1d'], data[sym]['funding'], fee, slip, sym) for sym in (syms or data) if len(data[sym]['1d']) > 0}
+
+
+def funding_coverage_text(data, trades_by_sym, info) -> list:
+    """«фандинг до ДАТЫ не учтён» + оценка вклада по доступному периоду: средний R фандинга на сделку (для сделок целиком после первой записи)."""
+    L = []
+    for sym, d in data.items():
+        f = d.get('funding') or []
+        dep = (info.get('funding_depth') or {}).get(sym, {})
+        if not f:
+            L.append(f'  {sym.split("/")[0]}: фандинга нет — не учтён за весь период')
+            continue
+        first = f[0][0]
+        trs = [t for t in trades_by_sym.get(sym, []) if t['entry_ts'] >= first]
+        est = (sum(t['R_fund'] for t in trs) / len(trs)) if trs else None
+        L.append(f'  {sym.split("/")[0]}: фандинг с {_date(first)} ({len(f)} событий); до {_date(first)} не учтён (глубже: {dep.get("status", "не пробовали")}); '
+                 + (f'средний вклад фандинга {est:+.3f}R на сделку по {len(trs)} сделкам с покрытием' if est is not None else 'сделок с покрытием нет'))
+    return L
+
+
+def build_wide_report(univ, kept, excluded, data, info, trades_by_sym, verd, boot, params, fee) -> str:
+    risk = portf_risk()
+    new_syms = [s for s in kept if s not in MAIN3]
+    L = ['📈 <b>H-T2W: T2 TSMOM-28 на широкой корзине USDT-перпетуалов BingX</b>',
+         f'Правила T2 — как в §2.28 (28 дней, понедельник 00:00 UTC, SL 2·ATR20, разворот при смене знака); издержки: FEE_TAKER={fee} + проскальзывание {SLIP} на сторону, '
+         f'фандинг по 8ч-интервалам там, где он доступен. IS до {IS_END}, OOS с {OOS_START}. Пре-коммит — BOT_SPEC §2.30.',
+         '⚠️ ОШИБКА ВЫЖИВШЕГО: вселенная отобрана по ТЕКУЩЕМУ объёму — монеты, которые выросли и остались ликвидными; результат на ней систематически оптимистичен.',
+         f'Вселенная (правило: топ-{WIDE_TOP_N} по 30-дн. объёму, без стейблкоинов/фиат-пар, 1D-история не позже {WIDE_HIST_MAX}):']
+    for r in univ:
+        st = 'в тесте' if r['sym'] in kept else 'исключён: ' + next((e['reason'] for e in excluded if e['sym'] == r['sym']), '?')
+        if r['sym'] in MAIN3 and r['sym'] in kept:
+            st = 'BTC/ETH/SOL — вне главного критерия'
+        L.append(f'  {r["sym"].split("/")[0]}: объём 30д ≈ {r["vol30"] / 1e6:,.0f}M USDT | {st}')
+    for sym, r in info.get('failed', {}).items():
+        L.append(f'⚠️ {sym[0].split("/")[0]} {sym[1].upper()}: НЕ ЗАГРУЖЕН ({r}) — символ исключён из расчёта')
+    L.append(f'Символов в главном критерии (без BTC/ETH/SOL): {len(new_syms)}')
+    L.append('\n<b>Главный критерий — НОВЫЕ символы, недельный портфель</b>')
+    ws_o, ws_f = verd['ws_oos'], verd['ws_full']
+    L.append(f'  Недельный портфель (среднее R по символам с позицией): полный период n={ws_f["n"]} недель, mean R net {ws_f["mean"]:+.4f}, t {ws_f["t"]:.2f}')
+    L.append(f'  OOS: n={ws_o["n"]} недель, mean R net {ws_o["mean"]:+.4f}, t {ws_o["t"]:.2f}')
+    L.append(_line('Сделки, весь период', verd['st_all']))
+    L.append(_line('Сделки, OOS', verd['st_oos']))
+    L.append(f'  Символов с OOS mean R&gt;0: {verd["pos_syms"]} из {verd["n_syms_oos"]}')
+    for sym, v in verd['per_sym'].items():
+        L.append(_line(f'{sym.split("/")[0]} OOS', v['oos']))
+    L.append(' Критерии: ' + (' | '.join(f'{k} {"✅" if ok else "❌"}' for k, ok in verd['checks'].items()) if verd['checks'] else '—'))
+    L.append(f' <b>ВЕРДИКТ H-T2W: {verd["text"]}</b>')
+    ps = verd['ps']
+    d_oos = max(_ms(OOS_START) // DAY_MS, 0)
+    L.append(f'\n<b>Кривая эквити: суммарный риск {risk * 100:g}% на неделю, поровну между открытыми позициями (дневная переоценка)</b>')
+    for label, fr in (('OOS', d_oos), ('полный период', None)):
+        e = equity_from_daily({d: risk * r for d, r in ps['daily'].items()}, fr)
+        L.append(f'  {label}: макс. просадка от пика {e["max_dd"] * 100:.1f}% | худший день {e["worst_day"] * 100:.2f}% | положительных месяцев {e["pos_months"]} из {e["n_months"]} | итог {e["total_ret"] * 100:+.1f}%')
+    if boot:
+        L.append(f'\n<b>Проп-бутстрап по недельной последовательности портфеля OOS (блоки по {BOOT_BLOCK_WEEKS} недели, {BOOT_RUNS} прогонов)</b>')
+        L.append(('⚠️ ПРИМЕРНЫЕ параметры, не правила конкретной фирмы: ' if params['example'] else 'Параметры из ENV: ')
+                 + f'цель {params["target"] * 100:g}%, дневной DD {params["daily"] * 100:g}%, общий DD {params["maxdd"] * 100:g}% ({params["mode"]}), мин. дней {params["min_days"]}')
+        for label, b in boot.items():
+            L.append(f' {label}: P(пройти) {b["p_pass"] * 100:.1f}% | P(провал по общему DD) {b["p_fail_maxdd"] * 100:.1f}% | P(провал по дневному) {b["p_fail_daily"] * 100:.1f}% | '
+                     f'P(не успеть по времени) {b["p_fail_time"] * 100:.1f}% | не завершён {b["p_unfinished"] * 100:.1f}% | '
+                     f'медиана дней до цели {("%.0f" % b["median_days"]) if b["median_days"] is not None else "—"} | 90-й перцентиль {("%.0f" % b["p90_days"]) if b.get("p90_days") is not None else "—"}')
+    L.append('\n<b>Фандинг:</b>')
+    L.extend(funding_coverage_text({s: data[s] for s in new_syms if s in data}, trades_by_sym, info)[:40])
+    L.append('\nНе прошедшая гипотеза не докручивается (параметры и вселенная не подбираются заново).')
+    return '\n'.join(L)
+
+
+def compute_wide(univ, data, info, fee, slip=SLIP, runs=BOOT_RUNS):
+    """Синхронная тяжёлая часть (в потоке): фильтр вселенной по истории, T2 по символам, недельный портфель, критерий, бутстрап."""
+    kept, excluded = filter_history(data, info)
+    trades_by_sym = run_wide_trades(data, fee, slip, kept)
+    new_syms = [s for s in kept if s not in MAIN3]
+    d_maps = {sym: {int(b[0] // DAY_MS): b[4] for b in data[sym]['1d']} for sym in kept}
+    trades_new = [t for s in new_syms for t in trades_by_sym.get(s, [])]
+    verd = wide_verdict(trades_new, d_maps)
+    risk, params = portf_risk(), prop_params()
+    boot = {}
+    ps = verd['ps']
+    if ps['weekly'] and verd['ws_oos']['n'] > 0 and verd['ws_oos']['mean'] > 0:
+        weeks = list(range(verd['oos_w0'], max(ps['weekly']) + 1))
+        feats = week_features({d: risk * r for d, r in ps['daily'].items()}, weeks)
+        for label, lim in (('лимит 30 дн', 30), ('без лимита времени', 0)):
+            p = dict(params); p['limit'] = lim
+            boot[label] = prop_bootstrap(feats, 1.0, p, runs=runs, block=BOOT_BLOCK_WEEKS, max_steps=1500)
+    return build_wide_report(univ, kept, excluded, data, info, trades_by_sym, verd, boot, params, fee), verd, boot
+
+
+async def run_wide(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
+    """/htf_backtest_wide: выбор вселенной правилом → загрузка 1D (+фандинг) с повторами/паузой/кэшем → расчёт в потоке."""
+    sel_info = {'requests': 0, 'fetch_log': []}
+    univ = await select_universe(exchange, sel_info, progress=progress)
+    syms = tuple(r['sym'] for r in univ)
+    data, info = await load_data(exchange, db_path, symbols=syms, progress=progress, tfs=('1d',))
+    info['requests'] += sel_info['requests']; info['universe_skipped'] = sel_info.get('universe_skipped', [])
+    text, verd, boot = await asyncio.to_thread(compute_wide, univ, data, info, fee, SLIP, runs)
+    return text, info, verd, boot
