@@ -387,9 +387,28 @@ def prop_bootstrap(feats, risk, params, runs=BOOT_RUNS, block=BOOT_BLOCK, seed=1
 # ── данные: загрузка с кэшем в SQLite ───────────────────────────────────────────────────
 def init_cache(db_path):
     con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE IF NOT EXISTS htf_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, version TEXT, text TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS htf_bars (symbol TEXT, tf TEXT, ts INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL, PRIMARY KEY (symbol, tf, ts))")
     con.execute("CREATE TABLE IF NOT EXISTS htf_funding (symbol TEXT, ts INTEGER, rate REAL, PRIMARY KEY (symbol, ts))")
     con.commit(); con.close()
+
+
+def save_report(db_path, version, text) -> int:
+    """Полный отчёт бэктеста — в БД (htf_reports) ДО отправки. → id записи."""
+    init_cache(db_path)
+    con = sqlite3.connect(db_path)
+    cur = con.execute("INSERT INTO htf_reports (ts, version, text) VALUES (?,?,?)", (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), version, text))
+    con.commit(); rid = cur.lastrowid; con.close()
+    return rid
+
+
+def last_report(db_path):
+    """Последний сохранённый отчёт → (id, ts, version, text) или None."""
+    init_cache(db_path)
+    con = sqlite3.connect(db_path)
+    row = con.execute("SELECT id, ts, version, text FROM htf_reports ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    return row
 
 
 def cache_bars(db_path, sym, tf):
@@ -406,7 +425,74 @@ def cache_funding(db_path, sym):
     return [(r[0], r[1]) for r in rows]
 
 
-async def _fetch_paged(fetch, since_ms, now_ms, step_ms, max_iter=400):
+# ── устойчивая загрузка: повторы, паузы, частичные сбои ─────────────────────────────────────
+RETRY_DELAYS = (2, 4, 8, 16, 32, 60)     # паузы между попытками, с; попыток всего len(RETRY_DELAYS) (после последней пауза не нужна)
+MAX_ATTEMPTS = len(RETRY_DELAYS)
+IS_START = '2024-01-01'                  # IS короче года (данные начинаются позже) → вердикт по символу невозможен
+_sleep = asyncio.sleep                   # подменяется в тестах
+
+
+def fetch_pause() -> float:
+    """HTF_FETCH_PAUSE_SEC (ENV, по умолчанию 2.0 с) — минимум между историческими запросами, поверх throttler'а ccxt."""
+    try:
+        return max(0.0, float(os.getenv('HTF_FETCH_PAUSE_SEC', '2.0')))
+    except ValueError:
+        return 2.0
+
+
+def is_retryable(e) -> bool:
+    """Повторяем: ExchangeError с кодом 100410 («повторите позже»), ошибки сети, RateLimitExceeded. Остальное — без повторов."""
+    try:
+        import ccxt as ce                                # классы ошибок — из пакета верхнего уровня (ccxt.base.errors как модуль не импортируем: в новых ccxt имя ccxt.base перекрыто)
+        if isinstance(e, ce.NetworkError):               # RateLimitExceeded ⊂ DDoSProtection ⊂ NetworkError; RequestTimeout, ExchangeNotAvailable
+            return True
+        if isinstance(e, ce.ExchangeError) and '100410' in str(e):
+            return True
+    except ImportError:
+        pass
+    return isinstance(e, (asyncio.TimeoutError, ConnectionError))
+
+
+class HtfFetchError(Exception):
+    def __init__(self, label, attempts, last):
+        self.label, self.attempts, self.last = label, attempts, last
+        super().__init__(f'{label}: {self.short()}')
+
+    def short(self):
+        m = str(self.last)
+        code = '100410' if '100410' in m else type(self.last).__name__
+        return f'{code} после {self.attempts} попыток' if self.attempts > 1 else f'{code}'
+
+
+async def call_with_retry(label, since, fn, info):
+    """Один исторический запрос: до MAX_ATTEMPTS попыток с паузами RETRY_DELAYS; пауза после запроса ≥ HTF_FETCH_PAUSE_SEC.
+    Каждая попытка пишется в лог и в info['fetch_log']. Исчерпание → HtfFetchError (наружу — только он)."""
+    import logging
+    last = None
+    for k in range(1, MAX_ATTEMPTS + 1):
+        info['requests'] = info.get('requests', 0) + 1
+        try:
+            res = await fn()
+            n = len(res or [])
+            info.setdefault('fetch_log', []).append({'label': label, 'since': since, 'n': n, 'attempt': k, 'error': ''})
+            logging.info(f'[HTF] {label} since={since} получено {n} попытка {k}')
+            await _sleep(fetch_pause())
+            return res
+        except Exception as e:
+            if not is_retryable(e):
+                info.setdefault('fetch_log', []).append({'label': label, 'since': since, 'n': 0, 'attempt': k, 'error': f'{type(e).__name__}: {e}'[:200]})
+                logging.warning(f'[HTF] {label} since={since} попытка {k}: {type(e).__name__}: {str(e)[:150]} (без повторов)')
+                raise HtfFetchError(label, k, e)
+            last = e
+            info.setdefault('fetch_log', []).append({'label': label, 'since': since, 'n': 0, 'attempt': k, 'error': f'{type(e).__name__}: {e}'[:200]})
+            logging.warning(f'[HTF] {label} since={since} попытка {k}/{MAX_ATTEMPTS}: {type(e).__name__}: {str(e)[:150]}')
+            if k < MAX_ATTEMPTS:
+                await _sleep(max(RETRY_DELAYS[k - 1], fetch_pause()))
+    raise HtfFetchError(label, MAX_ATTEMPTS, last)
+
+
+async def _fetch_paged(fetch, since_ms, now_ms, step_ms, on_batch=None, max_iter=400):
+    """Пагинация с since. on_batch(batch) вызывается после КАЖДОЙ страницы (сохранение в кэш по мере загрузки)."""
     out, cur, it = [], since_ms, 0
     while cur < now_ms and it < max_iter:
         it += 1
@@ -415,6 +501,8 @@ async def _fetch_paged(fetch, since_ms, now_ms, step_ms, max_iter=400):
         if not batch:
             cur += step_ms * 500                      # пустое окно (до листинга) — прыгаем вперёд
             continue
+        if on_batch:
+            on_batch(batch)
         out.extend(batch)
         nxt = batch[-1][0] + step_ms
         if nxt <= cur:
@@ -425,54 +513,114 @@ async def _fetch_paged(fetch, since_ms, now_ms, step_ms, max_iter=400):
     return out
 
 
+def _date(ms):
+    return f'{datetime.fromtimestamp(ms / 1000, timezone.utc):%Y-%m-%d}'
+
+
 async def load_data(exchange, db_path, symbols=SYMBOLS, now_ms=None, since_ms=None, progress=None):
     """Догружает кэш и возвращает {sym: {'1d': bars, '4h': bars, 'funding': [...]}} + служебную информацию.
-    Только ЗАКРЫТЫЕ бары. Если фандинг недоступен — funding_ok=False (фандинг = 0, «фандинг не учтён»)."""
+    Только ЗАКРЫТЫЕ бары. Сбой набора (символ×ТФ или фандинг символа) после всех повторов НЕ прерывает загрузку:
+    info['failed'][(sym, tf)] / info['funding_failed'][sym]; такой набор в данных пуст (фандинг = 0, «фандинг не учтён»).
+    Уже загруженное страницами пишется в кэш сразу — повторный запуск продолжает с места обрыва."""
     init_cache(db_path)
     now_ms = now_ms or int(time.time() * 1000)
     since_ms = since_ms if since_ms is not None else int(datetime(2019, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
-    data, info = {}, {'funding_ok': True, 'funding_note': '', 'requests': 0}
+    data = {}
+    info = {'funding_ok': True, 'funding_note': '', 'requests': 0, 'failed': {}, 'funding_failed': {}, 'fetch_log': []}
     has_fund = bool(getattr(exchange, 'has', {}).get('fetchFundingRateHistory', False))
+
+    async def say(msg):
+        if progress:
+            try:
+                await progress(msg)
+            except Exception:
+                pass
+
     for sym in symbols:
-        entry = {}
+        short = sym.split('/')[0]
+        entry = {'1d': [], '4h': [], 'funding': []}
         for tf in ('1d', '4h'):
             have = cache_bars(db_path, sym, tf)
             start = (have[-1][0] + TF_MS[tf]) if have else since_ms
 
             async def f(cur, sym=sym, tf=tf):
-                info['requests'] += 1
-                return await exchange.fetch_ohlcv(sym, tf, since=cur, limit=1000)
-            new = await _fetch_paged(f, start, now_ms, TF_MS[tf])
-            new = [b for b in new if b[0] + TF_MS[tf] <= now_ms]            # незакрытый бар не берём
-            if new:
-                con = sqlite3.connect(db_path)
-                con.executemany("INSERT OR REPLACE INTO htf_bars VALUES (?,?,?,?,?,?,?,?)", [(sym, tf, int(b[0]), b[1], b[2], b[3], b[4], b[5]) for b in new])
-                con.commit(); con.close()
-            entry[tf] = cache_bars(db_path, sym, tf)
-            if progress:
-                await progress(f'{sym} {tf}: {len(entry[tf])} баров')
-        fund = cache_funding(db_path, sym)
-        if has_fund:
+                return await call_with_retry(f'{sym} {tf}', cur, lambda: exchange.fetch_ohlcv(sym, tf, since=cur, limit=1000), info)
+
+            def save(batch, sym=sym, tf=tf):
+                rows = [(sym, tf, int(b[0]), b[1], b[2], b[3], b[4], b[5]) for b in batch if b[0] + TF_MS[tf] <= now_ms]   # незакрытый бар не берём
+                if rows:
+                    con = sqlite3.connect(db_path)
+                    con.executemany("INSERT OR REPLACE INTO htf_bars VALUES (?,?,?,?,?,?,?,?)", rows)
+                    con.commit(); con.close()
             try:
-                start = (fund[-1][0] + 1) if fund else since_ms
-                async def ff(cur, sym=sym):
-                    info['requests'] += 1
+                await _fetch_paged(f, start, now_ms, TF_MS[tf], on_batch=save)
+                entry[tf] = cache_bars(db_path, sym, tf)
+                await say(f'{short} {tf.upper()}: {len(entry[tf])} баров с {_date(entry[tf][0][0])}' if entry[tf] else f'{short} {tf.upper()}: баров нет')
+            except HtfFetchError as e:
+                info['failed'][(sym, tf)] = e.short()
+                await say(f'{short} {tf.upper()}: не загружен ({e.short()})')
+        # фандинг
+        fund, why = [], ''
+        if not has_fund:
+            why = 'биржа не поддерживает fetch_funding_rate_history'
+        else:
+            fund = cache_funding(db_path, sym)
+            start = (fund[-1][0] + 1) if fund else since_ms
+
+            async def ff(cur, sym=sym):
+                async def go():
                     r = await exchange.fetch_funding_rate_history(sym, since=cur, limit=1000)
                     return [[int(x['timestamp']), float(x.get('fundingRate') or 0.0)] for x in (r or []) if x.get('timestamp') is not None]
-                newf = await _fetch_paged(ff, start, now_ms, FUNDING_MS)
-                if newf:
-                    con = sqlite3.connect(db_path)
-                    con.executemany("INSERT OR REPLACE INTO htf_funding VALUES (?,?,?)", [(sym, int(a), float(b)) for a, b in newf])
-                    con.commit(); con.close()
+                return await call_with_retry(f'{sym} funding', cur, go, info)
+
+            def savef(batch, sym=sym):
+                con = sqlite3.connect(db_path)
+                con.executemany("INSERT OR REPLACE INTO htf_funding VALUES (?,?,?)", [(sym, int(a), float(b)) for a, b in batch])
+                con.commit(); con.close()
+            try:
+                await _fetch_paged(ff, start, now_ms, FUNDING_MS, on_batch=savef)
                 fund = cache_funding(db_path, sym)
-            except Exception as e:
-                info['funding_ok'] = False; info['funding_note'] = f'fetch_funding_rate_history: {type(e).__name__}: {e}'
-        if not fund:
+                if not fund:
+                    why = 'история фандинга пуста'
+            except HtfFetchError as e:
+                why = e.short(); fund = []
+        if why:
             info['funding_ok'] = False
-            info['funding_note'] = info['funding_note'] or ('биржа не поддерживает fetch_funding_rate_history' if not has_fund else 'история фандинга пуста')
+            info['funding_failed'][sym] = why
+            info['funding_note'] = '; '.join(f'{k.split("/")[0]}: {v}' for k, v in info['funding_failed'].items())
+            await say(f'{short} funding: не загружен ({why})')
+        else:
+            await say(f'{short} funding: {len(fund)} событий с {_date(fund[0][0])}')
         entry['funding'] = fund
         data[sym] = entry
     return data, info
+
+
+def history_flags(data, info) -> dict:
+    """{(sym, tf): 'ok' | 'not_loaded' | 'short_is'}; short_is — данные начинаются позже IS_START (IS короче года)."""
+    cut = int(datetime.strptime(IS_START, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
+    out = {}
+    for sym, d in data.items():
+        for tf in ('1d', '4h'):
+            if (sym, tf) in info.get('failed', {}) or not d[tf]:
+                out[(sym, tf)] = 'not_loaded'
+            elif d[tf][0][0] > cut:
+                out[(sym, tf)] = 'short_is'
+            else:
+                out[(sym, tf)] = 'ok'
+    return out
+
+
+SYS_TFS = {'T1': ('1d',), 'T2': ('1d',), 'T3': ('1d', '4h')}
+
+
+def system_blockers(key, flags) -> list:
+    """Что мешает вердикту системы: не загруженные наборы и слишком короткий IS (критерии §2.28.4 не меняются)."""
+    out = []
+    for (sym, tf), st in flags.items():
+        if tf in SYS_TFS[key] and st != 'ok':
+            out.append(f'{sym.split("/")[0]} {tf.upper()}: ' + ('не загружен' if st == 'not_loaded' else 'IS слишком короткий, вердикт по символу невозможен'))
+    return out
 
 
 # ── прогон и отчёт ────────────────────────────────────────────────────────────────────
@@ -480,9 +628,10 @@ def run_all(data, fee, slip=SLIP):
     """→ {sys: {sym: trades}} для T1/T2/T3."""
     res = {'T1': {}, 'T2': {}, 'T3': {}}
     for sym, d in data.items():
-        res['T1'][sym] = run_t1(d['1d'], d['funding'], fee, slip, sym)
-        res['T2'][sym] = run_t2(d['1d'], d['funding'], fee, slip, sym)
-        res['T3'][sym] = run_t3(d['4h'], d['1d'], d['funding'], fee, slip, sym)
+        have1, have4 = len(d['1d']) > 0, len(d['4h']) > 0
+        res['T1'][sym] = run_t1(d['1d'], d['funding'], fee, slip, sym) if have1 else []
+        res['T2'][sym] = run_t2(d['1d'], d['funding'], fee, slip, sym) if have1 else []
+        res['T3'][sym] = run_t3(d['4h'], d['1d'], d['funding'], fee, slip, sym) if (have1 and have4) else []
     return res
 
 
@@ -512,6 +661,12 @@ def build_report(data, info, results, fee, boot=None, params=None) -> str:
         def span(b):
             return (f'{datetime.fromtimestamp(b[0][0] / 1000, timezone.utc):%Y-%m-%d}…{datetime.fromtimestamp(b[-1][0] / 1000, timezone.utc):%Y-%m-%d} ({len(b)})') if b else 'нет данных'
         L.append(f'  {sym}: 1D {span(d["1d"])} | 4h {span(d["4h"])} | фандинг: {len(d["funding"])} событий')
+    flags = history_flags(data, info)
+    for (sym, tf), r in info.get('failed', {}).items():
+        L.append(f'⚠️ {sym.split("/")[0]} {tf.upper()}: НЕ ЗАГРУЖЕН ({r}) — набор исключён из расчёта; повторный запуск продолжит с кэша')
+    for (sym, tf), st in flags.items():
+        if st == 'short_is':
+            L.append(f'⚠️ {sym.split("/")[0]} {tf.upper()}: данные начинаются {_date(data[sym][tf][0][0])} (позже {IS_START}) — IS слишком короткий, вердикт по символу невозможен')
     d_maps = {sym: {int(b[0] // DAY_MS): b[4] for b in d['1d']} for sym, d in data.items()}
     verdicts = {}
     for key in ('T1', 'T2', 'T3'):
@@ -529,6 +684,11 @@ def build_report(data, info, results, fee, boot=None, params=None) -> str:
                 L.append(f'    эквити при риске {r * 100:.2f}%: макс. просадка от пика {e["max_dd"] * 100:.1f}% | худший день {e["worst_day"] * 100:.2f}% | '
                          f'положительных месяцев {e["pos_months"]} из {e["n_months"]} | итог {e["total_ret"] * 100:+.1f}%')
         v = verdict(by_sym); verdicts[key] = v
+        blockers = system_blockers(key, flags)
+        if blockers:                                       # неполные данные: вердикт по §2.28.4 невозможен (критерии не менялись)
+            v['status'] = 'INCOMPLETE'
+            v['text'] = 'вердикт невозможен — неполные данные (' + '; '.join(blockers) + ')'
+            v['checks'] = {}
         L.append(' Критерии (OOS, все символы): ' + (' | '.join(f'{k} {"✅" if ok else "❌"}' for k, ok in v['checks'].items()) if v['checks'] else '—'))
         L.append(f' <b>ВЕРДИКТ {key}: {v["text"]}</b> (OOS mean R {v["oos"]["mean_r"]:+.3f}, IS mean R {v["is"]["mean_r"]:+.3f})')
     if boot:
@@ -558,7 +718,7 @@ def compute(data, info, fee, slip=SLIP, runs=BOOT_RUNS):
         allt = [t for ts_ in results[key].values() for t in ts_]
         _i, oos = split_period(allt)
         st = trade_stats(oos)
-        if st['n'] > 0 and st['mean_r'] > 0:
+        if st['n'] > 0 and st['mean_r'] > 0 and not system_blockers(key, history_flags(data, info)):
             feats = [trade_features(t, d_maps[t['sym']]) for t in sorted(oos, key=lambda x: x['entry_ts'])]
             boot[key] = {r: prop_bootstrap(feats, r, params, runs=runs) for r in BOOT_RISKS}
     return build_report(data, info, results, fee, boot, params), results, boot

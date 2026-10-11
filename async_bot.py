@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v86'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v87'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -6456,8 +6456,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-11-v86'
+CODE_VERSION = '2026-10-11-v87'
 CHANGELOG = [
+    ('2026-10-11-v87', 'УСТОЙЧИВЫЙ /htf_backtest (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, критерии и пре-коммит §2.28, bybit_worker.py не менялись). ПРОД-ФАКТ: v86 упал на первом запросе истории: ExchangeError bingx {"code":100410,"msg":"请稍后重试"} («повторите позже»; в exceptions-карте ccxt 4.2.14 кода нет → общий ExchangeError). (1) Каждый исторический запрос — с повторами (ExchangeError 100410, сеть, RateLimitExceeded: 6 попыток, паузы 2/4/8/16/32 с между ними), пауза не меньше HTF_FETCH_PAUSE_SEC (2.0) между запросами; (2) сбой набора (символ×ТФ или фандинг) не прерывает бэктест: набор «не загружен», вердикт систем, зависящих от него, — «невозможен (неполные данные)»; фандинг без загрузки = 0 с пометкой; (3) кэш пишется постранично — повторный запуск продолжает с места обрыва; прогресс в Telegram после каждого набора, лог каждого запроса; (4) IS короче года (данные позже 2024-01-01) — явная пометка, вердикт по символу невозможен; (5) отчёт сохраняется в htf_reports до отправки, /htf_report шлёт последний, при сбое файла — текстом частями; сводка вердиктов вместо обрезанного сообщения. Шаг 0: тесты v75_dbg/v78_dbl/v78_live устарели из-за намеренных изменений (v76/v81/v79), v76_po3 — окружение (ccxt 4.5.78 вместо 4.2.14); регрессии нет'),
     ('2026-10-11-v86', 'СМЕНА ВЕКТОРА: СТАРШИЕ ТФ (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, модель комиссий, bybit_worker.py не менялись). (1) RB_ENABLED и новый SMC_SHADOW_ENABLED дефолт false (возврат через ENV; SMC_SIG не тронут; открытые записи RB/SMC_SHADOW закрываются штатно). (2) research_htf.py + /htf_backtest: фоновый исторический бэктест T1 Donchian-55, T2 TSMOM-28, T3 MTF-pullback на BTC/ETH/SOL (1D/4h, фандинг, IS/OOS, критерии BOT_SPEC Смена вектора, проп-бутстрап); параметры зафиксированы пре-коммитом'),
     ('2026-10-08-v85', 'АУДИТ ЭКСПЕРТА: LLM вне торговли, риск 0.25%, модель комиссий maker/taker, ORB_RT (shadow). Сигналы SMC/SMC_SIG/SMC2/PO3/RB, их контракты, breaker-ы v76/v77, замер задержек, SMC_LIVE (false), bybit_worker.py НЕ менялись. (1) Удалены ВСЕ LLM-оракулы: oracle_ai/oracle_groq/oracle_gemini/score_setup_local и их кэши, лимиты, шаблонный детектор, константы GROQ_*/GEMINI_*/OPENROUTER_*/AI_ORACLE_ENABLED/AI_BLOCK, проверки ключей и строки на старте, строка AI(...) в Telegram-сообщении о сделке (в execute() оракул мог БЛОКИРОВАТЬ вход при AI_ORACLE_ENABLED=1 и AI_BLOCK=1); oracle_volume — НЕ LLM (проверка объёма по тикерам BingX и binance/bybit/mexc, влияет на вход) — оставлен без изменений; trades.ai_conf/ai_comment остаются (история), новые сделки пишут 0/пусто; срез AI conf в /stats_analyze помечен историческим. (2) RISK_PER_TRADE = 0.0025 (доля эквити), RISK_WEEKEND = RISK_PER_TRADE, SMC/SA/PB_RISK_MULT = 1.0; при старте risk_config_errors(): эффективный риск каждой стратегии должен быть в (0, 0.01], иначе ERROR + Telegram с фактическим значением + SystemExit (пример: RISK_PER_TRADE = 0.25). (3) FEE_TAKER/FEE_MAKER (ENV, по умолчанию = FEE_RATE): _fee_pct(strategy, exit_reason) и SQL-эквивалент _fee_sql() — вход лимитом (SMC2_RT, ORB_RT) и TP по maker, прочие входы и SL/TIMEOUT по taker; используется всеми shadow-расчётами net (отчёты, контракты, H1, блок Б, аудит входа); при maker = taker net побитово совпадает с v84; живые отчёты по-прежнему FEE_RATE. (4) ORB_RT (shadow): первый закрытый бар окна ORB (06-12 UTC) с close за границей диапазона 00-06 UTC и объёмом >= 1.5 x медиана 20 баров -> ORB_MKT2 (по close пробоя) и ORB_RT (лимит на границе, заполнение low[f] < L в 8 барах), SL = 1.0 x ATR14, TP = 2R, таймаут 16 баров, ORB_NF-маркеры, 40 событий/сутки, сканер scan_orb_rt (окно 06-14 UTC, сумма исходов == total), контракт (А)/(Б) в константах ORB_RT_*, секция в /shadow_analyze; диапазон ORB вынесен в _orb_range_bars без изменения логики orb_signal. (5) Правила проекта в BOT_SPEC 2.27'),
     ('2026-10-06-v84', 'ТОЛЬКО ОТЧЁТЫ (торговая логика, сигналы, контракты, breaker-ы, SMC_LIVE, риск, bybit_worker.py не менялись). (1) ⭐ в отчётах: раньше при PF > 1 (RB Short с PF 1.00 получал ⭐, вводило в заблуждение), теперь _star_flag: n >= n_min (shadow 15, живые 10), PF net >= 1.3 И t >= 2.0 по net-результатам сделок; это только пометка кандидата, не решение; легенды обновлены в /shadow_analyze и /stats_analyze, _live_stats возвращает t. (2) PO3 НЕ выключается (дефолт true): владелец набирает данные пре-коммита §2.18.4 через ENV PO3_UNIVERSE_N=60. (3) Документация: статус SA (live n=71 после дедупликации PF net 0.75, gross 1.34; SA_SHADOW n=183 PF 0.62 t -2.32), результаты analysis_pack 2026-10-06 в BOT_SPEC 2.26, CLAUDE.md обновлён (был от v40)'),
@@ -6690,22 +6691,46 @@ _regime_cache: dict = {}     # {sym: (expire_ts, regime)} — до закрыт�
 _htf_running = [False]
 
 
+async def _htf_deliver(text: str) -> bool:
+    """[v87] Доставка отчёта HTF: краткая сводка вердиктов + файл; при сбое файла — лог с причиной (пишет tg_send_document)
+    и отправка текстом ЧАСТЯМИ (send_report_file → tg() режет по TG_MAX_LEN). → True, если ушёл файл."""
+    verdicts = [ln for ln in text.splitlines() if 'ВЕРДИКТ' in ln]
+    await tg('📈 HTF-бэктест готов:\n' + ('\n'.join(verdicts) if verdicts else '(вердикты — в отчёте)'))
+    ok = await send_report_file('htf_backtest', 'HTF-бэктест (/htf_backtest)', text)
+    if not ok:
+        logging.warning('[HTF] файл отчёта не доставлен — отчёт отправлен текстом частями')
+    return ok
+
+
 async def htf_backtest_run():
-    """[v86] /htf_backtest: загрузка истории через общий exchange (~100 запросов, с кэшем) и расчёт в потоке."""
+    """[v86/v87] /htf_backtest: загрузка истории через общий exchange (с повторами, паузой и кэшем) и расчёт в потоке.
+    Отчёт сохраняется в БД (htf_reports) ДО отправки; /htf_report пришлёт последний сохранённый."""
     if _htf_running[0]:
         return
     _htf_running[0] = True
     try:
         import research_htf
-        await tg('📈 /htf_backtest запущен (загрузка истории BTC/ETH/SOL 1D/4h, расчёт в фоне)…')
-        text, info, _res, _boot = await research_htf.run_backtest(exchange, TRADES_DB, FEE_TAKER)
-        await tg(text[:3900] if len(text) > 3900 else text)
-        await send_report_file('htf_backtest', 'HTF-бэктест (/htf_backtest)', text)
+        await tg('📈 /htf_backtest запущен (загрузка истории BTC/ETH/SOL 1D/4h с повторами и паузой '
+                 f'{research_htf.fetch_pause():g} с между запросами; расчёт в фоне)…')
+        text, info, _res, _boot = await research_htf.run_backtest(exchange, TRADES_DB, FEE_TAKER, progress=tg)
+        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+        await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_backtest')
         await tg(f'❌ /htf_backtest: {type(e).__name__}: {e}')
     finally:
         _htf_running[0] = False
+
+
+async def htf_report_send():
+    """[v87] /htf_report: повторно отправить последний сохранённый отчёт (текст сводки + файл)."""
+    import research_htf
+    row = research_htf.last_report(TRADES_DB)
+    if not row:
+        await tg('ℹ️ Сохранённых отчётов /htf_backtest нет — запусти /htf_backtest')
+        return
+    await tg(f'📈 Последний отчёт HTF-бэктеста: #{row[0]} от {row[1]} UTC (код {row[2]})')
+    await _htf_deliver(row[3])
 
 
 _bg_tasks: set = set()       # ссылки на фоновые задачи (иначе GC может их убить)
@@ -8815,6 +8840,7 @@ async def check_tg_commands():
                     '/stats_analyze file — отчёт по живым сделкам файлом\n'
                     '/analysis_pack — один файл: shadow + живые + режим + аудит входа + дубли\n'
                     '/htf_backtest — исторический бэктест трендследования 1D/4h (BTC/ETH/SOL), фоном, отчёт файлом\n'
+                    '/htf_report — повторно прислать последний сохранённый отчёт /htf_backtest\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
                     '/dups_impact — SMC/SA/режим: числа до и после исключения дублей (только чтение)\n'
                     '/maxdd_reset — снять ОБЩИЙ breaker и переснять пик эквити (после вывода средств)\n'
@@ -8843,6 +8869,11 @@ async def check_tg_commands():
                 else:
                     _t = asyncio.create_task(htf_backtest_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/htf_report':
+                # [v87] последний сохранённый отчёт /htf_backtest (из БД), текст + файл
+                _t = asyncio.create_task(htf_report_send())
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/analysis_pack':
                 # [v83] один файл: shadow + live + режим + аудит входа + дубли (только чтение)
