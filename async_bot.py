@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v87'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v88'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -6456,8 +6456,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-11-v87'
+CODE_VERSION = '2026-10-11-v88'
 CHANGELOG = [
+    ('2026-10-11-v88', 'ГИПОТЕЗА H-T2W + ФАНДИНГ ГЛУБЖЕ (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, правила T1/T2/T3 §2.28, bybit_worker.py не менялись). Итоги /htf_backtest 2026-10-11: T1 OOS mean R 0.000 (n=30), T2 +0.229 (t 1.17, PF 1.55, n=66), T3 -0.091 (n=470) — все три НЕ ПРОШЛИ §2.28, не докручиваются. (1) /htf_backtest_wide: T2 БЕЗ изменений правил на USDT-перпетуалах BingX; вселенная формируется ПРАВИЛОМ (топ-30 по 30-дн. объёму, без стейблкоинов/фиат-пар, 1D-история не позже 2023-01-01; список в отчёте, ручного нет); главный критерий — только НОВЫЕ символы (без BTC/ETH/SOL): значимость по недельному портфелю (t по ряду недельных значений, не по сделкам), PF net сделок OOS >= 1.3, полный период mean R > 0, OOS mean R > 0 у половины символов; суммарный риск PORTF_RISK_PCT (1.0%) поровну между открытыми позициями; кривая эквити; проп-бутстрап по неделям (блоки 4 нед.) с лимитом 30 дн и без лимита (медиана и 90-й перцентиль дней); предупреждение об ошибке выжившего; (2) фандинг: попытка пагинации назад через endTime, глубина в отчёте, при недоступности — «фандинг до ДАТЫ не учтён» и оценка вклада по доступному периоду; (3) итоги и пре-коммит — BOT_SPEC §2.28.7, §2.30'),
     ('2026-10-11-v87', 'УСТОЙЧИВЫЙ /htf_backtest (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, критерии и пре-коммит §2.28, bybit_worker.py не менялись). ПРОД-ФАКТ: v86 упал на первом запросе истории: ExchangeError bingx {"code":100410,"msg":"请稍后重试"} («повторите позже»; в exceptions-карте ccxt 4.2.14 кода нет → общий ExchangeError). (1) Каждый исторический запрос — с повторами (ExchangeError 100410, сеть, RateLimitExceeded: 6 попыток, паузы 2/4/8/16/32 с между ними), пауза не меньше HTF_FETCH_PAUSE_SEC (2.0) между запросами; (2) сбой набора (символ×ТФ или фандинг) не прерывает бэктест: набор «не загружен», вердикт систем, зависящих от него, — «невозможен (неполные данные)»; фандинг без загрузки = 0 с пометкой; (3) кэш пишется постранично — повторный запуск продолжает с места обрыва; прогресс в Telegram после каждого набора, лог каждого запроса; (4) IS короче года (данные позже 2024-01-01) — явная пометка, вердикт по символу невозможен; (5) отчёт сохраняется в htf_reports до отправки, /htf_report шлёт последний, при сбое файла — текстом частями; сводка вердиктов вместо обрезанного сообщения. Шаг 0: тесты v75_dbg/v78_dbl/v78_live устарели из-за намеренных изменений (v76/v81/v79), v76_po3 — окружение (ccxt 4.5.78 вместо 4.2.14); регрессии нет'),
     ('2026-10-11-v86', 'СМЕНА ВЕКТОРА: СТАРШИЕ ТФ (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, модель комиссий, bybit_worker.py не менялись). (1) RB_ENABLED и новый SMC_SHADOW_ENABLED дефолт false (возврат через ENV; SMC_SIG не тронут; открытые записи RB/SMC_SHADOW закрываются штатно). (2) research_htf.py + /htf_backtest: фоновый исторический бэктест T1 Donchian-55, T2 TSMOM-28, T3 MTF-pullback на BTC/ETH/SOL (1D/4h, фандинг, IS/OOS, критерии BOT_SPEC Смена вектора, проп-бутстрап); параметры зафиксированы пре-коммитом'),
     ('2026-10-08-v85', 'АУДИТ ЭКСПЕРТА: LLM вне торговли, риск 0.25%, модель комиссий maker/taker, ORB_RT (shadow). Сигналы SMC/SMC_SIG/SMC2/PO3/RB, их контракты, breaker-ы v76/v77, замер задержек, SMC_LIVE (false), bybit_worker.py НЕ менялись. (1) Удалены ВСЕ LLM-оракулы: oracle_ai/oracle_groq/oracle_gemini/score_setup_local и их кэши, лимиты, шаблонный детектор, константы GROQ_*/GEMINI_*/OPENROUTER_*/AI_ORACLE_ENABLED/AI_BLOCK, проверки ключей и строки на старте, строка AI(...) в Telegram-сообщении о сделке (в execute() оракул мог БЛОКИРОВАТЬ вход при AI_ORACLE_ENABLED=1 и AI_BLOCK=1); oracle_volume — НЕ LLM (проверка объёма по тикерам BingX и binance/bybit/mexc, влияет на вход) — оставлен без изменений; trades.ai_conf/ai_comment остаются (история), новые сделки пишут 0/пусто; срез AI conf в /stats_analyze помечен историческим. (2) RISK_PER_TRADE = 0.0025 (доля эквити), RISK_WEEKEND = RISK_PER_TRADE, SMC/SA/PB_RISK_MULT = 1.0; при старте risk_config_errors(): эффективный риск каждой стратегии должен быть в (0, 0.01], иначе ERROR + Telegram с фактическим значением + SystemExit (пример: RISK_PER_TRADE = 0.25). (3) FEE_TAKER/FEE_MAKER (ENV, по умолчанию = FEE_RATE): _fee_pct(strategy, exit_reason) и SQL-эквивалент _fee_sql() — вход лимитом (SMC2_RT, ORB_RT) и TP по maker, прочие входы и SL/TIMEOUT по taker; используется всеми shadow-расчётами net (отчёты, контракты, H1, блок Б, аудит входа); при maker = taker net побитово совпадает с v84; живые отчёты по-прежнему FEE_RATE. (4) ORB_RT (shadow): первый закрытый бар окна ORB (06-12 UTC) с close за границей диапазона 00-06 UTC и объёмом >= 1.5 x медиана 20 баров -> ORB_MKT2 (по close пробоя) и ORB_RT (лимит на границе, заполнение low[f] < L в 8 барах), SL = 1.0 x ATR14, TP = 2R, таймаут 16 баров, ORB_NF-маркеры, 40 событий/сутки, сканер scan_orb_rt (окно 06-14 UTC, сумма исходов == total), контракт (А)/(Б) в константах ORB_RT_*, секция в /shadow_analyze; диапазон ORB вынесен в _orb_range_bars без изменения логики orb_signal. (5) Правила проекта в BOT_SPEC 2.27'),
@@ -6718,6 +6719,26 @@ async def htf_backtest_run():
     except Exception as e:
         logging.exception('htf_backtest')
         await tg(f'❌ /htf_backtest: {type(e).__name__}: {e}')
+    finally:
+        _htf_running[0] = False
+
+
+async def htf_backtest_wide_run():
+    """[v88] /htf_backtest_wide: гипотеза H-T2W (T2 на широкой корзине USDT-перпетуалов, BingX), фоном, с повторами/паузой/кэшем.
+    Отчёт — в htf_reports ДО отправки (как /htf_backtest); /htf_report пришлёт последний."""
+    if _htf_running[0]:
+        return
+    _htf_running[0] = True
+    try:
+        import research_htf
+        await tg('📈 /htf_backtest_wide запущен (отбор вселенной правилом, загрузка 1D и фандинга с повторами и паузой '
+                 f'{research_htf.fetch_pause():g} с между запросами; первый запуск — десятки минут, повторный — из кэша)…')
+        text, info, _v, _b = await research_htf.run_wide(exchange, TRADES_DB, FEE_TAKER, progress=tg)
+        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+        await _htf_deliver(text)
+    except Exception as e:
+        logging.exception('htf_backtest_wide')
+        await tg(f'❌ /htf_backtest_wide: {type(e).__name__}: {e}')
     finally:
         _htf_running[0] = False
 
@@ -8840,6 +8861,7 @@ async def check_tg_commands():
                     '/stats_analyze file — отчёт по живым сделкам файлом\n'
                     '/analysis_pack — один файл: shadow + живые + режим + аудит входа + дубли\n'
                     '/htf_backtest — исторический бэктест трендследования 1D/4h (BTC/ETH/SOL), фоном, отчёт файлом\n'
+                    '/htf_backtest_wide — T2 на широкой корзине USDT-перпетуалов (гипотеза H-T2W), фоном\n'
                     '/htf_report — повторно прислать последний сохранённый отчёт /htf_backtest\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
                     '/dups_impact — SMC/SA/режим: числа до и после исключения дублей (только чтение)\n'
@@ -8868,6 +8890,14 @@ async def check_tg_commands():
                     await tg('⏳ /htf_backtest уже выполняется — дождись отчёта')
                 else:
                     _t = asyncio.create_task(htf_backtest_run())
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/htf_backtest_wide':
+                # [v88] H-T2W: T2 на широкой корзине (research_htf.py), фоном; торговлю не трогает
+                if _htf_running[0]:
+                    await tg('⏳ HTF-бэктест уже выполняется — дождись отчёта')
+                else:
+                    _t = asyncio.create_task(htf_backtest_wide_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/htf_report':
