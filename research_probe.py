@@ -4,19 +4,16 @@
 Ни одна строка данных из проверок не используется для расчёта сигналов в этом деплое; бэктеста H-OF1/H-OF2 в модуле НЕТ.
 Запросы идут с сервера бота (не из песочницы); каждая проверка изолирована: исключения наружу не выходят — в отчёте статус/текст ошибки.
 HTTP вынесен в передаваемый fetch(url, params, method) → dict(status, headers, body, error), чтобы тесты подставляли поддельные ответы."""
-import asyncio
-import io
 import json
 import math
 import os
-import re
 import shutil
 import sqlite3
 import time
-import zipfile
 from datetime import datetime, timezone
 
 import research_htf as H
+import research_vision as V
 
 FAPI = 'https://fapi.binance.com'
 ARCH = 'https://data.binance.vision'
@@ -41,20 +38,7 @@ def _js(r):
         return None
 
 
-def make_fetcher(session):
-    """Реальный HTTP через aiohttp: GET/HEAD, таймаут, тело ≤ 8 МБ. Ошибки → поле error, не исключение."""
-    import aiohttp
-
-    async def fetch(url, params=None, method='GET'):
-        try:
-            async with session.request(method, url, params=params, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT_S)) as resp:
-                body = b'' if method == 'HEAD' else await resp.content.read(8_000_000)
-                return {'status': resp.status, 'headers': {k.lower(): v for k, v in resp.headers.items()}, 'body': body, 'error': ''}
-        except asyncio.TimeoutError:
-            return {'status': None, 'headers': {}, 'body': b'', 'error': f'таймаут {FETCH_TIMEOUT_S} с'}
-        except Exception as e:
-            return {'status': None, 'headers': {}, 'body': b'', 'error': f'{type(e).__name__}: {str(e)[:120]}'}
-    return fetch
+make_fetcher = V.make_fetcher      # [v92] полное чтение тела (resp.read()); v91 читал resp.content.read(N) — усечённые zip/листинг (BadZipFile)
 
 
 async def _safe(name, coro, res):
@@ -127,91 +111,72 @@ async def probe_fapi(fetch):
     return out
 
 
-# ── 2.2 архив data.binance.vision ───────────────────────────────────────────────────────
-def _s3_keys(xml: bytes):
-    t = xml.decode('utf-8', 'ignore')
-    return re.findall(r'<Key>([^<]+)</Key>', t), '<IsTruncated>true</IsTruncated>' in t
+# ── 2.2 архив data.binance.vision (v2: через загрузчик research_vision) ──────────────────────
+def _pick(keys, want):
+    """Ключ с датой want (YYYY-MM[-DD]) или ближайший к середине списка."""
+    for k in keys:
+        if V.key_date(k) == want:
+            return k
+    return keys[len(keys) // 2] if keys else None
 
 
-async def _s3_list(fetch, prefix, marker=None, max_keys=1000):
-    p = {'prefix': prefix, 'max-keys': max_keys}
-    if marker:
-        p['marker'] = marker
-    r = await _get(fetch, S3, p)
-    if r['status'] != 200:
-        return None, False, r
-    keys, trunc = _s3_keys(r['body'])
-    return [k for k in keys if k.endswith('.zip')], trunc, r
-
-
-def _zip_first_lines(body: bytes, n=3):
-    z = zipfile.ZipFile(io.BytesIO(body))
-    name = z.namelist()[0]
-    raw = z.read(name).decode('utf-8', 'ignore').splitlines()
-    return name, raw[:n], len(raw)
-
-
-async def probe_archive(fetch):
-    out = {'reach': None, 'klines': {}, 'metrics': {}}
-    r = await _get(fetch, ARCH + '/data/futures/um/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2024-01.zip', None, 'HEAD')
-    out['reach'] = {'status': r['status'], 'error': r['error'], 'size': r['headers'].get('content-length')}
+async def probe_archive(fetch, universe=None):
+    """v2: HEAD-доступность; ПОЛНЫЙ листинг (все страницы) свечей 15m/1h и дневных metrics по BTCUSDT и числу файлов на каждый символ вселенной;
+    ОДИН месячный файл 15m, ОДИН 1h и ОДИН дневной metrics BTCUSDT реально скачиваются (проверка zip-сигнатуры и sha256) и РАЗБИРАЮТСЯ:
+    фактические колонки, taker_buy_volume, единицы времени, шаг metrics, поля. Ничего не сохраняется."""
+    out = {'reach': None, 'klines': {}, 'metrics': {}, 'per_symbol': {}}
+    r = await _get(fetch, V.ARCH + '/' + V.kline_key(SYMBOL, '1h', 2024, 1), None, 'HEAD')
+    out['reach'] = {'status': r['status'], 'error': r['error'], 'size': r['headers'].get('content-length'), 'content_type': r['headers'].get('content-type')}
     if r['status'] is None:
         out['blocked'] = True
         return out
+    listed = {}
     for tf in ('15m', '1h'):
         info = {}
-        keys, trunc, rr = await _s3_list(fetch, f'data/futures/um/monthly/klines/{SYMBOL}/{tf}/')
-        if keys:
-            info['n_files'] = f'≥{len(keys)}' if trunc else len(keys)
-            info['first'] = keys[0].rsplit('-', 2)[-2] + '-' + keys[0].rsplit('-', 2)[-1].replace('.zip', '')
-            info['last'] = keys[-1].rsplit('-', 2)[-2] + '-' + keys[-1].rsplit('-', 2)[-1].replace('.zip', '')
-        else:
-            info['list_note'] = 'листинг недоступен: ' + (rr['error'] or f'HTTP {rr["status"]}')
-        url = ARCH + f'/data/futures/um/monthly/klines/{SYMBOL}/{tf}/{SYMBOL}-{tf}-2024-01.zip'
-        g = await _get(fetch, url)
-        info['sample_status'] = g['status']
-        if g['status'] == 200:
-            try:
-                name, lines, nrows = _zip_first_lines(g['body'], 2)
-                first = lines[0].split(',') if lines else []
-                info['sample_size'] = len(g['body']); info['sample_rows'] = nrows
-                info['header'] = lines[0] if lines and not lines[0][:1].isdigit() else ''
-                data_line = next((l for l in lines if l[:1].isdigit()), '')
-                info['columns'] = len(data_line.split(',')) if data_line else len(first)
-                info['taker_buy'] = ('taker_buy_volume' in (lines[0] if lines else '')) or info['columns'] >= 11
-            except Exception as e:
-                info['parse_error'] = f'{type(e).__name__}: {str(e)[:100]}'
-        else:
-            info['sample_note'] = g['error']
-        out['klines'][tf] = info
-    # metrics (дневные файлы)
-    keys, trunc, rr = await _s3_list(fetch, f'data/futures/um/daily/metrics/{SYMBOL}/')
-    m = {}
-    if keys:
-        m['first'] = re.search(r'(\d{4}-\d{2}-\d{2})', keys[0]).group(1)
-        m['page_files'] = len(keys); m['truncated'] = trunc
-        tail, _t, _r = await _s3_list(fetch, f'data/futures/um/daily/metrics/{SYMBOL}/', marker=f'data/futures/um/daily/metrics/{SYMBOL}/{SYMBOL}-metrics-2026-09-')
-        if tail:
-            m['last'] = re.search(r'(\d{4}-\d{2}-\d{2})', tail[-1]).group(1)
-        sample_date = '2024-01-02'
-    else:
-        m['list_note'] = 'листинг недоступен: ' + (rr['error'] or f'HTTP {rr["status"]}'); sample_date = '2024-01-02'
-    g = await _get(fetch, ARCH + f'/data/futures/um/daily/metrics/{SYMBOL}/{SYMBOL}-metrics-{sample_date}.zip')
-    m['sample_status'] = g['status']
-    if g['status'] == 200:
         try:
-            name, lines, nrows = _zip_first_lines(g['body'], 3)
-            m['sample_size'] = len(g['body']); m['rows_per_day'] = nrows - 1 if lines and not lines[0][:1].isdigit() else nrows
-            m['header'] = lines[0] if lines else ''
-            ts = [l.split(',')[0] for l in lines[1:3]]
-            if len(ts) == 2:
-                t0 = datetime.strptime(ts[0], '%Y-%m-%d %H:%M:%S'); t1 = datetime.strptime(ts[1], '%Y-%m-%d %H:%M:%S')
-                m['step_min'] = (t1 - t0).total_seconds() / 60
-        except Exception as e:
-            m['parse_error'] = f'{type(e).__name__}: {str(e)[:100]}'
-    else:
-        m['sample_note'] = g['error']
+            keys, pages = await V.list_keys(fetch, f'data/futures/um/monthly/klines/{SYMBOL}/{tf}/')
+            listed[tf] = keys
+            info.update(n_files=len(keys), pages=pages, first=V.key_date(keys[0]) if keys else None, last=V.key_date(keys[-1]) if keys else None)
+        except V.VisionError as e:
+            info['list_error'] = str(e)[:200]
+        k = _pick(listed.get(tf, []), '2024-01')
+        if k:
+            try:
+                body = await V.download_zip(fetch, k)
+                p = V.parse_klines_csv(V.unzip_text(body))
+                info.update(sample=k.rsplit('/', 1)[-1], sample_size=len(body), sample_rows=len(p['ts']), columns=p['cols'], header=p['header'], unit=p['unit'],
+                            taker_buy=bool(p['cols'] >= 10 and float(p['tbv'].sum()) > 0), first_ts=int(p['ts'][0]), last_ts=int(p['ts'][-1]))
+            except Exception as e:
+                info['sample_error'] = f'{type(e).__name__}: {str(e)[:300]}'
+        out['klines'][tf] = info
+    m = {}
+    try:
+        keys, pages = await V.list_keys(fetch, f'data/futures/um/daily/metrics/{SYMBOL}/')
+        m.update(n_files=len(keys), pages=pages, first=V.key_date(keys[0]) if keys else None, last=V.key_date(keys[-1]) if keys else None)
+        k = _pick(keys, '2024-01-02')
+        if k:
+            body = await V.download_zip(fetch, k)
+            p = V.parse_metrics_csv(V.unzip_text(body))
+            m.update(sample=k.rsplit('/', 1)[-1], sample_size=len(body), rows_per_day=len(p['ts']), step_min=p['step_min'], fields=p['fields'], oi_ok=bool(len(p['oi'])))
+    except Exception as e:
+        m['error'] = f'{type(e).__name__}: {str(e)[:300]}'
     out['metrics'] = m
+    # число файлов по всем символам вселенной (листинг; без скачивания)
+    for sym in (universe or []):
+        b = sym.split('/')[0] + 'USDT'
+        row = {}
+        for tf in ('15m', '1h'):
+            try:
+                ks, _p = await V.list_keys(fetch, f'data/futures/um/monthly/klines/{b}/{tf}/')
+                row[tf] = (len(ks), V.key_date(ks[0]) if ks else None)
+            except Exception as e:
+                row[tf] = (None, f'{type(e).__name__}')
+        try:
+            ks, _p = await V.list_keys(fetch, f'data/futures/um/daily/metrics/{b}/')
+            row['metrics'] = (len(ks), V.key_date(ks[0]) if ks else None)
+        except Exception as e:
+            row['metrics'] = (None, f'{type(e).__name__}')
+        out['per_symbol'][b] = row
     return out
 
 
@@ -250,19 +215,14 @@ def estimate(res, n_symbols, now_ms, pause_s, disk_path):
         bars1h = bars15 / 4
         req1 = math.ceil(bars1h / lim) * n_symbols
         est['rest_1h'] = {'bars_per_sym': int(bars1h), 'requests': req1, 'minutes': req1 * pause_s / 60, 'db_mb': bars1h * n_symbols * KLINE_ROW_BYTES / 1e6}
+    ps = arc.get('per_symbol') or {}
     k15 = (arc.get('klines') or {}).get('15m') or {}
-    if k15.get('first'):
-        months = (datetime.fromtimestamp(now_ms / 1000, timezone.utc).year - int(k15['first'][:4])) * 12 + datetime.fromtimestamp(now_ms / 1000, timezone.utc).month - int(k15['first'][5:7]) + 1
-        files = months * n_symbols
-        mb = (k15.get('sample_size') or 0) * files / 1e6
-        est['arch_15m'] = {'files': files, 'minutes': files * pause_s / 60, 'download_mb': mb}
-    mt = arc.get('metrics') or {}
-    if mt.get('first'):
-        days = (datetime.fromtimestamp(now_ms / 1000, timezone.utc) - datetime.strptime(mt['first'], '%Y-%m-%d').replace(tzinfo=timezone.utc)).days
-        files = days * n_symbols
-        rows_day = mt.get('rows_per_day') or 288
-        est['arch_metrics'] = {'files': files, 'minutes': files * pause_s / 60, 'download_mb': (mt.get('sample_size') or 0) * files / 1e6,
-                               'db_mb_full': files * rows_day * OI_ROW_BYTES / 1e6, 'db_mb_hourly': files * 24 * OI_ROW_BYTES / 1e6}
+    if ps:
+        n15 = sum((r.get('15m') or (0,))[0] or 0 for r in ps.values()); n1h = sum((r.get('1h') or (0,))[0] or 0 for r in ps.values()); nm = sum((r.get('metrics') or (0,))[0] or 0 for r in ps.values())
+        rows_day = (arc.get('metrics') or {}).get('rows_per_day') or 288
+        est['arch_15m'] = {'files_15m': n15, 'files_1h': n1h, 'minutes': (n15 + n1h) * (pause_s + 0.5) / 60 / V.concurrency(), 'download_mb': (k15.get('sample_size') or 0) * (n15 + n1h) / 1e6}
+        est['arch_metrics'] = {'files': nm, 'minutes': nm * (pause_s + 0.5) / 60 / V.concurrency(), 'download_mb': ((arc.get('metrics') or {}).get('sample_size') or 0) * nm / 1e6,
+                               'db_mb_hourly_npz': nm * 24 * OI_ROW_BYTES / 1e6 / 4, 'raw_rows_if_stored': nm * rows_day}
     try:
         du = shutil.disk_usage(disk_path)
         est['disk'] = {'path': disk_path, 'free_mb': du.free / 1e6, 'total_mb': du.total / 1e6}
@@ -273,43 +233,58 @@ def estimate(res, n_symbols, now_ms, pause_s, disk_path):
 
 # ── 2.6 вывод ───────────────────────────────────────────────────────────────────────────
 def conclude(res):
-    """Что проверяемо на истории. H-OF1: нужны свечи с taker buy volume (REST или архив). H-OF2: ещё и история OI; если до конца IS
-    (2024-12-31) её меньше IS_MIN_DAYS дней — «непроверяема на истории» (правила гипотезы не меняются)."""
-    fapi, arc = res.get('fapi') or {}, res.get('archive') or {}
+    """Вердикты доступности — по ФАКТИЧЕСКИ РАЗОБРАННЫМ файлам архива (fapi геоблокирован с сервера и в вердикте не участвует).
+    H-OF1: разобран месячный файл 15m с колонками taker buy (суммарный taker_buy_volume > 0). H-OF2: ещё разобран 1h-файл и дневной metrics
+    с полем OI; если до конца IS (2024-12-31) истории OI меньше IS_MIN_DAYS дней — «непроверяема на истории» (правила гипотезы не меняются).
+    Строки, начинающиеся с «проверяема», — единственный признак для разрешения /of_backtest."""
+    arc = res.get('archive') or {}
+    k15, k1h, mt = (arc.get('klines') or {}).get('15m') or {}, (arc.get('klines') or {}).get('1h') or {}, arc.get('metrics') or {}
     out = {}
-    blocked_fapi = bool(fapi.get('blocked')) or 'error' in fapi
-    blocked_arc = bool(arc.get('blocked')) or 'error' in arc
-    k15 = (fapi.get('klines') or {}).get('15m') or {}
-    a15 = (arc.get('klines') or {}).get('15m') or {}
-    taker = bool(k15.get('taker_buy')) or bool(a15.get('taker_buy'))
-    start15 = k15.get('first_ts')
-    if not taker:
-        out['H-OF1'] = 'НЕ проверяема: taker buy volume в свечах не подтверждён' + (' (fapi и архив недоступны с сервера)' if blocked_fapi and blocked_arc else '')
+    if 'error' in arc or arc.get('blocked'):
+        why = arc.get('error') or (arc.get('reach') or {}).get('error') or 'архив недоступен с сервера'
+        return {'H-OF1': f'НЕ проверяема: архив недоступен ({why})', 'H-OF2': f'НЕПРОВЕРЯЕМА на истории: архив недоступен ({why})'}
+    if k15.get('taker_buy') and k15.get('n_files'):
+        out['H-OF1'] = (f'проверяема на истории: разобран файл {k15.get("sample")} ({k15.get("sample_rows")} строк, колонок {k15.get("columns")}, '
+                        f'taker buy volume есть); 15m-файлы BTCUSDT с {k15.get("first")} по {k15.get("last")} ({k15.get("n_files")})')
     else:
-        src = []
-        if k15.get('taker_buy'):
-            src.append('REST fapi' + (f' с {_d(start15)}' if start15 else ''))
-        if a15.get('taker_buy'):
-            src.append('архив' + (f' с {a15.get("first")}' if a15.get('first') else ''))
-        out['H-OF1'] = 'проверяема на истории: 15m + taker buy volume — ' + ', '.join(src)
-    oi_first = None; oi_src = ''
-    for per, info in ((fapi.get('oi') or {}).items()):
-        if info.get('old_n'):
-            oi_first = int(datetime(2022, 1, 1, tzinfo=timezone.utc).timestamp() * 1000); oi_src = f'REST openInterestHist ({per}) отдаёт данные 2022-01-01'
-    mt = arc.get('metrics') or {}
-    if mt.get('first'):
-        d_arc = int(datetime.strptime(mt['first'], '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
-        if oi_first is None or d_arc < oi_first:
-            oi_first = d_arc; oi_src = f'архив metrics с {mt["first"]} (шаг {mt.get("step_min")} мин)'
-    if oi_first is None:
-        out['H-OF2'] = 'НЕПРОВЕРЯЕМА на истории: история открытого интереса недоступна с сервера (REST отдаёт лишь недавние данные, архив недоступен/пуст)'
+        out['H-OF1'] = 'НЕ проверяема: ' + (k15.get('sample_error') or k15.get('list_error') or 'taker buy volume в разобранном файле 15m не подтверждён')
+    h1_ok = bool(k1h.get('taker_buy') and k1h.get('n_files'))
+    if not (mt.get('oi_ok') and mt.get('first')):
+        out['H-OF2'] = 'НЕПРОВЕРЯЕМА на истории: ' + (mt.get('error') or 'дневной metrics с полем OI не разобран')
+    elif not h1_ok:
+        out['H-OF2'] = 'НЕПРОВЕРЯЕМА на истории: файл 1h не разобран (' + (k1h.get('sample_error') or k1h.get('list_error') or 'нет taker buy') + ')'
     else:
-        is_days = (datetime.strptime(IS_END, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000 - oi_first) / 86_400_000
-        if is_days >= IS_MIN_DAYS:
-            out['H-OF2'] = f'проверяема на истории с {_d(oi_first)}: {oi_src}; IS ≈ {is_days:.0f} дн (≥ {IS_MIN_DAYS})'
-        else:
-            out['H-OF2'] = f'НЕПРОВЕРЯЕМА на истории: IS ≈ {max(is_days, 0):.0f} дн &lt; {IS_MIN_DAYS} ({oi_src})'
+        first = int(datetime.strptime(mt['first'], '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
+        is_days = (datetime.strptime(IS_END, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000 - first) / 86_400_000
+        base = f'metrics BTCUSDT с {mt["first"]} по {mt.get("last")} ({mt.get("n_files")} файлов), шаг {mt.get("step_min")} мин, разобран {mt.get("sample")}; IS ≈ {is_days:.0f} дн'
+        out['H-OF2'] = (f'проверяема на истории с {mt["first"]}: {base} (≥ {IS_MIN_DAYS})' if is_days >= IS_MIN_DAYS
+                        else f'НЕПРОВЕРЯЕМА на истории: {base} &lt; {IS_MIN_DAYS}')
     return out
+
+
+def verdict_ok(text) -> bool:
+    return str(text).startswith('проверяема')
+
+
+def save_status(db_path, version, concl):
+    """Результат последнего /data_probe — для разрешения /of_backtest (таблица of_probe_status)."""
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE IF NOT EXISTS of_probe_status (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, version TEXT, h_of1 TEXT, h_of2 TEXT, ok1 INTEGER, ok2 INTEGER)")
+    con.execute("INSERT INTO of_probe_status (ts, version, h_of1, h_of2, ok1, ok2) VALUES (?,?,?,?,?,?)",
+                (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), version, concl.get('H-OF1', ''), concl.get('H-OF2', ''),
+                 int(verdict_ok(concl.get('H-OF1', ''))), int(verdict_ok(concl.get('H-OF2', '')))))
+    con.commit(); con.close()
+
+
+def last_status(db_path):
+    """→ dict(ts, version, h_of1, h_of2, ok1, ok2) последнего /data_probe или None."""
+    try:
+        con = sqlite3.connect(db_path)
+        row = con.execute("SELECT ts, version, h_of1, h_of2, ok1, ok2 FROM of_probe_status ORDER BY id DESC LIMIT 1").fetchone()
+        con.close()
+    except sqlite3.Error:
+        return None
+    return dict(zip(('ts', 'version', 'h_of1', 'h_of2', 'ok1', 'ok2'), row)) if row else None
 
 
 # ── отчёт ───────────────────────────────────────────────────────────────────────────────
@@ -355,23 +330,30 @@ def build_report(res, est, concl, universe, now_ms) -> str:
     elif isinstance(ei, dict) and ei.get('error'):
         L.append(f'  exchangeInfo: {ei["error"]}')
     a = res.get('archive') or {}
-    L.append('\n<b>2.2 Архив data.binance.vision</b>')
+    L.append('\n<b>2.2 Архив data.binance.vision (v2: загрузчик с полным чтением тела, проверкой zip и sha256)</b>')
     if 'error' in a:
         L.append(f'  ошибка проверки: {a["error"]}')
     else:
         rc = a.get('reach') or {}
         L.append(f'  доступность (HEAD 1h-файла): HTTP {rc.get("status")}' + (f' ({rc.get("error")})' if rc.get('error') else '') + (f', размер {rc.get("size")} Б' if rc.get('size') else '') + (' — НЕДОСТУПЕН' if a.get('blocked') else ''))
         for tf, k in (a.get('klines') or {}).items():
-            L.append(f'  месячные свечи {tf}: файлов {k.get("n_files", "?")}, с {k.get("first", "?")} по {k.get("last", "?")}; образец 2024-01: HTTP {k.get("sample_status")}, '
-                     f'{k.get("sample_size", "?")} Б, строк {k.get("sample_rows", "?")}, колонок {k.get("columns", "?")}, заголовок: {"да" if k.get("header") else "нет"}, taker buy volume: {"ДА" if k.get("taker_buy") else "нет/не подтверждено"}'
-                     + (f'; {k["list_note"]}' if k.get('list_note') else '') + (f'; {k["parse_error"]}' if k.get('parse_error') else ''))
+            L.append(f'  месячные свечи {tf} BTCUSDT: файлов {k.get("n_files", "?")} (страниц листинга {k.get("pages", "?")}), с {k.get("first", "?")} по {k.get("last", "?")}'
+                     + (f'; {k["list_error"]}' if k.get('list_error') else ''))
+            if k.get('sample'):
+                L.append(f'    разобран {k["sample"]}: {k.get("sample_size")} Б, строк {k.get("sample_rows")}, колонок {k.get("columns")}, заголовок {"да" if k.get("header") else "нет"}, '
+                         f'время {k.get("unit")}, {_d(k.get("first_ts"))}…{_d(k.get("last_ts"))}, taker_buy_volume: {"ДА" if k.get("taker_buy") else "НЕТ"}')
+            if k.get('sample_error'):
+                L.append(f'    образец не разобран: {k["sample_error"]}')
         m = a.get('metrics') or {}
-        L.append(f'  дневные metrics: с {m.get("first", "?")} по {m.get("last", "?")}; образец: HTTP {m.get("sample_status")}, {m.get("sample_size", "?")} Б, строк/день {m.get("rows_per_day", "?")}, шаг {m.get("step_min", "?")} мин')
-        if m.get('header'):
-            L.append(f'    поля: {m["header"]}')
-        for kk in ('list_note', 'parse_error', 'sample_note'):
-            if m.get(kk):
-                L.append(f'    {m[kk]}')
+        L.append(f'  дневные metrics BTCUSDT: файлов {m.get("n_files", "?")} (страниц листинга {m.get("pages", "?")}), с {m.get("first", "?")} по {m.get("last", "?")}')
+        if m.get('sample'):
+            L.append(f'    разобран {m["sample"]}: {m.get("sample_size")} Б, строк/день {m.get("rows_per_day")}, шаг {m.get("step_min")} мин, поля: {m.get("fields")}')
+        if m.get('error'):
+            L.append(f'    ошибка: {m["error"]}')
+        if a.get('per_symbol'):
+            L.append('  файлов в архиве по символам (15m / 1h / metrics; первая дата):')
+            for b_, row in a['per_symbol'].items():
+                L.append('   ' + b_ + ': ' + ' | '.join(f'{k_} {v[0] if v[0] is not None else "ошибка"} ({v[1]})' for k_, v in row.items()))
     b = res.get('bingx') or {}
     L.append('\n<b>2.4 BingX</b>')
     if 'error' in b:
@@ -380,7 +362,7 @@ def build_report(res, est, concl, universe, now_ms) -> str:
         L.append(f'  свечи swap v3: HTTP {b.get("klines_status")}; ключи: {b.get("kline_keys", "?")}; taker buy volume: {"ДА" if b.get("taker_buy") else "НЕТ"}')
         L.append(f'  открытый интерес: HTTP {b.get("oi_status")}; ответ — {"только текущее значение (истории нет)" if b.get("oi_current_only") else "не подтверждён"}; ccxt has: {b.get("ccxt")}')
     L.append('\n<b>2.5 Оценка объёма загрузки (16 символов)</b>')
-    for key, name in (('rest_15m', 'REST 15m'), ('rest_1h', 'REST 1h'), ('arch_15m', 'архив 15m (месячные)'), ('arch_metrics', 'архив metrics (дневные)')):
+    for key, name in (('arch_15m', 'архив 15m (месячные)'), ('arch_metrics', 'архив metrics (дневные)')):
         e = est.get(key)
         if e:
             L.append(f'  {name}: ' + ', '.join(f'{k} {v:,.0f}' if isinstance(v, (int, float)) else f'{k} {v}' for k, v in e.items()))
@@ -389,11 +371,13 @@ def build_report(res, est, concl, universe, now_ms) -> str:
     L.append('\n<b>2.6 Вывод</b>')
     for k, v in concl.items():
         L.append(f' ВЕРДИКТ ДОСТУПНОСТИ {k}: {v}')
-    L.append('Ни одна строка данных из проверок не использована для сигналов; правила H-OF1/H-OF2 (BOT_SPEC §2.34) не менялись. Бэктест — отдельный деплой после этого отчёта.')
+    if (res.get('fapi') or {}).get('blocked'):
+        L.append('fapi закрыт гео-блоком региона сервера (HTTP 451) — для H-OF1/H-OF2 это не критично: taker buy и OI берутся из архива (доступен); смена региона не требуется.')
+    L.append('Ни одна строка данных из проверок не использована для сигналов; правила H-OF1/H-OF2 (BOT_SPEC §2.34) не менялись. Бэктест — /of_backtest (разрешается только при «проверяема» в этом отчёте).')
     return '\n'.join(L)
 
 
-async def run_probe(db_path, exchange=None, fetch=None, now_ms=None, disk_path=None, progress=None):
+async def run_probe(db_path, exchange=None, fetch=None, now_ms=None, disk_path=None, progress=None, version=''):
     """/data_probe: все проверки изолированы; исключения наружу не выходят. → текст отчёта."""
     now_ms = now_ms or int(time.time() * 1000)
     own = None
@@ -403,7 +387,8 @@ async def run_probe(db_path, exchange=None, fetch=None, now_ms=None, disk_path=N
             import aiohttp
             own = aiohttp.ClientSession()
             fetch = make_fetcher(own)
-        for name, coro in (('fapi', probe_fapi(fetch)), ('archive', probe_archive(fetch)), ('bingx', probe_bingx(fetch, exchange))):
+        universe0 = universe_from_db(db_path)
+        for name, coro in (('fapi', probe_fapi(fetch)), ('archive', probe_archive(fetch, universe0)), ('bingx', probe_bingx(fetch, exchange))):
             await _safe(name, coro, res)
             if progress:
                 try:
@@ -422,4 +407,8 @@ async def run_probe(db_path, exchange=None, fetch=None, now_ms=None, disk_path=N
         concl = conclude(res)
     except Exception as e:
         concl = {'H-OF1': f'ошибка вывода: {type(e).__name__}', 'H-OF2': f'ошибка вывода: {type(e).__name__}'}
+    try:
+        save_status(db_path, version, concl)
+    except Exception:
+        pass                               # статус не критичен для отчёта
     return build_report(res, est, concl, universe, now_ms), res, est, concl

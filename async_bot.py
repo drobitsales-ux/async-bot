@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v91'          # единый источник версии для стартовых сообщений
+BOT_VERSION   = 'v92'          # единый источник версии для стартовых сообщений
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -6456,8 +6456,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-12-v91'
+CODE_VERSION = '2026-10-12-v92'
 CHANGELOG = [
+    ('2026-10-12-v92', 'ИСПРАВЛЕННЫЙ ЗАГРУЗЧИК АРХИВА + /data_probe v2 + /of_backtest (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, прежние исследования, правила и критерии H-OF1/H-OF2 §2.34, bybit_worker.py не менялись). Итог /data_probe v91 (2026-10-12): fapi — HTTP 451 (гео-блок региона сервера), BingX — нет taker buy и истории OI, архив — BadZipFile на всех загрузках и обрыв листинга на 32 файлах; вердикты v91 по H-OF1/H-OF2 НЕДЕЙСТВИТЕЛЬНЫ. ПРИЧИНА: fetcher читал тело resp.content.read(8_000_000) — StreamReader.read(n) возвращает только то, что уже лежит в буфере (демонстрация: 65 536 из 1 024 004 байт), поэтому zip и XML-листинг приходили усечёнными; исправлено на полное чтение resp.read(). research_vision.py: прямые URL файлов, проверка ответа (200, не text/html, сигнатура PK), полный листинг S3 с продолжением, sha256 по .CHECKSUM (3 повтора → битый), повторы сеть/5xx до 5 попыток, VISION_PAUSE_SEC / VISION_CONCURRENCY, парсинг свечей (с заголовком/без, мс/мкс) и metrics (шаг и поля по данным), хранение npz в /data/vision (OI — часовой агрегат на конец часа), проверка места (< 200 МБ — остановка), атомарная запись, докачка только недостающего. /data_probe v2: вердикты доступности по фактически разобранным файлам, результат в of_probe_status. /of_backtest (research_of.py): H-OF1/H-OF2 строго по §2.34 только при «проверяема», сделки в of_trades, отчёт в htf_reports'),
     ('2026-10-12-v91', 'ПРЕ-КОММИТ H-OF1/H-OF2 НА НОВЫХ ДАННЫХ (Binance USDT-M: taker buy volume, открытый интерес) И ПРОВЕРКА ДОСТУПНОСТИ ДАННЫХ — бэктеста нет (живая логика, breaker-ы, SMC_LIVE, сигналы и контракты PO3/SMC2/ORB_RT, все прежние исследования, bybit_worker.py не менялись). Итог v90: H-WS ЗАКРЫТА — ни один из 7 вариантов не прошёл (лучший k=2 B: mean R +0.110, t 1.46, PF 1.19; парная разность к базе +0.136, t 2.18); диагностика: из 198 выбитых сделок 42.4% дошли до исходного TP за 48 ч, без касания 2*d0 — 20.7%; недочёт спецификации: значимость «по дням» при 9 днях данных не имеет мощности (вывод не меняется — по сделкам тоже не пройдено); правило остановки §2.32.8 действует. Исключение из правила остановки — НОВЫЙ ИСТОЧНИК ДАННЫХ (BOT_SPEC §2.34, записано до загрузки данных): H-OF1 «прокол с поглощением» (15m, delta = 2*taker_buy - volume) и H-OF2 «сброс с ликвидациями» (1h, OI), 16 фиксированных символов H-XS, TP 2R, таймаут 48 ч, издержки FEE_TAKER + проскальзывание 0.0003, критерии по дневному портфелю с t >= 2.5. /data_probe (research_probe.py): с сервера бота проверяет доступность Binance fapi (код ответа, taker buy в свечах, глубина и лимит), архива data.binance.vision (месячные свечи, дневные metrics: шаг и поля), истории OI, BingX (taker buy, история OI), оценивает объём загрузки и место на диске, делает вывод, какие гипотезы проверяемы на истории; ни одна строка данных не используется для сигналов'),
     ('2026-10-12-v90', 'ИСКЛЮЧЕНИЕ ИЗ ПРАВИЛА ОСТАНОВКИ: ГИПОТЕЗА H-WS («широкий стоп», внешнее обоснование владельца) — ТОЛЬКО пересимуляция ВЫХОДА на уже записанных shadow-сигналах (живая логика, breaker-ы, SMC_LIVE, сигналы и контракты PO3/SMC2/ORB_RT, T1-T3/H-T2W/H-XS, bybit_worker.py не менялись). Итог v89: H-XS НЕ ПРОЙДЕН (OOS недельный mean R -0.018, t -0.55, 91 неделя; OOS лонг-нога -0.164, шорт-нога +0.099; PF net OOS 0.93) — правило остановки §2.32.8 вступило в силу. /wide_stop_test (новый модуль research_ws.py): основная популяция SMC2_MKT/SMC2_RT/SMC_SIG/PO3/ORB_MKT2/ORB_RT (закрытые, sl_price > 0, recalc != 2), справочно RB с 2026-09-15; 15m-бары 48 ч в кэше ws_bars (повторы и пауза HTF_FETCH_PAUSE_SEC); варианты k in {1.0, 1.5, 2.0, 3.0} x TP «A» (исходный) / «B» (2R от нового стопа), единый таймаут 48 ч, база k=1.0 A, SL раньше TP; R = pnl_net/(k*d0); комиссии по типу входа/выхода (_fee_pct) + проскальзывание 0.0002 на рыночных исполнениях, фандинг не учтён; критерии: парная разность к базе t >= 2.6, mean R net > 0 при t >= 2.4, PF net >= 1.3, n >= 200 (значимость по сделкам и по дням, при расхождении — по дням); диагностика доли выбитых, чья цена дошла до исходного TP; минимальное эквити под минимальный ордер. Решение: ни один вариант не прошёл — H-WS закрыта, §2.32.8 без исключений; прошёл — победитель (макс. mean R) применяется к shadow-форварду SMC2'),
     ('2026-10-12-v89', 'ГИПОТЕЗА H-XS — кросс-секционный моментум, ТОЛЬКО ИСТОРИЯ (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, T1-T3, H-T2W, bybit_worker.py не менялись). Итог v88: H-T2W НЕ ПРОЙДЕН (OOS недельный mean R -0.014, t -0.25, 92 недели; сделки OOS n=298, PF net 1.06; OOS>0 у 5 из 13 символов; весь период PF 1.33 за счёт 2021-2024) — не докручивается. /htf_xsmom: вселенная ровно 16 символов (BTC, ETH, SOL + 13 символов H-T2W из сохранённого отчёта v88, замораживается в htf_xs_universe, заново не отбирается); каждый понедельник 00:00 UTC по закрытым 1D: r = close(t-1)/close(t-29) - 1, лонг топ-3, шорт низ-3 (< 8 символов с историей — неделя пропускается), SL 2*ATR20, удержание до следующего понедельника, оставшийся в группе не переоткрывается; значимость по недельному портфелю; критерии: OOS недельный mean R > 0 при t >= 2.4, PF net OOS >= 1.3, весь период > 0, обе ноги OOS >= 0, OOS недель >= 40; кривая эквити PORTF_RISK_PCT, проп-бутстрап по неделям. ПРАВИЛО ОСТАНОВКИ: если H-XS не пройден — поиск автоматических стратегий на OHLCV завершается (BOT_SPEC §2.32.8)'),
@@ -6798,12 +6799,48 @@ async def data_probe_run():
         import research_probe
         await tg('📡 /data_probe запущен (метаданные Binance fapi / data.binance.vision / BingX, пауза '
                  f'{research_htf.fetch_pause():g} с между запросами, ~1-3 минуты)…')
-        text, _res, _est, _concl = await research_probe.run_probe(TRADES_DB, exchange=exchange, progress=tg)
+        text, _res, _est, _concl = await research_probe.run_probe(TRADES_DB, exchange=exchange, progress=tg, version=CODE_VERSION)
         research_htf.save_report(TRADES_DB, CODE_VERSION, text)
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('data_probe')
         await tg(f'❌ /data_probe: {type(e).__name__}: {e}')
+    finally:
+        _htf_running[0] = False
+
+
+async def of_backtest_run():
+    """[v92] /of_backtest: бэктест H-OF1/H-OF2 по BOT_SPEC §2.34 (research_of.py) на данных архива data.binance.vision. Запускается ТОЛЬКО для гипотез, которые
+    последний /data_probe v2 признал «проверяема»; иначе отказ с причиной. Фон; прогресс по символам; сделки — в of_trades, отчёт — в htf_reports."""
+    if _htf_running[0]:
+        return
+    _htf_running[0] = True
+    try:
+        import research_htf
+        import research_of
+        import research_probe
+        import research_vision
+        allowed, reasons = research_of.gate(research_probe.last_status(TRADES_DB))
+        if not any(allowed.values()):
+            await tg('⛔ /of_backtest отказ: ни одна гипотеза не признана «проверяема» последним /data_probe v2.\n'
+                     + '\n'.join(f'{h}: {reasons[h]}' for h in research_of.HYPS))
+            return
+        universe = research_probe.universe_from_db(TRADES_DB)
+        if len(universe) != 16:
+            await tg(f'⛔ /of_backtest отказ: вселенная H-XS не заморожена ({len(universe)} символов вместо 16) — запусти /htf_xsmom')
+            return
+        await tg('📈 /of_backtest запущен: ' + ', '.join(h for h in research_of.HYPS if allowed[h])
+                 + (' (пропущены: ' + ', '.join(h for h in research_of.HYPS if not allowed[h]) + ')' if not all(allowed.values()) else '')
+                 + f'. Загрузка архива в {research_vision.vision_dir()} фоном (первый запуск — десятки минут), прогресс по символам, при обрыве повторный запуск продолжит из кэша…')
+        import aiohttp
+        async with aiohttp.ClientSession() as ses:
+            fetch = research_vision.make_fetcher(ses)
+            text, _res = await research_of.run_of(fetch, TRADES_DB, universe, allowed, reasons, FEE_TAKER, progress=tg)
+        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+        await _htf_deliver(text)
+    except Exception as e:
+        logging.exception('of_backtest')
+        await tg(f'❌ /of_backtest: {type(e).__name__}: {e}')
     finally:
         _htf_running[0] = False
 
@@ -8930,6 +8967,7 @@ async def check_tg_commands():
                     '/htf_xsmom — кросс-секционный моментум на 16 фиксированных символах (гипотеза H-XS), фоном\n'
                     '/wide_stop_test — гипотеза H-WS: пересимуляция выходов с широким стопом на записанных shadow-сигналах, фоном\n'
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
+                    '/of_backtest — бэктест H-OF1/H-OF2 по §2.34 (только если /data_probe признал гипотезу проверяемой), фоном\n'
                     '/htf_report — повторно прислать последний сохранённый отчёт /htf_backtest\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
                     '/dups_impact — SMC/SA/режим: числа до и после исключения дублей (только чтение)\n'
@@ -8990,6 +9028,14 @@ async def check_tg_commands():
                     await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
                 else:
                     _t = asyncio.create_task(data_probe_run())
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/of_backtest':
+                # [v92] бэктест H-OF1/H-OF2 (research_of.py), только при «проверяема» в последнем /data_probe; фон; торговлю не трогает
+                if _htf_running[0]:
+                    await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
+                else:
+                    _t = asyncio.create_task(of_backtest_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/htf_report':
