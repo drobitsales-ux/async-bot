@@ -1068,3 +1068,224 @@ async def run_wide(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
     info['requests'] += sel_info['requests']; info['universe_skipped'] = sel_info.get('universe_skipped', [])
     text, verd, boot = await asyncio.to_thread(compute_wide, univ, data, info, fee, SLIP, runs)
     return text, info, verd, boot
+
+
+# ══ [v89] H-XS: кросс-секционный моментум (лонг топ-3 / шорт низ-3 по 28-дневной доходности), только история ═══════
+# ПРЕ-КОММИТ — BOT_SPEC §2.32 (записан ДО первого запуска). Вселенная — РОВНО 16 символов: BTC, ETH, SOL + 13 символов
+# главного критерия H-T2W (v88); берётся из сохранённого отчёта v88 (htf_reports), замораживается в таблице htf_xs_universe
+# и больше не отбирается заново.
+XS_LOOKBACK, XS_ATR_N, XS_SL_ATR, XS_TOP, XS_MIN_SYMS = 28, 20, 2.0, 3, 8
+XS_CRIT_MIN_WEEKS = 40
+XS_N_NEW = 13
+
+
+def _is_monday_day(d):
+    return (d + 3) % 7 == 0
+
+
+def xs_universe(db_path):
+    """Фиксированная вселенная H-XS: BTC/ETH/SOL + 13 символов со статусом «в тесте» из ПОСЛЕДНЕГО сохранённого отчёта H-T2W.
+    Первый вызов замораживает список в htf_xs_universe; дальше список только читается. Не 13 символов → RuntimeError (заново не отбираем)."""
+    import re
+    init_cache(db_path)
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE IF NOT EXISTS htf_xs_universe (sym TEXT PRIMARY KEY, src TEXT)")
+    rows = con.execute("SELECT sym FROM htf_xs_universe ORDER BY sym").fetchall()
+    if rows:
+        con.close()
+        return [r[0] for r in rows]
+    rep = con.execute("SELECT id, text FROM htf_reports WHERE text LIKE '%H-T2W%' AND text LIKE '%Вселенная%' ORDER BY id DESC LIMIT 1").fetchone()
+    if not rep:
+        con.close()
+        raise RuntimeError('вселенная H-XS: в htf_reports нет отчёта H-T2W (запусти /htf_backtest_wide) — список заново не отбирается')
+    bases = re.findall(r'^\s{2}([A-Z0-9]+): объём 30д .*\| в тесте\s*$', rep[1], flags=re.M)
+    bases = [b for b in dict.fromkeys(bases) if b not in ('BTC', 'ETH', 'SOL')]
+    if len(bases) != XS_N_NEW:
+        con.close()
+        raise RuntimeError(f'вселенная H-XS: в отчёте H-T2W #{rep[0]} найдено {len(bases)} символов «в тесте» вместо {XS_N_NEW} — остановка, заново не отбираем')
+    syms = sorted(list(MAIN3) + [f'{b}/USDT:USDT' for b in bases])
+    con.executemany("INSERT INTO htf_xs_universe VALUES (?,?)", [(s, f'htf_reports#{rep[0]}' if s not in MAIN3 else 'main3') for s in syms])
+    con.commit(); con.close()
+    return syms
+
+
+def _xs_prepare(data, syms):
+    S = {}
+    for s in syms:
+        b = data[s]['1d']
+        if not b:
+            continue
+        ts = [int(x[0]) for x in b]
+        o = np.array([x[1] for x in b], float); h = np.array([x[2] for x in b], float)
+        l = np.array([x[3] for x in b], float); c = np.array([x[4] for x in b], float)
+        S[s] = {'ts': ts, 'o': o, 'h': h, 'l': l, 'c': c, 'atr': atr_series(h, l, c, XS_ATR_N), 'idx': {t: i for i, t in enumerate(ts)}}
+    return S
+
+
+def xs_rank(S, m, min_syms=XS_MIN_SYMS, top=XS_TOP):
+    """Ранжирование понедельника m (мс, 00:00 UTC) ТОЛЬКО по закрытым дневным барам до m: r = close(m−1д)/close(m−29д) − 1 по символам
+    с полной историей (оба бара есть, ATR20 на m−1д определён, бар понедельника есть). → (longs, shorts, n_eligible); при < min_syms → ([], [], n)."""
+    rows = []
+    for s, d in S.items():
+        i1, i29, im = d['idx'].get(m - DAY_MS), d['idx'].get(m - (XS_LOOKBACK + 1) * DAY_MS), d['idx'].get(m)
+        if i1 is None or i29 is None or im is None:
+            continue
+        a = d['atr'][i1]
+        if math.isnan(a) or a <= 0:
+            continue
+        rows.append((float(d['c'][i1] / d['c'][i29] - 1), s, float(a)))
+    n = len(rows)
+    if n < min_syms:
+        return [], [], n
+    rows.sort(key=lambda x: (-x[0], x[1]))
+    return rows[:top], rows[-top:], n
+
+
+def run_xsmom(data, fee, slip=SLIP, syms=None, min_syms=XS_MIN_SYMS):
+    """H-XS: каждый понедельник — лонг топ-3, шорт низ-3 (§2.32). SL = 2·ATR20(1D на m−1д) от цены входа; удержание до следующего понедельника;
+    остался в той же группе — удерживается без переоткрытия (SL — исходный), сменил сторону/выпал — закрытие по open понедельника, новый — открытие по open;
+    SL внутри недели по high/low дневных баров (гэп — по open). Неделя с < min_syms символов: все позиции закрываются по open, новых нет.
+    Сделка по SL: exit_ts = конец дня SL-бара (чтобы дневная переоценка отнесла результат к дню SL). Незакрытые на конец данных не учитываются."""
+    syms = list(syms or data)
+    S = _xs_prepare(data, syms)
+    if not S:
+        return []
+    days = sorted({t // DAY_MS for d in S.values() for t in d['ts']})
+    mondays = [d * DAY_MS for d in days if _is_monday_day(d)]
+    last_day = days[-1]
+    trades, pos = [], {}
+
+    def close_pos(s, px, ts_exit, why):
+        p = pos.pop(s)
+        trades.append(make_trade(p['side'], p['ts'], ts_exit, p['px'], px, p['sl'], data[s]['funding'], fee, slip, why, 'XS', s))
+
+    for k, m in enumerate(mondays):
+        longs, shorts, n = xs_rank(S, m, min_syms)
+        target = {s: 1 for _r, s, _a in longs}; target.update({s: -1 for _r, s, _a in shorts})
+        atr_of = {s: a for _r, s, a in longs + shorts}
+        for s in list(pos):                                       # закрытие по open понедельника: выпал/сменил сторону/неделя пропущена
+            if target.get(s) != pos[s]['side']:
+                d = S[s]; i = d['idx'].get(m)
+                if i is None:                                     # нет бара понедельника: ближайший следующий open
+                    nxt = [t for t in d['ts'] if t >= m]
+                    if not nxt:
+                        continue
+                    i = d['idx'][nxt[0]]
+                close_pos(s, float(d['o'][i]), d['ts'][i], 'rotate' if target else 'skip')
+        for s, side in target.items():                            # открытие новых
+            if s in pos:
+                continue
+            d = S[s]; i = d['idx'][m]; px = float(d['o'][i]); sl = px - side * XS_SL_ATR * atr_of[s]
+            if sl > 0:
+                pos[s] = {'side': side, 'ts': d['ts'][i], 'px': px, 'sl': sl}
+        end_day = (mondays[k + 1] // DAY_MS) if k + 1 < len(mondays) else last_day + 1
+        for day in range(m // DAY_MS, end_day):                   # SL по дневным барам недели (включая день входа)
+            for s in list(pos):
+                i = S[s]['idx'].get(day * DAY_MS)
+                if i is None:
+                    continue
+                p, d = pos[s], S[s]
+                if (p['side'] == 1 and d['l'][i] <= p['sl']) or (p['side'] == -1 and d['h'][i] >= p['sl']):
+                    close_pos(s, _stop_fill(p['side'], float(d['o'][i]), p['sl']), day * DAY_MS + DAY_MS - 1, 'sl')
+    return trades
+
+
+def xs_verdict(trades: list, d_close_maps: dict) -> dict:
+    """Критерии H-XS (§2.32.6): OOS недельный mean R net > 0 при t ≥ 2.4; PF net сделок OOS ≥ 1.3; весь период недельный mean R net > 0;
+    OOS mean R лонг-ноги ≥ 0 И шорт-ноги ≥ 0. OOS-недель < 40 → «недостаточно данных»."""
+    ps = portfolio_series(trades, d_close_maps)
+    oos_w0 = week_of_day(_ms(OOS_START) // DAY_MS)
+    if week_start_ms(oos_w0) < _ms(OOS_START):
+        oos_w0 += 1
+    wk = ps['weekly']
+    ws = {'IS': weekly_stats([v for w, v in wk.items() if w < oos_w0]), 'OOS': weekly_stats([v for w, v in wk.items() if w >= oos_w0]),
+          'ALL': weekly_stats(list(wk.values()))}
+    is_t, oos_t = split_period(trades)
+    sets = {'IS': is_t, 'OOS': oos_t, 'ALL': trades}
+    legs = {p: {'long': trade_stats([t for t in tr if t['side'] == 1]), 'short': trade_stats([t for t in tr if t['side'] == -1])} for p, tr in sets.items()}
+    res = {'ps': ps, 'oos_w0': oos_w0, 'ws': ws, 'st': {p: trade_stats(tr) for p, tr in sets.items()}, 'legs': legs}
+    if ws['OOS']['n'] < XS_CRIT_MIN_WEEKS:
+        res.update(status='NODATA', text=f'недостаточно данных (OOS недель {ws["OOS"]["n"]} &lt; {XS_CRIT_MIN_WEEKS})', checks={})
+        return res
+    lo, sh = legs['OOS']['long'], legs['OOS']['short']
+    checks = {
+        f'OOS недельный mean R&gt;0 при t≥{CRIT_T}': ws['OOS']['mean'] > 0 and ws['OOS']['t'] >= CRIT_T,
+        f'PF net сделок OOS≥{CRIT_PF}': res['st']['OOS']['pf'] >= CRIT_PF,
+        'весь период: недельный mean R&gt;0': ws['ALL']['mean'] > 0,
+        'OOS mean R лонг-ноги≥0 и шорт-ноги≥0': lo['n'] > 0 and sh['n'] > 0 and lo['mean_r'] >= 0 and sh['mean_r'] >= 0,
+    }
+    ok = all(checks.values())
+    res.update(status='PASS' if ok else 'FAIL', text='ПРОЙДЕНО' if ok else 'не пройдено', checks=checks)
+    return res
+
+
+def build_xs_report(syms, loaded, info, trades, verd, boot, params, fee) -> str:
+    risk = portf_risk()
+    L = ['📈 <b>H-XS: кросс-секционный моментум (лонг топ-3 / шорт низ-3 по 28-дн. доходности), недельная ротация</b>',
+         f'Вселенная — ровно {len(syms)} символов, зафиксирована (BTC, ETH, SOL + 13 символов H-T2W v88, заново не отбиралась): '
+         + ', '.join(s.split('/')[0] for s in syms),
+         f'Сигнал: понедельник 00:00 UTC по закрытым 1D до этого момента; &lt; {XS_MIN_SYMS} символов с полной историей — неделя пропускается. SL {XS_SL_ATR:g}·ATR{XS_ATR_N}; '
+         f'издержки: FEE_TAKER={fee} + проскальзывание {SLIP} на сторону, фандинг по 8ч-интервалам где доступен. IS до {IS_END}, OOS с {OOS_START}. Пре-коммит — BOT_SPEC §2.32.',
+         '⚠️ ОШИБКА ВЫЖИВШЕГО: вселенная отобрана по ТЕКУЩЕМУ объёму (v88) — монеты, которые выросли и остались ликвидными; результат систематически оптимистичен.']
+    for k, r in info.get('failed', {}).items():
+        L.append(f'⚠️ {k[0].split("/")[0]} {k[1].upper()}: НЕ ЗАГРУЖЕН ({r}) — символ исключён из расчёта')
+    for s in syms:
+        b = loaded.get(s, {}).get('1d') or []
+        if b:
+            L.append(f'  {s.split("/")[0]}: 1D с {_date(b[0][0])} по {_date(b[-1][0])} ({len(b)})')
+    ws = verd['ws']
+    L.append('\n<b>Недельный портфель (среднее R по ногам недели, до 6) и сделки</b>')
+    for p, name in (('IS', 'IS'), ('OOS', 'OOS'), ('ALL', 'весь период')):
+        L.append(f' {name}: недель {ws[p]["n"]}, недельный mean R net {ws[p]["mean"]:+.4f}, t {ws[p]["t"]:.2f}')
+        L.append(_line('сделки', verd['st'][p]))
+        L.append(_line('лонг-нога', verd['legs'][p]['long']))
+        L.append(_line('шорт-нога', verd['legs'][p]['short']))
+    L.append(' Критерии: ' + (' | '.join(f'{k} {"✅" if ok else "❌"}' for k, ok in verd['checks'].items()) if verd['checks'] else '—'))
+    L.append(f' <b>ВЕРДИКТ H-XS: {verd["text"]}</b>')
+    ps = verd['ps']
+    d_oos = _ms(OOS_START) // DAY_MS
+    L.append(f'\n<b>Кривая эквити: суммарный риск {risk * 100:g}% на неделю, поровну между открытыми ногами (дневная переоценка)</b>')
+    for label, fr in (('OOS', d_oos), ('весь период', None)):
+        e = equity_from_daily({d: risk * r for d, r in ps['daily'].items()}, fr)
+        L.append(f'  {label}: макс. просадка от пика {e["max_dd"] * 100:.1f}% | худший день {e["worst_day"] * 100:.2f}% | положительных месяцев {e["pos_months"]} из {e["n_months"]} | итог {e["total_ret"] * 100:+.1f}%')
+    if boot:
+        L.append(f'\n<b>Проп-бутстрап по недельному ряду OOS (блоки по {BOOT_BLOCK_WEEKS} недели, {BOOT_RUNS} прогонов)</b>')
+        L.append(('⚠️ ПРИМЕРНЫЕ параметры, не правила конкретной фирмы: ' if params['example'] else 'Параметры из ENV: ')
+                 + f'цель {params["target"] * 100:g}%, дневной DD {params["daily"] * 100:g}%, общий DD {params["maxdd"] * 100:g}% ({params["mode"]}), мин. дней {params["min_days"]}')
+        for label, b in boot.items():
+            L.append(f' {label}: P(пройти) {b["p_pass"] * 100:.1f}% | P(провал по общему DD) {b["p_fail_maxdd"] * 100:.1f}% | P(провал по дневному) {b["p_fail_daily"] * 100:.1f}% | '
+                     f'P(не успеть по времени) {b["p_fail_time"] * 100:.1f}% | не завершён {b["p_unfinished"] * 100:.1f}% | '
+                     f'медиана дней до цели {("%.0f" % b["median_days"]) if b["median_days"] is not None else "—"} | 90-й перцентиль {("%.0f" % b["p90_days"]) if b.get("p90_days") is not None else "—"}')
+    L.append('\n<b>Фандинг:</b>')
+    by_sym = {}
+    for t in trades:
+        by_sym.setdefault(t['sym'], []).append(t)
+    L.extend(funding_coverage_text({s: loaded[s] for s in syms if s in loaded}, by_sym, info)[:24])
+    L.append('\nПРАВИЛО ОСТАНОВКИ (BOT_SPEC §2.32.8): если H-XS не пройден — поиск автоматических стратегий на OHLCV завершается; новые гипотезы на свечах не запускаются без нового источника данных или внешнего обоснования, записанного до теста.')
+    return '\n'.join(L)
+
+
+def compute_xs(syms, data, info, fee, slip=SLIP, runs=BOOT_RUNS):
+    """Синхронная часть (в потоке): H-XS по загруженным символам, недельный портфель, критерии, эквити, бутстрап."""
+    use = [s for s in syms if s in data and data[s]['1d']]
+    trades = run_xsmom(data, fee, slip, use)
+    maps = {s: {int(b[0] // DAY_MS): b[4] for b in data[s]['1d']} for s in use}
+    verd = xs_verdict(trades, maps)
+    risk, params = portf_risk(), prop_params()
+    boot = {}
+    ps = verd['ps']
+    if ps['weekly'] and verd['ws']['OOS']['n'] > 0:
+        weeks = list(range(verd['oos_w0'], max(ps['weekly']) + 1))
+        feats = week_features({d: risk * r for d, r in ps['daily'].items()}, weeks)
+        for label, lim in (('лимит 30 дн', 30), ('без лимита времени', 0)):
+            p = dict(params); p['limit'] = lim
+            boot[label] = prop_bootstrap(feats, 1.0, p, runs=runs, block=BOOT_BLOCK_WEEKS, max_steps=1500)
+    return build_xs_report(syms, data, info, trades, verd, boot, params, fee), verd, boot
+
+
+async def run_xsmom_backtest(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
+    """/htf_xsmom: вселенная из замороженного списка, 1D из кэша (докачка недостающего с повторами/паузой), расчёт в потоке."""
+    syms = tuple(xs_universe(db_path))
+    data, info = await load_data(exchange, db_path, symbols=syms, progress=progress, tfs=('1d',), deep_funding=False)
+    text, verd, boot = await asyncio.to_thread(compute_xs, syms, data, info, fee, SLIP, runs)
+    return text, info, verd, boot
