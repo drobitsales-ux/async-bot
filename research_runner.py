@@ -179,8 +179,8 @@ async def _task_wide_stop(ctx: Ctx):
 
 
 async def _task_data_probe_ma(ctx: Ctx):
-    import research_ma
-    return {'text': await research_ma.run_probe_ma(ctx.payload(), ctx.params, progress=ctx.progress)}
+    import research_ma2                      # [v100] проба v2 (качество данных Dukascopy, спреды, стакан BingX, диагностика Stooq)
+    return {'text': await research_ma2.run_probe_ma2(ctx.payload(), ctx.params, progress=ctx.progress)}
 
 
 async def _task_carry_test(ctx: Ctx):

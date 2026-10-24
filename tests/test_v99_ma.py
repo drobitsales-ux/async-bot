@@ -384,9 +384,9 @@ class Wiring(unittest.TestCase):
         src = open(os.path.join(ROOT, 'async_bot.py'), encoding='utf-8').read()
         self.assertIn("elif cmd == '/data_probe_ma':", src)
         self.assertIn("_research_job('/data_probe_ma', 'data_probe_ma'", src)
-        self.assertIn('research_ma.prepare_ma_bingx(exchange', src)                    # BingX через общий exchange — в процессе бота
+        self.assertIn('research_ma2.prepare_ma_bingx_book(exchange', src)                # с v100: BingX через общий exchange (стакан) — в процессе бота
         self.assertIn('/data_probe_ma —', src)
-        self.assertNotIn('research_ma.run_probe_ma(', src)                             # расчёт/сеть Stooq и Dukascopy — только через runner
+        self.assertNotIn('research_ma2.run_probe_ma2(', src)                             # расчёт/сеть Stooq и Dukascopy — только через runner
 
     def test_stage1_has_no_calculation_or_lockbox_access(self):
         src = open(os.path.join(ROOT, 'research_ma.py'), encoding='utf-8').read()
