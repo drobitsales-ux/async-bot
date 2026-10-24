@@ -48,6 +48,7 @@ import statistics
 import time
 import aiohttp
 import numpy as np
+import research_runner as _rr   # [v97] RSS процесса и запуск исследований в дочернем процессе (лёгкий модуль, только stdlib)
 import ccxt.async_support as ccxt_async
 from datetime import datetime, timezone, timedelta
 from threading import Thread
@@ -56,7 +57,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ═══════════════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════
-BOT_VERSION   = 'v92'          # единый источник версии для стартовых сообщений
+# [v97] BOT_VERSION удалён: версия везде — CODE_VERSION (стартовое сообщение показывало устаревшее 'v92')
 DB_PATH       = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 TOKEN         = os.getenv('TELEGRAM_TOKEN')
 # ── Telegram Chat ID ────────────────────────────────────
@@ -1968,6 +1969,10 @@ def _dd_status_core() -> str:
 # ═══════════════════════════════════════════════════════
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════
+SESSION_START_UTC = "06:30"   # [v97] границы сессии вынесены в константы (значения прежние) — для стартового сообщения
+SESSION_END_UTC   = "17:00"
+
+
 def is_session() -> bool:
     """
     Расширенная сессия: 06:30 – 17:00 UTC (Киев 09:30 – 20:00).
@@ -1977,8 +1982,8 @@ def is_session() -> bool:
     Крипта 24/7 — форекс-перерывы не актуальны.
     """
     t = datetime.now(timezone.utc).time()
-    session_start = datetime.strptime("06:30", "%H:%M").time()
-    session_end   = datetime.strptime("17:00", "%H:%M").time()
+    session_start = datetime.strptime(SESSION_START_UTC, "%H:%M").time()
+    session_end   = datetime.strptime(SESSION_END_UTC, "%H:%M").time()
     return session_start <= t <= session_end
 
 def is_weekend() -> bool:
@@ -5807,7 +5812,7 @@ async def daily_reset():
 class HealthCheck(BaseHTTPRequestHandler):
     def do_GET(self):
         body = (
-            f"Unified SMC+RSI Bot {BOT_VERSION} | "
+            f"Bot {CODE_VERSION} | "
             f"SMC:{len(smc_positions)} RSI:{len(rsi_positions)} | "
             f"PnL:{daily_stats['pnl_pct']*100:+.2f}%"
         ).encode()
@@ -6121,6 +6126,7 @@ HEALTH_ERR_PER_HOUR   = 100     # ошибок одного типа за час
 HEALTH_DIGEST_ERR_DAY = 100     # ошибок за сутки → «АНОМАЛИЯ» в дайджесте
 HEALTH_MIN_CYCLES     = 5       # минимум циклов SMC в окне для оценки доли ctx_fail
 HEALTH_MIN_SYMBOLS    = 20      # минимум символов (сумма total) в окне для оценки доли fetch_err
+MEM_ALERT_MB          = float(os.getenv('MEM_ALERT_MB', '400'))   # [v97] RSS процесса бота выше → алерт (Render убивает контейнер при 512 МБ)
 
 _health_scans: dict = {}        # {strategy: [(ts, total, fetch_err, ctx_fail)]} — окно за час
 _health_errs: dict = {}         # {тип_ошибки: [ts, ...]} — окно за час
@@ -6184,7 +6190,7 @@ def health_snapshot(now: float = None) -> dict:
         if n:
             errs[k] = n
     return {'eq_ok_ts': ok_ts, 'eq_fails': fails, 'eq_down_sec': eq_down,
-            'ctx_ratio': ctx_ratio, 'ctx_cycles': ctx_cycles, 'fetch_err': fe, 'errs_1h': errs}
+            'ctx_ratio': ctx_ratio, 'ctx_cycles': ctx_cycles, 'fetch_err': fe, 'errs_1h': errs, 'rss_mb': _rr.rss_mb()}
 
 
 def health_conditions(now: float = None) -> list:
@@ -6200,6 +6206,9 @@ def health_conditions(now: float = None) -> list:
     for st_, (ratio, tot) in sorted(snap['fetch_err'].items()):
         if ratio > HEALTH_RATIO and tot >= HEALTH_MIN_SYMBOLS:
             out.append((f'fetch_err:{st_}', f"сканер {st_}: fetch_err у {ratio * 100:.0f}% символов за час (из {tot})"))
+    if snap['rss_mb'] > MEM_ALERT_MB:                       # [v97] память процесса бота
+        child = f"; дочерний исследовательский процесс {_rr.STATE['task']}: RSS {_rr.STATE['rss_mb']:.0f} МБ" if _rr.STATE['task'] else ''
+        out.append(('mem', f"RSS процесса бота {snap['rss_mb']:.0f} МБ > порога {MEM_ALERT_MB:g} МБ (Render перезапускает контейнер при 512 МБ суммарно){child}"))
     for k, n in sorted(snap['errs_1h'].items()):
         if n > HEALTH_ERR_PER_HOUR:
             out.append((f'errtype:{k}', f"{n} ошибок типа {k} за час (порог {HEALTH_ERR_PER_HOUR}); "
@@ -6711,8 +6720,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-26-v96'
+CODE_VERSION = '2026-10-27-v97'
 CHANGELOG = [
+    ('2026-10-27-v97', 'ИССЛЕДОВАНИЯ В ОТДЕЛЬНОМ ПРОЦЕССЕ + R1 ПО СИМВОЛАМ БЕЗ НАКОПЛЕНИЯ В ПАМЯТИ + СТАРТОВОЕ СООБЩЕНИЕ + ТРЕВОГА ПО ПАМЯТИ (торговая логика, контракты, правила и критерии R0/R1 §2.37, bybit_worker.py не менялись). Прод 2026-10-24 (v95): R0 завершён — 32000 случайных сделок, mean R до издержек −0.0044, |t| 0.58 → «измерительная система в норме»; R1 дважды прерван «Ran out of memory (used over 512MB)» — перезапускался ВЕСЬ бот (успели AAVE…BTC); причина — в памяти бота одновременно: свечи всех 16 символов (float64, ≈13 МБ на символ), R0 (32 тыс. сделок) и списки сделок всех вариантов по всем символам (≈850 Б/сделка × 25–40 тыс. сделок на символ). ПРАВКА 1: research_runner.py — общий запускатель: расчёт /edge_audit, /of_backtest, /htf_backtest, /htf_backtest_wide, /htf_xsmom, /wide_stop_test, /data_probe идёт в ДОЧЕРНЕМ процессе (свежий интерпретатор — по смыслу multiprocessing spawn, без повторного импорта async_bot как __main__) с лимитом RLIMIT_AS = RESEARCH_MEM_MB (ENV, 300); сетевые загрузки через общий exchange (prepare_* в research_htf/research_ws) остаются в процессе бота ДО запуска расчёта; связь — файлы (job/payload/progress/result), прогресс пересылается в Telegram; падение дочернего процесса (MemoryError, сигнал, код ≠ 0) → сообщение с причиной и последним прогрессом, бот работает; не больше одного исследования (прежний флаг); /status: «исследование: <команда> / нет, RSS бота N МБ». ПРАВКА 2: R1 строго по символу (свечи: время int64, o float32, h/l/c/v float64 без taker buy → варианты по одному → сделки пачками в SQLite edge.db (edge_trades, edge_progress, edge_v0_events, edge_runs) одной транзакцией с отметкой done → освобождение), повторный /edge_audit продолжает с первого незавершённого символа без дублей, R0 для текущего seed не пересчитывается; итоговые метрики (дневной портфель, IS/OOS, годы, месяцы роста/падения BTC, критерии §2.37.5) — SQL-агрегацией; прогресс по символу с RSS; проверка диска (< 200 МБ — остановка) и оценка размера edge_trades. ПРАВКА 3: стартовое сообщение — версия из CODE_VERSION, только реально включённые стратегии (живые и shadow отдельно), риск/плечо/сессия/breaker-ы из констант (BOT_VERSION удалён). ПРАВКА 4: тревога MEM_ALERT_MB (ENV, 400) по RSS процесса бота, не чаще раза в час. Тесты: tests/test_v97_research.py (28 проверок)'),
     ('2026-10-26-v96', 'ОТДЕЛЬНЫЙ КАНАЛ ПРИВАТНЫХ ВЫЗОВОВ + НЕИЗВЕСТНЫЕ КОМАНДЫ + HTML-РАЗМЕТКА TELEGRAM (торговая логика, сигналы, контракты, исследования, breaker-ы, bybit_worker.py не менялись). Прод /net_probe 2026-10-24 (v94): прямой aiohttp к BingX 0.2 с (публичный и приватный, HTTP 200), через ccxt приватный fetch_balance 63/120(TimeoutError)/47 с при очереди throttler 44–62 и 3 с при пустой очереди — вердикт «ОЧЕРЕДЬ ПЕРЕГРУЖЕНА»: сканеры дают 90–200 REST за цикл при ~1 запросе/с, приватные вызовы (cost 3) ждали за ними до 2 минут, что делало breaker-ы v76/v77 и установку SL после входа ненадёжными. ПРАВКА 1: второй экземпляр ccxt bingx exchange_priv (те же ключи/options, свой throttler, рынки копируются set_markets из общего) — через него ВСЕ приватные вызовы: fetch_balance (эквити/DD, исполнение, отчёты), fetch_positions, create_order, cancel_order (SL/TP/выходы), set_leverage, set_margin_mode, fetch_my_trades; рыночные данные (fetch_ohlcv/tickers/ticker/funding, markets) — на общем exchange; суммарный темп приватных запросов не растёт (rateLimit 1000, cost 3 — тот же), растёт только независимость от очереди сканеров; обёртки LAT (v77) на обоих экземплярах, /lat_status — отдельно приватный и публичный канал с глубиной очереди (публичный fetch_ohlcv — выборка каждого 10-го вызова); /net_probe — замер через exchange_priv + сравнение через общий канал, вердикт «ПРИВАТНЫЙ КАНАЛ В НОРМЕ / ОЧЕРЕДЬ ПЕРЕГРУЖЕНА только у публичного». ПРАВКА 2: любая команда без обработчика (начинается с «/», не адресована другому боту через @) — ответ «Неизвестная команда <cmd>. Версия бота: <CODE_VERSION>. /help — список команд». ПРАВКА 3: esc() — экранирование &, <, > во всех динамических частях сообщений HTML (тексты ошибок, символы в уведомлениях о сделках, пользовательский ввод, вывод /net_probe, пример ошибки в тревоге, вердикт дайджеста); /csv: причина «незакрытого <code>» — tg() режет длинное сообщение по строкам, а <code> с CSV охватывал десятки строк (первый кусок оставался без </code> → 400 → запасной путь без parse_mode); теперь каждый кусок — свой <code>…</code> с экранированием (_code_blocks); запасной путь без parse_mode сохранён. Тесты: tests/test_v96_channels.py (30 проверок), в tests/test_v94_health.py заглушки переведены на exchange_priv'),
     ('2026-10-25-v95', '/edge_audit — КАЛИБРОВКА ИЗМЕРИТЕЛЬНОЙ СИСТЕМЫ (R0) И ПРОВЕРКА SMC2 НА ИСТОРИИ 2020–2026 (R1), исключение из правила остановки §2.32.8 (BOT_SPEC §2.37, пре-коммит отдельным коммитом ДО кода); живая логика, breaker-ы, SMC_LIVE, SMC2_ENABLED (false), контракты, прежние исследования, bybit_worker.py не менялись. research_edge.py: R0 — по 2000 случайных входов на символ (16 символов H-XS, SEED=20261024+номер символа), SL 1.0×ATR14 [0.3%;3%], TP 2R, таймаут 16 баров, семантика _shadow_exit_eval, mean R до и после издержек, t; |t|>=3 (до издержек) — СТОП «ошибка измерения», отчёт заканчивается на R0. R1 — ровно _smc2_eval бота (передаётся аргументом; единственная правка — необязательный параметр vol_mult, в боте не используется) в воспроизведённом цикле scan_smc2 (окно 63 закрытых бара, MKT при первом появлении события, RT при первом окне filled, дедуп 2 ч), варианты V0 (объём пробоя, как shadow) / V1 (без фильтра) / V2 (объём предыдущей свечи, как старый SMC) / F (V0 + фандинг: шорт при >0, лонг при <0, архив fundingRate; «непроверяем» при покрытии <90%), 16 ячеек, критерии t>=3.0 по дневному портфелю на OOS с 2025-01-01, PF net>=1.3, OOS>=0.5×IS, n>=200, дней>=100, mean R>0 в месяцы роста И падения BTC; разбивка по годам и месяцам BTC; сверка с shadow SMC2 (справочно). Данные: кэш data.binance.vision + догрузка (research_vision), дневной хвост текущего месяца, ставки фандинга. Решение: ячейка прошла — отдельный пре-коммит shadow-форварда; ни одна — исследования на OHLCV/потоке ордеров закрыты окончательно. Тесты: tests/test_v95_edge.py'),
     ('2026-10-24-v94', 'ПРОД-ИНЦИДЕНТ «СЛЕПОТА ДАННЫХ» (торговая логика, контракты, исследования, breaker-ы, SMC_LIVE, bybit_worker.py не менялись). Прод 2026-10-23: 2060 RequestTimeout на GET user/balance, ctx_fail в 1033 из 1033 циклов SMC, fetch_err PO3 54.4/60 и ORB_RT 15.4/80, дайджест при этом «Аномалий нет». ШАГ 0: по коду ccxt==4.2.14 таймаут HTTP (10 с) считается ПОСЛЕ throttler — RequestTimeout не может быть следствием собственной очереди; /net_probe (фон): DNS open-api.bingx.com, по 5 замеров публичного (тикер) и приватного (баланс) запроса напрямую через aiohttp и через ccxt, глубина очереди, вердикт «сеть недоступна/медленная» / «очередь перегружена» / «отказ BingX (код)»; причина молчания самодиагностики — вердикт дайджеста смотрел только таблицу anomalies, INV-6 ловит лишь точные повторы ERROR, сбой эквити шёл как WARNING. ПРАВКА 1: health_alert_tick — немедленные алерты в Telegram (не чаще раза в час на тип): эквити не получено > 30 мин, ctx_fail > 50% циклов SMC за час, fetch_err > 50% символов у сканера за час, > 100 ошибок одного типа за час; дайджест «⚠️ АНОМАЛИЯ» при > 100 ошибок за сутки или сработавшем условии (раздел «ЗДОРОВЬЕ ДАННЫХ»); /status — строка состояния данных. ПРАВКА 2.3: _fetch_equity — повторы с паузами 5/15/30 с (повторы только если прошлый цикл был успешным, чтобы не растягивать цикл с monitor_all). Правки 2.1 (приоритет очереди) и 2.2 (перенос региона) не делались — решение владельца по вердикту /net_probe; описание переноса — BOT_SPEC §2.36.5. Тесты перенесены в tests/ (tests/README.md)'),
@@ -6966,6 +6976,23 @@ async def _htf_deliver(text: str) -> bool:
     return ok
 
 
+async def _tg_plain(text):
+    """[v97] Прогресс исследований — обычный текст (экранируется для parse_mode=HTML)."""
+    await tg(esc(text))
+
+
+async def _research_job(cmd, task, params, payload=None):
+    """[v97] Расчёт исследования — в ОТДЕЛЬНОМ процессе (research_runner): лимит памяти RESEARCH_MEM_MB, прогресс пересылается в Telegram, падение дочернего процесса
+    (MemoryError, сигнал, код ≠ 0) → сообщение с причиной и последним прогрессом, бот продолжает работу. → текст отчёта или None."""
+    r = await _rr.run_job(task, params, payload=payload, progress=_tg_plain, label=cmd)
+    if not r['ok']:
+        await tg(f'❌ {esc(cmd)}: расчёт прерван — {esc(r["error"])}.\nПоследний прогресс: {esc(r["last_progress"] or "нет")}.\n'
+                 f'Пик RSS дочернего процесса {r["rss_peak_mb"]:.0f} МБ (лимит RESEARCH_MEM_MB={_rr.mem_limit_mb():g}); бот работает.'
+                 + (' Повторный запуск продолжит с контрольной точки.' if task == 'edge_audit' else ''))
+        return None
+    return r['text']
+
+
 async def htf_backtest_run():
     """[v86/v87] /htf_backtest: загрузка истории через общий exchange (с повторами, паузой и кэшем) и расчёт в потоке.
     Отчёт сохраняется в БД (htf_reports) ДО отправки; /htf_report пришлёт последний сохранённый."""
@@ -6976,9 +7003,12 @@ async def htf_backtest_run():
         import research_htf
         await tg('📈 /htf_backtest запущен (загрузка истории BTC/ETH/SOL 1D/4h с повторами и паузой '
                  f'{research_htf.fetch_pause():g} с между запросами; расчёт в фоне)…')
-        text, info, _res, _boot = await research_htf.run_backtest(exchange, TRADES_DB, FEE_TAKER, progress=tg)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+        data, info = await research_htf.prepare_backtest(exchange, TRADES_DB, progress=_tg_plain)      # сеть через общий exchange — в процессе бота
+        text = await _research_job('/htf_backtest', 'htf_backtest', {'fee': FEE_TAKER, 'runs': research_htf.BOOT_RUNS}, payload=(data, info))
+        del data, info
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_backtest')
         await tg(f'❌ /htf_backtest: {esc(type(e).__name__)}: {esc(e)}')
@@ -6996,9 +7026,12 @@ async def htf_backtest_wide_run():
         import research_htf
         await tg('📈 /htf_backtest_wide запущен (отбор вселенной правилом, загрузка 1D и фандинга с повторами и паузой '
                  f'{research_htf.fetch_pause():g} с между запросами; первый запуск — десятки минут, повторный — из кэша)…')
-        text, info, _v, _b = await research_htf.run_wide(exchange, TRADES_DB, FEE_TAKER, progress=tg)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+        univ, data, info = await research_htf.prepare_wide(exchange, TRADES_DB, progress=_tg_plain)
+        text = await _research_job('/htf_backtest_wide', 'htf_wide', {'fee': FEE_TAKER, 'runs': research_htf.BOOT_RUNS}, payload=(univ, data, info))
+        del univ, data, info
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_backtest_wide')
         await tg(f'❌ /htf_backtest_wide: {esc(type(e).__name__)}: {esc(e)}')
@@ -7016,9 +7049,12 @@ async def htf_xsmom_run():
         import research_htf
         await tg('📈 /htf_xsmom запущен (вселенная — 16 фиксированных символов, 1D из кэша с докачкой недостающего, пауза '
                  f'{research_htf.fetch_pause():g} с между запросами; расчёт в фоне)…')
-        text, info, _v, _b = await research_htf.run_xsmom_backtest(exchange, TRADES_DB, FEE_TAKER, progress=tg)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+        syms, data, info = await research_htf.prepare_xs(exchange, TRADES_DB, progress=_tg_plain)
+        text = await _research_job('/htf_xsmom', 'htf_xsmom', {'fee': FEE_TAKER, 'runs': research_htf.BOOT_RUNS}, payload=(syms, data, info))
+        del syms, data, info
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_xsmom')
         await tg(f'❌ /htf_xsmom: {esc(type(e).__name__)}: {esc(e)}')
@@ -7037,9 +7073,12 @@ async def wide_stop_test_run():
         import research_ws
         await tg('📈 /wide_stop_test запущен (пересимуляция выходов SMC2/SMC_SIG/PO3/ORB на 15m-барах 48 ч, кэш ws_bars, повторы и пауза '
                  f'{research_htf.fetch_pause():g} с между запросами; первый запуск — десятки минут)…')
-        text, info, _res = await research_ws.run_wide_stop(exchange, TRADES_DB, FEE_MAKER, FEE_TAKER, progress=tg)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+        payload = await research_ws.prepare_wide_stop(exchange, TRADES_DB, progress=_tg_plain)
+        text = await _research_job('/wide_stop_test', 'wide_stop', {'db_path': TRADES_DB, 'fee_maker': FEE_MAKER, 'fee_taker': FEE_TAKER}, payload=payload)
+        payload = None
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('wide_stop_test')
         await tg(f'❌ /wide_stop_test: {esc(type(e).__name__)}: {esc(e)}')
@@ -7259,12 +7298,12 @@ async def data_probe_run():
     _htf_running[0] = True
     try:
         import research_htf
-        import research_probe
         await tg('📡 /data_probe запущен (метаданные Binance fapi / data.binance.vision / BingX, пауза '
                  f'{research_htf.fetch_pause():g} с между запросами, ~1-3 минуты)…')
-        text, _res, _est, _concl = await research_probe.run_probe(TRADES_DB, exchange=exchange, progress=tg, version=CODE_VERSION)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+        text = await _research_job('/data_probe', 'data_probe', {'db_path': TRADES_DB, 'has': dict(getattr(exchange, 'has', {}) or {}), 'version': CODE_VERSION})
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('data_probe')
         await tg(f'❌ /data_probe: {esc(type(e).__name__)}: {esc(e)}')
@@ -7295,12 +7334,10 @@ async def of_backtest_run():
         await tg('📈 /of_backtest запущен: ' + ', '.join(h for h in research_of.HYPS if allowed[h])
                  + (' (пропущены: ' + ', '.join(h for h in research_of.HYPS if not allowed[h]) + ')' if not all(allowed.values()) else '')
                  + f'. Загрузка архива в {research_vision.vision_dir()} фоном (первый запуск — десятки минут), прогресс по символам, при обрыве повторный запуск продолжит из кэша…')
-        import aiohttp
-        async with aiohttp.ClientSession() as ses:
-            fetch = research_vision.make_fetcher(ses)
-            text, _res = await research_of.run_of(fetch, TRADES_DB, universe, allowed, reasons, FEE_TAKER, progress=tg)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+        text = await _research_job('/of_backtest', 'of_backtest', {'db_path': TRADES_DB, 'universe': universe, 'allowed': allowed, 'reasons': reasons, 'fee': FEE_TAKER})
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('of_backtest')
         await tg(f'❌ /of_backtest: {esc(type(e).__name__)}: {esc(e)}')
@@ -7317,7 +7354,6 @@ async def edge_audit_run():
     _htf_running[0] = True
     try:
         import research_htf
-        import research_edge
         import research_probe
         import research_vision
         universe = research_probe.universe_from_db(TRADES_DB)
@@ -7325,13 +7361,13 @@ async def edge_audit_run():
             await tg(f'⛔ /edge_audit отказ: вселенная H-XS не заморожена ({len(universe)} символов вместо 16) — запусти /htf_xsmom')
             return
         await tg(f'📈 /edge_audit запущен: R0 (калибровка) → R1 (SMC2 на истории) по BOT_SPEC §2.37. Данные {research_vision.vision_dir()}: догрузка свечей/фандинга '
-                 f'фоном (первый запуск — десятки минут), затем расчёт (десятки минут), прогресс по символам. FEE_MAKER={FEE_MAKER} FEE_TAKER={FEE_TAKER}.')
-        import aiohttp
-        async with aiohttp.ClientSession() as ses:
-            fetch = research_vision.make_fetcher(ses)
-            text, res = await research_edge.run_edge_audit(fetch, TRADES_DB, universe, FEE_MAKER, FEE_TAKER, _smc2_eval, get_pivots, progress=tg)
-        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
-        await _htf_deliver(text)
+                 f'фоном (первый запуск — десятки минут), затем расчёт (десятки минут), прогресс по символам. Расчёт — в ОТДЕЛЬНОМ процессе (лимит RESEARCH_MEM_MB={_rr.mem_limit_mb():g} МБ), '
+                 f'сделки — в edge.db по символам (прерванный прогон продолжится с первого незавершённого символа). FEE_MAKER={FEE_MAKER} FEE_TAKER={FEE_TAKER}.')
+        text = await _research_job('/edge_audit', 'edge_audit', {'db_path': TRADES_DB, 'universe': universe, 'fee_maker': FEE_MAKER, 'fee_taker': FEE_TAKER,
+                                                               'vision_dir': research_vision.vision_dir()})
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
     except Exception as e:
         logging.exception('edge_audit')
         await tg(f'❌ /edge_audit: {esc(type(e).__name__)}: {esc(e)}')
@@ -9380,6 +9416,7 @@ async def check_tg_commands():
                     f'Позиций: {len(all_pos)} '
                     f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
                     f'{health_status_line()}\n'
+                    f'{esc(_rr.status_line())}\n'
                     f'Баланс: проверьте на бирже\n'
                     f'БД сделок: /stats | CSV: /csv'
                 )
@@ -9606,6 +9643,42 @@ async def check_tg_commands():
         logging.warning(f'⚠️ [CMD] check_tg_commands error: {e}')
 
 
+def active_strategies():
+    """[v97] Реально включённые флагами стратегии: (живые, shadow). Источник — те же флаги, что гейтят сканеры (main loop / scan_*)."""
+    live, shadow = [], []
+    if SMC_LIVE:
+        live.append('SMC')
+    else:
+        shadow.append('SMC_SIG (замер вместо живых входов, SMC_LIVE=false)')
+    if SMC_SHADOW_ENABLED:
+        shadow.append('SMC_SHADOW')
+    if SA_ENABLED:
+        (live if SA_LIVE else shadow).append('SA')
+    if RSI_ENABLED:
+        live.append('RSI')
+        if PB_ENABLED:
+            (live if PB_LIVE else shadow).append('PB')
+    if MOMENTUM_ENABLED:
+        (live if MOMENTUM_LIVE else shadow).append('MOM')
+    for flag, name in ((RB_ENABLED, 'RB'), (ORB_ENABLED, 'ORB'), (PO3_ENABLED, 'PO3'), (SMC2_ENABLED, 'SMC2'), (ORB_RT_ENABLED, 'ORB_RT')):
+        if flag:
+            shadow.append(name)
+    return live, shadow
+
+
+def startup_text() -> str:
+    """[v97] Стартовое сообщение: версия — CODE_VERSION, стратегии — только включённые (живые и shadow отдельно), параметры — из текущих констант."""
+    live, shadow = active_strategies()
+    return (
+        f"🟢 <b>Бот {esc(CODE_VERSION)}</b> запущен\n"
+        f"Живые стратегии: {esc(', '.join(live)) if live else 'нет (живые входы выключены)'}\n"
+        f"Shadow (виртуальные): {esc(', '.join(shadow)) if shadow else 'нет'}\n"
+        f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
+        f"Сессия SMC: {SESSION_START_UTC}–{SESSION_END_UTC} UTC\n"
+        f"Breaker'ы по эквити: дневной DD > {DAILY_DD_LIMIT_PCT:.1f}%/день, общий > {MAX_DD_LIMIT_PCT:.1f}% от пика"
+    )
+
+
 async def main():
     global http, _rest_prev
 
@@ -9653,15 +9726,8 @@ async def main():
     except:
         pass
 
-    await tg(
-        f"🟢 <b>Unified SMC+RSI+SA Bot {BOT_VERSION} PROP</b> запущен\n"
-        f"[SMC] Smart Money Concepts | [RSI] Mean Reversion | [SA] BTC VWAP MR\n"
-        f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  "
-        f"Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
-        f"Сессия: 06:30–17:00 UTC (Киев 09:30–20:00)\n"
-        f"Circuit breaker: при DD по эквити >{DAILY_DD_LIMIT_PCT:.1f}%/день (v76)"
-    )
-    logging.info(f"🚀 Unified SMC+RSI+SA Bot {BOT_VERSION} started")
+    await tg(startup_text())
+    logging.info(f"🚀 Bot {CODE_VERSION} started")
 
     cycle = 0
     try:
@@ -9881,7 +9947,7 @@ async def main():
 
     finally:
         logging.info("Shutting down...")
-        await tg(f"🔴 <b>Bot {BOT_VERSION}</b> остановлен")
+        await tg(f"🔴 <b>Bot {esc(CODE_VERSION)}</b> остановлен")
         if http:
             await http.close()
         await exchange.close()

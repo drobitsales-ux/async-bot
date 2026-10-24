@@ -764,9 +764,14 @@ def compute(data, info, fee, slip=SLIP, runs=BOOT_RUNS):
     return build_report(data, info, results, fee, boot, params), results, boot
 
 
+async def prepare_backtest(exchange, db_path, progress=None):
+    """[v97] Сетевая часть /htf_backtest (в процессе бота, через общий exchange): догрузка кэша → (data, info) для расчёта в дочернем процессе."""
+    return await load_data(exchange, db_path, progress=progress)
+
+
 async def run_backtest(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
     """Полный прогон: загрузка (async, через общий экземпляр биржи) + расчёт в потоке (цикл бота не блокируется)."""
-    data, info = await load_data(exchange, db_path, progress=progress)
+    data, info = await prepare_backtest(exchange, db_path, progress=progress)
     text, results, boot = await asyncio.to_thread(compute, data, info, fee, SLIP, runs)
     return text, info, results, boot
 
@@ -1059,13 +1064,19 @@ def compute_wide(univ, data, info, fee, slip=SLIP, runs=BOOT_RUNS):
     return build_wide_report(univ, kept, excluded, data, info, trades_by_sym, verd, boot, params, fee), verd, boot
 
 
-async def run_wide(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
-    """/htf_backtest_wide: выбор вселенной правилом → загрузка 1D (+фандинг) с повторами/паузой/кэшем → расчёт в потоке."""
+async def prepare_wide(exchange, db_path, progress=None):
+    """[v97] Сетевая часть /htf_backtest_wide (в процессе бота): выбор вселенной правилом + загрузка 1D (+фандинг) → (univ, data, info)."""
     sel_info = {'requests': 0, 'fetch_log': []}
     univ = await select_universe(exchange, sel_info, progress=progress)
     syms = tuple(r['sym'] for r in univ)
     data, info = await load_data(exchange, db_path, symbols=syms, progress=progress, tfs=('1d',))
     info['requests'] += sel_info['requests']; info['universe_skipped'] = sel_info.get('universe_skipped', [])
+    return univ, data, info
+
+
+async def run_wide(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
+    """/htf_backtest_wide: выбор вселенной правилом → загрузка 1D (+фандинг) с повторами/паузой/кэшем → расчёт в потоке."""
+    univ, data, info = await prepare_wide(exchange, db_path, progress=progress)
     text, verd, boot = await asyncio.to_thread(compute_wide, univ, data, info, fee, SLIP, runs)
     return text, info, verd, boot
 
@@ -1283,9 +1294,15 @@ def compute_xs(syms, data, info, fee, slip=SLIP, runs=BOOT_RUNS):
     return build_xs_report(syms, data, info, trades, verd, boot, params, fee), verd, boot
 
 
-async def run_xsmom_backtest(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
-    """/htf_xsmom: вселенная из замороженного списка, 1D из кэша (докачка недостающего с повторами/паузой), расчёт в потоке."""
+async def prepare_xs(exchange, db_path, progress=None):
+    """[v97] Сетевая часть /htf_xsmom (в процессе бота): замороженная вселенная + докачка 1D → (syms, data, info)."""
     syms = tuple(xs_universe(db_path))
     data, info = await load_data(exchange, db_path, symbols=syms, progress=progress, tfs=('1d',), deep_funding=False)
+    return syms, data, info
+
+
+async def run_xsmom_backtest(exchange, db_path, fee, progress=None, runs=BOOT_RUNS):
+    """/htf_xsmom: вселенная из замороженного списка, 1D из кэша (докачка недостающего с повторами/паузой), расчёт в потоке."""
+    syms, data, info = await prepare_xs(exchange, db_path, progress=progress)
     text, verd, boot = await asyncio.to_thread(compute_xs, syms, data, info, fee, SLIP, runs)
     return text, info, verd, boot
