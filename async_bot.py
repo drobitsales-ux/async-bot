@@ -4985,7 +4985,7 @@ def _smc2_rt_state(h, l, c, b: int, L: float, S: float, sl: float, is_long: bool
     return ('expired', None) if b + SMC2_RETEST_MAX_BARS <= n - 1 else ('pending', None)
 
 
-def _smc2_eval(ts, o, h, l, c, v, mode: str, ph=None, pl=None):
+def _smc2_eval(ts, o, h, l, c, v, mode: str, ph=None, pl=None, vol_mult=None):
     """[v79] Чистая функция: события SMC2 одного направления по ЗАКРЫТЫМ барам (массивы по возрастанию;
     последний бар — последний закрытый). Рассматриваются бары пробоя b в последних
     SMC2_RETEST_MAX_BARS+1 барах; всё считается «как на момент b» (pivot-ы, VWAP, ATR — только бары <= b),
@@ -4994,6 +4994,7 @@ def _smc2_eval(ts, o, h, l, c, v, mode: str, ph=None, pl=None):
     stage — глубина воронки среди всех кандидатов (-1 ... 4: no_struct,no_break,vol,vwap,sl_bounds)."""
     n = len(c)
     is_long = (mode == 'Long')
+    vm = SMC2_BREAK_VOL_MULT if vol_mult is None else vol_mult    # [v95] только для /edge_audit (V1 = 0, без фильтра); в боте всегда None
     if ph is None or pl is None:
         ph, pl = get_pivots(h, l, order=SMC_PIVOT_ORDER)
     brk_piv, st_piv = (ph, pl) if is_long else (pl, ph)
@@ -5011,7 +5012,7 @@ def _smc2_eval(ts, o, h, l, c, v, mode: str, ph=None, pl=None):
         if not broke or any((c[j] > L) if is_long else (c[j] < L) for j in range(pi + 1, b)):
             stage = max(stage, 1); continue           # нет пробоя ИМЕННО на b (первое закрытие за L)
         med = float(np.median(v[b - 20:b]))
-        if med <= 0 or v[b] < SMC2_BREAK_VOL_MULT * med:
+        if med <= 0 or v[b] < vm * med:
             stage = max(stage, 2); continue           # объём — на свече ПРОБОЯ, не на предыдущей
         vwap = calc_vwap(h[:b + 1], l[:b + 1], c[:b + 1], v[:b + 1])
         chase = (c[b] > vwap * SMC2_CHASE_MAX) if is_long else (c[b] < vwap * (2 - SMC2_CHASE_MAX))
@@ -6640,8 +6641,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-24-v94'
+CODE_VERSION = '2026-10-25-v95'
 CHANGELOG = [
+    ('2026-10-25-v95', '/edge_audit — КАЛИБРОВКА ИЗМЕРИТЕЛЬНОЙ СИСТЕМЫ (R0) И ПРОВЕРКА SMC2 НА ИСТОРИИ 2020–2026 (R1), исключение из правила остановки §2.32.8 (BOT_SPEC §2.37, пре-коммит отдельным коммитом ДО кода); живая логика, breaker-ы, SMC_LIVE, SMC2_ENABLED (false), контракты, прежние исследования, bybit_worker.py не менялись. research_edge.py: R0 — по 2000 случайных входов на символ (16 символов H-XS, SEED=20261024+номер символа), SL 1.0×ATR14 [0.3%;3%], TP 2R, таймаут 16 баров, семантика _shadow_exit_eval, mean R до и после издержек, t; |t|>=3 (до издержек) — СТОП «ошибка измерения», отчёт заканчивается на R0. R1 — ровно _smc2_eval бота (передаётся аргументом; единственная правка — необязательный параметр vol_mult, в боте не используется) в воспроизведённом цикле scan_smc2 (окно 63 закрытых бара, MKT при первом появлении события, RT при первом окне filled, дедуп 2 ч), варианты V0 (объём пробоя, как shadow) / V1 (без фильтра) / V2 (объём предыдущей свечи, как старый SMC) / F (V0 + фандинг: шорт при >0, лонг при <0, архив fundingRate; «непроверяем» при покрытии <90%), 16 ячеек, критерии t>=3.0 по дневному портфелю на OOS с 2025-01-01, PF net>=1.3, OOS>=0.5×IS, n>=200, дней>=100, mean R>0 в месяцы роста И падения BTC; разбивка по годам и месяцам BTC; сверка с shadow SMC2 (справочно). Данные: кэш data.binance.vision + догрузка (research_vision), дневной хвост текущего месяца, ставки фандинга. Решение: ячейка прошла — отдельный пре-коммит shadow-форварда; ни одна — исследования на OHLCV/потоке ордеров закрыты окончательно. Тесты: tests/test_v95_edge.py'),
     ('2026-10-24-v94', 'ПРОД-ИНЦИДЕНТ «СЛЕПОТА ДАННЫХ» (торговая логика, контракты, исследования, breaker-ы, SMC_LIVE, bybit_worker.py не менялись). Прод 2026-10-23: 2060 RequestTimeout на GET user/balance, ctx_fail в 1033 из 1033 циклов SMC, fetch_err PO3 54.4/60 и ORB_RT 15.4/80, дайджест при этом «Аномалий нет». ШАГ 0: по коду ccxt==4.2.14 таймаут HTTP (10 с) считается ПОСЛЕ throttler — RequestTimeout не может быть следствием собственной очереди; /net_probe (фон): DNS open-api.bingx.com, по 5 замеров публичного (тикер) и приватного (баланс) запроса напрямую через aiohttp и через ccxt, глубина очереди, вердикт «сеть недоступна/медленная» / «очередь перегружена» / «отказ BingX (код)»; причина молчания самодиагностики — вердикт дайджеста смотрел только таблицу anomalies, INV-6 ловит лишь точные повторы ERROR, сбой эквити шёл как WARNING. ПРАВКА 1: health_alert_tick — немедленные алерты в Telegram (не чаще раза в час на тип): эквити не получено > 30 мин, ctx_fail > 50% циклов SMC за час, fetch_err > 50% символов у сканера за час, > 100 ошибок одного типа за час; дайджест «⚠️ АНОМАЛИЯ» при > 100 ошибок за сутки или сработавшем условии (раздел «ЗДОРОВЬЕ ДАННЫХ»); /status — строка состояния данных. ПРАВКА 2.3: _fetch_equity — повторы с паузами 5/15/30 с (повторы только если прошлый цикл был успешным, чтобы не растягивать цикл с monitor_all). Правки 2.1 (приоритет очереди) и 2.2 (перенос региона) не делались — решение владельца по вердикту /net_probe; описание переноса — BOT_SPEC §2.36.5. Тесты перенесены в tests/ (tests/README.md)'),
     ('2026-10-16-v93', 'SMC2 ВЫКЛЮЧЕН ПО ДЕФОЛТУ — контракт (А)/(Б) §2.20.2 не выполнен (живая логика, breaker-ы, SMC_LIVE, PO3, ORB_RT, прочие стратегии, bybit_worker.py не менялись). Итог /shadow_analyze 2026-10-16: (А) Long MKT n=133 mean R -0.143 (t -1.67), Long RT n=107 -0.170 (t -1.74), Short MKT n=135 +0.099 (t 1.19, PF 1.47), Short RT n=105 +0.043 (t 0.43) — n>=100 по всем, PF>=1.3/t>=2.5 не достигнуты; (Б) n=264, разность -0.027 (t -0.65) — отвергнут. По правилу §2.32.8 SMC2_ENABLED дефолт false (возврат через ENV SMC2_ENABLED=true); открытые записи SMC2 закрываются штатно (shadow_check), отчётные секции SMC2 оставлены как история'),
     ('2026-10-12-v92', 'ИСПРАВЛЕННЫЙ ЗАГРУЗЧИК АРХИВА + /data_probe v2 + /of_backtest (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, прежние исследования, правила и критерии H-OF1/H-OF2 §2.34, bybit_worker.py не менялись). Итог /data_probe v91 (2026-10-12): fapi — HTTP 451 (гео-блок региона сервера), BingX — нет taker buy и истории OI, архив — BadZipFile на всех загрузках и обрыв листинга на 32 файлах; вердикты v91 по H-OF1/H-OF2 НЕДЕЙСТВИТЕЛЬНЫ. ПРИЧИНА: fetcher читал тело resp.content.read(8_000_000) — StreamReader.read(n) возвращает только то, что уже лежит в буфере (демонстрация: 65 536 из 1 024 004 байт), поэтому zip и XML-листинг приходили усечёнными; исправлено на полное чтение resp.read(). research_vision.py: прямые URL файлов, проверка ответа (200, не text/html, сигнатура PK), полный листинг S3 с продолжением, sha256 по .CHECKSUM (3 повтора → битый), повторы сеть/5xx до 5 попыток, VISION_PAUSE_SEC / VISION_CONCURRENCY, парсинг свечей (с заголовком/без, мс/мкс) и metrics (шаг и поля по данным), хранение npz в /data/vision (OI — часовой агрегат на конец часа), проверка места (< 200 МБ — остановка), атомарная запись, докачка только недостающего. /data_probe v2: вердикты доступности по фактически разобранным файлам, результат в of_probe_status. /of_backtest (research_of.py): H-OF1/H-OF2 строго по §2.34 только при «проверяема», сделки в of_trades, отчёт в htf_reports'),
@@ -7204,6 +7206,37 @@ async def of_backtest_run():
     except Exception as e:
         logging.exception('of_backtest')
         await tg(f'❌ /of_backtest: {type(e).__name__}: {e}')
+    finally:
+        _htf_running[0] = False
+
+
+async def edge_audit_run():
+    """[v95] /edge_audit: R0 (калибровка измерительной системы на случайных входах) и R1 (SMC2 на истории 2020–2026) строго по BOT_SPEC §2.37
+    (research_edge.py). Данные — архив data.binance.vision (кэш v92 + догрузка), вселенная — замороженные 16 символов H-XS. Фон; прогресс в Telegram;
+    отчёт сохраняется в htf_reports ДО отправки (/htf_report пришлёт последний). R0 печатается первым; при |t| >= 3 отчёт заканчивается на R0."""
+    if _htf_running[0]:
+        return
+    _htf_running[0] = True
+    try:
+        import research_htf
+        import research_edge
+        import research_probe
+        import research_vision
+        universe = research_probe.universe_from_db(TRADES_DB)
+        if len(universe) != 16:
+            await tg(f'⛔ /edge_audit отказ: вселенная H-XS не заморожена ({len(universe)} символов вместо 16) — запусти /htf_xsmom')
+            return
+        await tg(f'📈 /edge_audit запущен: R0 (калибровка) → R1 (SMC2 на истории) по BOT_SPEC §2.37. Данные {research_vision.vision_dir()}: догрузка свечей/фандинга '
+                 f'фоном (первый запуск — десятки минут), затем расчёт (десятки минут), прогресс по символам. FEE_MAKER={FEE_MAKER} FEE_TAKER={FEE_TAKER}.')
+        import aiohttp
+        async with aiohttp.ClientSession() as ses:
+            fetch = research_vision.make_fetcher(ses)
+            text, res = await research_edge.run_edge_audit(fetch, TRADES_DB, universe, FEE_MAKER, FEE_TAKER, _smc2_eval, get_pivots, progress=tg)
+        research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+        await _htf_deliver(text)
+    except Exception as e:
+        logging.exception('edge_audit')
+        await tg(f'❌ /edge_audit: {type(e).__name__}: {e}')
     finally:
         _htf_running[0] = False
 
@@ -9332,6 +9365,7 @@ async def check_tg_commands():
                     '/wide_stop_test — гипотеза H-WS: пересимуляция выходов с широким стопом на записанных shadow-сигналах, фоном\n'
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
                     '/net_probe — диагностика сети до BingX (DNS, публичный/приватный запрос напрямую и через ccxt, очередь), фоном\n'
+                    '/edge_audit — R0 калибровка измерительной системы + R1 SMC2 на истории 2020–2026 (BOT_SPEC §2.37), фоном; отчёт — /htf_report\n'
                     '/of_backtest — бэктест H-OF1/H-OF2 по §2.34 (только если /data_probe признал гипотезу проверяемой), фоном\n'
                     '/htf_report — повторно прислать последний сохранённый отчёт /htf_backtest\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
@@ -9401,6 +9435,14 @@ async def check_tg_commands():
                     await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
                 else:
                     _t = asyncio.create_task(data_probe_run())
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/edge_audit':
+                # [v95] R0 (калибровка) + R1 (SMC2 на истории), research_edge.py, фоном; торговлю не трогает
+                if _htf_running[0]:
+                    await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
+                else:
+                    _t = asyncio.create_task(edge_audit_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/of_backtest':
