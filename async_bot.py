@@ -37,6 +37,10 @@ import glob
 import json
 import math
 import os
+import re
+import hmac
+import hashlib
+import socket
 import logging
 import sqlite3
 import statistics
@@ -778,7 +782,7 @@ MAX_DD_LIMIT_PCT = float(os.getenv('MAX_DD_LIMIT_PCT', '6.0'))
 # но из условия breaker убрана. ДЕЙСТВИЕ breaker (circuit_open, TG, остановка
 # скана) не менялось — только условие срабатывания.
 _dd = {'start_equity': 0.0, 'start_date': '', 'equity': 0.0, 'ok_ts': 0.0,
-       'fails': 0, 'min_dd': 0.0}
+       'fails': 0, 'min_dd': 0.0, 'fail_since': 0.0}   # [v94] fail_since — начало текущей серии сбоев эквити
 _mdd = {'peak': 0.0, 'tripped': False}   # [v77] общая просадка от пика эквити
 
 
@@ -802,13 +806,27 @@ def _extract_equity(bal) -> float:
     return 0.0
 
 
-async def _fetch_equity():
-    try:
-        eq = _extract_equity(await asyncio.wait_for(exchange.fetch_balance(), 60))
-        return eq if eq > 0 else None
-    except Exception as _e:
-        logging.warning(f'[DD] эквити не получено: {type(_e).__name__}: {_e}')
-        return None
+# [v94] Повторы запроса эквити: пауза 5/15/30 с перед 2-й/3-й/4-й попыткой, и только потом сбой.
+# Прод 2026-10-23: 2060 RequestTimeout на user/balance — одиночная попытка признавала сбой сразу.
+EQUITY_RETRY_PAUSES = (5, 15, 30)
+EQUITY_ATTEMPT_TIMEOUT = 20   # с на одну попытку (внутри ccxt свой HTTP-таймаут 10 с — он считается ПОСЛЕ очереди)
+
+
+async def _fetch_equity(retry: bool = True):
+    """Эквити USDT или None. retry=True — до 1+3 попыток с паузами EQUITY_RETRY_PAUSES."""
+    pauses = EQUITY_RETRY_PAUSES if retry else ()
+    for i in range(len(pauses) + 1):
+        try:
+            eq = _extract_equity(await asyncio.wait_for(exchange.fetch_balance(), EQUITY_ATTEMPT_TIMEOUT))
+            if eq > 0:
+                return eq
+            err = 'пустой ответ'
+        except Exception as _e:
+            err = f'{type(_e).__name__}: {_e}'
+        logging.warning(f'[DD] эквити не получено (попытка {i + 1}/{len(pauses) + 1}): {err}')
+        if i < len(pauses):
+            await asyncio.sleep(pauses[i])
+    return None
 
 
 def _dd_save():
@@ -906,8 +924,12 @@ async def dd_update(force_rebase: bool = False) -> bool:
     бросает исключений наружу. Сбой → последнее известное значение, breaker не
     срабатывает и не сбрасывается; 3 сбоя подряд → один алерт в Telegram."""
     try:
-        eq = await _fetch_equity()
+        # [v94] повторы с паузами только когда прошлый цикл был успешным: при затяжном сбое цикл не
+        # растягивается на ~2 мин (monitor_all идёт ПОСЛЕ dd_update и ведёт открытые позиции)
+        eq = await _fetch_equity(retry=(_dd['fails'] == 0))
         if eq is None:
+            if _dd['fails'] == 0:
+                _dd['fail_since'] = time.time()
             _dd['fails'] += 1
             if _dd['fails'] == 3:
                 age = f"{(time.time() - _dd['ok_ts']) / 60:.0f} мин назад" if _dd['ok_ts'] else 'ни разу'
@@ -915,6 +937,7 @@ async def dd_update(force_rebase: bool = False) -> bool:
                          f"последнее известное значение (успешное обновление: {age}).")
             return False
         _dd['fails'] = 0
+        _dd['fail_since'] = 0.0
         _dd['equity'] = eq
         _dd['ok_ts'] = time.time()
         await _mdd_update(eq)   # [v77] пик/общий breaker — только по успешному эквити
@@ -5993,6 +6016,10 @@ _scan_summary_accum = {'SA': [], 'RB': [], 'ORB': [], 'SMC': [], 'PO3': [], 'SMC
 
 def _record_scan_summary(strategy: str, counts: dict):
     _scan_summary_accum.setdefault(strategy, []).append(counts)
+    try:
+        _health_note_scan(strategy, counts)   # [v94] окно «за час» для тревог fetch_err / ctx_fail
+    except Exception:
+        pass
 
 
 def _write_anomaly(severity: str, kind: str, detail: str, context: dict = None):
@@ -6006,6 +6033,145 @@ def _write_anomaly(severity: str, kind: str, detail: str, context: dict = None):
         con.commit(); con.close()
     except Exception as _e:
         logging.debug(f'[ANOMALY] write fail: {_e}')
+
+
+# ═══════════════════════════════════════════════════════
+#  [v94] ГРОМКИЕ ТРЕВОГИ САМОДИАГНОСТИКИ (BOT_SPEC §2.36)
+#  Прод 2026-10-23: 2060 RequestTimeout на user/balance, ctx_fail в каждом цикле SMC, fetch_err
+#  54/60 у PO3 — а дайджест писал «Аномалий нет». INV-6 ловит только ERROR-повторы ровно по тексту,
+#  «эквити не получено» логировалось как WARNING, вердикт дайджеста смотрел только таблицу anomalies.
+#  Здесь: окна за час в памяти + немедленные алерты в Telegram (не чаще 1 раза в час на тип).
+# ═══════════════════════════════════════════════════════
+HEALTH_WINDOW_SEC     = 3600
+HEALTH_ALERT_EVERY    = 3600    # не чаще 1 алерта в час на тип
+HEALTH_EQUITY_SEC     = 1800    # эквити не получено дольше 30 мин подряд
+HEALTH_RATIO          = 0.5     # ctx_fail > 50% циклов; fetch_err > 50% символов
+HEALTH_ERR_PER_HOUR   = 100     # ошибок одного типа за час
+HEALTH_DIGEST_ERR_DAY = 100     # ошибок за сутки → «АНОМАЛИЯ» в дайджесте
+HEALTH_MIN_CYCLES     = 5       # минимум циклов SMC в окне для оценки доли ctx_fail
+HEALTH_MIN_SYMBOLS    = 20      # минимум символов (сумма total) в окне для оценки доли fetch_err
+
+_health_scans: dict = {}        # {strategy: [(ts, total, fetch_err, ctx_fail)]} — окно за час
+_health_errs: dict = {}         # {тип_ошибки: [ts, ...]} — окно за час
+_health_err_sample: dict = {}   # {тип_ошибки: последний текст}
+_health_last_alert: dict = {}   # {тип_алерта: ts последней отправки}
+
+_ERR_TYPE_RE = re.compile(r'\b([A-Za-z]*(?:Timeout|Error|Exception|Unavailable|Exceeded|Denied|Failure|Refused))\b')
+
+
+def _err_type_key(msg: str) -> str:
+    """Тип ошибки по тексту лога: имя исключения (RequestTimeout, ExchangeNotAvailable…), иначе начало текста без цифр."""
+    m = _ERR_TYPE_RE.search(msg or '')
+    if m:
+        return m.group(1)
+    return re.sub(r'[\d.]+', '#', (msg or '')[:40]).strip() or '?'
+
+
+def _health_note_error(msg: str, now: float = None):
+    now = now if now is not None else time.time()
+    k = _err_type_key(msg)
+    h = _health_errs.setdefault(k, [])
+    h.append(now)
+    if len(h) > 2 * HEALTH_ERR_PER_HOUR:           # память ограничена; окно чистится и при проверке
+        h[:] = [t for t in h if now - t < HEALTH_WINDOW_SEC]
+    _health_err_sample[k] = (msg or '')[:160]
+
+
+def _health_note_scan(strategy: str, counts: dict, now: float = None):
+    now = now if now is not None else time.time()
+    h = _health_scans.setdefault(strategy, [])
+    h.append((now, int(counts.get('total', 0) or 0), float(counts.get('fetch_err', 0) or 0),
+              float(counts.get('ctx_fail', 0) or 0)))
+    h[:] = [x for x in h if now - x[0] < HEALTH_WINDOW_SEC]
+
+
+def health_snapshot(now: float = None) -> dict:
+    """Метрики окна за час для тревог, /status и дайджеста. Только чтение состояния."""
+    now = now if now is not None else time.time()
+    ok_ts = _dd.get('ok_ts', 0.0)
+    fails = _dd.get('fails', 0)
+    since = _dd.get('fail_since', 0.0) or 0.0
+    # длительность сбоя: от первого сбоя серии (или от старта процесса, если эквити не было ни разу)
+    eq_down = 0.0
+    if fails > 0:
+        eq_down = now - (since or ok_ts or _PROCESS_START_TS)
+    smc = [x for x in _health_scans.get('SMC', []) if now - x[0] < HEALTH_WINDOW_SEC]
+    ctx_cycles = len(smc)
+    ctx_ratio = (sum(x[3] for x in smc) / ctx_cycles) if ctx_cycles else None
+    fe = {}
+    for st_, rows in _health_scans.items():
+        rows = [x for x in rows if now - x[0] < HEALTH_WINDOW_SEC]
+        tot = sum(x[1] for x in rows)
+        if st_ == 'SMC' or tot <= 0:
+            continue
+        err = sum(x[2] for x in rows)
+        if err > 0 or tot >= HEALTH_MIN_SYMBOLS:
+            fe[st_] = (err / tot, tot)
+    errs = {}
+    for k, h in _health_errs.items():
+        n = sum(1 for t in h if now - t < HEALTH_WINDOW_SEC)
+        if n:
+            errs[k] = n
+    return {'eq_ok_ts': ok_ts, 'eq_fails': fails, 'eq_down_sec': eq_down,
+            'ctx_ratio': ctx_ratio, 'ctx_cycles': ctx_cycles, 'fetch_err': fe, 'errs_1h': errs}
+
+
+def health_conditions(now: float = None) -> list:
+    """→ [(тип_алерта, текст)] по условиям BOT_SPEC §2.36.1 на текущий момент."""
+    snap = health_snapshot(now)
+    out = []
+    if snap['eq_fails'] > 0 and snap['eq_down_sec'] > HEALTH_EQUITY_SEC:
+        out.append(('equity', f"эквити BingX не получено {snap['eq_down_sec'] / 60:.0f} мин подряд "
+                              f"(сбоев подряд: {snap['eq_fails']}) — breaker-ы дневного DD и просадки от пика работают вслепую"))
+    if snap['ctx_ratio'] is not None and snap['ctx_cycles'] >= HEALTH_MIN_CYCLES and snap['ctx_ratio'] > HEALTH_RATIO:
+        out.append(('ctx_fail', f"контекст BTC не загружается: ctx_fail в {snap['ctx_ratio'] * 100:.0f}% циклов SMC за час "
+                                f"({snap['ctx_cycles']} циклов) — гейт alt_score работает на заглушке"))
+    for st_, (ratio, tot) in sorted(snap['fetch_err'].items()):
+        if ratio > HEALTH_RATIO and tot >= HEALTH_MIN_SYMBOLS:
+            out.append((f'fetch_err:{st_}', f"сканер {st_}: fetch_err у {ratio * 100:.0f}% символов за час (из {tot})"))
+    for k, n in sorted(snap['errs_1h'].items()):
+        if n > HEALTH_ERR_PER_HOUR:
+            out.append((f'errtype:{k}', f"{n} ошибок типа {k} за час (порог {HEALTH_ERR_PER_HOUR}); "
+                                        f"пример: {_health_err_sample.get(k, '')}"))
+    return out
+
+
+async def health_alert_tick(now: float = None) -> list:
+    """Раз в цикл: немедленный алерт в Telegram по каждому сработавшему условию, не чаще 1 раза в час на тип.
+    Пишет и в anomalies (попадает в дайджест). Возвращает список отправленных типов. Не бросает исключений."""
+    sent = []
+    try:
+        now = now if now is not None else time.time()
+        for typ, text in health_conditions(now):
+            if now - _health_last_alert.get(typ, 0.0) < HEALTH_ALERT_EVERY:
+                continue
+            _health_last_alert[typ] = now
+            _write_anomaly('critical', f'HEALTH-{typ}', text)
+            logging.info(f'[HEALTH] алерт {typ}: {text}')
+            await tg(f'🚨 <b>ДАННЫЕ/СЕТЬ</b>: {text}\nПовтор этого типа — не чаще раза в час. Диагностика: /net_probe, сводка: /status.')
+            sent.append(typ)
+    except Exception as _e:
+        logging.debug(f'[HEALTH] tick fail: {_e}')
+    return sent
+
+
+def health_status_line(now: float = None) -> str:
+    """Строка состояния данных для /status."""
+    now = now if now is not None else time.time()
+    snap = health_snapshot(now)
+    if snap['eq_ok_ts']:
+        eq = f"последнее эквити {(now - snap['eq_ok_ts']) / 60:.0f} мин назад"
+    else:
+        eq = 'эквити ещё не получено'
+    if snap['eq_fails']:
+        eq += f" (сбоев подряд: {snap['eq_fails']})"
+    ctx = (f"ctx_fail {snap['ctx_ratio'] * 100:.0f}% ({snap['ctx_cycles']} циклов)"
+           if snap['ctx_ratio'] is not None else 'ctx_fail н/д (SMC не сканировал за час)')
+    fe = ', '.join(f'{k} {v[0] * 100:.0f}%' for k, v in sorted(snap['fetch_err'].items())) or 'н/д'
+    top = sorted(snap['errs_1h'].items(), key=lambda kv: -kv[1])[:2]
+    er = ', '.join(f'{k}:{n}' for k, n in top) or '0'
+    return f'Данные (за час): {eq} | {ctx} | fetch_err: {fe} | ошибки: {er}'
+
 
 
 def check_invariants(payload: dict) -> list:
@@ -6110,6 +6276,10 @@ class _AnomalyLogHandler(logging.Handler):
                     (datetime.now(timezone.utc).isoformat(), record.levelname, msg[:500])
                 )
                 con.commit(); con.close()
+            except Exception:
+                pass
+            try:
+                _health_note_error(msg, now)   # [v94] счётчик «ошибок одного типа за час» (WARNING+)
             except Exception:
                 pass
             if record.levelno >= logging.ERROR:
@@ -6278,6 +6448,12 @@ async def build_daily_digest(date_str: str = None):
     lines.append(f'SMC: циклов с ctx_ok=False (alt_score=50 заглушка) за аптайм: {_ctx_fail_cycles}')
     lines.append(f'DUP-GUARD: пропущено повторных записей закрытия за аптайм: {_dup_guard["n"]}'
                  + (f' (последняя: {_dup_guard["last"]})' if _dup_guard['last'] else ''))   # [v81]
+    # [v94] здоровье данных: состояние на момент построения дайджеста + условия тревог (BOT_SPEC §2.36)
+    h_conds = health_conditions()
+    lines.append('')
+    lines.append('── ЗДОРОВЬЕ ДАННЫХ ──')
+    lines.append(health_status_line())
+    lines.append('Условия тревог сейчас: ' + ('; '.join(t for _k, t in h_conds) if h_conds else 'нет'))
 
     text = '\n'.join(lines)
     fpath = ''
@@ -6293,13 +6469,21 @@ async def build_daily_digest(date_str: str = None):
 
     # [v67] Вердикт — ПЕРВАЯ строка сопроводительного сообщения, чтобы решение
     # принималось без открытия файла (см. Блок 3 Уровень 3).
-    if not anomalies:
-        verdict = f'✅ Аномалий нет ({len(alerts)} алертов, {n_errors_total} ошибок). Файл для архива — разбор не требуется.'
-    else:
+    # [v94] «АНОМАЛИЯ» также при > HEALTH_DIGEST_ERR_DAY ошибок за сутки или сработавшем условии тревог (раньше
+    # вердикт смотрел только таблицу anomalies: 2060 ошибок давали «✅ Аномалий нет»)
+    problems = []
+    if anomalies:
         kinds_uniq = list(dict.fromkeys(a[2] for a in anomalies))
         n_crit = sum(1 for a in anomalies if a[1] == 'critical')
-        verdict = (f'⚠️ АНОМАЛИИ: {len(anomalies)} ({", ".join(kinds_uniq)}), '
-                   f'из них critical: {n_crit}. → Файл нужно передать на разбор.')
+        problems.append(f'записей аномалий: {len(anomalies)} ({", ".join(kinds_uniq)}), из них critical: {n_crit}')
+    if n_errors_total > HEALTH_DIGEST_ERR_DAY:
+        top = f'; чаще всего: x{top_errs[0][2]} {top_errs[0][0][:80]}' if top_errs else ''
+        problems.append(f'ошибок за сутки: {n_errors_total} (> {HEALTH_DIGEST_ERR_DAY}){top}')
+    problems += [t for _k, t in h_conds]
+    if not problems:
+        verdict = f'✅ Аномалий нет ({len(alerts)} алертов, {n_errors_total} ошибок). Файл для архива — разбор не требуется.'
+    else:
+        verdict = '⚠️ АНОМАЛИЯ (' + str(len(problems)) + '): ' + ' | '.join(problems) + '. → Файл нужно передать на разбор.'
 
     return fpath, verdict
 
@@ -6456,8 +6640,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-16-v93'
+CODE_VERSION = '2026-10-24-v94'
 CHANGELOG = [
+    ('2026-10-24-v94', 'ПРОД-ИНЦИДЕНТ «СЛЕПОТА ДАННЫХ» (торговая логика, контракты, исследования, breaker-ы, SMC_LIVE, bybit_worker.py не менялись). Прод 2026-10-23: 2060 RequestTimeout на GET user/balance, ctx_fail в 1033 из 1033 циклов SMC, fetch_err PO3 54.4/60 и ORB_RT 15.4/80, дайджест при этом «Аномалий нет». ШАГ 0: по коду ccxt==4.2.14 таймаут HTTP (10 с) считается ПОСЛЕ throttler — RequestTimeout не может быть следствием собственной очереди; /net_probe (фон): DNS open-api.bingx.com, по 5 замеров публичного (тикер) и приватного (баланс) запроса напрямую через aiohttp и через ccxt, глубина очереди, вердикт «сеть недоступна/медленная» / «очередь перегружена» / «отказ BingX (код)»; причина молчания самодиагностики — вердикт дайджеста смотрел только таблицу anomalies, INV-6 ловит лишь точные повторы ERROR, сбой эквити шёл как WARNING. ПРАВКА 1: health_alert_tick — немедленные алерты в Telegram (не чаще раза в час на тип): эквити не получено > 30 мин, ctx_fail > 50% циклов SMC за час, fetch_err > 50% символов у сканера за час, > 100 ошибок одного типа за час; дайджест «⚠️ АНОМАЛИЯ» при > 100 ошибок за сутки или сработавшем условии (раздел «ЗДОРОВЬЕ ДАННЫХ»); /status — строка состояния данных. ПРАВКА 2.3: _fetch_equity — повторы с паузами 5/15/30 с (повторы только если прошлый цикл был успешным, чтобы не растягивать цикл с monitor_all). Правки 2.1 (приоритет очереди) и 2.2 (перенос региона) не делались — решение владельца по вердикту /net_probe; описание переноса — BOT_SPEC §2.36.5. Тесты перенесены в tests/ (tests/README.md)'),
     ('2026-10-16-v93', 'SMC2 ВЫКЛЮЧЕН ПО ДЕФОЛТУ — контракт (А)/(Б) §2.20.2 не выполнен (живая логика, breaker-ы, SMC_LIVE, PO3, ORB_RT, прочие стратегии, bybit_worker.py не менялись). Итог /shadow_analyze 2026-10-16: (А) Long MKT n=133 mean R -0.143 (t -1.67), Long RT n=107 -0.170 (t -1.74), Short MKT n=135 +0.099 (t 1.19, PF 1.47), Short RT n=105 +0.043 (t 0.43) — n>=100 по всем, PF>=1.3/t>=2.5 не достигнуты; (Б) n=264, разность -0.027 (t -0.65) — отвергнут. По правилу §2.32.8 SMC2_ENABLED дефолт false (возврат через ENV SMC2_ENABLED=true); открытые записи SMC2 закрываются штатно (shadow_check), отчётные секции SMC2 оставлены как история'),
     ('2026-10-12-v92', 'ИСПРАВЛЕННЫЙ ЗАГРУЗЧИК АРХИВА + /data_probe v2 + /of_backtest (живая логика, breaker-ы, SMC_LIVE, PO3/SMC2/ORB_RT, прежние исследования, правила и критерии H-OF1/H-OF2 §2.34, bybit_worker.py не менялись). Итог /data_probe v91 (2026-10-12): fapi — HTTP 451 (гео-блок региона сервера), BingX — нет taker buy и истории OI, архив — BadZipFile на всех загрузках и обрыв листинга на 32 файлах; вердикты v91 по H-OF1/H-OF2 НЕДЕЙСТВИТЕЛЬНЫ. ПРИЧИНА: fetcher читал тело resp.content.read(8_000_000) — StreamReader.read(n) возвращает только то, что уже лежит в буфере (демонстрация: 65 536 из 1 024 004 байт), поэтому zip и XML-листинг приходили усечёнными; исправлено на полное чтение resp.read(). research_vision.py: прямые URL файлов, проверка ответа (200, не text/html, сигнатура PK), полный листинг S3 с продолжением, sha256 по .CHECKSUM (3 повтора → битый), повторы сеть/5xx до 5 попыток, VISION_PAUSE_SEC / VISION_CONCURRENCY, парсинг свечей (с заголовком/без, мс/мкс) и metrics (шаг и поля по данным), хранение npz в /data/vision (OI — часовой агрегат на конец часа), проверка места (< 200 МБ — остановка), атомарная запись, докачка только недостающего. /data_probe v2: вердикты доступности по фактически разобранным файлам, результат в of_probe_status. /of_backtest (research_of.py): H-OF1/H-OF2 строго по §2.34 только при «проверяема», сделки в of_trades, отчёт в htf_reports'),
     ('2026-10-12-v91', 'ПРЕ-КОММИТ H-OF1/H-OF2 НА НОВЫХ ДАННЫХ (Binance USDT-M: taker buy volume, открытый интерес) И ПРОВЕРКА ДОСТУПНОСТИ ДАННЫХ — бэктеста нет (живая логика, breaker-ы, SMC_LIVE, сигналы и контракты PO3/SMC2/ORB_RT, все прежние исследования, bybit_worker.py не менялись). Итог v90: H-WS ЗАКРЫТА — ни один из 7 вариантов не прошёл (лучший k=2 B: mean R +0.110, t 1.46, PF 1.19; парная разность к базе +0.136, t 2.18); диагностика: из 198 выбитых сделок 42.4% дошли до исходного TP за 48 ч, без касания 2*d0 — 20.7%; недочёт спецификации: значимость «по дням» при 9 днях данных не имеет мощности (вывод не меняется — по сделкам тоже не пройдено); правило остановки §2.32.8 действует. Исключение из правила остановки — НОВЫЙ ИСТОЧНИК ДАННЫХ (BOT_SPEC §2.34, записано до загрузки данных): H-OF1 «прокол с поглощением» (15m, delta = 2*taker_buy - volume) и H-OF2 «сброс с ликвидациями» (1h, OI), 16 фиксированных символов H-XS, TP 2R, таймаут 48 ч, издержки FEE_TAKER + проскальзывание 0.0003, критерии по дневному портфелю с t >= 2.5. /data_probe (research_probe.py): с сервера бота проверяет доступность Binance fapi (код ответа, taker buy в свечах, глубина и лимит), архива data.binance.vision (месячные свечи, дневные metrics: шаг и поля), истории OI, BingX (taker buy, история OI), оценивает объём загрузки и место на диске, делает вывод, какие гипотезы проверяемы на истории; ни одна строка данных не используется для сигналов'),
@@ -6787,6 +6972,183 @@ async def wide_stop_test_run():
         await tg(f'❌ /wide_stop_test: {type(e).__name__}: {e}')
     finally:
         _htf_running[0] = False
+
+
+# ═══════════════════════════════════════════════════════
+#  [v94] /net_probe — диагностика доступа к BingX с сервера бота (BOT_SPEC §2.36.2)
+#  Только чтение (GET тикера и баланса), торговлю и очередь не меняет. Результат — в Telegram.
+#  Три вердикта: «сеть недоступна/медленная», «очередь перегружена», «отказ BingX (код)».
+# ═══════════════════════════════════════════════════════
+NET_PROBE_HOST    = 'open-api.bingx.com'
+NET_PROBE_N       = 5       # замеров на каждый вид запроса
+NET_PROBE_TIMEOUT = 15      # с на прямой запрос
+NET_PROBE_SLOW    = 3.0     # с: медиана прямого ответа выше → «медленная»
+_net_probe_running = [False]
+
+
+async def _np_dns(host: str) -> dict:
+    t0 = time.time()
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(loop.getaddrinfo(host, 443, type=socket.SOCK_STREAM), 10)
+        return {'ok': True, 'dt': time.time() - t0, 'ips': sorted({i[4][0] for i in infos})[:6]}
+    except Exception as e:
+        return {'ok': False, 'dt': time.time() - t0, 'err': f'{type(e).__name__}: {e}'}
+
+
+async def _np_http_get(session, url: str, headers: dict = None) -> dict:
+    """Один GET напрямую через aiohttp (в обход ccxt). Не бросает исключений."""
+    t0 = time.time()
+    try:
+        async with session.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=NET_PROBE_TIMEOUT)) as r:
+            body = await r.text()
+            code, msg = None, ''
+            try:
+                j = json.loads(body)
+                code, msg = j.get('code'), str(j.get('msg', ''))[:100]
+            except Exception:
+                msg = body[:100]
+            return {'dt': time.time() - t0, 'status': r.status, 'api_code': code, 'msg': msg, 'err': None}
+    except Exception as e:
+        return {'dt': time.time() - t0, 'status': None, 'api_code': None, 'msg': '',
+                'err': f'{type(e).__name__}: {e}'.strip(': ')}
+
+
+async def _np_ccxt_call(kind: str) -> dict:
+    """Один вызов через ccxt с текущими настройками; глубина очереди throttler ДО вызова."""
+    q = _lat_qlen(exchange)
+    t0 = time.time()
+    try:
+        if kind == 'pub':
+            await asyncio.wait_for(exchange.fetch_ticker('BTC/USDT:USDT'), 120)
+        else:
+            await asyncio.wait_for(exchange.fetch_balance(), 120)
+        return {'dt': time.time() - t0, 'err': None, 'queue': q}
+    except Exception as e:
+        return {'dt': time.time() - t0, 'err': f'{type(e).__name__}: {e}'[:160], 'queue': q}
+
+
+def _np_median(vals):
+    vals = sorted(vals)
+    return vals[len(vals) // 2] if vals else None
+
+
+def _net_probe_verdict(res: dict) -> str:
+    """Вердикт по результатам замеров (чистая функция, тестируется синтетикой)."""
+    dns = res.get('dns') or {}
+    if not dns.get('ok', False):
+        return f"СЕТЬ НЕДОСТУПНА: DNS {NET_PROBE_HOST} не резолвится ({dns.get('err', '?')})"
+    direct = (res.get('direct_pub') or []) + (res.get('direct_priv') or [])
+    ccx = (res.get('ccxt_pub') or []) + (res.get('ccxt_priv') or [])
+    denied = [r for r in direct if r.get('status') is not None and
+              (r['status'] >= 400 or r.get('api_code') not in (0, None))]
+    if denied:
+        r = denied[0]
+        return f"ОТКАЗ BINGX: HTTP {r['status']}, code {r.get('api_code')}, {r.get('msg', '')}"
+    ok_direct = [r for r in direct if r.get('err') is None]
+    if direct and not ok_direct:
+        return f"СЕТЬ НЕДОСТУПНА: все {len(direct)} прямых запросов упали ({direct[0].get('err', '?')})"
+    n_fail = len(direct) - len(ok_direct)
+    med = _np_median([r['dt'] for r in ok_direct])
+    if n_fail or (med is not None and med > NET_PROBE_SLOW):
+        return (f"СЕТЬ МЕДЛЕННАЯ/НЕСТАБИЛЬНАЯ: прямых сбоев {n_fail} из {len(direct)}, "
+                f"медиана ответа {med:.1f} с (порог {NET_PROBE_SLOW:.0f} с)" if med is not None else
+                f"СЕТЬ МЕДЛЕННАЯ/НЕСТАБИЛЬНАЯ: сбоев {n_fail} из {len(direct)}")
+    qmax = max([r.get('queue', -1) for r in ccx] or [-1])
+    ccx_fail = [r for r in ccx if r.get('err')]
+    ccx_med = _np_median([r['dt'] for r in ccx if not r.get('err')])
+    slow = (ccx_med is not None and ccx_med > max(3 * (med or 0), 5.0))
+    if ccx_fail or slow:
+        if qmax >= 10:
+            return (f"ОЧЕРЕДЬ ПЕРЕГРУЖЕНА: прямой запрос быстрый (медиана {med:.1f} с), через ccxt "
+                    f"сбоев {len(ccx_fail)} из {len(ccx)}, медиана {ccx_med if ccx_med is not None else float('nan'):.1f} с, глубина очереди до {qmax}")
+        return (f"СЕТЬ ОК, НО CCXT ПРОБЛЕМНЫЙ: прямой запрос быстрый (медиана {med:.1f} с), через ccxt "
+                f"сбоев {len(ccx_fail)} из {len(ccx)} при малой очереди ({qmax}) — смотреть сессию/настройки ccxt")
+    return f"ДОСТУП В НОРМЕ: прямой запрос медиана {med:.1f} с, через ccxt сбоев нет"
+
+
+def _np_fmt(recs, title: str) -> str:
+    if not recs:
+        return f'{title}: нет замеров'
+    parts = []
+    for r in recs:
+        if r.get('err'):
+            parts.append(f"{r['dt']:.1f}с ERR {r['err'][:70]}")
+        elif 'status' in r:
+            parts.append(f"{r['dt']:.1f}с HTTP {r['status']}" + (f" code {r['api_code']} {r.get('msg', '')[:40]}"
+                                                                if r.get('api_code') not in (0, None) else ''))
+        else:
+            parts.append(f"{r['dt']:.1f}с (очередь {r.get('queue', -1)})")
+    return f'{title}: ' + '; '.join(parts)
+
+
+async def net_probe_collect() -> dict:
+    """Собирает замеры. Каждый шаг в своём try — наружу исключения не выходят."""
+    res = {'dns': {}, 'direct_pub': [], 'direct_priv': [], 'ccxt_pub': [], 'ccxt_priv': [],
+           'queue_start': -1}
+    try:
+        res['queue_start'] = _lat_qlen(exchange)
+    except Exception:
+        pass
+    try:
+        res['dns'] = await _np_dns(NET_PROBE_HOST)
+    except Exception as e:
+        res['dns'] = {'ok': False, 'dt': 0.0, 'err': f'{type(e).__name__}: {e}'}
+    base = f'https://{NET_PROBE_HOST}'
+    try:
+        async with aiohttp.ClientSession() as sess:
+            for _ in range(NET_PROBE_N):
+                res['direct_pub'].append(await _np_http_get(sess, f'{base}/openApi/swap/v2/quote/price?symbol=BTC-USDT'))
+            for _ in range(NET_PROBE_N):
+                if not (BINGX_KEY and BINGX_SECRET):
+                    res['direct_priv'].append({'dt': 0.0, 'status': None, 'api_code': None, 'msg': '',
+                                               'err': 'ключи BingX не заданы'})
+                    break
+                q = f'timestamp={int(time.time() * 1000)}'
+                sig = hmac.new(BINGX_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+                res['direct_priv'].append(await _np_http_get(
+                    sess, f'{base}/openApi/swap/v2/user/balance?{q}&signature={sig}', {'X-BX-APIKEY': BINGX_KEY}))
+    except Exception as e:
+        res['direct_pub'].append({'dt': 0.0, 'status': None, 'api_code': None, 'msg': '',
+                                  'err': f'session: {type(e).__name__}: {e}'})
+    for _ in range(NET_PROBE_N):
+        res['ccxt_pub'].append(await _np_ccxt_call('pub'))
+    for _ in range(NET_PROBE_N):
+        res['ccxt_priv'].append(await _np_ccxt_call('priv'))
+    return res
+
+
+def net_probe_text(res: dict) -> str:
+    dns = res.get('dns') or {}
+    lines = ['📡 <b>/net_probe</b> ' + CODE_VERSION,
+             '<b>' + _net_probe_verdict(res) + '</b>',
+             f"DNS {NET_PROBE_HOST}: " + (f"ok {dns.get('dt', 0):.2f}с {','.join(dns.get('ips', []))}"
+                                          if dns.get('ok') else f"ОШИБКА {dns.get('err', '?')}"),
+             _np_fmt(res.get('direct_pub'), 'aiohttp публичный (тикер BTC-USDT)'),
+             _np_fmt(res.get('direct_priv'), 'aiohttp приватный (баланс)'),
+             _np_fmt(res.get('ccxt_pub'), 'ccxt публичный (fetch_ticker)'),
+             _np_fmt(res.get('ccxt_priv'), 'ccxt приватный (fetch_balance)'),
+             f"Очередь throttler в начале замера: {res.get('queue_start', -1)} (−1 — недоступно)"]
+    return '\n'.join(lines)
+
+
+async def net_probe_run():
+    """[v94] /net_probe (фон): замеры → вердикт → Telegram. Не бросает исключений."""
+    if _net_probe_running[0]:
+        return
+    _net_probe_running[0] = True
+    try:
+        await tg(f'📡 /net_probe запущен (DNS + {NET_PROBE_N} замеров × 4 вида; до ~1–3 мин)…')
+        res = await net_probe_collect()
+        await tg(net_probe_text(res))
+    except Exception as e:
+        logging.exception('net_probe')
+        try:
+            await tg(f'❌ /net_probe: {type(e).__name__}: {e}')
+        except Exception:
+            pass
+    finally:
+        _net_probe_running[0] = False
 
 
 async def data_probe_run():
@@ -8873,6 +9235,7 @@ async def check_tg_commands():
                     f'(лимит: {DAILY_DD_LIMIT_PCT:.1f}%; старая метрика {daily_stats["pnl_pct"]*100:+.2f}%)\n'
                     f'Позиций: {len(all_pos)} '
                     f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
+                    f'{health_status_line()}\n'
                     f'Баланс: проверьте на бирже\n'
                     f'БД сделок: /stats | CSV: /csv'
                 )
@@ -8968,6 +9331,7 @@ async def check_tg_commands():
                     '/htf_xsmom — кросс-секционный моментум на 16 фиксированных символах (гипотеза H-XS), фоном\n'
                     '/wide_stop_test — гипотеза H-WS: пересимуляция выходов с широким стопом на записанных shadow-сигналах, фоном\n'
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
+                    '/net_probe — диагностика сети до BingX (DNS, публичный/приватный запрос напрямую и через ccxt, очередь), фоном\n'
                     '/of_backtest — бэктест H-OF1/H-OF2 по §2.34 (только если /data_probe признал гипотезу проверяемой), фоном\n'
                     '/htf_report — повторно прислать последний сохранённый отчёт /htf_backtest\n'
                     '/trades_dups_mark — пометить копии точных дублей (dup_of), ничего не удаляет; идемпотентно\n'
@@ -9021,6 +9385,14 @@ async def check_tg_commands():
                     await tg('⏳ HTF-бэктест уже выполняется — дождись отчёта')
                 else:
                     _t = asyncio.create_task(wide_stop_test_run())
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/net_probe':
+                # [v94] диагностика доступа к BingX с сервера; только чтение, торговлю не трогает
+                if _net_probe_running[0]:
+                    await tg('⏳ /net_probe уже выполняется — дождись отчёта')
+                else:
+                    _t = asyncio.create_task(net_probe_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/data_probe':
@@ -9143,6 +9515,7 @@ async def main():
             try:
                 await daily_reset()
                 await dd_update()   # [v76] эквити раз в цикл (до сканеров/мониторинга)
+                await health_alert_tick()   # [v94] громкие тревоги (эквити/ctx_fail/fetch_err/ошибки), 1 раз в час на тип
 
                 # Команды Telegram — вызывается ВСЕГДА (включая circuit breaker)
                 await check_tg_commands()
