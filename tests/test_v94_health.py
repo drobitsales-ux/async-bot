@@ -89,15 +89,15 @@ class DigestVerdict(unittest.TestCase):
         class _Ex:
             async def fetch_balance(self_):
                 return {'USDT': {'total': 75.0}}
-        self._ex = a.exchange
-        a.exchange = _Ex()
+        self._ex = a.exchange_priv
+        a.exchange_priv = _Ex()
 
         async def _ws():
             return 'н/д'
         a._fetch_worker_status = _ws
 
     def tearDown(self):
-        a.exchange = self._ex
+        a.exchange_priv = self._ex
 
     def _fill_errors(self, n):
         con = sqlite3.connect(self.db)
@@ -139,12 +139,12 @@ class NetProbe(unittest.TestCase):
         class _Ex:
             fetch_ticker = staticmethod(boom)
             fetch_balance = staticmethod(boom)
-        saved = (a.exchange, a._np_dns, a._np_http_get)
-        a.exchange, a._np_dns, a._np_http_get = _Ex(), boom, boom
+        saved = (a.exchange, a.exchange_priv, a._np_dns, a._np_http_get)
+        a.exchange, a.exchange_priv, a._np_dns, a._np_http_get = _Ex(), _Ex(), boom, boom
         try:
             run(a.net_probe_run())
         finally:
-            a.exchange, a._np_dns, a._np_http_get = saved
+            a.exchange, a.exchange_priv, a._np_dns, a._np_http_get = saved
         self.assertFalse(a._net_probe_running[0])
         self.assertTrue(any('СЕТЬ НЕДОСТУПНА' in m for m in self.sent), self.sent)
 
@@ -155,12 +155,12 @@ class NetProbe(unittest.TestCase):
         class _Ex:
             fetch_ticker = staticmethod(boom)
             fetch_balance = staticmethod(boom)
-        saved = (a.exchange, a.NET_PROBE_HOST, a.NET_PROBE_N)
-        a.exchange, a.NET_PROBE_HOST, a.NET_PROBE_N = _Ex(), 'unreachable.invalid', 1
+        saved = (a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N)
+        a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N = _Ex(), _Ex(), 'unreachable.invalid', 1
         try:
             run(a.net_probe_run())
         finally:
-            a.exchange, a.NET_PROBE_HOST, a.NET_PROBE_N = saved
+            a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N = saved
         self.assertTrue(any('СЕТЬ НЕДОСТУПНА' in m for m in self.sent), self.sent)
 
     def _ok(self, dt=0.3):
@@ -196,14 +196,14 @@ class EquityRetry(unittest.TestCase):
     def setUp(self):
         self.db, self.sent = fresh_state()
         self.pauses = []
-        self._sleep, self._ex = a.asyncio.sleep, a.exchange
+        self._sleep, self._ex = a.asyncio.sleep, a.exchange_priv
 
         async def fake_sleep(sec, *_a, **_k):
             self.pauses.append(sec)
         a.asyncio.sleep = fake_sleep
 
     def tearDown(self):
-        a.asyncio.sleep, a.exchange = self._sleep, self._ex
+        a.asyncio.sleep, a.exchange_priv = self._sleep, self._ex
 
     def _exchange(self, fails):
         calls = {'n': 0}
@@ -214,7 +214,7 @@ class EquityRetry(unittest.TestCase):
                 if calls['n'] <= fails:
                     raise a.ccxt_async.RequestTimeout('bingx GET user/balance')
                 return {'info': {'data': {'balance': {'equity': '76.5'}}}}
-        a.exchange = _Ex()
+        a.exchange_priv = _Ex()
         return calls
 
     def test_recovers_on_third_attempt(self):
