@@ -216,7 +216,7 @@ ORB_BREAK_ATR = float(os.getenv('ORB_BREAK_ATR', '0.1'))
 # Срез по regime_4h — ТОЛЬКО информационный; любой фильтр по режиму для
 # PO3 — отдельная гипотеза с отдельным пре-коммитом. Пороги не смягчать.
 # [v84] PO3_ENABLED остаётся true: владелец набирает данные пре-коммита §2.18.4 (PO3_UNIVERSE_N=60 через ENV).
-PO3_ENABLED         = os.getenv('PO3_ENABLED', 'true').lower() == 'true'  # shadow
+PO3_ENABLED         = os.getenv('PO3_ENABLED', 'false').lower() == 'true'  # shadow; [v98] дефолт false — досрочная остановка (BOT_SPEC §2.37.10)
 PO3_FORWARD_FROM    = os.getenv('PO3_FORWARD_FROM', '2026-10-01')  # ISO-дата деплоя v75 (UTC)
 PO3_UNIVERSE_N      = int(os.getenv('PO3_UNIVERSE_N', '20'))   # топ по объёму
 PO3_PIVOT_ORDER     = 2
@@ -268,7 +268,7 @@ SMC2_H1_FROM        = os.getenv('SMC2_H1_FROM', '2026-10-07')
 # (Б) RT против MKT2 на уровне событий (RT без заполнения = 0): подтверждено при n >= 100 событий, средняя разность > 0,
 #     парный t >= 2.0.
 # Срезы по режиму, часу, ATR — только информационные. Перевод в live — только по правилу BOT_SPEC §2.27.5.
-ORB_RT_ENABLED       = os.getenv('ORB_RT_ENABLED', 'true').lower() == 'true'   # shadow
+ORB_RT_ENABLED       = os.getenv('ORB_RT_ENABLED', 'false').lower() == 'true'   # shadow; [v98] дефолт false — досрочная остановка (BOT_SPEC §2.37.10)
 ORB_RT_FORWARD_FROM  = os.getenv('ORB_RT_FORWARD_FROM', '2026-10-08')           # ISO-дата деплоя v85 (UTC)
 ORB_RT_VOL_MULT      = 1.5     # объём бара пробоя >= 1.5 × медиана 20 баров до него
 ORB_RT_RETEST_BARS   = 8       # окно ретеста после пробоя
@@ -381,6 +381,7 @@ FEE_RATE         = 0.0005
 # [v85] Модель комиссий maker/taker для SHADOW-расчётов net (живая торговля и живые отчёты по-прежнему используют FEE_RATE).
 # Значения — из актуальной сетки комиссий BingX аккаунта владельца (вносит владелец через ENV); по умолчанию
 # maker = taker = FEE_RATE (консервативно, net совпадает с прежним).
+FEE_SPOT         = float(os.getenv('FEE_SPOT', '0.001'))   # [v98] комиссия спота на сторону (сетка BingX VIP0) — только /carry_test, BOT_SPEC §2.40.4
 FEE_TAKER        = float(os.getenv('FEE_TAKER', str(FEE_RATE)))
 FEE_MAKER        = float(os.getenv('FEE_MAKER', str(FEE_RATE)))
 _LIMIT_ENTRY_STRATS = ('SMC2_RT', 'ORB_RT')   # вход лимитным ордером на ретесте → FEE_MAKER
@@ -6720,8 +6721,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-27-v97'
+CODE_VERSION = '2026-10-28-v98'
 CHANGELOG = [
+    ('2026-10-28-v98', 'ИТОГ /edge_audit, ДОСРОЧНАЯ ОСТАНОВКА PO3 И ORB_RT, /carry_test (живая торговля SMC_LIVE=false, breaker-ы, каналы v96, контракты, bybit_worker.py не менялись). Итог /edge_audit (прод 2026-10-24, v97; BOT_SPEC §2.37.9): R0 32000 случайных сделок — до издержек −0.0044 (t −0.58), после −0.244, лонг −0.031, шорт +0.021, издержки на 15m ≈ 0.24R/сделку; R1 — 0 из 16 ячеек, SMC2 до издержек на OOS от −0.07 до +0.02R во всех вариантах (V0/V1/V2/F), шорты SMC2 ≈ случайным шортам R0 (бета), таймаут 55–59% сделок, фильтр объёма и фандинг эффекта не дают → исследования на OHLCV/потоке ордеров закрыты окончательно (§2.32.8); сверка shadow/R1 18%/57% — известное ограничение; выход по точной цене уровня при гэпе даёт оптимистичное смещение (§2.39.6), бэктесты скорее завышены. ПРАВКА 1: PO3_ENABLED и ORB_RT_ENABLED дефолт false (возврат через ENV) — остановка ДОСРОЧНАЯ, по новым данным (R0+R1 при издержках ≈ 0.24R: 15m-входы «пробой/ретест» не отличаются от случайных до издержек; форвард PO3 n=28 mean R −0.477, ORB_RT/ORB_MKT2 Long −0.84…−0.96), а не по контракту (BOT_SPEC §2.37.10); открытые записи закрываются штатно, SMC_SIG оставлен. ПРАВКА 2: /carry_test (research_carry.py) — оценка C1 «сбор фандинга» (лонг спот + шорт перп равного номинала, еженедельно топ-5 по среднему фандингу за 7 дней, перп 3×, 5 равных слотов, комиссии спот FEE_SPOT=0.1% + перп FEE_TAKER + проскальзывание 0.0003 на сторону по обеим ногам, базис не моделируется) только на истории: фандинг BingX 16 символов H-XS (кэш v86–v88, докачка через общий exchange в процессе бота), справка по Binance (кэш v95), APR по годам и OOS, доля недель с отрицательным фандингом, худший месяц, макс. просадка, доля издержек, «капитал для 50 USDT в день» = 50×365/APR, риск ликвидации шорта (рост ≥ 30% за 8 ч); расчёт в дочернем процессе (v97); критериев «пройдено» нет — решение за владельцем; правила записаны в BOT_SPEC §2.40 ДО кода. Тесты: tests/test_v98_carry.py (26 проверок)'),
     ('2026-10-27-v97', 'ИССЛЕДОВАНИЯ В ОТДЕЛЬНОМ ПРОЦЕССЕ + R1 ПО СИМВОЛАМ БЕЗ НАКОПЛЕНИЯ В ПАМЯТИ + СТАРТОВОЕ СООБЩЕНИЕ + ТРЕВОГА ПО ПАМЯТИ (торговая логика, контракты, правила и критерии R0/R1 §2.37, bybit_worker.py не менялись). Прод 2026-10-24 (v95): R0 завершён — 32000 случайных сделок, mean R до издержек −0.0044, |t| 0.58 → «измерительная система в норме»; R1 дважды прерван «Ran out of memory (used over 512MB)» — перезапускался ВЕСЬ бот (успели AAVE…BTC); причина — в памяти бота одновременно: свечи всех 16 символов (float64, ≈13 МБ на символ), R0 (32 тыс. сделок) и списки сделок всех вариантов по всем символам (≈850 Б/сделка × 25–40 тыс. сделок на символ). ПРАВКА 1: research_runner.py — общий запускатель: расчёт /edge_audit, /of_backtest, /htf_backtest, /htf_backtest_wide, /htf_xsmom, /wide_stop_test, /data_probe идёт в ДОЧЕРНЕМ процессе (свежий интерпретатор — по смыслу multiprocessing spawn, без повторного импорта async_bot как __main__) с лимитом RLIMIT_AS = RESEARCH_MEM_MB (ENV, 300); сетевые загрузки через общий exchange (prepare_* в research_htf/research_ws) остаются в процессе бота ДО запуска расчёта; связь — файлы (job/payload/progress/result), прогресс пересылается в Telegram; падение дочернего процесса (MemoryError, сигнал, код ≠ 0) → сообщение с причиной и последним прогрессом, бот работает; не больше одного исследования (прежний флаг); /status: «исследование: <команда> / нет, RSS бота N МБ». ПРАВКА 2: R1 строго по символу (свечи: время int64, o float32, h/l/c/v float64 без taker buy → варианты по одному → сделки пачками в SQLite edge.db (edge_trades, edge_progress, edge_v0_events, edge_runs) одной транзакцией с отметкой done → освобождение), повторный /edge_audit продолжает с первого незавершённого символа без дублей, R0 для текущего seed не пересчитывается; итоговые метрики (дневной портфель, IS/OOS, годы, месяцы роста/падения BTC, критерии §2.37.5) — SQL-агрегацией; прогресс по символу с RSS; проверка диска (< 200 МБ — остановка) и оценка размера edge_trades. ПРАВКА 3: стартовое сообщение — версия из CODE_VERSION, только реально включённые стратегии (живые и shadow отдельно), риск/плечо/сессия/breaker-ы из констант (BOT_VERSION удалён). ПРАВКА 4: тревога MEM_ALERT_MB (ENV, 400) по RSS процесса бота, не чаще раза в час. Тесты: tests/test_v97_research.py (28 проверок)'),
     ('2026-10-26-v96', 'ОТДЕЛЬНЫЙ КАНАЛ ПРИВАТНЫХ ВЫЗОВОВ + НЕИЗВЕСТНЫЕ КОМАНДЫ + HTML-РАЗМЕТКА TELEGRAM (торговая логика, сигналы, контракты, исследования, breaker-ы, bybit_worker.py не менялись). Прод /net_probe 2026-10-24 (v94): прямой aiohttp к BingX 0.2 с (публичный и приватный, HTTP 200), через ccxt приватный fetch_balance 63/120(TimeoutError)/47 с при очереди throttler 44–62 и 3 с при пустой очереди — вердикт «ОЧЕРЕДЬ ПЕРЕГРУЖЕНА»: сканеры дают 90–200 REST за цикл при ~1 запросе/с, приватные вызовы (cost 3) ждали за ними до 2 минут, что делало breaker-ы v76/v77 и установку SL после входа ненадёжными. ПРАВКА 1: второй экземпляр ccxt bingx exchange_priv (те же ключи/options, свой throttler, рынки копируются set_markets из общего) — через него ВСЕ приватные вызовы: fetch_balance (эквити/DD, исполнение, отчёты), fetch_positions, create_order, cancel_order (SL/TP/выходы), set_leverage, set_margin_mode, fetch_my_trades; рыночные данные (fetch_ohlcv/tickers/ticker/funding, markets) — на общем exchange; суммарный темп приватных запросов не растёт (rateLimit 1000, cost 3 — тот же), растёт только независимость от очереди сканеров; обёртки LAT (v77) на обоих экземплярах, /lat_status — отдельно приватный и публичный канал с глубиной очереди (публичный fetch_ohlcv — выборка каждого 10-го вызова); /net_probe — замер через exchange_priv + сравнение через общий канал, вердикт «ПРИВАТНЫЙ КАНАЛ В НОРМЕ / ОЧЕРЕДЬ ПЕРЕГРУЖЕНА только у публичного». ПРАВКА 2: любая команда без обработчика (начинается с «/», не адресована другому боту через @) — ответ «Неизвестная команда <cmd>. Версия бота: <CODE_VERSION>. /help — список команд». ПРАВКА 3: esc() — экранирование &, <, > во всех динамических частях сообщений HTML (тексты ошибок, символы в уведомлениях о сделках, пользовательский ввод, вывод /net_probe, пример ошибки в тревоге, вердикт дайджеста); /csv: причина «незакрытого <code>» — tg() режет длинное сообщение по строкам, а <code> с CSV охватывал десятки строк (первый кусок оставался без </code> → 400 → запасной путь без parse_mode); теперь каждый кусок — свой <code>…</code> с экранированием (_code_blocks); запасной путь без parse_mode сохранён. Тесты: tests/test_v96_channels.py (30 проверок), в tests/test_v94_health.py заглушки переведены на exchange_priv'),
     ('2026-10-25-v95', '/edge_audit — КАЛИБРОВКА ИЗМЕРИТЕЛЬНОЙ СИСТЕМЫ (R0) И ПРОВЕРКА SMC2 НА ИСТОРИИ 2020–2026 (R1), исключение из правила остановки §2.32.8 (BOT_SPEC §2.37, пре-коммит отдельным коммитом ДО кода); живая логика, breaker-ы, SMC_LIVE, SMC2_ENABLED (false), контракты, прежние исследования, bybit_worker.py не менялись. research_edge.py: R0 — по 2000 случайных входов на символ (16 символов H-XS, SEED=20261024+номер символа), SL 1.0×ATR14 [0.3%;3%], TP 2R, таймаут 16 баров, семантика _shadow_exit_eval, mean R до и после издержек, t; |t|>=3 (до издержек) — СТОП «ошибка измерения», отчёт заканчивается на R0. R1 — ровно _smc2_eval бота (передаётся аргументом; единственная правка — необязательный параметр vol_mult, в боте не используется) в воспроизведённом цикле scan_smc2 (окно 63 закрытых бара, MKT при первом появлении события, RT при первом окне filled, дедуп 2 ч), варианты V0 (объём пробоя, как shadow) / V1 (без фильтра) / V2 (объём предыдущей свечи, как старый SMC) / F (V0 + фандинг: шорт при >0, лонг при <0, архив fundingRate; «непроверяем» при покрытии <90%), 16 ячеек, критерии t>=3.0 по дневному портфелю на OOS с 2025-01-01, PF net>=1.3, OOS>=0.5×IS, n>=200, дней>=100, mean R>0 в месяцы роста И падения BTC; разбивка по годам и месяцам BTC; сверка с shadow SMC2 (справочно). Данные: кэш data.binance.vision + догрузка (research_vision), дневной хвост текущего месяца, ставки фандинга. Решение: ячейка прошла — отдельный пре-коммит shadow-форварда; ни одна — исследования на OHLCV/потоке ордеров закрыты окончательно. Тесты: tests/test_v95_edge.py'),
@@ -7371,6 +7373,36 @@ async def edge_audit_run():
     except Exception as e:
         logging.exception('edge_audit')
         await tg(f'❌ /edge_audit: {esc(type(e).__name__)}: {esc(e)}')
+    finally:
+        _htf_running[0] = False
+
+
+async def carry_test_run():
+    """[v98] /carry_test: сбор фандинга C1 (лонг спот + шорт перп) по BOT_SPEC §2.40 (research_carry.py), ТОЛЬКО история, оценка без критериев. Сеть (докачка 1D и
+    фандинга BingX через общий exchange) — в процессе бота, расчёт — в дочернем процессе (лимит RESEARCH_MEM_MB). Отчёт — в htf_reports ДО отправки."""
+    if _htf_running[0]:
+        return
+    _htf_running[0] = True
+    try:
+        import research_carry
+        import research_htf
+        import research_probe
+        import research_vision
+        universe = research_probe.universe_from_db(TRADES_DB)
+        if len(universe) != 16:
+            await tg(f'⛔ /carry_test отказ: вселенная H-XS не заморожена ({len(universe)} символов вместо 16) — запусти /htf_xsmom')
+            return
+        await tg('📈 /carry_test запущен (C1: сбор фандинга, только история, BOT_SPEC §2.40): докачка 1D и фандинга BingX по 16 символам с повторами и паузой '
+                 f'{research_htf.fetch_pause():g} с (кэш v86–v88, первый запуск — десятки минут), затем расчёт в отдельном процессе. FEE_SPOT={FEE_SPOT} FEE_TAKER={FEE_TAKER}.')
+        data, info = await research_carry.prepare_carry(exchange, TRADES_DB, universe, progress=_tg_plain)
+        text = await _research_job('/carry_test', 'carry_test', {'fee_spot': FEE_SPOT, 'fee_perp': FEE_TAKER, 'vision_dir': research_vision.vision_dir()}, payload=(data, info))
+        data = info = None
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
+    except Exception as e:
+        logging.exception('carry_test')
+        await tg(f'❌ /carry_test: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -9511,6 +9543,7 @@ async def check_tg_commands():
                     '/wide_stop_test — гипотеза H-WS: пересимуляция выходов с широким стопом на записанных shadow-сигналах, фоном\n'
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
                     '/net_probe — диагностика сети до BingX (DNS, публичный/приватный запрос напрямую и через ccxt, очередь), фоном\n'
+                    '/carry_test — C1: сбор фандинга (лонг спот + шорт перп), только история, оценка APR (BOT_SPEC §2.40), фоном; отчёт — /htf_report\n'
                     '/edge_audit — R0 калибровка измерительной системы + R1 SMC2 на истории 2020–2026 (BOT_SPEC §2.37), фоном; отчёт — /htf_report\n'
                     '/of_backtest — бэктест H-OF1/H-OF2 по §2.34 (только если /data_probe признал гипотезу проверяемой), фоном\n'
                     '/htf_report — повторно прислать последний сохранённый отчёт /htf_backtest\n'
@@ -9581,6 +9614,14 @@ async def check_tg_commands():
                     await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
                 else:
                     _t = asyncio.create_task(data_probe_run())
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/carry_test':
+                # [v98] C1 — сбор фандинга, только история (BOT_SPEC §2.40); торговлю не трогает
+                if _htf_running[0]:
+                    await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
+                else:
+                    _t = asyncio.create_task(carry_test_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/edge_audit':
