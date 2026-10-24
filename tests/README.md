@@ -9,4 +9,4 @@ python3 -m unittest discover -s tests -v
 Особенности:
 - тесты не ходят в сеть и не пишут в боевую БД: `TRADES_DB` подменяется временным файлом, `tg()` и обращения к бирже — заглушки;
 - `SMC2_ENABLED` по умолчанию `false` (v93); тесты сканера SMC2 запускать с `SMC2_ENABLED=true`;
-- до v94 регрессионные тесты хранились вне git и в репозиторий не попали; здесь тесты v94 (`test_v94_health.py`) и v95 (`test_v95_edge.py`, `/edge_audit`), v96 (`test_v96_channels.py`), v97 (`test_v97_research.py`). Новые тесты добавлять сюда же.
+- до v94 регрессионные тесты хранились вне git и в репозиторий не попали; здесь тесты v94 (`test_v94_health.py`) и v95 (`test_v95_edge.py`, `/edge_audit`), v96 (`test_v96_channels.py`), v97 (`test_v97_research.py`), v98 (`test_v98_carry.py`), v99 (`test_v99_ma.py`). Новые тесты добавлять сюда же.
