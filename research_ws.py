@@ -466,8 +466,9 @@ def compute(main_rows, ref_rows, bars_of, exc_main, exc_ref, markets, fees, info
     return text, {'table': table, 'verdicts': ver, 'winner': decision(table, ver) if table else None, 'diag': diag, 'n': len(main_sims)}
 
 
-async def run_wide_stop(exchange, db_path, fee_maker, fee_taker, progress=None, now_ms=None):
-    """/wide_stop_test: популяции из shadow_signals → 15m-бары (кэш ws_bars, повторы/пауза) → пересимуляция в потоке."""
+async def prepare_wide_stop(exchange, db_path, progress=None, now_ms=None):
+    """[v97] Сетевая часть /wide_stop_test (в процессе бота, через общий exchange): популяции → докачка 15m-баров в кэш ws_bars → рынки.
+    → payload для расчёта в дочернем процессе: {'main_rows', 'ref_rows', 'markets', 'info', 'now_ms'}."""
     now_ms = now_ms or int(time.time() * 1000)
     info = {'requests': 0, 'fetch_log': []}
     main_rows = load_population(db_path, MAIN_STRATS)
@@ -482,8 +483,20 @@ async def run_wide_stop(exchange, db_path, fee_maker, fee_taker, progress=None, 
         markets = exchange.markets or {}
     except H.HtfFetchError:
         info['markets_failed'] = True
-    ok_m, bars_m, exc_m, _ = prepare(main_rows, db_path, now_ms)
-    ok_r, bars_r, exc_r, _ = prepare(ref_rows, db_path, now_ms)
+    return {'main_rows': main_rows, 'ref_rows': ref_rows, 'markets': markets, 'info': info, 'now_ms': now_ms}
+
+
+def finish_wide_stop(payload, db_path, fee_maker, fee_taker):
+    """[v97] Расчётная часть /wide_stop_test (синхронная; в дочернем процессе): бары из кэша ws_bars → пересимуляция → отчёт. → (text, res)."""
+    now_ms = payload['now_ms']
+    ok_m, bars_m, exc_m, _ = prepare(payload['main_rows'], db_path, now_ms)
+    ok_r, bars_r, exc_r, _ = prepare(payload['ref_rows'], db_path, now_ms)
     bars_m.update(bars_r)
-    text, res = await asyncio.to_thread(compute, ok_m, ok_r, bars_m, exc_m, exc_r, markets, (fee_maker, fee_taker), info, now_ms)
-    return text, info, res
+    return compute(ok_m, ok_r, bars_m, exc_m, exc_r, payload['markets'], (fee_maker, fee_taker), payload['info'], now_ms)
+
+
+async def run_wide_stop(exchange, db_path, fee_maker, fee_taker, progress=None, now_ms=None):
+    """/wide_stop_test: популяции из shadow_signals → 15m-бары (кэш ws_bars, повторы/пауза) → пересимуляция в потоке."""
+    payload = await prepare_wide_stop(exchange, db_path, progress=progress, now_ms=now_ms)
+    text, res = await asyncio.to_thread(finish_wide_stop, payload, db_path, fee_maker, fee_taker)
+    return text, payload['info'], res

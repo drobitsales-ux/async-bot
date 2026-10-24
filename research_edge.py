@@ -7,6 +7,8 @@
 месячные файлы fundingRate (`funding.npz`). Расчёт по символу целиком в памяти; в БД пишется только отчёт (htf_reports)."""
 import asyncio
 import bisect
+import gc
+import json
 import math
 import os
 import sqlite3
@@ -16,6 +18,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 import research_htf as H
+import research_runner as R
 import research_vision as V
 
 SEED = 20261024
@@ -284,14 +287,19 @@ def variant_trades(sym, events, variant, arr_seg, fees, funding=None):
     return trades, diag
 
 
-def r1_symbol(sym, arr, fees, smc2_eval, get_pivots, funding=None):
-    """Полный расчёт R1 по символу: scan (V1 = без фильтра объёма — надмножество), затем варианты. → {variant: (trades, diag)}, события V0."""
+def _empty_diag():
+    return {k: {'events': 0, 'nofund': 0, 'dedup': 0, 'late_mkt': 0} for k in VARIANTS}
+
+
+def r1_symbol_stream(sym, arr, fees, smc2_eval, get_pivots, funding, sink):
+    """Расчёт R1 по символу БЕЗ накопления сделок: scan (V1 = без фильтра объёма — надмножество), затем варианты по одному; готовый список сделок варианта
+    отдаётся в sink(variant, trades) и сразу освобождается. → (diag по вариантам, события V0 [(mode, ts_b)], число разрывов в ряду)."""
     ts, o, h, l, c, v = (arr[k] for k in ('ts', 'o', 'h', 'l', 'c', 'v'))
-    res = {k: ([], {'events': 0, 'nofund': 0, 'dedup': 0, 'late_mkt': 0}) for k in VARIANTS}
+    diag = _empty_diag()
     v0_events = []
-    gaps = 0
+    segs = 0
     for a, b in segments(ts):
-        gaps += 1
+        segs += 1
         if b - a < WINDOW + TIMEOUT_BARS + 2:
             continue
         sts, so, sh, sl_, sc, sv = ts[a:b], o[a:b], h[a:b], l[a:b], c[a:b], v[a:b]
@@ -299,13 +307,25 @@ def r1_symbol(sym, arr, fees, smc2_eval, get_pivots, funding=None):
         events = scan_segment(sts, so, sh, sl_, sc, sv, ph, pl, smc2_eval, vol_mult=0.0)
         for var in VARIANTS:
             tr, dg = variant_trades(sym, events, var, (sts, sh, sl_, sc, b - a), fees, funding)
-            res[var][0].extend(tr)
+            sink(var, tr)
             for k, x in dg.items():
-                res[var][1][k] += x
+                diag[var][k] += x
+            del tr
         for rec in events.values():
             if rec['v0'] and rec['rec_e'] is not None:
                 v0_events.append((rec['mode'], rec['ts_b']))
-    return res, v0_events, gaps - 1 if gaps else 0
+        del events, ph, pl
+    return diag, v0_events, segs - 1 if segs else 0
+
+
+def r1_symbol(sym, arr, fees, smc2_eval, get_pivots, funding=None):
+    """Те же расчёты с накоплением в памяти (тесты и малые наборы). → {variant: (trades, diag)}, события V0, разрывы."""
+    res = {k: [] for k in VARIANTS}
+
+    def sink(var, tr):
+        res[var].extend(tr)
+    diag, v0, gaps = r1_symbol_stream(sym, arr, fees, smc2_eval, get_pivots, funding, sink)
+    return {k: (res[k], diag[k]) for k in VARIANTS}, v0, gaps
 
 
 # ── статистика и критерии ────────────────────────────────────────────────────────────────────────────
@@ -373,12 +393,9 @@ def month_split(trades, btc):
     return {'up': f(up), 'down': f(dn)}
 
 
-def cell_verdict(trades, btc):
-    """Критерии §2.37.5. → dict(status PASS|FAIL|NODATA, checks, is_stats, oos_stats, months, months_oos)."""
-    is_t, oos_t = split_is_oos(trades)
-    s_is, s_oos = stats(is_t), stats(oos_t)
-    ms = month_split(trades, btc)
-    res = {'is': s_is, 'oos': s_oos, 'months': ms, 'months_oos': month_split(oos_t, btc), 'checks': {}}
+def verdict_from_parts(s_is, s_oos, ms, ms_oos):
+    """Критерии §2.37.5 по готовым агрегатам (одни и те же для расчёта в памяти и по SQL). → dict(status PASS|FAIL|NODATA, checks, text, is, oos, months, months_oos)."""
+    res = {'is': s_is, 'oos': s_oos, 'months': ms, 'months_oos': ms_oos, 'checks': {}}
     if s_oos['n'] < CRIT_N or s_oos['days'] < CRIT_DAYS:
         res.update(status='NODATA', text=f'недостаточно данных (OOS сделок {s_oos["n"]}, дней {s_oos["days"]}; нужно ≥ {CRIT_N} и ≥ {CRIT_DAYS})')
         return res
@@ -391,6 +408,138 @@ def cell_verdict(trades, btc):
     }
     ok = all(checks.values())
     res.update(status='PASS' if ok else 'FAIL', checks=checks, text='ПРОЙДЕНА' if ok else 'не пройдена')
+    return res
+
+
+def cell_verdict(trades, btc):
+    """Критерии §2.37.5 по списку сделок в памяти (тесты, малые наборы)."""
+    is_t, oos_t = split_is_oos(trades)
+    return verdict_from_parts(stats(is_t), stats(oos_t), month_split(trades, btc), month_split(oos_t, btc))
+
+
+# ── хранилище R0/R1 (SQLite, отдельный файл edge.db) и агрегация SQL-запросами (v97) ─────────────────────────────
+EDGE_R0_REV = '1'                # менять при любой правке кода измерения R0: иначе итог R0 берётся из сохранённого для этого seed
+EDGE_MIN_FREE_MB = 200           # меньше — остановка до прогона
+EST_ROWS_PER_SYMBOL = 30_000     # оценка по проду 2026-10-24: V0 4–8 тыс. + V1 10–14.5 тыс. + V2 ≈ V0 + F ≈ V0/2 на символ
+EST_BYTES_PER_ROW = 140          # измерено на синтетике: edge.db 3.14 МБ на 22 445 строк (данные + индекс) ≈ 140 Б/строка
+INSERT_CHUNK = 5000
+
+
+def edge_db_path(db_path):
+    return os.environ.get('EDGE_DB') or os.path.join(os.path.dirname(os.path.abspath(db_path)), 'edge.db')
+
+
+def estimate_edge_mb(n_symbols):
+    """Оценка размера edge_trades (R0 + R1), МБ."""
+    return (n_symbols * (EST_ROWS_PER_SYMBOL + N_RANDOM)) * EST_BYTES_PER_ROW / 1e6
+
+
+def init_edge_db(path):
+    con = sqlite3.connect(path, isolation_level=None)
+    con.execute("CREATE TABLE IF NOT EXISTS edge_runs (run_id TEXT PRIMARY KEY, kind TEXT, seed INTEGER, started TEXT, status TEXT, finished TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS edge_trades (run_id TEXT, symbol TEXT, variant TEXT, entry TEXT, direction TEXT, open_ts INTEGER, close_ts INTEGER, "
+                "r_gross REAL, r_net REAL, exit_reason TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_edge_trades ON edge_trades (run_id, variant, entry, direction, open_ts)")
+    con.execute("CREATE TABLE IF NOT EXISTS edge_progress (run_id TEXT, symbol TEXT, done INTEGER, diag TEXT, PRIMARY KEY (run_id, symbol))")
+    con.execute("CREATE TABLE IF NOT EXISTS edge_v0_events (run_id TEXT, symbol TEXT, mode TEXT, ts_b INTEGER)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_edge_v0 ON edge_v0_events (run_id, ts_b)")
+    con.close()
+
+
+def insert_trades(con, run_id, sym, variant, trades):
+    """Пачками по INSERT_CHUNK строк (внутри транзакции вызывающего)."""
+    buf = []
+    for t in trades:
+        buf.append((run_id, sym, variant, t['etype'], 'Long' if t['long'] else 'Short', int(t['entry_ts']), int(t['exit_ts']), float(t['Rg']), float(t['R']), t['reason']))
+        if len(buf) >= INSERT_CHUNK:
+            con.executemany("INSERT INTO edge_trades VALUES (?,?,?,?,?,?,?,?,?,?)", buf)
+            buf = []
+    if buf:
+        con.executemany("INSERT INTO edge_trades VALUES (?,?,?,?,?,?,?,?,?,?)", buf)
+
+
+def _where(run_id, variant=None, entry=None, direction=None, ts_lo=None, ts_hi=None):
+    cl, args = ['run_id=?'], [run_id]
+    for col, val in (('variant', variant), ('entry', entry), ('direction', direction)):
+        if val is not None:
+            cl.append(f'{col}=?'); args.append(val)
+    if ts_lo is not None:
+        cl.append('open_ts>=?'); args.append(int(ts_lo))
+    if ts_hi is not None:
+        cl.append('open_ts<?'); args.append(int(ts_hi))
+    return ' AND '.join(cl), args
+
+
+def _t_from_sums(n, s1, s2):
+    if n < 2:
+        return 0.0
+    m = s1 / n
+    var = (s2 - n * m * m) / (n - 1)
+    return m / math.sqrt(var / n) if var > 1e-15 else 0.0
+
+
+def sql_stats(con, run_id, variant=None, entry=None, direction=None, ts_lo=None, ts_hi=None):
+    """Те же показатели, что stats(список сделок), но агрегацией SQL (без загрузки сделок в память); дневной портфель — чтением по дням порциями."""
+    w, args = _where(run_id, variant, entry, direction, ts_lo, ts_hi)
+    r = con.execute(
+        "SELECT COUNT(*), SUM(r_net), SUM(r_net*r_net), SUM(r_gross), SUM(r_gross*r_gross), "
+        "SUM(CASE WHEN r_net>0 THEN r_net ELSE 0 END), SUM(CASE WHEN r_net<0 THEN -r_net ELSE 0 END), SUM(CASE WHEN r_net>0 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN exit_reason='SL' THEN 1 ELSE 0 END), SUM(CASE WHEN exit_reason='TP' THEN 1 ELSE 0 END), SUM(CASE WHEN exit_reason='TIMEOUT' THEN 1 ELSE 0 END) "
+        f"FROM edge_trades WHERE {w}", args).fetchone()
+    n = r[0] or 0
+    if n == 0:
+        return stats([])
+    s1, s2, g1, g2, gw, gl, wins, sl, tp, to = (x or 0 for x in r[1:])
+    nd = sd = sd2 = 0
+    cur = con.execute(f"SELECT AVG(r_net) FROM edge_trades WHERE {w} GROUP BY close_ts/86400000", args)
+    while True:
+        rows = cur.fetchmany(2000)
+        if not rows:
+            break
+        for (m,) in rows:
+            nd += 1; sd += m; sd2 += m * m
+    return {'n': n, 'wr': wins / n * 100, 'pf': (gw / gl) if gl > 0 else (float('inf') if gw > 0 else 0.0),
+            'mean': s1 / n, 't': _t_from_sums(n, s1, s2), 'mean_g': g1 / n, 't_g': _t_from_sums(n, g1, g2),
+            'dmean': (sd / nd) if nd else 0.0, 'dt': _t_from_sums(nd, sd, sd2), 'days': nd,
+            'sl': sl / n * 100, 'tp': tp / n * 100, 'to': to / n * 100}
+
+
+def sql_by_year(con, run_id, variant=None, entry=None, direction=None, gross=False):
+    """{год входа: (n, mean R net)}; gross=True → {год: (n, mean R gross, t gross)}."""
+    w, args = _where(run_id, variant, entry, direction)
+    y = "CAST(strftime('%Y', open_ts/1000, 'unixepoch') AS INTEGER)"
+    out = {}
+    if gross:
+        for yr, n, g1, g2 in con.execute(f"SELECT {y}, COUNT(*), SUM(r_gross), SUM(r_gross*r_gross) FROM edge_trades WHERE {w} GROUP BY 1 ORDER BY 1", args):
+            out[yr] = (n, g1 / n, _t_from_sums(n, g1, g2))
+    else:
+        for yr, n, s1 in con.execute(f"SELECT {y}, COUNT(*), SUM(r_net) FROM edge_trades WHERE {w} GROUP BY 1 ORDER BY 1", args):
+            out[yr] = (n, s1 / n)
+    return out
+
+
+def sql_month_split(con, run_id, variant, entry, direction, btc, ts_lo=None):
+    """mean R net по входам в месяцы роста/падения BTC (как month_split), агрегацией по месяцам."""
+    w, args = _where(run_id, variant, entry, direction, ts_lo)
+    up = [0, 0.0]; dn = [0, 0.0]
+    for m, n, s1 in con.execute(f"SELECT strftime('%Y-%m', open_ts/1000, 'unixepoch'), COUNT(*), SUM(r_net) FROM edge_trades WHERE {w} GROUP BY 1", args):
+        r = btc.get(m)
+        if r is None:
+            continue
+        tgt = up if r > 0 else dn
+        tgt[0] += n; tgt[1] += s1
+    f = lambda x: (x[0], (x[1] / x[0]) if x[0] else 0.0)
+    return {'up': f(up), 'down': f(dn)}
+
+
+def cell_verdict_sql(con, run_id, variant, entry, direction, btc):
+    """Критерии §2.37.5 по SQL-агрегатам. Те же правила и числа, что cell_verdict(список сделок)."""
+    cut = _ms(OOS_START)
+    s_is = sql_stats(con, run_id, variant, entry, direction, ts_hi=cut)
+    s_oos = sql_stats(con, run_id, variant, entry, direction, ts_lo=cut)
+    res = verdict_from_parts(s_is, s_oos, sql_month_split(con, run_id, variant, entry, direction, btc),
+                             sql_month_split(con, run_id, variant, entry, direction, btc, ts_lo=cut))
+    res['years'] = sql_by_year(con, run_id, variant, entry, direction)
     return res
 
 
@@ -611,6 +760,30 @@ def load_series(d, sym, tf='15m'):
     return k
 
 
+def load_series_lean(d, sym, tf='15m'):
+    """[v97] Свечи символа для расчёта R0/R1 с минимумом памяти: время int64, o float32, h/l/c/v float64 (точный апкаст float32 из кэша — те же значения, что у
+    load_series); колонка taker buy (tbv) не загружается. Месячные свечи + дневной хвост (уникальные ts по возрастанию) → dict(ts,o,h,l,c,v) или None."""
+    z = V._load_npz(V.klines_path(d, sym, tf))
+    if z is None or len(z['ts']) < 300:
+        return None
+    ts = z['ts']
+    cols = {'o': z['o'], 'h': z['h'], 'l': z['l'], 'c': z['c'], 'v': z['v']}
+    del z
+    t = V._load_npz(tail_path(d, sym, tf))
+    if t is not None and len(t['ts']):
+        ts = np.concatenate([ts, t['ts']])
+        cols = {k: np.concatenate([cols[k], t[k]]) for k in cols}
+        o = np.argsort(ts, kind='stable'); ts = ts[o]
+        keep = np.r_[True, np.diff(ts) != 0] if len(ts) > 1 else np.ones(len(ts), bool)
+        ts = ts[keep]
+        cols = {k: cols[k][o][keep] for k in cols}
+    del t
+    out = {'ts': ts.astype(np.int64, copy=False), 'o': cols['o'].astype(np.float32, copy=False)}
+    for k in ('h', 'l', 'c', 'v'):
+        out[k] = cols[k].astype(np.float64)
+    return out
+
+
 # ── отчёт ────────────────────────────────────────────────────────────────────────────────────────────
 def _fpf(x):
     return 'inf' if x == float('inf') else f'{x:.2f}'
@@ -624,8 +797,24 @@ def _row(label, s):
             f'SL {s["sl"]:.0f}% / TP {s["tp"]:.0f}% / таймаут {s["to"]:.0f}%')
 
 
-def r0_verdict(trades):
-    s = stats(trades)
+def summary_from_trades(trades):
+    """Итог R0 по списку сделок в памяти: {'all','long','short': stats, 'years': {год: (n, mean R gross, t gross)}}."""
+    yrs = {}
+    for t in trades:
+        yrs.setdefault(_year(t['entry_ts']), []).append(t['Rg'])
+    return {'all': stats(trades), 'long': stats([t for t in trades if t['long']]), 'short': stats([t for t in trades if not t['long']]),
+            'years': {y: (len(v), sum(v) / len(v), _tstat(v)) for y, v in sorted(yrs.items())}}
+
+
+def r0_summary_sql(con, run_id):
+    """Итог R0 SQL-агрегацией (та же структура, что summary_from_trades)."""
+    return {'all': sql_stats(con, run_id, 'R0'), 'long': sql_stats(con, run_id, 'R0', direction='Long'),
+            'short': sql_stats(con, run_id, 'R0', direction='Short'), 'years': sql_by_year(con, run_id, 'R0', gross=True)}
+
+
+def r0_verdict(x):
+    """Вердикт R0 по stats-словарю (SQL) или по списку сделок."""
+    s = x if isinstance(x, dict) else stats(x)
     if s['n'] == 0:
         return 'NODATA', 'нет сделок — калибровка невозможна'
     if abs(s['t_g']) >= R0_STOP_T:
@@ -635,9 +824,12 @@ def r0_verdict(trades):
     return 'OK', f'измерительная система в норме: |t| = {abs(s["t_g"]):.2f} < {R0_WARN_T:g} при mean R до издержек {s["mean_g"]:+.4f}'
 
 
-def build_r0(trades, diags, missing, fees):
-    s = stats(trades)
-    status, text = r0_verdict(trades)
+def build_r0(summary, diags, missing, fees):
+    """Отчёт R0. summary — итог (SQL или summary_from_trades); при списке сделок — считается в памяти."""
+    if isinstance(summary, list):
+        summary = summary_from_trades(summary)
+    s = summary['all']
+    status, text = r0_verdict(s)
     L = ['📈 <b>/edge_audit — R0: калибровка на случайных входах (BOT_SPEC §2.37.3)</b>',
          f'16 символов, 15m, по {N_RANDOM} входов на символ, SEED={SEED} (+ номер символа), направление 50/50; вход = close, SL 1.0×ATR14 [{SL_BOUNDS[0]}%; {SL_BOUNDS[1]}%], '
          f'TP {TP_R:g}R, таймаут {TIMEOUT_BARS} баров, SL раньше TP; издержки: FEE_MAKER={fees[0]} / FEE_TAKER={fees[1]}, проскальзывание {SLIP} на рыночных исполнениях.']
@@ -647,27 +839,26 @@ def build_r0(trades, diags, missing, fees):
              f'отсеяно по границам SL {sum(d["bounds"] for d in diags.values())}, не закрыто {sum(d["unclosed"] for d in diags.values())}')
     L.append(f' ВСЕ: n={s["n"]} | mean R ДО издержек {s["mean_g"]:+.4f} (t {s["t_g"]:.2f}) | ПОСЛЕ издержек {s["mean"]:+.4f} (t {s["t"]:.2f}) | '
              f'дневной портфель net: mean {s["dmean"]:+.4f}, t {s["dt"]:.2f} | SL {s["sl"]:.0f}% / TP {s["tp"]:.0f}% / таймаут {s["to"]:.0f}%')
-    for name, sel in (('лонг', True), ('шорт', False)):
-        x = stats([t for t in trades if t['long'] == sel])
+    for name, key in (('лонг', 'long'), ('шорт', 'short')):
+        x = summary[key]
         L.append(f'  {name}: n={x["n"]} | ДО {x["mean_g"]:+.4f} (t {x["t_g"]:.2f}) | ПОСЛЕ {x["mean"]:+.4f} (t {x["t"]:.2f}) | '
                  f'SL {x["sl"]:.0f}% / TP {x["tp"]:.0f}% / таймаут {x["to"]:.0f}%')
-    yrs = {}
-    for t in trades:
-        yrs.setdefault(_year(t['entry_ts']), []).append(t)
-    L.append('  по годам (ДО издержек): ' + '; '.join(f'{y}: n={len(v)} {stats(v)["mean_g"]:+.3f} (t {stats(v)["t_g"]:.1f})' for y, v in sorted(yrs.items())))
+    L.append('  по годам (ДО издержек): ' + '; '.join(f'{y}: n={n} {m:+.3f} (t {t:.1f})' for y, (n, m, t) in summary['years'].items()))
     L.append(f'<b>ВЕРДИКТ R0: {text}</b>')
     if status == 'STOP':
         L.append('R1 НЕ ЗАПУЩЕН. Исследования стоят до исправления измерения; искать причину в системе измерения (сегменты данных, ATR, семантика выхода, издержки).')
     return '\n'.join(L), status
 
 
-def build_r1(cells, diag, btc_ok, fund_info, cmp_, gaps, fees, since_note=''):
+def build_r1(cells, diag, btc_ok, fund_info, cmp_, gaps, fees, since_note='', missing=None):
     L = ['', '📈 <b>R1: SMC2 на истории 2020–2026 (BOT_SPEC §2.37.4–2.37.5)</b>',
          f'Логика — `_smc2_eval` бота, окно {WINDOW} закрытых баров, дедуп 2 ч, V0/V1/V2/F, MKT/RT; издержки BingX: maker {fees[0]}, taker {fees[1]}, проскальзывание {SLIP}; '
          f'IS до {OOS_START}, OOS с {OOS_START}. Критерии: OOS дневной mean R&gt;0 при t≥{CRIT_T:g}, PF net≥{CRIT_PF}, OOS≥{CRIT_RATIO}×IS, n≥{CRIT_N} и дней≥{CRIT_DAYS}, '
          f'mean R&gt;0 в месяцы роста И падения BTC (по всей истории). 16 ячеек, пороги не подбирались.',
          '⚠️ ОШИБКА ВЫЖИВШЕГО: 16 фиксированных символов, отобраны по объёму на 2026-10 — результат оптимистичен.',
          f'Разрывов в рядах (сегментов − 1, сумма по символам): {gaps}.' + (' ' + since_note if since_note else '')]
+    if missing:
+        L.append(f'⚠️ R1 без данных/не посчитано: {", ".join(missing)}')
     if not btc_ok:
         L.append('⚠️ BTCUSDT без данных — условие по месяцам BTC не проверяемо, ячейки не могут быть пройдены.')
     L.append('Диагностика событий (сумма по символам): ' + '; '.join(
@@ -714,17 +905,171 @@ def build_r1(cells, diag, btc_ok, fund_info, cmp_, gaps, fees, since_note=''):
 
 
 # ── оркестрация ──────────────────────────────────────────────────────────────────────────────────────
+def _connect(edb):
+    return sqlite3.connect(edb, isolation_level=None, timeout=60)
+
+
+def _tx(con, fn):
+    """Транзакция одним куском: при любой ошибке откат (частичных строк символа не остаётся)."""
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        out = fn()
+        con.execute('COMMIT')
+        return out
+    except BaseException:
+        try:
+            con.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+
+
+def process_symbol_r0(edb, run_id, sym, idx, d, fees):
+    """R0 одного символа: загрузка свечей → случайные входы → запись сделок и отметка done ОДНОЙ транзакцией → освобождение. → (n, diag) или None (нет данных)."""
+    arr = load_series_lean(d, sym)
+    if arr is None:
+        return None
+    box = {}
+    box['tr'], dg = r0_trades(sym, idx, arr, fees)
+    arr = None
+    con = _connect(edb)
+    try:
+        def work():
+            con.execute('DELETE FROM edge_trades WHERE run_id=? AND symbol=?', (run_id, sym))
+            insert_trades(con, run_id, sym, 'R0', box['tr'])
+            con.execute('INSERT OR REPLACE INTO edge_progress VALUES (?,?,1,?)', (run_id, sym, json.dumps(dg)))
+        _tx(con, work)
+    finally:
+        con.close()
+    n = len(box['tr'])
+    box.clear()
+    gc.collect()
+    return n, dg
+
+
+def process_symbol_r1(edb, run_id, sym, d, fees, smc2_eval, get_pivots, funding):
+    """R1 одного символа: свечи (float32/int64 → рабочие массивы) → все варианты, сделки варианта сразу в SQLite пачками → освобождение. Сделки, события V0 и
+    отметка done — в одной транзакции (прерывание не оставляет частичных данных символа). → (counts по вариантам, diag) или None (нет данных)."""
+    arr = load_series_lean(d, sym)
+    if arr is None:
+        return None
+    last_ts = int(arr['ts'][-1]) + TF_MS
+    box = {'arr': arr}
+    arr = None
+    con = _connect(edb)
+    counts = {k: 0 for k in VARIANTS}
+    try:
+        def work():
+            con.execute('DELETE FROM edge_trades WHERE run_id=? AND symbol=?', (run_id, sym))
+            con.execute('DELETE FROM edge_v0_events WHERE run_id=? AND symbol=?', (run_id, sym))
+
+            def sink(var, tr):
+                counts[var] += len(tr)
+                insert_trades(con, run_id, sym, var, tr)
+            diag, v0, gaps = r1_symbol_stream(sym, box['arr'], fees, smc2_eval, get_pivots, funding, sink)
+            con.executemany('INSERT INTO edge_v0_events VALUES (?,?,?,?)', [(run_id, sym, m, int(tb)) for m, tb in v0])
+            diag['_meta'] = {'gaps': gaps, 'last_ts': last_ts, 'has_fund': bool(funding is not None and len(funding[0])), 'counts': counts}
+            con.execute('INSERT OR REPLACE INTO edge_progress VALUES (?,?,1,?)', (run_id, sym, json.dumps(diag)))
+            return diag
+        diag = _tx(con, work)
+    finally:
+        con.close()
+    box.clear()
+    gc.collect()
+    return counts, diag
+
+
+def _done_map(edb, run_id):
+    con = _connect(edb)
+    try:
+        return {sym: json.loads(dg or '{}') for sym, dg in con.execute('SELECT symbol, diag FROM edge_progress WHERE run_id=? AND done=1', (run_id,))}
+    finally:
+        con.close()
+
+
+def _ensure_run(edb, run_id, kind):
+    con = _connect(edb)
+    try:
+        con.execute('INSERT OR IGNORE INTO edge_runs VALUES (?,?,?,?,?,NULL)', (run_id, kind, SEED, datetime.now(timezone.utc).isoformat(), 'running'))
+    finally:
+        con.close()
+
+
+def _finish_run(edb, run_id):
+    con = _connect(edb)
+    try:
+        con.execute("UPDATE edge_runs SET status='done', finished=? WHERE run_id=?", (datetime.now(timezone.utc).isoformat(), run_id))
+    finally:
+        con.close()
+
+
+def _pick_r1_run(edb):
+    """Незавершённый R1-прогон (прерванный) → продолжаем с первого незавершённого символа; иначе новый run_id."""
+    con = _connect(edb)
+    try:
+        row = con.execute("SELECT run_id FROM edge_runs WHERE kind='r1' AND status!='done' ORDER BY started DESC LIMIT 1").fetchone()
+    finally:
+        con.close()
+    if row:
+        return row[0], True
+    return 'r1-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S'), False
+
+
+def aggregate_r0(edb, run_id):
+    con = _connect(edb)
+    try:
+        return r0_summary_sql(con, run_id)
+    finally:
+        con.close()
+
+
+def aggregate_r1(edb, run_id, btc):
+    """Все 16 ячеек SQL-агрегацией (чтение порциями, без загрузки сделок в память)."""
+    con = _connect(edb)
+    try:
+        cells = {}
+        for var in VARIANTS:
+            for side in SIDES:
+                for et in ENTRIES:
+                    cells[(var, side, et)] = cell_verdict_sql(con, run_id, var, et, side, btc)
+        return cells
+    finally:
+        con.close()
+
+
+def compare_shadow_db(db_path, edb, run_id, bingx_of, data_end_ms, since='2026-10-02'):
+    """Сверка с shadow (1.6): события V0 берутся из edge_v0_events только за окно сверки."""
+    t0 = _ms(since)
+    con = _connect(edb)
+    try:
+        ev = {}
+        for sym, mode, tb in con.execute('SELECT symbol, mode, ts_b FROM edge_v0_events WHERE run_id=? AND ts_b>=?', (run_id, t0 - TF_MS)):
+            ev.setdefault(sym, []).append((mode, tb))
+    finally:
+        con.close()
+    return compare_shadow(db_path, ev, bingx_of, data_end_ms, since)
+
+
 def binance_symbols(universe):
     return sorted(s.split('/')[0] + 'USDT' for s in universe)
 
 
-async def run_edge_audit(fetch, db_path, universe, fee_maker, fee_taker, smc2_eval, get_pivots, progress=None, d=None, now_ms=None, sync=True):
-    """Загрузка (с продолжением из кэша) → R0 → (если не STOP) R1 → отчёт. → (текст, итог dict)."""
+async def run_edge_audit(fetch, db_path, universe, fee_maker, fee_taker, smc2_eval, get_pivots, progress=None, d=None, now_ms=None, sync=True, edge_db=None, inline=False):
+    """Загрузка (с продолжением из кэша) → R0 → (если не STOP) R1 → отчёт. По символам, без накопления сделок в памяти: сделки — в SQLite (edge.db), контрольные точки —
+    edge_progress; повторный запуск продолжает с первого незавершённого символа, R0 для текущего seed не пересчитывается. → (текст, итог dict)."""
     d = d or V.vision_dir()
     now_ms = now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     fees = (fee_maker, fee_taker)
     syms = binance_symbols(universe)
     bingx_of = {s.split('/')[0] + 'USDT': s for s in universe}
+    edb = edge_db or edge_db_path(db_path)
+
+    async def call(fn, *args):
+        """inline=True (дочерний процесс исследований): расчёт в том же потоке — без рабочего потока (его стек и арена malloc ≈ 70 МБ адресного пространства
+        при лимите RLIMIT_AS); в процессе бота — в потоке, чтобы не блокировать цикл событий."""
+        if inline:
+            return fn(*args)
+        return await asyncio.to_thread(fn, *args)
 
     async def say(m):
         if progress:
@@ -732,6 +1077,15 @@ async def run_edge_audit(fetch, db_path, universe, fee_maker, fee_taker, smc2_ev
                 await progress(m)
             except Exception:
                 pass
+    os.makedirs(os.path.dirname(os.path.abspath(edb)), exist_ok=True)
+    free = V.free_mb(os.path.dirname(os.path.abspath(edb)))
+    est = estimate_edge_mb(len(syms))
+    if free < EDGE_MIN_FREE_MB:
+        return (f'⛔ /edge_audit остановлен до прогона: свободно {free:.0f} МБ < {EDGE_MIN_FREE_MB} МБ (оценка размера edge_trades ≈ {est:.0f} МБ). Освободите место и повторите.',
+                {'r0': 'DISK', 'passed': []})
+    init_edge_db(edb)
+    await say(f'edge.db: {edb}; свободно {free:.0f} МБ; оценка размера edge_trades ≈ {est:.0f} МБ ({EST_ROWS_PER_SYMBOL} строк × {len(syms)} символов R1 + R0, ≈{EST_BYTES_PER_ROW} Б/строка); '
+              f'RSS {R.rss_mb():.0f} МБ')
     stopped = ''
     if sync:
         for sym in syms:
@@ -758,48 +1112,60 @@ async def run_edge_audit(fetch, db_path, universe, fee_maker, fee_taker, smc2_ev
                 await say(f'{sym}: фандинг не загружен — {type(e).__name__}: {str(e)[:150]}')
     if stopped:
         await say(stopped)
-    arrs, missing = {}, []
-    for sym in syms:
-        a = load_series(d, sym)
-        if a is None:
-            missing.append(sym)
-        else:
-            arrs[sym] = a
-    # ── R0 ──
-    r0_all, r0_diag = [], {}
+    # ── R0 (по символам; итог сохраняется для seed + ревизии кода измерения) ──
+    r0_id = f'r0-{SEED}-{EDGE_R0_REV}'
+    _ensure_run(edb, r0_id, 'r0')
+    done0 = _done_map(edb, r0_id)
+    missing = []
     for i, sym in enumerate(syms):
-        if sym not in arrs:
+        if sym in done0:
             continue
-        tr, dg = await asyncio.to_thread(r0_trades, sym, i, arrs[sym], fees)
-        r0_all.extend(tr); r0_diag[sym] = dg
+        out = await call(process_symbol_r0, edb, r0_id, sym, i, d, fees)
+        if out is None:
+            missing.append(sym)
+            continue
+        done0[sym] = out[1]
+        await say(f'R0 {sym}: сделок {out[0]} | RSS {R.rss_mb():.0f} МБ')
         await asyncio.sleep(0)
-    text0, status0 = build_r0(r0_all, r0_diag, missing + ([stopped] if stopped else []), fees)
-    await say(f'R0: сделок {len(r0_all)}; ' + text0.splitlines()[-1].replace('<b>', '').replace('</b>', '')[:200])
+    summ0 = await call(aggregate_r0, edb, r0_id)
+    text0, status0 = build_r0(summ0, done0, missing + ([stopped] if stopped else []), fees)
+    await say('R0: ' + text0.splitlines()[-1].replace('<b>', '').replace('</b>', '')[:200])
     if status0 in ('STOP', 'NODATA'):
         return text0, {'r0': status0, 'passed': []}
     # ── R1 ──
-    funding = {}
+    run_id, resumed = _pick_r1_run(edb)
+    _ensure_run(edb, run_id, 'r1')
+    done1 = _done_map(edb, run_id)
+    if resumed:
+        await say(f'R1: продолжаю прогон {run_id} — готово символов {len(done1)} из {len(syms)}, продолжение с первого незавершённого')
+    missing1 = []
     for sym in syms:
-        f = load_funding(d, sym)
-        if f is not None and len(f['ts']):
-            funding[sym] = (f['ts'], f['rate'])
-    all_tr = {v: [] for v in VARIANTS}
-    diag = {v: {'events': 0, 'nofund': 0, 'dedup': 0, 'late_mkt': 0} for v in VARIANTS}
-    v0_events, gaps = {}, 0
-    for sym in syms:
-        if sym not in arrs:
+        if sym in done1:
             continue
-        res, v0e, g = await asyncio.to_thread(r1_symbol, sym, arrs[sym], fees, smc2_eval, get_pivots, funding.get(sym))
+        f = load_funding(d, sym)
+        fund = (f['ts'], f['rate']) if f is not None and len(f['ts']) else None
+        out = await call(process_symbol_r1, edb, run_id, sym, d, fees, smc2_eval, get_pivots, fund)
+        f = fund = None
+        if out is None:
+            missing1.append(sym)
+            continue
+        counts, diag = out
+        done1[sym] = diag
+        await say(f'R1 {sym}: сделок V0 {counts["V0"]}, V1 {counts["V1"]}, V2 {counts["V2"]}, F {counts["F"]} | RSS {R.rss_mb():.0f} МБ')
+        await asyncio.sleep(0)
+    btc_arr = await call(load_series_lean, d, 'BTCUSDT')
+    btc = btc_month_dirs(btc_arr)
+    del btc_arr
+    gc.collect()
+    diag = _empty_diag()
+    gaps, fund_syms, data_end = 0, 0, 0
+    for sym, dg in done1.items():
         for v in VARIANTS:
-            all_tr[v].extend(res[v][0])
-            for k, x in res[v][1].items():
+            for k, x in (dg.get(v) or {}).items():
                 diag[v][k] += x
-        v0_events[sym] = v0e; gaps += g
-        await say(f'R1 {sym}: сделок V0 {len(res["V0"][0])}, V1 {len(res["V1"][0])}')
-    btc = btc_month_dirs(arrs.get('BTCUSDT'))
-    # покрытие фандинга: доля событий V0 с известной ставкой
+        meta = dg.get('_meta') or {}
+        gaps += meta.get('gaps', 0); fund_syms += 1 if meta.get('has_fund') else 0; data_end = max(data_end, meta.get('last_ts', 0))
     n_v0_cand = diag['V0']['events'] + diag['V0']['dedup']       # кандидаты V0 до дедупа — та же база, что у счётчика nofund варианта F
-    fund_syms = len(funding)
     cov = 1.0 - diag['F']['nofund'] / max(1, n_v0_cand)
     f_unver = ''
     if fund_syms == 0:
@@ -808,20 +1174,17 @@ async def run_edge_audit(fetch, db_path, universe, fee_maker, fee_taker, smc2_ev
         f_unver = f'ставки покрыты для {cov * 100:.0f}% событий V0 (< {FUND_MIN_COV * 100:.0f}%)'
     fund_info = (f'Фандинг: ставки загружены по {fund_syms} из {len(syms)} символов; покрытие событий V0 {cov * 100:.0f}%' +
                  (f' → вариант F НЕПРОВЕРЯЕМ ({f_unver})' if f_unver else ' → вариант F проверяем'))
+    cells_all = await call(aggregate_r1, edb, run_id, btc)
     cells = {}
-    for var in VARIANTS:
-        for side in SIDES:
-            for et in ENTRIES:
-                if var == 'F' and f_unver:
-                    cells[(var, side, et)] = {'unverifiable': f_unver, 'status': 'UNVERIFIABLE'}
-                    continue
-                tr = [t for t in all_tr[var] if t['long'] == (side == 'Long') and t['etype'] == et]
-                cv = cell_verdict(tr, btc)
-                cv['years'] = by_year(tr)
-                if not btc:
-                    cv['status'] = 'FAIL'; cv['text'] = 'BTC без данных — условие по месяцам не проверяемо'
-                cells[(var, side, et)] = cv
-    data_end = max(int(a['ts'][-1]) + TF_MS for a in arrs.values()) if arrs else 0
-    cmp_ = await asyncio.to_thread(compare_shadow, db_path, v0_events, bingx_of, data_end)
-    text1, passed = build_r1(cells, diag, bool(btc), fund_info, cmp_, gaps, fees)
-    return text0 + '\n' + text1, {'r0': status0, 'passed': passed}
+    for key, cv in cells_all.items():
+        if key[0] == 'F' and f_unver:
+            cells[key] = {'unverifiable': f_unver, 'status': 'UNVERIFIABLE'}
+        else:
+            if not btc:
+                cv['status'] = 'FAIL'; cv['text'] = 'BTC без данных — условие по месяцам не проверяемо'
+            cells[key] = cv
+    cmp_ = await call(compare_shadow_db, db_path, edb, run_id, bingx_of, data_end) if data_end else {'ok': False, 'why': 'нет данных'}
+    text1, passed = build_r1(cells, diag, bool(btc), fund_info, cmp_, gaps, fees, missing=missing1)
+    if not missing1:
+        _finish_run(edb, run_id)
+    return text0 + '\n' + text1, {'r0': status0, 'passed': passed, 'run_id': run_id}
