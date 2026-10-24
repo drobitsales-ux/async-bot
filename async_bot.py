@@ -38,6 +38,7 @@ import json
 import math
 import os
 import re
+import html
 import hmac
 import hashlib
 import socket
@@ -505,6 +506,14 @@ exchange = ccxt_async.bingx({
     'options': {'defaultType': 'swap', 'marginMode': 'isolated'},
     'enableRateLimit': True,
 })
+# [v96] ВТОРОЙ экземпляр ccxt bingx с теми же ключами и СВОИМ throttler — для ВСЕХ приватных (подписанных) вызовов: эквити/баланс,
+# позиции, ордера, SL, сделки, плечо/маржа. Прод 2026-10-24 (/net_probe): через общий экземпляр приватный fetch_balance ждал 47–120 с
+# в очереди за сканерами (90–200 публичных REST за цикл при 1 запросе/с), прямой aiohttp — 0.2 с. Рыночные данные остаются на `exchange`.
+exchange_priv = ccxt_async.bingx({
+    'apiKey': BINGX_KEY, 'secret': BINGX_SECRET,
+    'options': {'defaultType': 'swap', 'marginMode': 'isolated'},
+    'enableRateLimit': True,
+})
 binance = ccxt_async.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'},
@@ -676,6 +685,35 @@ def _log_alert_history(text: str):
         logging.debug(f'[ALERT_HISTORY] write fail: {_e}')
 
 
+def esc(x) -> str:
+    """[v96] Экранирование &, <, > в ДИНАМИЧЕСКОЙ части сообщения с parse_mode=HTML (символы, тексты ошибок, имена файлов, пользовательский ввод).
+    Разметку (<b>, <code>) сообщения НЕ экранировать — вызывать только на подставляемых значениях."""
+    return html.escape(str(x), quote=False)
+
+
+def _code_blocks(text: str, limit: int = 3500) -> list:
+    """[v96] Текст → список блоков `<code>…</code>` (каждый со своими тегами, экранированный, ≤ limit символов). Причина бага /csv: tg() режет
+    длинное сообщение по строкам (_split_tg_text рассчитан на теги в пределах одной строки), а <code>…</code> с CSV охватывал десятки строк —
+    первый кусок оставался с незакрытым <code>, Telegram отвечал 400 «can't parse entities», срабатывал запасной путь без parse_mode."""
+    blocks, cur = [], ''
+    for line in text.split('\n'):
+        e = esc(line)
+        while len(e) > limit:                       # одна строка длиннее лимита — режем жёстко (экранированный текст, по границе сущности)
+            cut = e.rfind('&', 0, limit)
+            cut = limit if cut < limit - 8 else cut
+            if cur:
+                blocks.append(cur); cur = ''
+            blocks.append(e[:cut]); e = e[cut:]
+        cand = f'{cur}\n{e}' if cur else e
+        if len(cand) <= limit:
+            cur = cand
+        else:
+            blocks.append(cur); cur = e
+    if cur:
+        blocks.append(cur)
+    return [f'<code>{b}</code>' for b in blocks]
+
+
 async def tg(text: str):
     # [P-1] Логируем причину молчания вместо тихого return
     if not TOKEN:
@@ -817,7 +855,7 @@ async def _fetch_equity(retry: bool = True):
     pauses = EQUITY_RETRY_PAUSES if retry else ()
     for i in range(len(pauses) + 1):
         try:
-            eq = _extract_equity(await asyncio.wait_for(exchange.fetch_balance(), EQUITY_ATTEMPT_TIMEOUT))
+            eq = _extract_equity(await asyncio.wait_for(exchange_priv.fetch_balance(), EQUITY_ATTEMPT_TIMEOUT))
             if eq > 0:
                 return eq
             err = 'пустой ответ'
@@ -1004,7 +1042,13 @@ _rest_n = 0                    # REST-запросов процесса (счё�
 _rest_prev = 0
 _lat_last_purge = 0.0
 _LAT_METHODS = ('create_order', 'cancel_order', 'fetch_positions', 'fetch_balance',
-                'set_leverage', 'set_margin_mode', 'fetch_my_trades', 'fetch_tickers')
+                'set_leverage', 'set_margin_mode', 'fetch_my_trades', 'fetch_tickers', 'fetch_ohlcv')
+# [v96] каналы: приватный (exchange_priv) — операции entry/sl_*/close_order/cancel/positions/equity/setup/my_trades; публичный (exchange) —
+# tickers и ohlcv. fetch_ohlcv пишется выборочно (каждый 10-й вызов), иначе ~200 строк за цикл.
+_LAT_PUBLIC_OPS = ('tickers', 'ohlcv')
+_LAT_SAMPLE = {'fetch_ohlcv': 10}
+_lat_sample_n: dict = {}
+_rest_priv_n = 0               # REST-запросов приватного экземпляра (часть _rest_n)
 
 
 def _lat_qlen(ex) -> int:
@@ -1041,6 +1085,8 @@ def _lat_classify(name: str, a: tuple, kw: dict):
             return 'my_trades', (a[0] if a else kw.get('symbol', ''))
         if name == 'fetch_tickers':
             return 'tickers', 'ALL'
+        if name == 'fetch_ohlcv':
+            return 'ohlcv', (a[0] if a else kw.get('symbol', ''))
     except Exception:
         pass
     return name, ''
@@ -1066,7 +1112,7 @@ def _lat_note(op: str, sym: str, dur: float, ok: bool, q: int):
                 lat_flush()
                 if w > LAT_ALERT_SEC:
                     asyncio.create_task(tg(
-                        f'⚠️ <b>Окно без стопа {w:.1f} с</b> ({sym}): вход подтверждён биржей, SL подтверждён через '
+                        f'⚠️ <b>Окно без стопа {w:.1f} с</b> ({esc(sym)}): вход подтверждён биржей, SL подтверждён через '
                         f'{w:.1f} с (порог {LAT_ALERT_SEC:.0f} с). Информационный алерт, действий с позицией нет.'))
             else:
                 op = 'sl_place' if (sym in _lat_pending_entry) else 'sl_move'
@@ -1080,7 +1126,13 @@ def _lat_note(op: str, sym: str, dur: float, ok: bool, q: int):
 
 
 def _lat_make(ex, name: str, orig):
+    every = _LAT_SAMPLE.get(name, 1)
+
     async def wrapper(*a, **kw):
+        if every > 1:                       # выборочный замер (публичный fetch_ohlcv): вызов проходит как есть
+            _lat_sample_n[name] = _lat_sample_n.get(name, 0) + 1
+            if _lat_sample_n[name] % every:
+                return await orig(*a, **kw)
         op, sym = _lat_classify(name, a, kw)
         q = _lat_qlen(ex)
         t0 = time.time()
@@ -1106,8 +1158,10 @@ def lat_install(ex=None):
     _orig_fetch = ex.fetch
 
     async def _counted_fetch(*a, **kw):
-        global _rest_n
+        global _rest_n, _rest_priv_n
         _rest_n += 1
+        if ex is exchange_priv:
+            _rest_priv_n += 1
         return await _orig_fetch(*a, **kw)
     ex.fetch = _counted_fetch
     ex._lat_installed = True
@@ -1138,18 +1192,22 @@ def _pct(vals, p):
 
 
 def lat_report_text(hours: float = 24) -> str:
-    """По каждой операции за период: n, медиана, p95, максимум; окно без стопа: n, медиана, максимум."""
+    """По каждой операции за период: n, медиана, p95, максимум; окно без стопа: n, медиана, максимум. [v96] Отдельно ПРИВАТНЫЙ канал
+    (exchange_priv) и ПУБЛИЧНЫЙ (exchange) + глубина очереди throttler (медиана/максимум в момент вызова)."""
     lat_flush()
     try:
         con = sqlite3.connect(TRADES_DB)
-        rows = con.execute("SELECT op, dur, ok FROM latency_log WHERE ts >= ?",
+        rows = con.execute("SELECT op, dur, ok, qlen FROM latency_log WHERE ts >= ?",
                            (time.time() - hours * 3600,)).fetchall()
         con.close()
     except Exception as _e:
-        return f'⏱ Латентность: ошибка чтения ({_e})'
+        return f'⏱ Латентность: ошибка чтения ({esc(_e)})'
     by: dict = {}
-    for op, dur, ok in rows:
+    qs: dict = {}
+    for op, dur, ok, ql in rows:
         by.setdefault(op, []).append((dur, ok))
+        if op != 'unprotected_window' and ql is not None and ql >= 0:
+            qs.setdefault('pub' if op in _LAT_PUBLIC_OPS else 'priv', []).append(ql)
     lines = [f'⏱ <b>Латентность BingX за {hours:g} ч</b> (с, от вызова до ответа)']
     w = [d for d, _ in by.get('unprotected_window', [])]
     if w:
@@ -1157,12 +1215,20 @@ def lat_report_text(hours: float = 24) -> str:
                      f'(порог алерта {LAT_ALERT_SEC:.0f})')
     else:
         lines.append('Окно без стопа: нет замеров')
-    for op in sorted(k for k in by if k != 'unprotected_window'):
-        d = [x for x, _ in by[op]]
-        err = sum(1 for _, ok in by[op] if not ok)
-        lines.append(f'{op}: n={len(d)} | мед {statistics.median(d):.2f} | p95 {_pct(d, 95):.2f} | макс {max(d):.2f}'
-                     + (f' | ошибок {err}' if err else ''))
-    lines.append(f'REST-запросов процесса всего: {_rest_n}')
+
+    def block(title, ops, key):
+        lines.append(title + (f' | очередь throttler: мед {statistics.median(qs[key]):.0f}, макс {max(qs[key])}' if qs.get(key) else ''))
+        if not ops:
+            lines.append('  нет замеров')
+        for op in ops:
+            d = [x for x, _ in by[op]]
+            err = sum(1 for _, ok in by[op] if not ok)
+            lines.append(f'  {op}: n={len(d)} | мед {statistics.median(d):.2f} | p95 {_pct(d, 95):.2f} | макс {max(d):.2f}'
+                         + (f' | ошибок {err}' if err else ''))
+    ops_all = sorted(k for k in by if k != 'unprotected_window')
+    block('🔒 <b>Приватный канал</b> (exchange_priv: эквити, позиции, ордера, SL)', [o for o in ops_all if o not in _LAT_PUBLIC_OPS], 'priv')
+    block('🌐 <b>Публичный канал</b> (exchange: рыночные данные; ohlcv — выборка каждого 10-го вызова)', [o for o in ops_all if o in _LAT_PUBLIC_OPS], 'pub')
+    lines.append(f'REST-запросов процесса всего: {_rest_n} (из них приватный канал: {_rest_priv_n})')
     return '\n'.join(lines)
 
 
@@ -2183,6 +2249,10 @@ async def get_markets() -> dict:
         return markets_cache
     markets_cache = await exchange.load_markets()
     markets_ts    = time.time()
+    try:
+        exchange_priv.set_markets(exchange.markets, exchange.currencies)   # [v96] без собственного load_markets (лишний запрос в очереди)
+    except Exception as _me:
+        logging.warning(f'[PRIV] set_markets: {type(_me).__name__}: {_me}')
     logging.info(f"🗺 Markets cache updated: {len(markets_cache)} symbols")
     return markets_cache
 
@@ -3408,7 +3478,7 @@ async def execute(sym: str, sig: dict, strategy: str,
 
     # Баланс
     try:
-        bal       = await exchange.fetch_balance()
+        bal       = await exchange_priv.fetch_balance()
         free_usdt = float(bal.get('USDT', {}).get('free', 0))
     except Exception as e:
         logging.error(f"Balance error: {e}")
@@ -3517,15 +3587,15 @@ async def execute(sym: str, sig: dict, strategy: str,
     sl_side    = 'sell'  if mode == 'Long'  else 'buy'
 
     try:
-        await exchange.set_margin_mode('isolated', sym)
+        await exchange_priv.set_margin_mode('isolated', sym)
         # BingX hedge mode: leverage нужно установить для каждой стороны
-        await exchange.set_leverage(LEVERAGE, sym,
+        await exchange_priv.set_leverage(LEVERAGE, sym,
             params={'side': pos_side})
-        await exchange.create_order(
+        await exchange_priv.create_order(
             sym, 'market', order_side, qty,
             params={'positionSide': pos_side}
         )
-        sl_ord = await exchange.create_order(
+        sl_ord = await exchange_priv.create_order(
             sym, 'STOP_MARKET', sl_side, qty,
             params={'positionSide': pos_side,
                     'stopPrice': round(sl, 8),
@@ -3607,7 +3677,7 @@ async def execute(sym: str, sig: dict, strategy: str,
     wknd = ' (Weekend ½)' if is_weekend() else ''
     rr = abs(tp - price) / abs(price - sl)
     msg = (
-        f"{'🟢' if mode=='Long' else '🔴'} <b>[{strategy}] {sym}</b> — {mode}{wknd}\n"
+        f"{'🟢' if mode=='Long' else '🔴'} <b>[{strategy}] {esc(sym)}</b> — {mode}{wknd}\n"
         f"Цена: <code>{price:.6f}</code>\n"
         f"SL: <code>{sl:.6f}</code>  TP: <code>{tp:.6f}</code>\n"
         # [v39] Qty/Notional/Риск — от РЕАЛЬНОГО округлённого объёма (= биржа)
@@ -3670,10 +3740,10 @@ async def _close_trail_impossible(pos: dict, sym: str, strategy: str,
     try:
         if pos.get('sl_order_id'):
             try:
-                await exchange.cancel_order(pos['sl_order_id'], sym)
+                await exchange_priv.cancel_order(pos['sl_order_id'], sym)
             except Exception:
                 pass  # ордер мог уже не существовать (см. "order not exist") — не критично
-        await exchange.create_order(
+        await exchange_priv.create_order(
             sym, 'market', sl_side, qty,
             params={'positionSide': pos_side, 'reduceOnly': True}
         )
@@ -3705,7 +3775,7 @@ async def monitor_all():
 
     syms = list({p['symbol'] for p in all_pos})
     try:
-        pos_raw = await exchange.fetch_positions(syms)
+        pos_raw = await exchange_priv.fetch_positions(syms)
         tickers = await exchange.fetch_tickers(syms)
     except Exception as e:
         logging.error(f"Monitor fetch error: {e}")
@@ -3769,12 +3839,12 @@ async def monitor_all():
                     hit = curr_p >= pos['current_sl']
                 if hit:
                     try:
-                        await exchange.create_order(
+                        await exchange_priv.create_order(
                             sym, 'market', sl_side, real_qty,
                             params={'positionSide': pos_side, 'reduceOnly': True})
                         if pos.get('sl_order_id'):
                             try:
-                                await exchange.cancel_order(pos['sl_order_id'], sym)
+                                await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                             except Exception:
                                 pass
                         pnl_f = ((curr_p - entry) / entry if is_long
@@ -3787,7 +3857,7 @@ async def monitor_all():
                         except Exception:
                             dur_m = 0
                         net_u = pos.get('initial_qty', 0) * entry * (pnl_f/100) * LEVERAGE
-                        await tg(f"🚀 <b>[{pos.get('strategy')}] {sym}</b> трейл-выход "
+                        await tg(f"🚀 <b>[{pos.get('strategy')}] {esc(sym)}</b> трейл-выход "
                                  f"<code>{curr_p:.6f}</code>  P&L: {pnl_f:+.2f}%")
                         # [v73] бета: движение BTC за время сделки (§2.14)
                         pos['btc_move_pct'] = await _btc_move_pct(float(pos.get('btc_entry_price', 0) or 0))
@@ -3809,13 +3879,13 @@ async def monitor_all():
                 )
                 try:
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                    await exchange.create_order(
+                        await exchange_priv.cancel_order(pos['sl_order_id'], sym)
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, real_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
                     await tg(
-                        f'👻 <b>[{strategy}] {sym}</b>: ghost position закрыта\n'
+                        f'👻 <b>[{strategy}] {esc(sym)}</b>: ghost position закрыта\n'
                         f'Остаток: {pos_value_usdt:.4f} USDT — слишком мал для SL ордера'
                     )
                 except Exception as _ge:
@@ -3852,10 +3922,10 @@ async def monitor_all():
                 try:
                     if pos.get('sl_order_id'):
                         try:
-                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                            await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                         except Exception:
                             pass  # SL уже мог быть снят/исполнен — не блокируем закрытие
-                    await exchange.create_order(
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, real_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
@@ -3869,7 +3939,7 @@ async def monitor_all():
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
-                        f'⏰ [{strategy}] {sym}: жёсткий потолок {MAX_TRADE_MIN_HARD}мин — закрыто по рынку\n'
+                        f'⏰ [{strategy}] {esc(sym)}: жёсткий потолок {MAX_TRADE_MIN_HARD}мин — закрыто по рынку\n'
                         f'Длительность: {dur_min:.0f}мин | PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
                     )
                 except Exception as _he:
@@ -3889,8 +3959,8 @@ async def monitor_all():
                 )
                 try:
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                    await exchange.create_order(
+                        await exchange_priv.cancel_order(pos['sl_order_id'], sym)
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, real_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
@@ -3905,7 +3975,7 @@ async def monitor_all():
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
-                        f'⏰ <b>[SMC] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
+                        f'⏰ <b>[SMC] {esc(sym)}</b>: smart-timeout {dur_min:.0f}мин\n'
                         f'Сделка не отработала | PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
                     )
                 except Exception as _te:
@@ -3927,8 +3997,8 @@ async def monitor_all():
                 )
                 try:
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                    await exchange.create_order(
+                        await exchange_priv.cancel_order(pos['sl_order_id'], sym)
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, real_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
@@ -3941,7 +4011,7 @@ async def monitor_all():
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, _sa_mfe_pct, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
-                        f'⏰ <b>[SA] {sym}</b>: smart-timeout {dur_min:.0f}мин\n'
+                        f'⏰ <b>[SA] {esc(sym)}</b>: smart-timeout {dur_min:.0f}мин\n'
                         f'MFE {_sa_mfe_pct:.2f}% — возврата к VWAP нет | '
                         f'PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
                     )
@@ -3956,8 +4026,8 @@ async def monitor_all():
                 )
                 try:
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                    await exchange.create_order(
+                        await exchange_priv.cancel_order(pos['sl_order_id'], sym)
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, real_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
@@ -3972,7 +4042,7 @@ async def monitor_all():
                     log_trade(pos, curr_p, pnl * LEVERAGE, _to_net, mfe_t, mae_t,
                               int(dur_min), 'Timeout')
                     await tg(
-                        f'⏰ <b>[{strategy}] {sym}</b>: таймаут {dur_min:.0f}мин\n'
+                        f'⏰ <b>[{strategy}] {esc(sym)}</b>: таймаут {dur_min:.0f}мин\n'
                         f'Закрыто рыночным | PnL: {pnl:+.2f}% ({_to_net:+.2f} USDT)'
                     )
                 except Exception as _te:
@@ -3992,8 +4062,8 @@ async def monitor_all():
                 new_sl = entry * 1.0015 if is_long else entry * 0.9985  # 0.15% > 2×fee
                 try:
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
-                    sl_ord = await exchange.create_order(
+                        await exchange_priv.cancel_order(pos['sl_order_id'], sym)
+                    sl_ord = await exchange_priv.create_order(
                         sym, 'STOP_MARKET', sl_side, real_qty,
                         params={'positionSide': pos_side,
                                 'stopPrice': round(new_sl, 8),
@@ -4003,7 +4073,7 @@ async def monitor_all():
                                 'sl_order_id': sl_ord['id'],
                                 'be_moved': True})
                     save_all()
-                    await tg(f"🛡 <b>[{strategy}] {sym}</b>: SL → БУ "
+                    await tg(f"🛡 <b>[{strategy}] {esc(sym)}</b>: SL → БУ "
                              f"<code>{new_sl:.6f}</code>  P&L: +{pnl:.2f}%")
                 except Exception as e:
                     logging.error(f"BE error {sym}: {e}")
@@ -4035,8 +4105,8 @@ async def monitor_all():
                     be_price = entry * (1 + sl_dist_pct/100 * 0.2) if is_long else entry * (1 - sl_dist_pct/100 * 0.2)
                     try:
                         if pos.get('sl_order_id'):
-                            await exchange.cancel_order(pos['sl_order_id'], sym)
-                        sl_ord = await exchange.create_order(
+                            await exchange_priv.cancel_order(pos['sl_order_id'], sym)
+                        sl_ord = await exchange_priv.create_order(
                             sym, 'STOP_MARKET', sl_side, real_qty,
                             params={'positionSide': pos_side,
                                     'stopPrice': round(be_price, 8),
@@ -4052,11 +4122,11 @@ async def monitor_all():
                         pos['sl_on_exchange'] = False
                         logging.error(f'{sym}: TP50 (мелкая поз) SL НЕ переставлен — '
                                       f'позиция без БУ, таймаут остаётся активен: {_e}')
-                        await tg(f"🚨 <b>[{strategy}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
+                        await tg(f"🚨 <b>[{strategy}] {esc(sym)}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
                     save_all()
                     return True  # [FIX] continue→return (мы в функции, не в цикле)
                 try:
-                    await exchange.create_order(
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, close_qty,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
@@ -4071,9 +4141,9 @@ async def monitor_all():
                 be_after_tp50 = entry * 1.0015 if is_long else entry * 0.9985
                 try:
                     if pos.get('sl_order_id'):
-                        await exchange.cancel_order(pos['sl_order_id'], sym)
+                        await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                     # [SA-EXIT] БУ хвоста с учётом 2×комиссии (голый entry = минус на фи)
-                    sl_ord = await exchange.create_order(
+                    sl_ord = await exchange_priv.create_order(
                         sym, 'STOP_MARKET', sl_side, remain,
                         params={'positionSide': pos_side,
                                 'stopPrice': round(be_after_tp50, 8),
@@ -4088,7 +4158,7 @@ async def monitor_all():
                                 'current_sl': be_after_tp50,  # [SA-EXIT] БУ ровно в момент TP50
                                 'sl_on_exchange': True})
                     save_all()
-                    await tg(f"💰 <b>[{strategy}] {sym}</b>: TP50% зафиксирован "
+                    await tg(f"💰 <b>[{strategy}] {esc(sym)}</b>: TP50% зафиксирован "
                              f"P&L: +{pnl:.2f}% | {tp50_raw - tp50_fee:+.2f} USDT")
                 except Exception as e:
                     # Частичное закрытие УЖЕ прошло на бирже (позиция физически
@@ -4098,7 +4168,7 @@ async def monitor_all():
                     save_all()
                     logging.error(f"[{strategy}] {sym}: SL НЕ переставлен после TP50 close! "
                                   f"Позиция уменьшена на бирже, БУ не подтверждён: {e}")
-                    await tg(f"🚨 <b>[{strategy}] {sym}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
+                    await tg(f"🚨 <b>[{strategy}] {esc(sym)}</b>: SL НЕ переставлен после TP50 — позиция без БУ!")
 
             # ── [SA-FRONTRUN v38] Защитный БУ при недоходе до VWAP ──
             # Если цена прошла >=80% пути к TP, но не коснулась его — переводим
@@ -4117,9 +4187,9 @@ async def monitor_all():
                         if better:
                             try:
                                 if pos.get('sl_order_id'):
-                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                    await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                                 _q = float(pos.get('current_qty', real_qty))
-                                sl_ord = await exchange.create_order(
+                                sl_ord = await exchange_priv.create_order(
                                     sym, 'STOP_MARKET', sl_side, _q,
                                     params={'positionSide': pos_side,
                                             'stopPrice': round(be_price, 8),
@@ -4129,7 +4199,7 @@ async def monitor_all():
                                             'be_moved': True,
                                             'sl_on_exchange': True})  # [v56]
                                 save_all()
-                                await tg(f"🛡 <b>[SA] {sym}</b>: фронтран "
+                                await tg(f"🛡 <b>[SA] {esc(sym)}</b>: фронтран "
                                          f"{peak*100:.0f}% пути к VWAP — SL→БУ "
                                          f"<code>{be_price:.6f}</code>")
                             except Exception as _fe:
@@ -4160,10 +4230,10 @@ async def monitor_all():
                         try:
                             if pos.get('sl_order_id'):
                                 try:
-                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                    await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                                 except Exception:
                                     pass  # [v67] ордер мог уже не существовать — не блокируем перевыпуск
-                            sl_ord = await exchange.create_order(
+                            sl_ord = await exchange_priv.create_order(
                                 sym, 'STOP_MARKET', sl_side, run_qty_p,
                                 params={'positionSide': pos_side,
                                         'stopPrice': round(new_trail, 8),
@@ -4208,10 +4278,10 @@ async def monitor_all():
                         try:
                             if pos.get('sl_order_id'):
                                 try:
-                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                    await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                                 except Exception:
                                     pass
-                            sl_ord = await exchange.create_order(
+                            sl_ord = await exchange_priv.create_order(
                                 sym, 'STOP_MARKET', sl_side, full_qty_p,
                                 params={'positionSide': pos_side,
                                         'stopPrice': round(trail_sl, 8),
@@ -4229,16 +4299,16 @@ async def monitor_all():
                     save_all()
                     return True
                 try:
-                    await exchange.create_order(
+                    await exchange_priv.create_order(
                         sym, 'market', sl_side, close_qty_p,
                         params={'positionSide': pos_side, 'reduceOnly': True}
                     )
                     if pos.get('sl_order_id'):
                         try:
-                            await exchange.cancel_order(pos['sl_order_id'], sym)
+                            await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                         except Exception:
                             pass  # [v67] ордер мог уже не существовать — не блокируем перевыпуск
-                    sl_ord = await exchange.create_order(
+                    sl_ord = await exchange_priv.create_order(
                         sym, 'STOP_MARKET', sl_side, remain_p,
                         params={'positionSide': pos_side,
                                 'stopPrice': round(trail_sl, 8),
@@ -4254,7 +4324,7 @@ async def monitor_all():
                                 'sl_order_id': sl_ord['id'],
                                 'current_sl': trail_sl})
                     save_all()
-                    await tg(f"🏆 <b>[{strategy}] {sym}</b>: TP100 взят! "
+                    await tg(f"🏆 <b>[{strategy}] {esc(sym)}</b>: TP100 взят! "
                              f"Трейлинг включён P&L: +{pnl:.2f}% | {tp100_net:+.2f} USDT")
                 except Exception as e:
                     _log_throttled(sym, 'tp100_error', f"TP100 error {sym}: {e}", 'error')
@@ -4277,10 +4347,10 @@ async def monitor_all():
                         try:
                             if pos.get('sl_order_id'):
                                 try:
-                                    await exchange.cancel_order(pos['sl_order_id'], sym)
+                                    await exchange_priv.cancel_order(pos['sl_order_id'], sym)
                                 except Exception:
                                     pass
-                            sl_ord = await exchange.create_order(
+                            sl_ord = await exchange_priv.create_order(
                                 sym, 'STOP_MARKET', sl_side, run_qty_p,
                                 params={'positionSide': pos_side,
                                         'stopPrice': round(new_trail, 8),
@@ -4305,7 +4375,7 @@ async def monitor_all():
 
             exit_p = float(pos.get('current_sl', curr_p))
             try:
-                trades = await exchange.fetch_my_trades(sym, limit=5)
+                trades = await exchange_priv.fetch_my_trades(sym, limit=5)
                 if trades:
                     open_ts = int(
                         datetime.fromisoformat(pos['open_time']).timestamp() * 1000
@@ -4377,7 +4447,7 @@ async def monitor_all():
                           else ' (BE)' if is_be
                           else f' (SL{_tp_mark})')
             await tg(
-                f"{'✅' if is_win else ('⚖️' if is_be else '🛑')} <b>[{strategy}] {sym}</b> закрыта{result_tag}\n"
+                f"{'✅' if is_win else ('⚖️' if is_be else '🛑')} <b>[{strategy}] {esc(sym)}</b> закрыта{result_tag}\n"
                 f"PnL: <code>{pnl_pct:+.2f}%</code> | Net: <code>{net_pnl:+.2f} USDT</code>\n"
                 f"📈 MFE {mfe_pct:.2f}% | 📉 MAE {mae_pct:.2f}% | ⏱ {dur_min}мин\n"
                 f"Вход: {entry:.6f} | Выход: {exit_p:.6f}\n"
@@ -5668,7 +5738,7 @@ async def send_daily_report():
     wrate  = wins / trades * 100 if trades > 0 else 0
 
     try:
-        bal = await exchange.fetch_balance()
+        bal = await exchange_priv.fetch_balance()
         bal_usdt = float(bal.get('USDT', {}).get('total', 0))
     except:
         bal_usdt = daily_stats.get('start_balance', 0)
@@ -5714,7 +5784,7 @@ async def daily_reset():
 
     # Сброс
     try:
-        bal = await exchange.fetch_balance()
+        bal = await exchange_priv.fetch_balance()
         new_start = float(bal.get('USDT', {}).get('total', 0))
     except:
         new_start = daily_stats.get('start_balance', 0.0)
@@ -5765,7 +5835,7 @@ async def sync_positions_with_exchange() -> int:
     removed = 0
     try:
         # Получаем все реально открытые позиции на BingX
-        real_positions = await exchange.fetch_positions()
+        real_positions = await exchange_priv.fetch_positions()
         # Множество символов с реально открытыми позициями
         # Строим set (символ, сторона) — BCH Short ≠ BCH Long!
         real_pos_set: set = set()
@@ -6149,7 +6219,7 @@ async def health_alert_tick(now: float = None) -> list:
             _health_last_alert[typ] = now
             _write_anomaly('critical', f'HEALTH-{typ}', text)
             logging.info(f'[HEALTH] алерт {typ}: {text}')
-            await tg(f'🚨 <b>ДАННЫЕ/СЕТЬ</b>: {text}\nПовтор этого типа — не чаще раза в час. Диагностика: /net_probe, сводка: /status.')
+            await tg(f'🚨 <b>ДАННЫЕ/СЕТЬ</b>: {esc(text)}\nПовтор этого типа — не чаще раза в час. Диагностика: /net_probe, сводка: /status.')
             sent.append(typ)
     except Exception as _e:
         logging.debug(f'[HEALTH] tick fail: {_e}')
@@ -6358,7 +6428,7 @@ async def build_daily_digest(date_str: str = None):
     uptime_h = (time.time() - _PROCESS_START_TS) / 3600
     lines.append(f'Аптайм процесса: {uptime_h:.1f}ч')
     try:
-        bal = await exchange.fetch_balance()
+        bal = await exchange_priv.fetch_balance()
         bal_bingx = float(bal.get('USDT', {}).get('total', 0))
         lines.append(f'Баланс BingX: {bal_bingx:.2f} USDT')
     except Exception as e:
@@ -6525,7 +6595,7 @@ async def send_digest_now(date_str: str = None):
     """Строит и доставляет дайджест: сначала вердикт текстом (мгновенно
     видно, нужен ли разбор), затем сам файл документом."""
     fpath, verdict = await build_daily_digest(date_str)
-    await tg(verdict)
+    await tg(esc(verdict))   # [v96] вердикт — обычный текст (в нём тексты ошибок), разметки нет
     if fpath:
         await tg_send_document(fpath, caption=f'Дайджест {date_str or datetime.now(timezone.utc).date().isoformat()}')
     else:
@@ -6641,8 +6711,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-10-25-v95'
+CODE_VERSION = '2026-10-26-v96'
 CHANGELOG = [
+    ('2026-10-26-v96', 'ОТДЕЛЬНЫЙ КАНАЛ ПРИВАТНЫХ ВЫЗОВОВ + НЕИЗВЕСТНЫЕ КОМАНДЫ + HTML-РАЗМЕТКА TELEGRAM (торговая логика, сигналы, контракты, исследования, breaker-ы, bybit_worker.py не менялись). Прод /net_probe 2026-10-24 (v94): прямой aiohttp к BingX 0.2 с (публичный и приватный, HTTP 200), через ccxt приватный fetch_balance 63/120(TimeoutError)/47 с при очереди throttler 44–62 и 3 с при пустой очереди — вердикт «ОЧЕРЕДЬ ПЕРЕГРУЖЕНА»: сканеры дают 90–200 REST за цикл при ~1 запросе/с, приватные вызовы (cost 3) ждали за ними до 2 минут, что делало breaker-ы v76/v77 и установку SL после входа ненадёжными. ПРАВКА 1: второй экземпляр ccxt bingx exchange_priv (те же ключи/options, свой throttler, рынки копируются set_markets из общего) — через него ВСЕ приватные вызовы: fetch_balance (эквити/DD, исполнение, отчёты), fetch_positions, create_order, cancel_order (SL/TP/выходы), set_leverage, set_margin_mode, fetch_my_trades; рыночные данные (fetch_ohlcv/tickers/ticker/funding, markets) — на общем exchange; суммарный темп приватных запросов не растёт (rateLimit 1000, cost 3 — тот же), растёт только независимость от очереди сканеров; обёртки LAT (v77) на обоих экземплярах, /lat_status — отдельно приватный и публичный канал с глубиной очереди (публичный fetch_ohlcv — выборка каждого 10-го вызова); /net_probe — замер через exchange_priv + сравнение через общий канал, вердикт «ПРИВАТНЫЙ КАНАЛ В НОРМЕ / ОЧЕРЕДЬ ПЕРЕГРУЖЕНА только у публичного». ПРАВКА 2: любая команда без обработчика (начинается с «/», не адресована другому боту через @) — ответ «Неизвестная команда <cmd>. Версия бота: <CODE_VERSION>. /help — список команд». ПРАВКА 3: esc() — экранирование &, <, > во всех динамических частях сообщений HTML (тексты ошибок, символы в уведомлениях о сделках, пользовательский ввод, вывод /net_probe, пример ошибки в тревоге, вердикт дайджеста); /csv: причина «незакрытого <code>» — tg() режет длинное сообщение по строкам, а <code> с CSV охватывал десятки строк (первый кусок оставался без </code> → 400 → запасной путь без parse_mode); теперь каждый кусок — свой <code>…</code> с экранированием (_code_blocks); запасной путь без parse_mode сохранён. Тесты: tests/test_v96_channels.py (30 проверок), в tests/test_v94_health.py заглушки переведены на exchange_priv'),
     ('2026-10-25-v95', '/edge_audit — КАЛИБРОВКА ИЗМЕРИТЕЛЬНОЙ СИСТЕМЫ (R0) И ПРОВЕРКА SMC2 НА ИСТОРИИ 2020–2026 (R1), исключение из правила остановки §2.32.8 (BOT_SPEC §2.37, пре-коммит отдельным коммитом ДО кода); живая логика, breaker-ы, SMC_LIVE, SMC2_ENABLED (false), контракты, прежние исследования, bybit_worker.py не менялись. research_edge.py: R0 — по 2000 случайных входов на символ (16 символов H-XS, SEED=20261024+номер символа), SL 1.0×ATR14 [0.3%;3%], TP 2R, таймаут 16 баров, семантика _shadow_exit_eval, mean R до и после издержек, t; |t|>=3 (до издержек) — СТОП «ошибка измерения», отчёт заканчивается на R0. R1 — ровно _smc2_eval бота (передаётся аргументом; единственная правка — необязательный параметр vol_mult, в боте не используется) в воспроизведённом цикле scan_smc2 (окно 63 закрытых бара, MKT при первом появлении события, RT при первом окне filled, дедуп 2 ч), варианты V0 (объём пробоя, как shadow) / V1 (без фильтра) / V2 (объём предыдущей свечи, как старый SMC) / F (V0 + фандинг: шорт при >0, лонг при <0, архив fundingRate; «непроверяем» при покрытии <90%), 16 ячеек, критерии t>=3.0 по дневному портфелю на OOS с 2025-01-01, PF net>=1.3, OOS>=0.5×IS, n>=200, дней>=100, mean R>0 в месяцы роста И падения BTC; разбивка по годам и месяцам BTC; сверка с shadow SMC2 (справочно). Данные: кэш data.binance.vision + догрузка (research_vision), дневной хвост текущего месяца, ставки фандинга. Решение: ячейка прошла — отдельный пре-коммит shadow-форварда; ни одна — исследования на OHLCV/потоке ордеров закрыты окончательно. Тесты: tests/test_v95_edge.py'),
     ('2026-10-24-v94', 'ПРОД-ИНЦИДЕНТ «СЛЕПОТА ДАННЫХ» (торговая логика, контракты, исследования, breaker-ы, SMC_LIVE, bybit_worker.py не менялись). Прод 2026-10-23: 2060 RequestTimeout на GET user/balance, ctx_fail в 1033 из 1033 циклов SMC, fetch_err PO3 54.4/60 и ORB_RT 15.4/80, дайджест при этом «Аномалий нет». ШАГ 0: по коду ccxt==4.2.14 таймаут HTTP (10 с) считается ПОСЛЕ throttler — RequestTimeout не может быть следствием собственной очереди; /net_probe (фон): DNS open-api.bingx.com, по 5 замеров публичного (тикер) и приватного (баланс) запроса напрямую через aiohttp и через ccxt, глубина очереди, вердикт «сеть недоступна/медленная» / «очередь перегружена» / «отказ BingX (код)»; причина молчания самодиагностики — вердикт дайджеста смотрел только таблицу anomalies, INV-6 ловит лишь точные повторы ERROR, сбой эквити шёл как WARNING. ПРАВКА 1: health_alert_tick — немедленные алерты в Telegram (не чаще раза в час на тип): эквити не получено > 30 мин, ctx_fail > 50% циклов SMC за час, fetch_err > 50% символов у сканера за час, > 100 ошибок одного типа за час; дайджест «⚠️ АНОМАЛИЯ» при > 100 ошибок за сутки или сработавшем условии (раздел «ЗДОРОВЬЕ ДАННЫХ»); /status — строка состояния данных. ПРАВКА 2.3: _fetch_equity — повторы с паузами 5/15/30 с (повторы только если прошлый цикл был успешным, чтобы не растягивать цикл с monitor_all). Правки 2.1 (приоритет очереди) и 2.2 (перенос региона) не делались — решение владельца по вердикту /net_probe; описание переноса — BOT_SPEC §2.36.5. Тесты перенесены в tests/ (tests/README.md)'),
     ('2026-10-16-v93', 'SMC2 ВЫКЛЮЧЕН ПО ДЕФОЛТУ — контракт (А)/(Б) §2.20.2 не выполнен (живая логика, breaker-ы, SMC_LIVE, PO3, ORB_RT, прочие стратегии, bybit_worker.py не менялись). Итог /shadow_analyze 2026-10-16: (А) Long MKT n=133 mean R -0.143 (t -1.67), Long RT n=107 -0.170 (t -1.74), Short MKT n=135 +0.099 (t 1.19, PF 1.47), Short RT n=105 +0.043 (t 0.43) — n>=100 по всем, PF>=1.3/t>=2.5 не достигнуты; (Б) n=264, разность -0.027 (t -0.65) — отвергнут. По правилу §2.32.8 SMC2_ENABLED дефолт false (возврат через ENV SMC2_ENABLED=true); открытые записи SMC2 закрываются штатно (shadow_check), отчётные секции SMC2 оставлены как история'),
@@ -6910,7 +6981,7 @@ async def htf_backtest_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_backtest')
-        await tg(f'❌ /htf_backtest: {type(e).__name__}: {e}')
+        await tg(f'❌ /htf_backtest: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -6930,7 +7001,7 @@ async def htf_backtest_wide_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_backtest_wide')
-        await tg(f'❌ /htf_backtest_wide: {type(e).__name__}: {e}')
+        await tg(f'❌ /htf_backtest_wide: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -6950,7 +7021,7 @@ async def htf_xsmom_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('htf_xsmom')
-        await tg(f'❌ /htf_xsmom: {type(e).__name__}: {e}')
+        await tg(f'❌ /htf_xsmom: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -6971,7 +7042,7 @@ async def wide_stop_test_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('wide_stop_test')
-        await tg(f'❌ /wide_stop_test: {type(e).__name__}: {e}')
+        await tg(f'❌ /wide_stop_test: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -7017,14 +7088,19 @@ async def _np_http_get(session, url: str, headers: dict = None) -> dict:
 
 
 async def _np_ccxt_call(kind: str) -> dict:
-    """Один вызов через ccxt с текущими настройками; глубина очереди throttler ДО вызова."""
-    q = _lat_qlen(exchange)
+    """Один вызов через ccxt с текущими настройками; глубина очереди throttler ДО вызова (того экземпляра, который вызывается).
+    kind: 'pub' — публичный (exchange), 'priv' — приватный через exchange_priv (боевой путь с v96), 'priv_shared' — приватный через ОБЩИЙ
+    exchange (только для сравнения с прежним путём: показывает, как очередь сканеров задерживает подписанные запросы)."""
+    ex = exchange_priv if kind == 'priv' else exchange
+    q = _lat_qlen(ex)
     t0 = time.time()
     try:
         if kind == 'pub':
             await asyncio.wait_for(exchange.fetch_ticker('BTC/USDT:USDT'), 120)
+        elif kind == 'priv':
+            await asyncio.wait_for(exchange_priv.fetch_balance(), 120)
         else:
-            await asyncio.wait_for(exchange.fetch_balance(), 120)
+            await asyncio.wait_for(exchange.fetch_balance(), 120)   # сравнение с прежним путём (общая очередь), НЕ боевой вызов
         return {'dt': time.time() - t0, 'err': None, 'queue': q}
     except Exception as e:
         return {'dt': time.time() - t0, 'err': f'{type(e).__name__}: {e}'[:160], 'queue': q}
@@ -7056,16 +7132,34 @@ def _net_probe_verdict(res: dict) -> str:
         return (f"СЕТЬ МЕДЛЕННАЯ/НЕСТАБИЛЬНАЯ: прямых сбоев {n_fail} из {len(direct)}, "
                 f"медиана ответа {med:.1f} с (порог {NET_PROBE_SLOW:.0f} с)" if med is not None else
                 f"СЕТЬ МЕДЛЕННАЯ/НЕСТАБИЛЬНАЯ: сбоев {n_fail} из {len(direct)}")
-    qmax = max([r.get('queue', -1) for r in ccx] or [-1])
-    ccx_fail = [r for r in ccx if r.get('err')]
-    ccx_med = _np_median([r['dt'] for r in ccx if not r.get('err')])
-    slow = (ccx_med is not None and ccx_med > max(3 * (med or 0), 5.0))
-    if ccx_fail or slow:
-        if qmax >= 10:
-            return (f"ОЧЕРЕДЬ ПЕРЕГРУЖЕНА: прямой запрос быстрый (медиана {med:.1f} с), через ccxt "
-                    f"сбоев {len(ccx_fail)} из {len(ccx)}, медиана {ccx_med if ccx_med is not None else float('nan'):.1f} с, глубина очереди до {qmax}")
-        return (f"СЕТЬ ОК, НО CCXT ПРОБЛЕМНЫЙ: прямой запрос быстрый (медиана {med:.1f} с), через ccxt "
-                f"сбоев {len(ccx_fail)} из {len(ccx)} при малой очереди ({qmax}) — смотреть сессию/настройки ccxt")
+    def chan(recs):
+        fails = [r for r in recs if r.get('err')]
+        cm = _np_median([r['dt'] for r in recs if not r.get('err')])
+        return {'n': len(recs), 'fails': len(fails), 'med': cm, 'qmax': max([r.get('queue', -1) for r in recs] or [-1]),
+                'bad': bool(fails) or (cm is not None and cm > max(3 * (med or 0), 5.0))}
+    pub, priv, shared = chan(res.get('ccxt_pub') or []), chan(res.get('ccxt_priv') or []), chan(res.get('ccxt_priv_shared') or [])
+    allc = chan(ccx)
+
+    def fmt_med(c):
+        return f"{c['med']:.1f}" if c['med'] is not None else 'н/д'
+
+    def overload(c, who):
+        if c['qmax'] >= 10:
+            return (f"ОЧЕРЕДЬ ПЕРЕГРУЖЕНА{who}: прямой запрос быстрый (медиана {med:.1f} с), через ccxt "
+                    f"сбоев {c['fails']} из {c['n']}, медиана {fmt_med(c)} с, глубина очереди до {c['qmax']}")
+        return (f"СЕТЬ ОК, НО CCXT ПРОБЛЕМНЫЙ{who}: прямой запрос быстрый (медиана {med:.1f} с), через ccxt "
+                f"сбоев {c['fails']} из {c['n']} при малой очереди ({c['qmax']}) — смотреть сессию/настройки ccxt")
+    if priv['n']:                                   # [v96] есть замер приватного канала (exchange_priv) — оцениваем его отдельно
+        if priv['bad']:
+            return overload(priv, ' (ПРИВАТНЫЙ КАНАЛ exchange_priv)')
+        extra = (f"; через общий канал приватный запрос — медиана {fmt_med(shared)} с, очередь до {shared['qmax']}" if shared['n'] else '')
+        if pub['bad']:
+            return (f"ПРИВАТНЫЙ КАНАЛ В НОРМЕ (медиана {fmt_med(priv)} с, очередь до {priv['qmax']}); "
+                    f"ОЧЕРЕДЬ ПЕРЕГРУЖЕНА только у публичного канала: сбоев {pub['fails']} из {pub['n']}, "
+                    f"медиана {fmt_med(pub)} с, очередь до {pub['qmax']}" + extra)
+        return f"ДОСТУП В НОРМЕ: прямой запрос медиана {med:.1f} с, приватный ccxt медиана {fmt_med(priv)} с, сбоев нет" + extra
+    if allc['bad']:                                 # прежняя логика (замера приватного канала нет)
+        return overload(allc, '')
     return f"ДОСТУП В НОРМЕ: прямой запрос медиана {med:.1f} с, через ccxt сбоев нет"
 
 
@@ -7075,9 +7169,9 @@ def _np_fmt(recs, title: str) -> str:
     parts = []
     for r in recs:
         if r.get('err'):
-            parts.append(f"{r['dt']:.1f}с ERR {r['err'][:70]}")
+            parts.append(f"{r['dt']:.1f}с ERR {esc(r['err'][:70])}")
         elif 'status' in r:
-            parts.append(f"{r['dt']:.1f}с HTTP {r['status']}" + (f" code {r['api_code']} {r.get('msg', '')[:40]}"
+            parts.append(f"{r['dt']:.1f}с HTTP {r['status']}" + (f" code {r['api_code']} {esc(r.get('msg', '')[:40])}"
                                                                 if r.get('api_code') not in (0, None) else ''))
         else:
             parts.append(f"{r['dt']:.1f}с (очередь {r.get('queue', -1)})")
@@ -7086,10 +7180,11 @@ def _np_fmt(recs, title: str) -> str:
 
 async def net_probe_collect() -> dict:
     """Собирает замеры. Каждый шаг в своём try — наружу исключения не выходят."""
-    res = {'dns': {}, 'direct_pub': [], 'direct_priv': [], 'ccxt_pub': [], 'ccxt_priv': [],
-           'queue_start': -1}
+    res = {'dns': {}, 'direct_pub': [], 'direct_priv': [], 'ccxt_pub': [], 'ccxt_priv': [], 'ccxt_priv_shared': [],
+           'queue_start': -1, 'queue_start_priv': -1}
     try:
         res['queue_start'] = _lat_qlen(exchange)
+        res['queue_start_priv'] = _lat_qlen(exchange_priv)
     except Exception:
         pass
     try:
@@ -7116,21 +7211,24 @@ async def net_probe_collect() -> dict:
     for _ in range(NET_PROBE_N):
         res['ccxt_pub'].append(await _np_ccxt_call('pub'))
     for _ in range(NET_PROBE_N):
-        res['ccxt_priv'].append(await _np_ccxt_call('priv'))
+        res['ccxt_priv'].append(await _np_ccxt_call('priv'))            # [v96] боевой путь: exchange_priv со своей очередью
+    for _ in range(NET_PROBE_N):
+        res['ccxt_priv_shared'].append(await _np_ccxt_call('priv_shared'))   # [v96] для сравнения: тот же вызов через общую очередь
     return res
 
 
 def net_probe_text(res: dict) -> str:
     dns = res.get('dns') or {}
-    lines = ['📡 <b>/net_probe</b> ' + CODE_VERSION,
-             '<b>' + _net_probe_verdict(res) + '</b>',
-             f"DNS {NET_PROBE_HOST}: " + (f"ok {dns.get('dt', 0):.2f}с {','.join(dns.get('ips', []))}"
-                                          if dns.get('ok') else f"ОШИБКА {dns.get('err', '?')}"),
+    lines = ['📡 <b>/net_probe</b> ' + esc(CODE_VERSION),
+             '<b>' + esc(_net_probe_verdict(res)) + '</b>',
+             f"DNS {esc(NET_PROBE_HOST)}: " + (f"ok {dns.get('dt', 0):.2f}с {esc(','.join(dns.get('ips', [])))}"
+                                              if dns.get('ok') else f"ОШИБКА {esc(dns.get('err', '?'))}"),
              _np_fmt(res.get('direct_pub'), 'aiohttp публичный (тикер BTC-USDT)'),
              _np_fmt(res.get('direct_priv'), 'aiohttp приватный (баланс)'),
-             _np_fmt(res.get('ccxt_pub'), 'ccxt публичный (fetch_ticker)'),
-             _np_fmt(res.get('ccxt_priv'), 'ccxt приватный (fetch_balance)'),
-             f"Очередь throttler в начале замера: {res.get('queue_start', -1)} (−1 — недоступно)"]
+             _np_fmt(res.get('ccxt_pub'), 'ccxt публичный (fetch_ticker, общий канал)'),
+             _np_fmt(res.get('ccxt_priv'), 'ccxt приватный через exchange_priv (fetch_balance, боевой путь v96)'),
+             _np_fmt(res.get('ccxt_priv_shared'), 'ccxt приватный через ОБЩИЙ канал (fetch_balance, для сравнения с прежним путём)'),
+             f"Очередь throttler в начале замера: общий канал {res.get('queue_start', -1)}, приватный {res.get('queue_start_priv', -1)} (−1 — недоступно)"]
     return '\n'.join(lines)
 
 
@@ -7140,13 +7238,13 @@ async def net_probe_run():
         return
     _net_probe_running[0] = True
     try:
-        await tg(f'📡 /net_probe запущен (DNS + {NET_PROBE_N} замеров × 4 вида; до ~1–3 мин)…')
+        await tg(f'📡 /net_probe запущен (DNS + {NET_PROBE_N} замеров × 5 видов; до ~2–5 мин)…')
         res = await net_probe_collect()
         await tg(net_probe_text(res))
     except Exception as e:
         logging.exception('net_probe')
         try:
-            await tg(f'❌ /net_probe: {type(e).__name__}: {e}')
+            await tg(f'❌ /net_probe: {esc(type(e).__name__)}: {esc(e)}')
         except Exception:
             pass
     finally:
@@ -7169,7 +7267,7 @@ async def data_probe_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('data_probe')
-        await tg(f'❌ /data_probe: {type(e).__name__}: {e}')
+        await tg(f'❌ /data_probe: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -7188,7 +7286,7 @@ async def of_backtest_run():
         allowed, reasons = research_of.gate(research_probe.last_status(TRADES_DB))
         if not any(allowed.values()):
             await tg('⛔ /of_backtest отказ: ни одна гипотеза не признана «проверяема» последним /data_probe v2.\n'
-                     + '\n'.join(f'{h}: {reasons[h]}' for h in research_of.HYPS))
+                     + '\n'.join(f'{h}: {esc(reasons[h])}' for h in research_of.HYPS))
             return
         universe = research_probe.universe_from_db(TRADES_DB)
         if len(universe) != 16:
@@ -7205,7 +7303,7 @@ async def of_backtest_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('of_backtest')
-        await tg(f'❌ /of_backtest: {type(e).__name__}: {e}')
+        await tg(f'❌ /of_backtest: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -7236,7 +7334,7 @@ async def edge_audit_run():
         await _htf_deliver(text)
     except Exception as e:
         logging.exception('edge_audit')
-        await tg(f'❌ /edge_audit: {type(e).__name__}: {e}')
+        await tg(f'❌ /edge_audit: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
 
@@ -7978,7 +8076,7 @@ async def shadow_recalc_run(dry: bool = False):
         await tg('\n'.join(lines))
     except Exception as _e:
         logging.exception('[RECALC] fail')
-        await tg(f'❌ /shadow_recalc: {_e}')
+        await tg(f'❌ /shadow_recalc: {esc(_e)}')
     finally:
         _shadow_recalc_busy = False
 
@@ -8058,7 +8156,7 @@ async def regime_backfill_run():
         await tg('\n'.join(lines))
     except Exception as _e:
         logging.exception('[REGIME_BF] fail')
-        await tg(f'❌ /regime_backfill: {_e}')
+        await tg(f'❌ /regime_backfill: {esc(_e)}')
     finally:
         _regime_backfill_busy = False
 
@@ -9160,6 +9258,19 @@ def get_trades_stats() -> str:
     )
 
 
+def _is_unknown_command(text: str) -> bool:
+    """[v96] Сообщение — команда (начинается с '/'), адресованная НЕ другому боту (/cmd@other_bot игнорируется)."""
+    t = (text or '').strip()
+    if not t.startswith('/'):
+        return False
+    return '@' not in t.split()[0]
+
+
+def _unknown_command_text(text: str) -> str:
+    cmd = (text or '').strip().lower().split()[0][:40]
+    return f'Неизвестная команда {esc(cmd)}. Версия бота: {esc(CODE_VERSION)}. /help — список команд'
+
+
 async def check_tg_commands():
     """
     Обработка команд управления из Telegram группы.
@@ -9279,21 +9390,19 @@ async def check_tg_commands():
                 await tg('⏸ Торговля остановлена. /reset для возобновления.')
 
             elif cmd == '/csv':
-                # Экспорт всех сделок в CSV для анализа
+                # Экспорт сделок в CSV для анализа. [v96] каждый кусок — со своими <code>…</code> и экранированием (<, >, & в данных)
                 csv_data = export_trades_csv()
-                # Telegram лимит 4096 символов — отправляем частями
-                if len(csv_data) <= 4000:
-                    await tg(f'📊 <b>Все сделки (CSV):</b>\n<code>{csv_data}</code>')
+                lines_csv = csv_data.split('\n')
+                if len(csv_data) <= 3500:
+                    title, body = '📊 <b>Все сделки (CSV):</b>\n', csv_data
+                    tail = ''
                 else:
-                    # Первые 30 строк
-                    lines_csv = csv_data.split('\n')
-                    header = lines_csv[0]
-                    recent = '\n'.join([header] + lines_csv[1:31])
-                    await tg(
-                        f'📊 <b>Последние 30 сделок (CSV):</b>\n'
-                        f'<code>{recent}</code>\n'
-                        f'Всего строк: {len(lines_csv)-1}'
-                    )
+                    title = '📊 <b>Последние 30 сделок (CSV):</b>\n'
+                    body = '\n'.join([lines_csv[0]] + lines_csv[1:31])
+                    tail = f'\nВсего строк: {len(lines_csv) - 1}'
+                blocks = _code_blocks(body)
+                for i, blk in enumerate(blocks):
+                    await tg((title if i == 0 else '') + blk + (tail if i == len(blocks) - 1 else ''))
 
             elif cmd == '/stats':
                 stats_text = get_trades_stats()
@@ -9487,6 +9596,10 @@ async def check_tg_commands():
                     f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})'
                 )
 
+            elif _is_unknown_command(text):
+                # [v96] команда без обработчика — ответ с версией (раньше молчание, было не отличить «не принято» от «не задеплоено»)
+                await tg(_unknown_command_text(text))
+
     except asyncio.TimeoutError:
         pass  # таймаут — не критично
     except Exception as e:
@@ -9527,13 +9640,14 @@ async def main():
     logging.info("=" * 60)
 
     await verify_risk_config_or_exit()   # [v85] недопустимый риск → старт блокируется
-    lat_install()   # [v77] замер задержки живых вызовов биржи + счётчик REST
+    lat_install(exchange)        # [v77] замер задержки вызовов биржи + счётчик REST (публичный канал)
+    lat_install(exchange_priv)   # [v96] то же на приватном канале
     dd_load()   # [v76] база дня по эквити (рестарт в тот же день не обнуляет)
     mdd_load()  # [v77] пик эквити и флаг общего breaker
 
     # Инициализация баланса
     try:
-        bal = await exchange.fetch_balance()
+        bal = await exchange_priv.fetch_balance()
         if daily_stats['start_balance'] == 0.0:
             daily_stats['start_balance'] = float(bal.get('USDT', {}).get('total', 0))
     except:
@@ -9771,6 +9885,7 @@ async def main():
         if http:
             await http.close()
         await exchange.close()
+        await exchange_priv.close()
         await binance.close()
         await bybit.close()
         await mexc.close()
