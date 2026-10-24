@@ -398,7 +398,7 @@ NOW = ms(2026, 10, 25)
 class Discovery(unittest.TestCase):
     def test_variant_fallback(self):
         calls = []
-        fx = M2.Fetcher(fake_duka({'WTICMDUSD'}, 80.0, 1e3, calls=calls), 0)
+        fx = M2.Fetcher(fake_duka({'WTICMDUSD'}, 80.0, 1e3, calls=calls), 0, delays=())
         info = run(M2.discover(fx, 'WTI', NOW))
         self.assertEqual(info['folder'], 'WTICMDUSD')                                          # первый вариант LIGHTCMDUSD — 404, второй найден
         self.assertEqual(info['tried'][0][:2], ('LIGHTCMDUSD', 404))
@@ -408,7 +408,7 @@ class Discovery(unittest.TestCase):
         self.assertEqual(info['order'], 'ocLH')
 
     def test_not_found(self):
-        fx = M2.Fetcher(fake_duka(set(), 80.0, 1e3), 0)
+        fx = M2.Fetcher(fake_duka(set(), 80.0, 1e3), 0, delays=())
         info = run(M2.discover(fx, 'BRENT', NOW))
         self.assertIsNone(info['folder'])
         self.assertFalse(info['ok_format'])
@@ -416,16 +416,84 @@ class Discovery(unittest.TestCase):
 
     def test_cache_does_not_refetch(self):
         calls = []
-        fx = M2.Fetcher(fake_duka({'EURUSD'}, 1.10, 1e5, calls=calls), 0)
+        fx = M2.Fetcher(fake_duka({'EURUSD'}, 1.10, 1e5, calls=calls), 0, delays=())
         run(fx.month('EURUSD', 'BID', 2024, 0))
         run(fx.month('EURUSD', 'BID', 2024, 0))
         self.assertEqual(len(calls), 1)
         self.assertEqual(fx.requests, 1)
 
 
+class Throttling(unittest.TestCase):
+    """Находка прогона v100: Dukascopy отвечает 503 (ограничение частоты); проба записывала это как «нет истории». Теперь — повторы, 404 отделён от сбоев."""
+
+    def flaky(self, fail_first, status=503, calls=None):
+        inner = fake_duka({'EURUSD'}, 1.10, 1e5)
+        seen = {}
+
+        async def fetch(url, params=None, method='GET'):
+            seen[url] = seen.get(url, 0) + 1
+            if calls is not None:
+                calls.append(url)
+            if seen[url] <= fail_first:
+                return {'status': status, 'headers': {}, 'body': b'x' * 107, 'error': ''}
+            return await inner(url, params, method)
+        return fetch
+
+    def test_retry_recovers(self):
+        slept = []
+
+        async def sl(t):
+            slept.append(t)
+        fx = M2.Fetcher(self.flaky(2), 0, delays=(3, 8, 20), sleep=sl)
+        m = run(fx.month('EURUSD', 'BID', 2024, 0))
+        self.assertEqual(m['status'], 200)
+        self.assertIsNotNone(m['p'])
+        self.assertEqual(m['retries'], 2)
+        self.assertFalse(m['transient'])
+        self.assertEqual(slept[:2], [3, 8])
+
+    def test_404_not_retried(self):
+        calls = []
+        fx = M2.Fetcher(fake_duka(set(), 1.0, 1e5, calls=calls), 0, delays=(1, 1, 1))
+        m = run(fx.month('NOPE', 'BID', 2024, 0))
+        self.assertEqual((m['status'], m['transient'], m['retries'], len(calls)), (404, False, 0, 1))
+
+    def test_persistent_503_is_undetermined_not_unfit(self):
+        fx = M2.Fetcher(self.flaky(10 ** 6), 0, delays=(0, 0))
+        info = run(M2.discover(fx, 'EURUSD', NOW))
+        self.assertIsNone(info['folder'])
+        self.assertTrue(info['undetermined'])
+        ok, why = M2.instrument_ok(info)
+        self.assertFalse(ok)
+        self.assertIn('не определён', why)
+
+    def test_depth_with_transient_years_is_undetermined(self):
+        inner = fake_duka({'EURUSD'}, 1.10, 1e5)
+
+        async def fetch(url, params=None, method='GET'):
+            if any(f'/EURUSD/{y}/' in url for y in (2008, 2012, 2016, 2018, 2019)):
+                return {'status': 503, 'headers': {}, 'body': b'', 'error': ''}
+            return await inner(url, params, method)
+        fx = M2.Fetcher(fetch, 0, delays=())
+        info = run(M2.discover(fx, 'EURUSD', NOW))
+        r = run(M2.probe_instrument(fx, info, NOW))
+        self.assertEqual(r['depth_unknown'], [2008, 2012, 2016, 2018, 2019])
+        self.assertEqual(r['earliest_year'], 2020)
+        ok, why = M2.instrument_ok(r)
+        self.assertFalse(ok)
+        self.assertIn('не определено', why)
+        self.assertNotIn('история с 2020 (>', why)
+
+    def test_report_marks_undetermined(self):
+        fx = M2.Fetcher(self.flaky(10 ** 6), 0, delays=())
+        info = run(M2.discover(fx, 'EURUSD', NOW))
+        txt = M2.build_report2({'error': 'x', 'elapsed_s': 1}, {'EURUSD': info}, {}, {}, {}, NOW, 100.0, 5)
+        self.assertIn('НЕ ОПРЕДЕЛЁН (сбои, не 404)', txt)
+
+
 class InstrumentFlow(unittest.TestCase):
     def setUp(self):
-        self.fx = M2.Fetcher(fake_duka({'EURUSD', 'XAUUSD'}, {'EURUSD': 1.10, 'XAUUSD': 1900.0}, 1e5), 0)
+        self.fx = M2.Fetcher(fake_duka({'EURUSD', 'XAUUSD'}, {'EURUSD': 1.10, 'XAUUSD': 1900.0}, 1e5), 0, delays=())
 
     def test_probe_instrument(self):
         # EURUSD: масштаб 1e5 ⇒ цена 1.10 в диапазоне FX
@@ -494,7 +562,7 @@ class Proposal(unittest.TestCase):
 
 class Report(unittest.TestCase):
     def test_report_contains_all_sections(self):
-        fx = M2.Fetcher(fake_duka({'EURUSD', 'XAUUSD'}, {'EURUSD': 1.10, 'XAUUSD': 1900.0}, 1e5), 0)
+        fx = M2.Fetcher(fake_duka({'EURUSD', 'XAUUSD'}, {'EURUSD': 1.10, 'XAUUSD': 1900.0}, 1e5), 0, delays=())
         infos = {k: run(M2.discover(fx, k, NOW)) for k in M2.TARGETS}
         instruments = {k: (run(M2.probe_instrument(fx, i, NOW)) if i['folder'] else i) for k, i in infos.items()}
         tz = run(M2.probe_tz(fx, infos))

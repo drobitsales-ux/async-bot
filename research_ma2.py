@@ -49,6 +49,7 @@ SPREAD_SAMPLES = ((2021, 5), (2023, 1))           # (год, month0) — плю�
 ACTIVE_HOURS = range(7, 21)                       # 07:00–20:59 UTC в будни — «активные» часы
 STUB_BARS = 4                                     # дневной бар из < 4 живых часовых баров — «обрубок»
 RUN_MIN = 12                                      # серия из ≥ 12 подряд идущих плоских часовых баров — закрытие рынка (правило исключения)
+RETRY_DELAYS = (3, 8, 20, 45)                    # секунды между повторами при временных сбоях (503/429/5xx/сеть) Dukascopy
 DAYS_RANGE = (250, 262)                           # ожидаемое число дневных баров в год (~252–260)
 BINGX_BOOK = {'золото': 'NCCOGOLD2USD', 'серебро': 'NCCOXAG2USD', 'платина': 'NCCOXPT2USD', 'палладий': 'NCCOPALLADIUM2USD', 'Brent': 'NCCO1OILBRENT2USD',
               'WTI': 'NCCO1OILWTI2USD', 'газ': 'NCCO7241NATGAS2USD', 'медь': 'NCCO724COPPER2USD', 'S&P 500': 'NCSISP5002USD', 'Nasdaq 100': 'NCSINASDAQ1002USD'}
@@ -359,20 +360,34 @@ def duka_url(folder, side, year, month0):
     return f'{M.DUKA_BASE}/{folder}/{year}/{month0:02d}/{side}_candles_hour_1.bi5'
 
 
+def is_transient(status) -> bool:
+    """Временный сбой (повторить позже): нет ответа, 429, любой 5xx. 404 и прочие 4xx — определённый ответ."""
+    return status is None or status == 429 or status >= 500
+
+
 class Fetcher:
     """Кэш месячных файлов (BID/ASK) на время пробы: один и тот же месяц не качается дважды."""
 
-    def __init__(self, fetch, pause):
+    def __init__(self, fetch, pause, delays=RETRY_DELAYS, sleep=None):
         self.fetch, self.pause, self.cache, self.requests = fetch, pause, {}, 0
+        self.delays = tuple(delays)
+        self.sleep = sleep or asyncio.sleep
 
     async def month(self, folder, side, year, month0, order='ocLH'):
         key = (folder, side, year, month0)
         if key in self.cache:
             return self.cache[key]
-        r = await self.fetch(duka_url(folder, side, year, month0), None, 'GET')
+        url = duka_url(folder, side, year, month0)
+        r = await self.fetch(url, None, 'GET')
         self.requests += 1
-        await asyncio.sleep(self.pause)
-        res = {'status': r['status'], 'bytes': len(r['body']), 'error': r['error'], 'p': None, 'why': ''}
+        tries = 0
+        while is_transient(r['status']) and tries < len(self.delays):      # 503 у Dukascopy = ограничение частоты, а не «файла нет» (нет файла = 404)
+            await self.sleep(self.delays[tries])
+            tries += 1
+            r = await self.fetch(url, None, 'GET')
+            self.requests += 1
+        await self.sleep(self.pause)
+        res = {'status': r['status'], 'bytes': len(r['body']), 'error': r['error'], 'p': None, 'why': '', 'transient': is_transient(r['status']), 'retries': tries}
         if r['status'] == 200 and r['body']:
             try:
                 raw = M.decode_bi5(r['body'])
@@ -409,24 +424,28 @@ async def discover(fx: Fetcher, key, now_ms):
     cls, variants, (lo, hi) = TARGETS[key]
     ly, lm = last_complete_month(now_ms)
     tried = []
+    unknown = False
     for folder in variants:
         m = await fx.month(folder, 'BID', ly, lm)
         tried.append((folder, m['status'], m['bytes']))
+        unknown = unknown or m['transient']
         if m['p'] is not None:
             sc = M.pick_scale(float(np.median(m['p']['c'])), lo, hi)
             return {'key': key, 'class': cls, 'folder': folder, 'tried': tried, 'order': m['order'], 'consistency': m['consistency'], 'scale': sc, 'ok_format': m['consistency'] >= 0.99 and sc is not None}
-    return {'key': key, 'class': cls, 'folder': None, 'tried': tried, 'ok_format': False}
+    return {'key': key, 'class': cls, 'folder': None, 'tried': tried, 'ok_format': False, 'undetermined': unknown}
 
 
 async def probe_instrument(fx: Fetcher, info, now_ms, progress=None):
     """Всё по одному найденному инструменту: глубина, выходные, спред из истории BID/ASK."""
     key, folder = info['key'], info['folder']
     cls, _v, (lo, hi) = TARGETS[key]
-    out = dict(info, depth={}, weekend=None, spread={}, spread_pooled=None, earliest_year=None)
+    out = dict(info, depth={}, weekend=None, spread={}, spread_pooled=None, earliest_year=None, depth_unknown=[])
     ly, lm = last_complete_month(now_ms)
     for y in DEPTH_YEARS:
         m = await fx.month(folder, 'BID', y, 0)
         out['depth'][y] = (m['status'], m['bytes'])
+        if m['transient']:
+            out['depth_unknown'].append(y)
     have = [y for y, (st, n) in out['depth'].items() if st == 200 and n > 0]
     out['earliest_year'] = min(have) if have else None
     sc = info['scale']
@@ -495,14 +514,17 @@ def instrument_ok(r: dict):
     """Пригодность инструмента Dukascopy для фабрики: формат/масштаб распознаны, история с ≤ 2019, спред посчитан."""
     why = []
     if not r.get('folder'):
-        return False, 'не найден в datafeed'
+        return False, ('не определён: временные сбои Dukascopy (503/сеть), не 404' if r.get('undetermined') else 'не найден в datafeed (404)')
     if not r.get('ok_format'):
         why.append('формат/масштаб не распознаны')
     if r.get('earliest_year') is None or r['earliest_year'] > DEPTH_MAX_FIRST_YEAR:
-        why.append(f'история с {r.get("earliest_year")} (> {DEPTH_MAX_FIRST_YEAR})')
+        if r.get('depth_unknown'):
+            why.append(f'не определено: годы {r["depth_unknown"]} не получены из-за временных сбоев (503/сеть); без них история с {r.get("earliest_year")}')
+        else:
+            why.append(f'история с {r.get("earliest_year")} (> {DEPTH_MAX_FIRST_YEAR})')
     sp = r.get('spread_pooled')
     if not sp or sp['active']['median'] is None:
-        why.append('спред из истории не посчитан')
+        why.append('спред из истории не посчитан (сбои запросов)' if any('HTTP 5' in str(v.get('error', '')) or 'HTTP None' in str(v.get('error', '')) for v in (r.get('spread') or {}).values()) else 'спред из истории не посчитан')
     return (not why), ('; '.join(why) if why else 'формат распознан, история достаточна, спред посчитан')
 
 
@@ -533,7 +555,7 @@ def _f(x, nd=1):
 
 def build_report2(stooq, instruments, tz, daily, book, now_ms, disk_mb, requests, version=''):
     R = ['📡 <b>/data_probe_ma, ПРОБА v2 (BOT_SPEC §2.41.14): качество данных Dukascopy, спреды, правила; только метаданные и образцы — доходностей стратегий не считалось</b>',
-         f'Время проверки: {datetime.fromtimestamp(now_ms / 1000, timezone.utc):%Y-%m-%d %H:%M} UTC; запросов к Dukascopy: {requests}. {version}']
+         f'Время проверки: {datetime.fromtimestamp(now_ms / 1000, timezone.utc):%Y-%m-%d %H:%M} UTC; запросов к Dukascopy (с повторами): {requests}. {version}']
     # 3. Stooq
     R.append('\n<b>Stooq — одна диагностическая попытка (таймаут 15 с)</b>')
     if 'error' in stooq:
@@ -548,10 +570,10 @@ def build_report2(stooq, instruments, tz, daily, book, now_ms, disk_mb, requests
     for key, r in instruments.items():
         ok, why = instrument_ok(r)
         if not r.get('folder'):
-            R.append(f'  {key} [{r["class"]}]: НЕ НАЙДЕН — варианты {r["tried"]}')
+            R.append(f'  {key} [{r["class"]}]: {"НЕ ОПРЕДЕЛЁН (сбои, не 404)" if r.get("undetermined") else "НЕ НАЙДЕН (404)"} — варианты {r["tried"]}')
             continue
         dep = ', '.join(f'{y}:{st}' for y, (st, n) in r['depth'].items())
-        R.append(f'  {key} [{r["class"]}] папка {r["folder"]}: {"ПРИГОДЕН" if ok else "НЕПРИГОДЕН"} — {why}; порядок полей {r["order"]} (OHLC {r["consistency"] * 100:.0f}%), масштаб ÷{r["scale"]:g}; '
+        R.append(f'  {key} [{r["class"]}] папка {r["folder"]}: {"ПРИГОДЕН" if ok else ("НЕ ОПРЕДЕЛЕНО" if r.get("depth_unknown") or "сбои" in why else "НЕПРИГОДЕН")} — {why}; порядок полей {r["order"]} (OHLC {r["consistency"] * 100:.0f}%), масштаб ÷{r["scale"]:g}; '
                  f'глубина (январь→HTTP): {dep}; самый ранний {r["earliest_year"]}')
     # 1.1 выходные
     R.append('\n<b>1.1 Выходные и закрытие рынка (последний завершённый месяц, по данным)</b> — плоский бар: O=H=L=C; окно закрытия — ячейки «день недели × час UTC», где ≥ 90% баров плоские')
@@ -602,6 +624,7 @@ def build_report2(stooq, instruments, tz, daily, book, now_ms, disk_mb, requests
         st = book_stats(b['samples'])
         R.append(f'  {name} ({b["symbol"]}, размер контракта {b.get("contract_size")}): спред медиана {_f(st["spread_median"], 2)} б.п. (мин {_f(st["spread_min"], 2)}, макс {_f(st["spread_max"], 2)}, замеров {st["n"]}), '
                  f'глубина лучшего уровня bid {_f(st["bid_depth_usdt"], 0)} / ask {_f(st["ask_depth_usdt"], 0)} USDT (price × amount; единицы amount в ccxt для этих контрактов не проверены)'
+                 + ('; ВНИМАНИЕ: спред одинаков во всех замерах — возможно, котировка, а не живой стакан; для издержек не использовать без проверки' if st['n'] > 1 and st['spread_min'] == st['spread_max'] else '')
                  + (f'; ошибка: {b["error"]}' if b.get('error') else ''))
     # вывод
     prop = proposal2(instruments, daily)
@@ -624,7 +647,7 @@ async def run_probe_ma2(payload, params, progress=None):
         stooq = await stooq_diagnose(ses)
         if progress:
             await progress('Stooq: ' + (stooq.get('error') or f'HTTP {stooq.get("status")}'))
-        fx = Fetcher(V.make_fetcher(ses), 0.25)
+        fx = Fetcher(V.make_fetcher(ses), 1.0)
         infos = {}
         for key in TARGETS:
             infos[key] = await discover(fx, key, now_ms)
