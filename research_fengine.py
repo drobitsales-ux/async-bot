@@ -182,6 +182,7 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
     ret = np.zeros(n)
     if detail:
         c_side, c_swap, c_fund, expo = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
+        ret_long, ret_short = np.zeros(n), np.zeros(n)
     t0 = S['trade_from'] if trade_from is None else trade_from
     ev = np.flatnonzero(sig != 0)
     ev = ev[(ev >= t0) & (ev < n - 1)]
@@ -255,6 +256,8 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
             kind, cursor_next = 'end', n
         m = len(pts) - 1
         last = e + m - 1
+        if detail:
+            snap = ret[e:e + m].copy()
         ret[e:e + m] += (d * w / px) * np.diff(pts)
         ret[e] -= w * cost.side
         ret[last] -= w * cost.side
@@ -271,13 +274,14 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
             c_side[e] += w * cost.side
             c_side[last] += w * cost.side
             expo[e:last + 1] += w
+            (ret_long if d > 0 else ret_short)[e:e + m] += ret[e:e + m] - snap          # вклад сделки по направлению (лонг/шорт-ноги)
         trades.append((e, last, d, w, kind))
         cursor = cursor_next
         if kind == 'end':
             break
     out = {'ret': ret, 'day': S['day'], 'trades': trades}
     if detail:
-        out.update(c_side=c_side, c_swap=c_swap, c_fund=c_fund, expo=expo)
+        out.update(c_side=c_side, c_swap=c_swap, c_fund=c_fund, expo=expo, ret_long=ret_long, ret_short=ret_short)
     return out
 
 
