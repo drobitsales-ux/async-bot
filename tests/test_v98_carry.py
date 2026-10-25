@@ -272,15 +272,16 @@ class EarlyStop(unittest.TestCase):
 
     def test_startup_message_without_po3_orb_rt_by_default(self):
         fresh_state()
-        saved = (a.PO3_ENABLED, a.ORB_RT_ENABLED)
+        saved = (a.PO3_ENABLED, a.ORB_RT_ENABLED, a.SMC_SIG_ENABLED)
         a.PO3_ENABLED = a.ORB_RT_ENABLED = False
+        a.SMC_SIG_ENABLED = True                                    # v107: по умолчанию выключен — включаем явно
         try:
             live, shadow = a.active_strategies()
             self.assertNotIn('PO3', shadow)
             self.assertNotIn('ORB_RT', shadow)
             self.assertTrue(any(x.startswith('SMC_SIG') for x in shadow) or a.SMC_LIVE)    # SMC_SIG сохранён
         finally:
-            a.PO3_ENABLED, a.ORB_RT_ENABLED = saved
+            a.PO3_ENABLED, a.ORB_RT_ENABLED, a.SMC_SIG_ENABLED = saved
 
 
 if __name__ == '__main__':
