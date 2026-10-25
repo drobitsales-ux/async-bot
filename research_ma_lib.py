@@ -128,3 +128,34 @@ def read_lockbox(ts, *arrays, final=False):
     ts = np.asarray(ts)
     m = ts >= lo
     return (ts[m],) + tuple(np.asarray(a)[m] for a in arrays)
+
+
+class LockboxSession:
+    """[v103] Сессия финала: единственный легальный доступ к данным LOCKBOX для нескольких инструментов подряд. Создаётся open_lockbox_session(final=True) ОДИН раз за процесс
+    (повторное открытие — LockboxError); slice() отдаёт часть ряда с 2025-01-01. Защита от повторного ЗАПУСКА финала между процессами — флаг в БД (research_factory)."""
+
+    def __init__(self):
+        self._lo, _ = period_bounds_ms('LOCKBOX')
+
+    def slice(self, ts, *arrays):
+        import numpy as np
+        ts = np.asarray(ts)
+        m = ts >= self._lo
+        return (ts[m],) + tuple(np.asarray(a)[m] for a in arrays)
+
+
+_lockbox_session_state = {'opened': False}
+
+
+def open_lockbox_session(final=False):
+    if final is not True:
+        raise LockboxError('LOCKBOX не читается до финального шага: нужен флаг final=True')
+    if _lockbox_session_state['opened']:
+        raise LockboxError('сессия LOCKBOX уже открывалась в этом процессе: финал выполняется один раз, повтор запрещён')
+    _lockbox_session_state['opened'] = True
+    return LockboxSession()
+
+
+def lockbox_start_ms():
+    """Начало LOCKBOX (мс UTC) — граница, ДО которой строятся ряды TRAIN/VALID."""
+    return period_bounds_ms('LOCKBOX')[0]

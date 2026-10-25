@@ -198,10 +198,31 @@ async def _task_data_probe(ctx: Ctx):
     return {'text': text}
 
 
+async def _task_factory_load(ctx: Ctx):
+    import research_factory                      # [v103] загрузка Dukascopy для «фабрики» (BOT_SPEC §2.41.17)
+    return {'text': await research_factory.run_load(ctx.params, progress=ctx.progress)}
+
+
+async def _task_factory_pairs(ctx: Ctx):
+    import research_factory
+    return {'text': research_factory.run_pairs(ctx.params)}
+
+
+async def _task_factory(ctx: Ctx):
+    import research_factory
+    return {'text': await research_factory.run_factory(ctx.params, progress=ctx.progress)}
+
+
+async def _task_factory_final(ctx: Ctx):
+    import research_factory
+    return {'text': await research_factory.run_final(ctx.params, progress=ctx.progress)}
+
+
 TASKS = {
     '_selftest_mem': _task_selftest_mem, '_selftest_ok': _task_selftest_ok, '_selftest_kill': _task_selftest_kill,
     'edge_audit': _task_edge_audit, 'of_backtest': _task_of_backtest, 'htf_backtest': _task_htf_backtest, 'htf_wide': _task_htf_wide,
     'htf_xsmom': _task_htf_xsmom, 'wide_stop': _task_wide_stop, 'data_probe': _task_data_probe, 'carry_test': _task_carry_test, 'data_probe_ma': _task_data_probe_ma,
+    'factory_load': _task_factory_load, 'factory_pairs': _task_factory_pairs, 'factory': _task_factory, 'factory_final': _task_factory_final,
 }
 
 

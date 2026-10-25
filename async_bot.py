@@ -623,6 +623,12 @@ def _esc(s) -> str:
     НЕ к разметке (<b>, <code>...) — иначе теги превратятся в текст."""
     return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
+def _plain_alert_line(text: str) -> str:
+    """[v103] Первая строка алерта из истории (там HTML: теги и сущности &amp;) → обычный текст для файла дайджеста."""
+    first = (text or '').splitlines()[0] if text else ''
+    return html.unescape(re.sub(r'</?[a-zA-Z][^<>]*>', '', first))
+
+
 _LOG_NORM_RES = ((re.compile(r'signature=[0-9a-fA-F]+'), 'signature=…'), (re.compile(r'timestamp=\d+'), 'timestamp=…'), (re.compile(r'\d+(?:\.\d+)?'), 'N'))
 
 
@@ -645,6 +651,33 @@ def _group_log_events(rows, top=10):
             groups[k] = [msg, 1]
     out = sorted(((v[0], k[1], v[1]) for k, v in groups.items()), key=lambda t: -t[2])
     return out[:top]
+
+
+_TG_TAG_RE = re.compile(r'</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler|span|tg-emoji|blockquote)(?:\s[^<>]*)?>')
+_TG_AMP_RE = re.compile(r'&(?!(?:amp|lt|gt|quot|#\d+|#x[0-9a-fA-F]+);)')
+
+
+def _html_safe(text: str) -> str:
+    """[v103] Для parse_mode=HTML: «&» вне сущности → &amp;, «<» вне допустимого тега Telegram → &lt; (иначе 400 «can't parse entities», как у R0 «|t| = 0.58 < 2» до v97).
+    Допустимые теги и уже экранированные сущности не трогаются, поэтому повторное экранирование (esc()) не ломается."""
+    if not text or ('<' not in text and '&' not in text):
+        return text
+    text = _TG_AMP_RE.sub('&amp;', text)
+    out, i = [], 0
+    while True:
+        j = text.find('<', i)
+        if j < 0:
+            out.append(text[i:])
+            break
+        out.append(text[i:j])
+        m = _TG_TAG_RE.match(text, j)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+        else:
+            out.append('&lt;')
+            i = j + 1
+    return ''.join(out)
 
 
 def _split_tg_text(text: str, max_len: int = TG_MAX_LEN) -> list:
@@ -765,7 +798,7 @@ async def tg(text: str):
         try:
             async with http.post(
                 f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                json={"chat_id": CHAT_ID, "text": _html_safe(chunk), "parse_mode": "HTML"},
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
                 if resp.status != 200:
@@ -6502,7 +6535,7 @@ async def build_daily_digest(date_str: str = None):
     lines.append(f'── АЛЕРТЫ ({len(alerts)}) ──')
     for ts, kind, text in alerts:
         t_short = ts[11:16] if len(ts) > 16 else ts
-        lines.append(f'[{t_short}] ({kind}) {text.splitlines()[0] if text else ""}')
+        lines.append(f'[{t_short}] ({kind}) {_plain_alert_line(text)}')
     lines.append('')
 
     # ── Аномалии ──
@@ -6742,8 +6775,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-01-v102'
+CODE_VERSION = '2026-11-02-v103'
 CHANGELOG = [
+    ('2026-11-02-v103', 'ЭТАП 2 «ФАБРИКИ» (BOT_SPEC §2.41 + ПОПРАВКА §2.41.17, записана ОТДЕЛЬНЫМ коммитом ДО кода; живая торговля SMC_LIVE=false, breaker-ы, каналы v96, поведение research_runner, bybit_worker.py не менялись; в research_runner только записи задач в реестр TASKS). Поправка владельца: классы CRYPTO (16) / COMMODITIES (XAU, XAG, Brent, WTI) / FX (7) / INDICES (5) / BONDS (Bund, T-Note) / MULTI (все 18 не-крипто), 12 ячеек (1D — все, 4h — CRYPTO/COMMODITIES/FX/INDICES, 1h — CRYPTO/FX), X-MOM при ≥ 6 инструментах, бары Dukascopy с нулевым объёмом исключаются, граница дня ny17 (17:00 Нью-Йорка) для не-крипто и 00:00 UTC для CRYPTO, издержки не-крипто — сценарий (б): 1 медианный спред Dukascopy на сторону + перенос FIN_RATE_YR=0.06 годовых за сутки (сценарий (а) BingX отменён), стресс ×2 для финала, новые семейства P-PAIR (10 пар по корреляции на TRAIN, 6 тестов) и L-LAG (опережение BTC, 4 теста), N = 204, seed 20261025. Код: research_fdata.py (загрузка Dukascopy по месяцам с повторами 3/8/20/45 с и паузой 1 с, продолжение с места остановки, доступ к LOCKBOX только через сессию финала), research_fengine.py (индикаторы, сигналы, симулятор по сделкам со стопом 3·ATR20 и гэпом, издержки, Ньюи–Уэст, Бенджамини–Хохберг), research_factory.py (калибровка 200 случайных на ячейку, шаги A/B, шаг C). Команды: /factory_load, /factory_pairs [ok], /factory (калибровка ПЕРВОЙ; провал любой ячейки — СТОП «процедура ненадёжна» без показа результатов), /factory_final confirm (один раз, флаг в БД). НАХОДКА: правило B-VC «оба уровня достигнуты — сделка не открывается» использует исход бара t+1 и даёт t > 5 на случайном блуждании — в отчёте предупреждение и диагностика OCO без отбора (не входит в N). ЧАСТЬ 3: tg() экранирует «<» и «&» вне допустимых тегов (_html_safe; причина «TG 400» — «|t| = 0.58 < 2» в R0 до v97), в файле дайджеста алерты — обычным текстом. Диагностика RequestTimeout баланса (без правки): показанные в дайджесте 24.10 ошибки относятся к 00:01–00:16 UTC — эпоха v92 до отдельного канала v96. Тесты: tests/test_v103_factory.py (29), tests/test_v103_e2e.py (11)'),
     ('2026-11-01-v102', 'ДАЙДЖЕСТ + ПРОБА v2 (живая торговля, breaker-ы, каналы v96, research_runner, bybit_worker.py не менялись). ДАЙДЖЕСТ: раздел «ОШИБКИ» группировал записи по точному тексту, поэтому каждая «RequestTimeout на GET user/balance» с новой подписью и меткой времени была отдельной строкой x1 (прод 2026-10-24: 886 записей → 8 строк по x1, масштаб не виден); теперь тексты нормализуются (подпись, timestamp, числа) и группируются — топ-10 групп с реальными счётчиками. «TG 400 can\'t parse entities» ×2 за сутки — это были прогресс-сообщения R0 до v97 («|t| = 0.58 < 2» с неэкранированным «<»); сообщение дошло через fallback без разметки; с v97 прогресс идёт через _tg_plain (экранирование) — правки не требуется. ПРОБА v2: второй проход по инструментам, не определённым из-за 503 (прогон v101: XAGUSD), после очистки временных сбоев из кэша и паузы 30 с; замер «плоский бар × объём» (плоские с нулевым объёмом и с объёмом > 0 вне серий ≥ 12 ч, нулевой объём у неплоских) — данные для выбора правила исключения выходных и ежедневных перерывов. Тесты: tests/test_v102_digest_probe.py (6 проверок)'),
     ('2026-10-31-v101', 'ИСПРАВЛЕНИЕ ПРОБЫ v2 /data_probe_ma (прогон v100, прод 2026-10-24: ~90% запросов Dukascopy вернули HTTP 503 — ограничение частоты, проба не повторяла запросы, кэшировала 503 и записывала «история с None / НЕПРИГОДЕН / НЕ НАЙДЕН»; вывод «0 пригодных» недействителен, поправка к §2.41 по нему НЕ готовится). Теперь: временный сбой (нет ответа, 429, 5xx) повторяется с паузами 3/8/20/45 с, пауза между запросами 1 с (было 0.25), 404 — определённый ответ без повторов; инструмент/глубина с неполученными из-за сбоев данными получают вердикт «НЕ ОПРЕДЕЛЕНО», а не «непригоден»; в отчёте замеры BingX с одинаковым спредом во всех замерах помечаются предупреждением. Живая торговля, breaker-ы, каналы v96, research_runner, bybit_worker.py не менялись. Тесты: tests/test_v100_ma2.py (41 проверка)'),
     ('2026-10-30-v100', 'ПРОБА v2 /data_probe_ma (research_ma2.py; только метаданные и образцы, расчётов стратегий и доходностей нет; живая торговля SMC_LIVE=false, breaker-ы, каналы v96, поведение research_runner, bybit_worker.py не менялись; в research_runner только перенаправлена задача data_probe_ma на research_ma2). Решение владельца по итогам пробы v99 (Stooq недоступен по таймауту, Dukascopy пригоден): вариант B. Dukascopy: доля плоских баров O=H=L=C и объём выходные vs будни; ПРАВИЛО ИСКЛЮЧЕНИЯ — плоский бар в серии ≥12 подряд плоских часовых баров (окно по ячейкам день×час плывёт с летним временем США — найдено тестом на годовом образце); часовой пояс (первый живой бар недели/последний бар пятницы, EURUSD и XAUUSD, январь/июль) с вердиктом по сезонному сдвигу; спред из истории BID/ASK (медиана и p90 б.п., активные/ночные часы, 3 месяца разных лет); расширение списка (XPT, Brent, WTI, AUD/CHF/CAD/NZD, индексы, облигации — поиск символов); дневки из часовых по двум правилам границы дня (00:00 UTC и 17:00 Нью-Йорка) с проверкой 250–262 баров/год и обрубков. BingX: fetch_order_book(limit 5) × 5 замеров только активных контрактов (золото, серебро, платина, палладий, Brent, WTI, газ, медь, S&P 500, Nasdaq 100), медиана спреда б.п. и глубина лучшего уровня USDT. Stooq: таймаут 15 с, одна диагностическая попытка. После отчёта — ПРОЕКТ поправки к §2.41 (в BOT_SPEC не вносится без подтверждения владельца). Тесты: tests/test_v100_ma2.py (36 проверок)'),
@@ -7430,6 +7464,65 @@ async def carry_test_run():
         await tg(f'❌ /carry_test: {esc(type(e).__name__)}: {esc(e)}')
     finally:
         _htf_running[0] = False
+
+
+def _factory_syms():
+    """[v103] 16 символов H-XS в формате кэша Binance (BTCUSDT…); [] — вселенная не заморожена."""
+    import research_probe
+    uni = research_probe.universe_from_db(TRADES_DB)
+    return sorted(u.split('/')[0] + 'USDT' for u in uni) if len(uni) == 16 else []
+
+
+async def factory_job(cmd, task, extra=None, need_universe=True):
+    """[v103] Команды этапа 2 «фабрики» (BOT_SPEC §2.41.17): /factory_load, /factory_pairs, /factory, /factory_final. Расчёт и сеть Dukascopy — в дочернем процессе
+    (лимит RESEARCH_MEM_MB); результаты и флаги — в SQLite {FACTORY_DIR}/factory.db. Отчёт — в htf_reports ДО отправки."""
+    if _htf_running[0]:
+        await tg('⏳ HTF-задача уже выполняется — дождись отчёта')
+        return
+    _htf_running[0] = True
+    try:
+        import research_factory
+        import research_htf
+        import research_vision
+        syms = _factory_syms()
+        if need_universe and not syms:
+            await tg(f'⛔ {esc(cmd)} отказ: вселенная H-XS не заморожена (нужно 16 символов) — запусти /htf_xsmom')
+            return
+        params = dict(extra or {}, vdir=research_vision.vision_dir(), fdir=research_factory.FD.factory_dir(), syms=syms, version=CODE_VERSION)
+        text = await _research_job(cmd, task, params)
+        if text:
+            research_htf.save_report(TRADES_DB, CODE_VERSION, text)
+            await _htf_deliver(text)
+    except Exception as e:
+        logging.exception(cmd)
+        await tg(f'❌ {esc(cmd)}: {esc(type(e).__name__)}: {esc(e)}')
+    finally:
+        _htf_running[0] = False
+
+
+async def factory_pairs_ok():
+    """[v103] /factory_pairs ok — подтверждение, что список пар P-PAIR записан в BOT_SPEC (без него /factory не запускается)."""
+    import research_factory
+    pairs = research_factory.kv_get('pairs')
+    if not pairs:
+        await tg('⛔ Список пар не заморожен — сначала /factory_pairs')
+    else:
+        research_factory.kv_set('pairs_ack', True)
+        await tg('✅ Список пар P-PAIR подтверждён (записан в BOT_SPEC): ' + esc(', '.join(f'{a}/{b}' for a, b, _c, _n in pairs)))
+
+
+async def factory_final_gate(args):
+    """[v103] /factory_final: без слова confirm — только показ кандидатов и состояния флага; с confirm [идентификаторы] — запуск шага C (один раз, флаг в БД)."""
+    import research_factory
+    cands = research_factory.kv_get('candidates') or []
+    done = research_factory.kv_get('final_started') or research_factory.kv_get('final_done')
+    if not args or args[0].lower() != 'confirm':
+        await tg('🔒 <b>/factory_final</b> — шаг C на LOCKBOX: ОДИН прогон, повтор запрещён навсегда (флаг в БД).\n'
+                 f'Кандидаты: {esc(", ".join(cands) or "нет")}\nФлаг финала: {"УЖЕ ВЗЯТ — запуск невозможен" if done else "свободен"}.\n'
+                 'Запуск: <code>/factory_final confirm</code> (все кандидаты) или <code>/factory_final confirm ID1 ID2</code> (подмножество; регистр важен).')
+        return
+    ids = [a for a in args[1:] if a]
+    await factory_job('/factory_final', 'factory_final', {'ids': ids or None})
 
 
 async def data_probe_ma_run():
@@ -9595,6 +9688,7 @@ async def check_tg_commands():
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
                     '/net_probe — диагностика сети до BingX (DNS, публичный/приватный запрос напрямую и через ccxt, очередь), фоном\n'
                     '/data_probe_ma — проверка источников Stooq/Dukascopy/BingX для «фабрики» на металлах/FX/индексах (только метаданные, §2.41 этап 1), фоном; отчёт — /htf_report\n'
+                    '/factory_load — [v103] загрузка Dukascopy (18 инструментов) для «фабрики», с места остановки; /factory_pairs [ok] — 10 пар P-PAIR; /factory — калибровка + шаги A/B; /factory_final confirm — шаг C на LOCKBOX (один раз)\n'
                     '/carry_test — C1: сбор фандинга (лонг спот + шорт перп), только история, оценка APR (BOT_SPEC §2.40), фоном; отчёт — /htf_report\n'
                     '/edge_audit — R0 калибровка измерительной системы + R1 SMC2 на истории 2020–2026 (BOT_SPEC §2.37), фоном; отчёт — /htf_report\n'
                     '/of_backtest — бэктест H-OF1/H-OF2 по §2.34 (только если /data_probe признал гипотезу проверяемой), фоном\n'
@@ -9667,6 +9761,28 @@ async def check_tg_commands():
                 else:
                     _t = asyncio.create_task(data_probe_run())
                     _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/factory_load':
+                # [v103] загрузка Dukascopy для «фабрики» (BOT_SPEC §2.41.17): с места остановки, фоном
+                _t = asyncio.create_task(factory_job('/factory_load', 'factory_load', need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/factory_pairs' or cmd == '/factory_pairs ok':
+                if cmd.endswith(' ok'):
+                    await factory_pairs_ok()
+                else:
+                    _t = asyncio.create_task(factory_job('/factory_pairs', 'factory_pairs'))
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/factory':
+                # [v103] калибровка на случайных стратегиях, затем шаги A и B (LOCKBOX не читается), фоном
+                _t = asyncio.create_task(factory_job('/factory', 'factory'))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/factory_final' or cmd.startswith('/factory_final '):
+                # [v103] шаг C — только вручную, с confirm, один раз
+                _t = asyncio.create_task(factory_final_gate(text.split('@')[0].split()[1:]))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/data_probe_ma':
                 # [v99] источники данных для «фабрики» (металлы/FX/индексы) — только метаданные, BOT_SPEC §2.41 этап 1
