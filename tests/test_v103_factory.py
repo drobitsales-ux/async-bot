@@ -240,17 +240,47 @@ class Families(unittest.TestCase):
             closed = [t for t in rp['trades'] if t[4] != 'end' and t[1] < cut - 10]
             self.assertEqual(closed, rf['trades'][:len(closed)], cfg.id)
 
-    def test_bvc_both_levels_hit_means_no_trade_but_oco_trades(self):
-        n = 40
+    def test_bvc_both_levels_is_minus_one_r_and_not_skipped(self):
+        """v104 (§2.41.19): оба уровня на баре t+1 — сделка открыта и закрыта по стопу: −1R плюс издержки обеих сторон; отбора по исходу бара нет."""
+        n = 60
         t0 = 1_577_836_800_000
         ts = t0 + np.arange(n) * 3_600_000
         c = np.full(n, 100.0)
         o, h, l = c.copy(), c + 2.0, c - 2.0
-        h[20], l[20] = 100.4, 99.6                                              # бар 20 — NR7 (узкий диапазон)
-        h[21], l[21] = 101.0, 99.0                                              # бар 21 достигает ОБА уровня
+        h[30], l[30] = 100.4, 99.6                                              # бар 30 — NR7 (узкий диапазон)
+        h[31], l[31] = 101.0, 99.0                                              # бар 31 достигает ОБА уровня
         S = E.make_series('X', {'ts': ts, 'o': o, 'h': h, 'l': l, 'c': c, 'day': ts // 86_400_000}, t0)
-        self.assertEqual(int(E.sig_b_vc(S)['sig'][20]), 0)
-        self.assertNotEqual(int(E.sig_b_vc(S, oco=True)['sig'][20]), 0)
+        g = E.sig_b_vc(S)
+        self.assertEqual(int(g['sig'][30]), E.BOTH)
+        r0 = E.simulate(S, g['sig'], E.Cost(0.0), hold=g['hold'], entry_px=g['entry_px'])
+        self.assertEqual([t[4] for t in r0['trades'] if t[0] == 31], ['both'])
+        self.assertAlmostEqual(r0['ret'][31], -E.RISK, places=12)                # −1R без издержек
+        r1 = E.simulate(S, g['sig'], E.Cost(0.001), hold=g['hold'], entry_px=g['entry_px'])
+        w = E.RISK / (3 * S['atr'][30] / S['o'][31])
+        self.assertAlmostEqual(r1['ret'][31], -E.RISK - 2 * w * 0.001, places=12)  # плюс издержки обеих сторон
+        # событие занимает только бар t+1: следующий сигнал возможен сразу (нет блокировки позиции)
+        self.assertEqual([t[:2] for t in r1['trades'] if t[0] == 31], [(31, 31)])
+
+    def test_bvc_single_level_unchanged_and_no_outcome_selection(self):
+        n = 80
+        t0 = 1_577_836_800_000
+        rng = np.random.default_rng(3)
+        o, h, l, c = F.gbm(n, rng, 0.004)
+        ts = t0 + np.arange(n) * 3_600_000
+        S = E.make_series('X', {'ts': ts, 'o': o, 'h': h, 'l': l, 'c': c, 'day': ts // 86_400_000}, t0)
+        g = E.sig_b_vc(S)
+        # каждый NR7-бар, у которого на следующем баре задет хотя бы один уровень, даёт сигнал (1, −1 или BOTH): ничего не отбрасывается по исходу
+        rng7 = h - l
+        nr7 = np.zeros(n, bool)
+        for t in range(6, n - 1):
+            nr7[t] = rng7[t] <= rng7[t - 6:t].min()
+        hit = (h[1:] >= h[:-1]) | (l[1:] <= l[:-1])
+        expect = nr7[:-1] & hit
+        self.assertTrue(np.array_equal(g['sig'][:-1] != 0, expect))
+        both = nr7[:-1] & (h[1:] >= h[:-1]) & (l[1:] <= l[:-1])
+        self.assertTrue(np.array_equal(g['sig'][:-1] == E.BOTH, both))
+        self.assertTrue(np.all(g['hold'][(g['sig'] == 1) | (g['sig'] == -1)] == 6))
+        self.assertTrue(np.all(g['hold'][g['sig'] == E.BOTH] == 0))
 
 
 class Stats(unittest.TestCase):

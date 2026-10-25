@@ -27,7 +27,7 @@ def run(coro):
 class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._inst, cls._cm, cls._cells, cls._calib = dict(FD.INSTRUMENTS), dict(FD.CLASS_MEMBERS), list(FD.CELLS), RF.CALIB_N
+        cls._inst, cls._cm, cls._cells, cls._calib, cls._bias = dict(FD.INSTRUMENTS), dict(FD.CLASS_MEMBERS), list(FD.CELLS), RF.CALIB_N, RF.BIAS_REPS
         FD.INSTRUMENTS.clear()
         FD.INSTRUMENTS.update({k: (v[0], v[1], v[2], (2019, 1)) for k, v in cls._inst.items() if k in KEYS})
         FD.CLASS_MEMBERS.clear()
@@ -35,6 +35,7 @@ class Base(unittest.TestCase):
         FD.CLASS_MEMBERS['MULTI'] = list(FD.INSTRUMENTS)
         FD.CELLS[:] = [('CRYPTO', '1D'), ('CRYPTO', '4h'), ('COMMODITIES', '1D'), ('FX', '1D'), ('FX', '4h'), ('MULTI', '1D')]
         RF.CALIB_N = 30
+        RF.BIAS_REPS = 4
         cls.d, cls.vd = tempfile.mkdtemp(), tempfile.mkdtemp()
         for i, k in enumerate(FD.INSTRUMENTS):
             F.write_instrument(cls.d, k, seed=i + 1, p0={'XAUUSD': 1500, 'XAGUSD': 20, 'USDJPY': 110}.get(k, 1.0))
@@ -48,6 +49,7 @@ class Base(unittest.TestCase):
         FD.CLASS_MEMBERS.clear(); FD.CLASS_MEMBERS.update(cls._cm)
         FD.CELLS[:] = cls._cells
         RF.CALIB_N = cls._calib
+        RF.BIAS_REPS = cls._bias
 
     def reset(self, keep=('spread:XAGUSD',)):
         con = RF._con(self.d)
@@ -55,11 +57,19 @@ class Base(unittest.TestCase):
         con.commit(); con.close()
         L._lockbox_session_state['opened'] = False
 
+    def write_spec(self, pairs_line):
+        f = tempfile.NamedTemporaryFile('w', suffix='.md', delete=False, encoding='utf-8')
+        f.write('# spec\n' + pairs_line + '\n')
+        f.close()
+        return f.name
+
     def ready(self):
         RF.kv_set('spread:XAGUSD', {'median': 2.0}, self.d)
-        pairs = run_pairs(self.params)
+        txt = run_pairs(self.params)
         RF.kv_set('pairs_ack', True, self.d)
-        return pairs
+        pairs = RF.kv_get('pairs', self.d)
+        self.params = dict(self.__class__.params, spec_path=self.write_spec('PAIRS-FROZEN: ' + ', '.join(f'{a}/{b}' for a, b, _c, _n in pairs)))
+        return txt
 
 
 def run_pairs(params):
@@ -71,14 +81,22 @@ class Preflight(Base):
         self.reset(keep=())
         txt = run(RF.run_factory(self.params))
         self.assertIn('/factory отказ', txt)
-        self.assertIn('спред XAGUSD не измерен', txt)
+        self.assertNotIn('спред XAGUSD не измерен', txt)                       # v104: запасное значение 10.99 б.п. (§2.41.21 п. 3.4)
         self.assertIn('пары P-PAIR не заморожены', txt)
-        RF.kv_set('spread:XAGUSD', {'median': 2.0}, self.d)
         RF.run_pairs(self.params)
         txt = run(RF.run_factory(self.params))
         self.assertIn('не подтверждён', txt)
-        # пропуск месяца между имеющимися — «данные неполны» (хронические 503)
+        # подтверждение без записи в BOT_SPEC (строка-заглушка) — отказ (§2.41.21 п. 3.5)
         RF.kv_set('pairs_ack', True, self.d)
+        txt = run(RF.run_factory(dict(self.params, spec_path=self.write_spec('PAIRS-FROZEN: (не записан)'))))
+        self.assertIn('список пар не записан в BOT_SPEC', txt)
+        pairs = RF.kv_get('pairs', self.d)
+        good = ', '.join(f'{a}/{b}' for a, b, _c, _n in pairs)
+        bad = ', '.join(f'{a}/{b}' for a, b, _c, _n in pairs[::-1])
+        txt = run(RF.run_factory(dict(self.params, spec_path=self.write_spec('PAIRS-FROZEN: ' + bad))))
+        self.assertIn('не совпадает с замороженным в БД', txt)
+        self.params = dict(self.params, spec_path=self.write_spec('PAIRS-FROZEN: ' + good))
+        # пропуск месяца между имеющимися — «данные неполны» (хронические 503)
         p = FD.month_path(self.d, 'EURUSD', 2022, 5)
         os.rename(p, p + '.bak')
         try:
@@ -86,6 +104,21 @@ class Preflight(Base):
             self.assertIn('EURUSD: не получено 1 мес.', txt)
         finally:
             os.rename(p + '.bak', p)
+
+    def test_xag_spread_fallback_and_measured(self):
+        """BOT_SPEC §2.41.21 п. 3.4: измеренный спред XAGUSD, иначе 10.99 б.п. (значение владельца) с указанием источника."""
+        self.reset(keep=())
+        ctx = RF.build_ctx(self.params)
+        probs, spreads, pairs, excl = RF.preflight(ctx)
+        self.assertEqual(spreads['XAGUSD'], 10.99)
+        self.assertIn('10.99', ctx['xag_src'])
+        self.assertIn('не измерено', ctx['xag_src'])
+        RF.kv_set('spread:XAGUSD', {'median': 7.5}, self.d)
+        ctx = RF.build_ctx(self.params)
+        probs, spreads, pairs, excl = RF.preflight(ctx)
+        self.assertEqual(spreads['XAGUSD'], 7.5)
+        self.assertIn('измерено', ctx['xag_src'])
+        self.assertNotIn('не измерено', ctx['xag_src'])
 
     def test_pairs_top10_sorted_and_not_acked(self):
         self.reset()
@@ -115,16 +148,25 @@ class Pipeline(Base):
         self.assertIn('ШАГ A (TRAIN', txt)
         self.assertIn('ШАГ B (VALID', txt)
         self.assertIn('ТАБЛИЦА ВСЕХ N ТЕСТОВ', txt)
-        n_expected = RF.count_n({'CRYPTO': 6, 'COMMODITIES': 2, 'FX': 6, 'INDICES': 0, 'BONDS': 0, 'MULTI': 8})
-        self.assertIn(f'N = {n_expected}', txt)
-        rows = [ln for ln in txt.splitlines() if ' | ' in ln and ln.split(' | ')[0].split(' ')[0] in ('CRYPTO', 'COMMODITIES', 'FX', 'MULTI')]
-        self.assertEqual(len(rows), n_expected)
+        import re
+        n_all = RF.count_n({'CRYPTO': 6, 'COMMODITIES': 2, 'FX': 6, 'INDICES': 0, 'BONDS': 0, 'MULTI': 8})
+        n_rep = int(re.search(r'N = (\d+)', txt).group(1))
+        self.assertLessEqual(n_rep, n_all)
+        rows = [ln for ln in txt.splitlines() if ' | ' in ln and ln.split(' | ')[0].split(' ')[0] in ('CRYPTO', 'COMMODITIES', 'FX', 'MULTI') and 'нет данных' not in ln
+                and not ln.startswith('ячейка')]
+        self.assertEqual(len(rows), n_rep)
+        # первым разделом идёт проверка смещения (до калибровки)
+        self.assertIn('0. ПРОВЕРКА СМЕЩЕНИЯ ПРАВИЛ НА СИНТЕТИКЕ', txt)
+        self.assertLess(txt.index('0. ПРОВЕРКА СМЕЩЕНИЯ'), txt.index('КАЛИБРОВКА'))
+        self.assertIn('Спред XAGUSD:', txt)
         self.assertTrue(any('результаты скрыты до калибровки' in m for m in msgs))     # реальные результаты не показываются до калибровки
         self.assertIsNotNone(RF.kv_get('candidates', self.d))
         self.assertLessEqual(len(RF.kv_get('candidates', self.d)), 3)
         # калибровка на случайном блуждании не должна «проходить» процедуру отбора чаще 5%
+        excl = RF.kv_get('excluded_families', self.d)
+        tag = ','.join(sorted(excl)) or '-'
         for ci in range(len(FD.CELLS)):
-            cal = RF.kv_get(f'cell:{RF.REV}:{ci}', self.d)['calib']
+            cal = RF.kv_get(f'cell:{RF.REV}:{ci}:{tag}', self.d)['calib']
             self.assertFalse(cal['fail'], (FD.CELLS[ci], cal))
         # продолжение: сохранённые ячейки не пересчитываются
         calls = []

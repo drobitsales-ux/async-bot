@@ -52,7 +52,7 @@ def cost_crypto(mult=1.0):
 
 
 def cost_noncrypto(key, spreads, mult=1.0):
-    return Cost(float(spreads[key]) * 1e-4, fin_rate_yr() / 365.0, mult)
+    return Cost(float(spreads[base_key(key)]) * 1e-4, fin_rate_yr() / 365.0, mult)
 
 
 # ── индикаторы ───────────────────────────────────────────────────────────────────────────────────────
@@ -125,6 +125,28 @@ def make_series(key, bars, trade_from_ms, fund=None):
     return S
 
 
+def split_series(S, breaks, trade_from_ms):
+    """[v104, BOT_SPEC §2.41.21] Ряд → сегменты по индексам постоянных разрывов: сегмент — независимый ряд (свои индикаторы с прогревом, свой номер бара, закрытие позиции по close
+    последнего бара сегмента). Ключ первого сегмента — key, последующих — key#k. Без разрывов возвращает [S]."""
+    if not breaks:
+        return [S]
+    cuts = [0] + [int(b) for b in breaks] + [S['n']]
+    out = []
+    for k in range(len(cuts) - 1):
+        a, b = cuts[k], cuts[k + 1]
+        if b - a < 2:
+            continue
+        bars = {c: S[c][a:b] for c in ('ts', 'o', 'h', 'l', 'c', 'day')}
+        fund = None if S['fund'] is None else S['fund'][a:b]
+        out.append(make_series(S['key'] if k == 0 else f"{S['key']}#{k}", bars, trade_from_ms, fund))
+    return out
+
+
+def base_key(key):
+    """Ключ инструмента без суффикса сегмента (key#k)."""
+    return key.split('#')[0]
+
+
 def cached(S, name, fn):
     c = S['_c']
     if name not in c:
@@ -159,8 +181,8 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
     t0 = S['trade_from'] if trade_from is None else trade_from
     ev = np.flatnonzero(sig != 0)
     ev = ev[(ev >= t0) & (ev < n - 1)]
-    ev_long = ev[sig[ev] > 0]
-    ev_short = ev[sig[ev] < 0]
+    ev_long = ev[sig[ev] == 1]
+    ev_short = ev[sig[ev] == -1]
     el = np.flatnonzero(exit_l) if exit_l is not None else np.zeros(0, np.int64)
     es = np.flatnonzero(exit_s) if exit_s is not None else np.zeros(0, np.int64)
     trades = []
@@ -175,6 +197,17 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
         e = t + 1
         if e >= n:
             break
+        if d == BOTH:                                                # B-VC: оба уровня задеты на баре t+1 → −1R плюс издержки обеих сторон (худший случай)
+            a = float(atr[t])
+            px0 = float(o[e])
+            if not (a > 0) or not (px0 > 0) or not math.isfinite(px0):
+                cursor = t + 1
+                continue
+            w = RISK / (STOP_ATR * a / px0)
+            ret[e] -= RISK + 2.0 * w * cost.side
+            trades.append((e, e, 0, w, 'both'))
+            cursor = e
+            continue
         px = float(entry_px[t]) if entry_px is not None and not np.isnan(entry_px[t]) else float(o[e])
         a = float(atr[t])
         if not (a > 0) or not (px > 0) or not math.isfinite(px):
@@ -300,14 +333,21 @@ def sig_r_bb(S, z, win=20):
         return {'sig': sig, 'exit_l': c >= m, 'exit_s': c <= m, 'reverse': False}
 
 
-def sig_b_vc(S, nr=7, hold_after=5, oco=False):
+BOTH = 2                                                           # метка сигнала B-VC «на баре t+1 задеты ОБА уровня» (BOT_SPEC §2.41.19)
+
+
+def sig_b_vc(S, nr=7, hold_after=5):
+    """B-VC (BOT_SPEC §2.41.19): два стоп-ордера на баре t+1 (пробой high и low бара NR7). Один уровень — сделка по первому сработавшему (цена max(open, high_t) / min(open, low_t)),
+    выход по close бара входа + hold_after. ОБА уровня внутри бара t+1 — порядок неизвестен: сделка открыта и закрыта по стопу, результат −1R плюс издержки обеих сторон
+    (метка BOTH в sig; обработка в simulate). Отбора по исходу бара нет."""
     o, h, l = S['o'], S['h'], S['l']
     n = S['n']
     rng = h - l
     sig = np.zeros(n, np.int8)
     epx = np.full(n, np.nan)
+    hold = np.zeros(n, np.int32)
     if n < nr + 2:
-        return {'sig': sig, 'entry_px': epx, 'hold': np.zeros(n, np.int32), 'reverse': False}
+        return {'sig': sig, 'entry_px': epx, 'hold': hold, 'reverse': False}
     pm = np.full(n, np.nan)
     w = swv(rng, nr - 1).min(axis=1)                               # min диапазона по nr−1 ПРЕДЫДУЩИМ барам: окно i..i+nr−2 относится к t = i+nr−1
     pm[nr - 1:] = w[:n - nr + 1]
@@ -317,25 +357,11 @@ def sig_b_vc(S, nr=7, hold_after=5, oco=False):
     t = np.arange(n - 1)
     lh = h[t + 1] >= h[t]
     sh = l[t + 1] <= l[t]
-    if oco:
-        # ДИАГНОСТИКА (не входит в N): без отбора по исходу бара t+1 — OCO-пара стоп-ордеров; если достигнуты оба уровня, первым считается ближайший к open уровень
-        both = lh & sh
-        first_long = np.abs(o[1:] - h[:-1]) <= np.abs(o[1:] - l[:-1])
-        go_long = nr7[:-1] & ((lh & ~sh) | (both & first_long))
-        go_short = nr7[:-1] & ((sh & ~lh) | (both & ~first_long))
-        lh_use = go_long
-        sig[:-1][go_long] = 1
-        sig[:-1][go_short] = -1
-        epx[:-1] = np.where(lh_use, np.maximum(o[1:], h[:-1]), np.minimum(o[1:], l[:-1]))
-        hold = np.zeros(n, np.int32)
-        hold[sig != 0] = hold_after + 1
-        return {'sig': sig, 'entry_px': epx, 'hold': hold, 'reverse': False}
-    valid = nr7[:-1] & (lh != sh)
-    sig[:-1][valid & lh] = 1
-    sig[:-1][valid & sh] = -1
+    sig[:-1][nr7[:-1] & lh & ~sh] = 1
+    sig[:-1][nr7[:-1] & sh & ~lh] = -1
+    sig[:-1][nr7[:-1] & lh & sh] = BOTH
     epx[:-1] = np.where(lh, np.maximum(o[1:], h[:-1]), np.minimum(o[1:], l[:-1]))
-    hold = np.zeros(n, np.int32)
-    hold[sig != 0] = hold_after + 1                                # выход по close бара входа + hold_after
+    hold[(sig == 1) | (sig == -1)] = hold_after + 1                # выход по close бара входа + hold_after
     return {'sig': sig, 'entry_px': epx, 'hold': hold, 'reverse': False}
 
 

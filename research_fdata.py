@@ -22,6 +22,9 @@ MIN_FREE_MB = 200
 WARM_START = '2019-01-01'                # с этой даты бары участвуют в расчётах (разогрев индикаторов перед TRAIN)
 MIN_BARS_1D = 4                          # дневной бар из < 4 живых часовых — «обрубок», отбрасывается
 MIN_BARS_4H = 2
+CALC_FIRST = (2019, 1)                   # первый месяц, участвующий в расчётах (BOT_SPEC §2.41.21): раньше — не загружается и не проверяется
+GAP_ATTEMPTS = 3                         # месяц ≥ 2019-01, не полученный в 3 запусках /factory_load, — «постоянный разрыв»
+GAP_MAX_PER_INSTRUMENT = 2               # /factory допускает не более 2 месяцев разрыва на инструмент, иначе инструмент исключается
 
 # ключ → (класс, папка datafeed, правдоподобный диапазон цены для выбора масштаба, первый месяц загрузки (год, месяц 1..12))
 INSTRUMENTS = {
@@ -85,6 +88,8 @@ def load_index(d, key):
     x.setdefault('scale', None)
     x.setdefault('absent', [])
     x.setdefault('bad', [])
+    x.setdefault('attempts', {})
+    x.setdefault('gaps', [])
     return x
 
 
@@ -94,6 +99,10 @@ def save_index(d, key, idx):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(idx, f, ensure_ascii=False)
     os.replace(tmp, index_path(d, key))
+
+
+def calc_first(first):
+    return max(tuple(first), CALC_FIRST)
 
 
 def month_tags(first, last):
@@ -121,18 +130,20 @@ def stored_tags(d, key):
 
 
 def coverage(d, key, now_ms):
-    """Полнота загрузки: → dict(first, last, stored, absent, missing[], complete). missing — месяцы между первым имеющимся и последним полным, которых нет ни файлом, ни пометкой 404."""
+    """Полнота загрузки по месяцам, участвующим в расчётах (с 2019-01 по последний полный): → dict(stored, absent, bad, gaps[], missing[], complete…).
+    missing — месяцы без файла, без пометки 404 и не признанные постоянным разрывом; месяцы до 2019-01 не учитываются (BOT_SPEC §2.41.21)."""
     cls, folder, rng, first = INSTRUMENTS[key]
     idx = load_index(d, key)
-    have = set(stored_tags(d, key))
-    absent = set(idx['absent'])
-    bad = set(idx['bad'])
     ly, lm = last_complete(now_ms)
-    want = month_tags(first, (ly, lm))
-    missing = [t for t in want if t not in have and t not in absent and t not in bad]
-    # месяцы до первого имеющегося — допустимо отсутствуют только если 404 (в absent), иначе — пропуск загрузки
-    return {'key': key, 'first_wanted': want[0], 'last_wanted': want[-1], 'stored': len(have), 'absent': len(absent), 'bad': len(bad), 'missing': missing,
-            'first_have': min(have) if have else None, 'last_have': max(have) if have else None, 'complete': (not missing and bool(have))}
+    want = month_tags(calc_first(first), (ly, lm))
+    wset = set(want)
+    have = set(stored_tags(d, key)) & wset
+    absent = set(idx['absent']) & wset
+    bad = set(idx['bad']) & wset
+    gaps = sorted(set(idx['gaps']) & wset)
+    missing = [t for t in want if t not in have and t not in absent and t not in bad and t not in gaps]
+    return {'key': key, 'first_wanted': want[0], 'last_wanted': want[-1], 'stored': len(have), 'absent': len(absent), 'bad': len(bad), 'gaps': gaps, 'missing': missing,
+            'first_have': min(have) if have else None, 'last_have': max(have) if have else None, 'complete': (not missing and bool(have)), 'wanted': len(want)}
 
 
 # ── загрузка Dukascopy ───────────────────────────────────────────────────────────────────────────────
@@ -172,11 +183,11 @@ async def load_instrument(fetch, key, d, now_ms, progress=None, pause=PAUSE_S, d
     idx = load_index(d, key)
     ly, lm = last_complete(now_ms)
     have = set(stored_tags(d, key))
-    st = {'key': key, 'loaded': 0, 'skipped': 0, 'absent_new': 0, 'failed': [], 'bad': [], 'stopped': '', 'requests': 0}
+    st = {'key': key, 'loaded': 0, 'skipped': 0, 'absent_new': 0, 'failed': [], 'bad': [], 'stopped': '', 'requests': 0, 'new_gaps': []}
     consec = 0
-    for tag in month_tags(first, (ly, lm)):
+    for tag in month_tags(calc_first(first), (ly, lm)):                      # только месяцы, участвующие в расчётах (с 2019-01)
         y, m1 = int(tag[:4]), int(tag[5:])
-        if tag in have or tag in idx['absent'] or tag in idx['bad']:
+        if tag in have or tag in idx['absent'] or tag in idx['bad'] or tag in idx['gaps']:
             st['skipped'] += 1
             continue
         if deadline is not None and time.time() > deadline:
@@ -196,6 +207,11 @@ async def load_instrument(fetch, key, d, now_ms, progress=None, pause=PAUSE_S, d
             continue
         if r['status'] != 200:
             st['failed'].append(tag); consec += 1
+            n_try = int(idx['attempts'].get(tag, 0)) + 1                   # одна попытка = один запуск, в котором месяц не получен после повторов
+            idx['attempts'][tag] = n_try
+            if n_try >= GAP_ATTEMPTS:
+                idx['gaps'].append(tag); st['new_gaps'].append(tag)
+            save_index(d, key, idx)
             if consec >= max_consec_fail:
                 st['stopped'] = f'{consec} подряд неполученных месяцев (HTTP {r["status"]})'
                 break
@@ -407,3 +423,28 @@ def funding_per_bar(bar_ts, f_ts, f_rate, step_ms):
 
 def step_ms_of(tf):
     return {'1h': HOUR_MS, '4h': 4 * HOUR_MS, '1D': DAY_MS}[tf]
+
+
+def gap_breaks(d, key, ts):
+    """Индексы баров ряда ts, ПЕРЕД которыми находится постоянный разрыв (месяц без данных, BOT_SPEC §2.41.21): ряд режется на сегменты по этим индексам."""
+    idx = load_index(d, key)
+    out = set()
+    ts = np.asarray(ts)
+    for tag in idx['gaps']:
+        y, m1 = int(tag[:4]), int(tag[5:])
+        a = int(datetime(y, m1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        b = int(datetime(y + (m1 == 12), 1 if m1 == 12 else m1 + 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        i = int(np.searchsorted(ts, a, side='left'))
+        if 0 < i < len(ts) and ts[i] >= b:
+            out.add(i)
+    return sorted(out)
+
+
+def gaps_in_period(d, key, period_start_ms):
+    """Постоянные разрывы инструмента, начинающиеся не раньше period_start_ms (для отчёта финала: разрыв в LOCKBOX-периоде)."""
+    out = []
+    for tag in load_index(d, key)['gaps']:
+        y, m1 = int(tag[:4]), int(tag[5:])
+        if int(datetime(y, m1, 1, tzinfo=timezone.utc).timestamp() * 1000) >= period_start_ms:
+            out.append(tag)
+    return sorted(out)
