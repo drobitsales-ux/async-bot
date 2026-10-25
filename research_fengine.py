@@ -51,8 +51,9 @@ def cost_crypto(mult=1.0):
     return Cost(fee_taker() + SLIP, 0.0, mult)
 
 
-def cost_noncrypto(key, spreads, mult=1.0):
-    return Cost(float(spreads[base_key(key)]) * 1e-4, fin_rate_yr() / 365.0, mult)
+def cost_noncrypto(key, spreads, mult=1.0, swap_yr=None):
+    """swap_yr — годовая ставка переноса от номинала (None → ENV FIN_RATE_YR, по умолчанию 0.06, §2.41.17; поправка §2.41.23 задаёт 0.025 явно)."""
+    return Cost(float(spreads[base_key(key)]) * 1e-4, (fin_rate_yr() if swap_yr is None else float(swap_yr)) / 365.0, mult)
 
 
 # ── индикаторы ───────────────────────────────────────────────────────────────────────────────────────
@@ -169,15 +170,18 @@ def _empty_sig(n):
     return np.zeros(n, np.int8)
 
 
-def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, entry_px=None, trade_from=None, stop_mult=STOP_ATR):
+def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, entry_px=None, trade_from=None, stop_mult=STOP_ATR, detail=False):
     """Симуляция одного инструмента. sig[t] ∈ {−1,0,1} — сигнал входа по закрытию бара t (исполнение open t+1; entry_px[t] — цена входа стоп-ордером, nan = open t+1);
     exit_l/exit_s[t] — сигнал выхода из лонга/шорта по закрытию t (исполнение open t+1); reverse — противоположный сигнал при позиции = разворот; hold[t] = k > 0 — выход по
     close бара входа+k−1 (если стоп не раньше). Сделки не пересекаются: пока позиция открыта, новые сигналы игнорируются (кроме разворота).
+    detail=True добавляет по барам компоненты (для /factory_decomp): c_side (спред/комиссии), c_swap (перенос), c_fund (фандинг: плата +, получение −), expo (номинал открытой позиции / капитал).
     → dict(ret — вклад по барам (доля эквити, после издержек), day, trades — список (вход, последний бар, направление, w, вид выхода))."""
     n = S['n']
     o, h, l, c, ts, atr = S['o'], S['h'], S['l'], S['c'], S['ts'], S['atr']
     fund = S['fund']
     ret = np.zeros(n)
+    if detail:
+        c_side, c_swap, c_fund, expo = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
     t0 = S['trade_from'] if trade_from is None else trade_from
     ev = np.flatnonzero(sig != 0)
     ev = ev[(ev >= t0) & (ev < n - 1)]
@@ -205,6 +209,9 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
                 continue
             w = RISK / (STOP_ATR * a / px0)
             ret[e] -= RISK + 2.0 * w * cost.side
+            if detail:
+                c_side[e] += 2.0 * w * cost.side
+                expo[e] += w
             trades.append((e, e, 0, w, 'both'))
             cursor = e
             continue
@@ -253,14 +260,25 @@ def simulate(S, sig, cost, exit_l=None, exit_s=None, reverse=False, hold=None, e
         ret[last] -= w * cost.side
         if cost.swap_day and m > 1:
             ret[e + 1:last + 1] -= w * cost.swap_day * np.diff(ts[e:last + 1]) / DAY_MS
+            if detail:
+                c_swap[e + 1:last + 1] += w * cost.swap_day * np.diff(ts[e:last + 1]) / DAY_MS
         if fund is not None:
             hi = last if kind == 'open' else last + 1
             ret[e:hi] -= d * w * fund[e:hi]
+            if detail:
+                c_fund[e:hi] += d * w * fund[e:hi]
+        if detail:
+            c_side[e] += w * cost.side
+            c_side[last] += w * cost.side
+            expo[e:last + 1] += w
         trades.append((e, last, d, w, kind))
         cursor = cursor_next
         if kind == 'end':
             break
-    return {'ret': ret, 'day': S['day'], 'trades': trades}
+    out = {'ret': ret, 'day': S['day'], 'trades': trades}
+    if detail:
+        out.update(c_side=c_side, c_swap=c_swap, c_fund=c_fund, expo=expo)
+    return out
 
 
 # ── сигналы конфигураций библиотеки (по одному инструменту) ──────────────────────────────────────────
@@ -450,7 +468,7 @@ def sig_l_lag(S_alt, S_btc, H, win=100):
     return {'sig': sig, 'hold': hold, 'reverse': False}
 
 
-def simulate_pair(SA, SB, Lb, cost_a, cost_b, trade_from_ms, z_in=2.0, z_stop=4.0):
+def simulate_pair(SA, SB, Lb, cost_a, cost_b, trade_from_ms, z_in=2.0, z_stop=4.0, detail=False):
     """P-PAIR одной пары на общих барах: z = (ln(A/B) − SMA_L)/σ_L; вход при |z| > z_in (шорт убежавшей, лонг отставшей, равный номинал w = RISK/(2σ_L), ориентация A<B),
     исполнение open t+1; выход — z пересекает 0, стоп |z| > z_stop (исполнение open следующего бара) или 2L баров после бара входа (open). Издержки — обе ноги, вход и выход.
     → dict(ret, day, trades)."""
@@ -466,8 +484,13 @@ def simulate_pair(SA, SB, Lb, cost_a, cost_b, trade_from_ms, z_in=2.0, z_stop=4.
     o_b, c_b = SB['o'][B_idx], SB['c'][B_idx]
     ret = np.zeros(n)
     trades = []
+    zeros = (lambda: np.zeros(n))
+    c_side, c_swap, c_fund, expo = zeros(), zeros(), zeros(), zeros()
     if n < Lb + 10:
-        return {'ret': ret, 'day': day, 'trades': trades}
+        out = {'ret': ret, 'day': day, 'trades': trades}
+        if detail:
+            out.update(c_side=c_side, c_swap=c_swap, c_fund=c_fund, expo=expo)
+        return out
     x = np.log(c_a / c_b)
     m = sma(x, Lb)
     sd = rolling_std(x, Lb)
@@ -512,18 +535,28 @@ def simulate_pair(SA, SB, Lb, cost_a, cost_b, trade_from_ms, z_in=2.0, z_stop=4.
         ret[e:e + mlen] += w * (da * np.diff(pts_a) / o_a[e] + db * np.diff(pts_b) / o_b[e])
         ret[e] -= w * (cost_a.side + cost_b.side)
         ret[last] -= w * (cost_a.side + cost_b.side)
+        c_side[e] += w * (cost_a.side + cost_b.side)
+        c_side[last] += w * (cost_a.side + cost_b.side)
+        expo[e:last + 1] += 2.0 * w                                  # обе ноги
         if cost_a.swap_day and mlen > 1:
-            ret[e + 1:last + 1] -= w * (cost_a.swap_day + cost_b.swap_day) * np.diff(ts[e:last + 1]) / DAY_MS
+            sw = w * (cost_a.swap_day + cost_b.swap_day) * np.diff(ts[e:last + 1]) / DAY_MS
+            ret[e + 1:last + 1] -= sw
+            c_swap[e + 1:last + 1] += sw
         hi = last if not forced else last + 1
         if fa is not None:
             ret[e:hi] -= da * w * fa[e:hi]
+            c_fund[e:hi] += da * w * fa[e:hi]
         if fb is not None:
             ret[e:hi] -= db * w * fb[e:hi]
+            c_fund[e:hi] += db * w * fb[e:hi]
         trades.append((e, last, zs, w, 'open'))
         cursor = x_exec if not forced else n
         if forced:
             break
-    return {'ret': ret, 'day': day, 'trades': trades}
+    out = {'ret': ret, 'day': day, 'trades': trades}
+    if detail:
+        out.update(c_side=c_side, c_swap=c_swap, c_fund=c_fund, expo=expo)
+    return out
 
 
 # ── портфель и статистика ────────────────────────────────────────────────────────────────────────────
@@ -535,6 +568,28 @@ def portfolio_daily(parts):
     r = np.concatenate([p['ret'] for p in parts])
     u, inv = np.unique(days, return_inverse=True)
     return u, np.bincount(inv, weights=r, minlength=len(u))
+
+
+def portfolio_daily_multi(parts, keys):
+    """Как portfolio_daily, но сразу для нескольких массивов вкладов (ключи parts): → (дни, {ключ: сумма по дням}). Для 'expo' — НЕ сумма по барам, а среднее за день по барам
+    каждой части, затем сумма по частям (номинал, а не накопленный итог)."""
+    if not parts:
+        return np.zeros(0, np.int64), {k: np.zeros(0) for k in keys}
+    days = np.concatenate([p['day'] for p in parts]).astype(np.int64)
+    u, inv = np.unique(days, return_inverse=True)
+    out = {}
+    for k in keys:
+        if k == 'expo':
+            acc = np.zeros(len(u))
+            for p in parts:
+                dd = p['day'].astype(np.int64)
+                ud, iv = np.unique(dd, return_inverse=True)
+                mean = np.bincount(iv, weights=p['expo']) / np.bincount(iv)
+                acc[np.searchsorted(u, ud)] += mean
+            out[k] = acc
+        else:
+            out[k] = np.bincount(inv, weights=np.concatenate([p[k] for p in parts]), minlength=len(u))
+    return u, out
 
 
 def day_bounds(name):

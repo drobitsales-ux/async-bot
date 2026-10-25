@@ -1,6 +1,7 @@
 """v97: исследования в отдельном процессе (лимит памяти), R1 по символам с контрольными точками и SQL-агрегацией, стартовое сообщение, тревога по памяти."""
 import asyncio
 import os
+import time
 import random
 import sqlite3
 import tempfile
@@ -213,6 +214,7 @@ class EdgeResume(unittest.TestCase):
     def test_new_run_after_finished_run(self):
         edb = os.path.join(tempfile.mkdtemp(), 'edge.db')
         _, r1 = self._go(edb, inline=True)
+        time.sleep(1.1)                                              # идентификатор прогона — метка времени с точностью до секунды: два прогона в одну секунду совпадали (нестабильный тест)
         _, r2 = self._go(edb, inline=True)
         self.assertNotEqual(r1['run_id'], r2['run_id'])              # завершённый прогон не «продолжается» — новые данные дают новый прогон
 
