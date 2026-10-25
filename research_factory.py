@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+import research_fbias as RB
 import research_fdata as FD
 import research_fengine as E
 import research_ma as M
@@ -30,6 +31,9 @@ LAG_TFS = ('1h', '4h')
 MAX_FINALISTS = L.FINAL_MAX
 DURS_KEEP = 4000                                            # образец длительностей сделок для калибровки (на ячейку)
 BTC = 'BTCUSDT'
+BIAS_REPS = RB.REPS                                         # 50 повторов на конфигурацию (тесты уменьшают)
+SPREAD_XAG_FALLBACK = 10.99                                 # б.п., BOT_SPEC §2.41.21 п. 3.4 (значение владельца; используется, если /factory_load не измерил)
+SPEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'BOT_SPEC.md')
 
 
 def db_path(d=None):
@@ -78,24 +82,18 @@ def cell_classes(n_by_class):
     return [(i, c, tf) for i, (c, tf) in enumerate(FD.CELLS)]
 
 
-def enumerate_tests(n_by_class):
-    """Все тесты этапа 2: [(индекс ячейки, класс, ТФ, id конфигурации, семейство)]. n_by_class — число доступных инструментов по классам (X-MOM при ≥ 6)."""
+def enumerate_tests(n_by_class, excluded=()):
+    """Все тесты этапа 2: [(индекс ячейки, класс, ТФ, id конфигурации, семейство)]. n_by_class — число доступных инструментов по классам (X-MOM при ≥ 6);
+    excluded — семейства, исключённые проверкой смещения (§2.41.20)."""
     out = []
     for i, (cls, tf) in enumerate(FD.CELLS):
-        for cfg in L.configs_for(n_by_class[cls]):
-            out.append((i, cls, tf, cfg.id, cfg.family))
-        if cls == 'CRYPTO':
-            if tf in PAIR_TFS:
-                for lb in PAIR_LS:
-                    out.append((i, cls, tf, f'P-PAIR-L{lb}', 'P-PAIR'))
-            if tf in LAG_TFS:
-                for h in LAG_HS:
-                    out.append((i, cls, tf, f'L-LAG-H{h}', 'L-LAG'))
+        for cid, fam, _spec in specs_for_cell(cls, tf, n_by_class[cls], excluded):
+            out.append((i, cls, tf, cid, fam))
     return out
 
 
-def count_n(n_by_class):
-    return len(enumerate_tests(n_by_class))
+def count_n(n_by_class, excluded=()):
+    return len(enumerate_tests(n_by_class, excluded))
 
 
 def tid(cls, tf, cid):
@@ -135,7 +133,8 @@ def noncrypto_series(d, keys, tf, mode='pre', session=None):
         del raw
         if bars is None or len(bars['ts']) < 100:
             continue
-        out.append(E.make_series(key, bars, FD_trade_from()))
+        S = E.make_series(key, bars, FD_trade_from())
+        out += E.split_series(S, FD.gap_breaks(d, key, S['ts']), FD_trade_from())          # постоянные разрывы → независимые сегменты (§2.41.21)
     return out
 
 
@@ -163,8 +162,6 @@ def run_config(spec, series, tf, cls, spreads, pairs, mult=1.0):
         cfg = spec[1]
         if cfg.cross_sectional:
             sigs = E.xmom_signals(series, tf, dict(cfg.params)['lookback'], dict(cfg.params)['rebalance'])
-        elif len(spec) > 2 and spec[2] == 'oco':                                                  # диагностика B-VC (не входит в N)
-            sigs = {S['key']: E.sig_b_vc(S, dict(cfg.params)['nr'], dict(cfg.params)['hold'], oco=True) for S in series}
         else:
             sigs = {S['key']: E.library_signals(cfg, S) for S in series}
         for S in series:
@@ -347,8 +344,10 @@ async def run_load(params, progress=None):
             cov = FD.coverage(d, key, now_ms)
             if progress:
                 await progress(f'{key}: файлов {cov["stored"]}, пометок 404 {cov["absent"]}, не получено {len(cov["missing"])}')
-            lines.append(f'  {key}: файлов {cov["stored"]} ({cov["first_have"]} … {cov["last_have"]}), до начала истории (404) {cov["absent"]}, нечитаемых {cov["bad"]}, '
-                         f'НЕ ПОЛУЧЕНО {len(cov["missing"])}' + (f' [{", ".join(cov["missing"][:6])}{"…" if len(cov["missing"]) > 6 else ""}]' if cov['missing'] else '')
+            att = FD.load_index(d, key)['attempts']
+            lines.append(f'  {key}: файлов {cov["stored"]} из {cov["wanted"]} месяцев 2019+ ({cov["first_have"]} … {cov["last_have"]}), 404 {cov["absent"]}, нечитаемых {cov["bad"]}, '
+                         f'НЕ ПОЛУЧЕНО {len(cov["missing"])}' + (f' [{", ".join(f"{t} (попыток {att.get(t, 0)}/{FD.GAP_ATTEMPTS})" for t in cov["missing"][:6])}{"…" if len(cov["missing"]) > 6 else ""}]' if cov['missing'] else '')
+                         + (f'; ПОСТОЯННЫЕ РАЗРЫВЫ {", ".join(cov["gaps"])}' if cov['gaps'] else '')
                          + f'; запросов {st["requests"]}' + (f'; остановлен: {st["stopped"]}' if st['stopped'] else '') + (f'; плохие: {st["bad"][:2]}' if st['bad'] else ''))
             if st['stopped'] == 'время':
                 stopped_all = '⏱ бюджет времени прогона исчерпан — повторите /factory_load (продолжит с места остановки)'
@@ -357,9 +356,9 @@ async def run_load(params, progress=None):
             sp = await measure_spread(fetch, 'XAGUSD', now_ms, progress)
             if sp['ok']:
                 kv_set('spread:XAGUSD', sp, d)
-                lines.append(f'  спред XAGUSD (медиана активных часов, 3 месяца): {sp["median"]:.2f} б.п. (p90 {sp["p90"]:.2f}, n={sp["n"]}) — записан в БД, перенести в BOT_SPEC §2.41.17')
+                lines.append(f'  спред XAGUSD (медиана активных часов, 3 месяца): {sp["median"]:.2f} б.п. (p90 {sp["p90"]:.2f}, n={sp["n"]}) — записан в БД и будет использован вместо 10.99 б.п. из §2.41.21 (перенести в BOT_SPEC)')
             else:
-                lines.append(f'  спред XAGUSD НЕ измерен: {sp["info"]} — повторите /factory_load')
+                lines.append(f'  спред XAGUSD НЕ измерен: {sp["info"]} — будет использовано 10.99 б.п. (BOT_SPEC §2.41.21 п. 3.4)')
         elif kv_get('spread:XAGUSD', d):
             sp = kv_get('spread:XAGUSD', d)
             lines.append(f'  спред XAGUSD: {sp["median"]:.2f} б.п. (из БД)')
@@ -368,27 +367,56 @@ async def run_load(params, progress=None):
     ok, probs, avail, excl = availability(d, now_ms)
     lines.append('\n' + ('✅ Данные полны: можно запускать /factory_pairs, затем /factory.' if ok else '⚠️ Данные неполны: ' + '; '.join(probs) + ' — повторите /factory_load.'))
     if excl:
-        lines.append('Исключены как недоступные (404 на всю историю): ' + ', '.join(f'{k} ({v})' for k, v in excl.items()))
+        lines.append('Исключены из расчётов: ' + ', '.join(f'{k} ({v})' for k, v in excl.items()))
+    gp = gaps_of(d, now_ms, avail)
+    if gp:
+        lines.append('Постоянные разрывы (допустимо ≤ 2 на инструмент; сегментация — BOT_SPEC §2.41.21): ' + '; '.join(f'{k}: {", ".join(v)}' for k, v in gp.items()))
     return '\n'.join(lines)
 
 
 def availability(d, now_ms):
-    """→ (готово, проблемы[], доступные инструменты, исключённые {ключ: причина}). Инструмент без единого файла и со всеми месяцами в 404 исключается (допустимо §2.41.17);
-    пропуски месяцев между имеющимися — проблема (хронические 503)."""
+    """→ (готово, проблемы[], доступные инструменты, исключённые {ключ: причина}). Учитываются только месяцы с 2019-01 (§2.41.21). Инструмент без файлов и со всеми месяцами в 404
+    исключается (§2.41.17); с > 2 постоянными разрывами — исключается (§2.41.21); непостоянные пропуски — проблема (повторить /factory_load)."""
     probs, avail, excl = [], [], {}
     for key in FD.INSTRUMENTS:
         cov = FD.coverage(d, key, now_ms)
         if cov['stored'] == 0:
-            if cov['absent'] >= len(FD.month_tags(FD.INSTRUMENTS[key][3], FD.last_complete(now_ms))) and cov['absent'] > 0:
-                excl[key] = '404 на всю историю'
+            if cov['absent'] >= cov['wanted'] and cov['absent'] > 0:
+                excl[key] = '404 на всю историю (2019+)'
             else:
                 probs.append(f'{key}: данных нет (не загружено)')
             continue
         if cov['missing']:
             probs.append(f'{key}: не получено {len(cov["missing"])} мес.')
             continue
+        if len(cov['gaps']) > FD.GAP_MAX_PER_INSTRUMENT:
+            excl[key] = f'{len(cov["gaps"])} постоянных разрывов (> {FD.GAP_MAX_PER_INSTRUMENT}): {", ".join(cov["gaps"])}'
+            continue
         avail.append(key)
     return (not probs), probs, avail, excl
+
+
+def gaps_of(d, now_ms, keys):
+    """Постоянные разрывы (≥ 2019-01) по доступным инструментам: {ключ: [месяцы]}; пустые не включаются."""
+    out = {}
+    for k in keys:
+        g = FD.coverage(d, k, now_ms)['gaps']
+        if g:
+            out[k] = g
+    return out
+
+
+def read_spec_pairs(path=None):
+    """Список пар из строки `PAIRS-FROZEN:` файла BOT_SPEC (формат `A/B, C/D, …`) → ['A/B', …] | None (строки нет или список не записан)."""
+    try:
+        with open(path or SPEC_PATH, encoding='utf-8') as f:
+            for ln in f:
+                if ln.startswith('PAIRS-FROZEN:'):
+                    items = [x.strip() for x in ln.split(':', 1)[1].split(',') if x.strip()]
+                    return items if items and all('/' in x and ' ' not in x for x in items) else None
+    except OSError:
+        return None
+    return None
 
 
 # ── /factory_pairs ───────────────────────────────────────────────────────────────────────────────────
@@ -410,7 +438,7 @@ def run_pairs(params):
 def build_ctx(params):
     d = params.get('fdir') or FD.factory_dir()
     now_ms = params.get('now_ms') or int(time.time() * 1000)
-    return {'fdir': d, 'vdir': params['vdir'], 'syms': list(params['syms']), 'now_ms': now_ms}
+    return {'fdir': d, 'vdir': params['vdir'], 'syms': list(params['syms']), 'now_ms': now_ms, 'spec_path': params.get('spec_path')}
 
 
 def preflight(ctx):
@@ -420,17 +448,27 @@ def preflight(ctx):
     ok, p, avail, excl = availability(d, ctx['now_ms'])
     probs += p
     spreads = dict(E.SPREAD_BPS)
+    ctx['xag_src'] = None
     if 'XAGUSD' in avail:
         sp = kv_get('spread:XAGUSD', d)
-        if not sp:
-            probs.append('спред XAGUSD не измерен (/factory_load)')
-        else:
+        if sp:
             spreads['XAGUSD'] = sp['median']
+            ctx['xag_src'] = f'измерено /factory_load: {sp["median"]:.2f} б.п.'
+        else:
+            spreads['XAGUSD'] = SPREAD_XAG_FALLBACK
+            ctx['xag_src'] = f'из поправки BOT_SPEC §2.41.21 (значение владельца, не измерено): {SPREAD_XAG_FALLBACK:.2f} б.п.'
     pairs = kv_get('pairs', d)
     if not pairs or len(pairs) != PAIR_N:
         probs.append('пары P-PAIR не заморожены (/factory_pairs)')
-    elif not kv_get('pairs_ack', d):
-        probs.append('список пар не подтверждён (/factory_pairs ok после записи в BOT_SPEC)')
+    else:
+        if not kv_get('pairs_ack', d):
+            probs.append('список пар не подтверждён (/factory_pairs ok после записи в BOT_SPEC)')
+        spec_pairs = read_spec_pairs(ctx.get('spec_path'))
+        db_pairs = [f'{a}/{b}' for a, b, _c, _n in pairs]
+        if spec_pairs is None:
+            probs.append('список пар не записан в BOT_SPEC (строка PAIRS-FROZEN:, §2.41.21 п. 3.5)')
+        elif spec_pairs != db_pairs:
+            probs.append(f'список пар в BOT_SPEC не совпадает с замороженным в БД (BOT_SPEC: {", ".join(spec_pairs)}; БД: {", ".join(db_pairs)})')
     for s in ctx['syms']:
         if V.load_klines(ctx['vdir'], s, '15m') is None:
             probs.append(f'{s}: нет кэша 15m (/data/vision)')
@@ -446,8 +484,8 @@ def n_by_class(ctx):
     return n
 
 
-def specs_for_cell(cls, tf, n_cls):
-    """Список (id, семейство, spec) тестов ячейки."""
+def specs_for_cell(cls, tf, n_cls, excluded=()):
+    """Список (id, семейство, spec) тестов ячейки без исключённых семейств."""
     out = []
     for cfg in L.configs_for(n_cls):
         out.append((cfg.id, cfg.family, ('lib', cfg)))
@@ -456,39 +494,64 @@ def specs_for_cell(cls, tf, n_cls):
             out += [(f'P-PAIR-L{lb}', 'P-PAIR', ('pair', lb)) for lb in PAIR_LS]
         if tf in LAG_TFS:
             out += [(f'L-LAG-H{h}', 'L-LAG', ('lag', h)) for h in LAG_HS]
-    return out
+    return [x for x in out if x[1] not in excluded]
 
 
 async def run_factory(params, progress=None):
-    """/factory. → текст отчёта. Порядок: по каждой ячейке — реальные конфигурации (результаты не показываются) → калибровка ячейки; провал любой калибровки = СТОП без реальных
-    результатов; затем BH по всем N, шаги A и B, кандидаты на финал."""
+    """/factory. → текст отчёта. Порядок: 0) проверка смещения правил на синтетике (§2.41.20; смещённые семейства исключаются из N); затем по каждой ячейке — реальные конфигурации
+    (результаты не показываются) → калибровка ячейки; провал любой калибровки = СТОП без реальных результатов; затем BH по оставшимся N, шаги A и B, кандидаты на финал."""
     ctx = build_ctx(params)
     d = ctx['fdir']
     probs, spreads, pairs, excl = preflight(ctx)
     if probs:
         return '⛔ /factory отказ: ' + '; '.join(probs)
     ncls = n_by_class(ctx)
-    tests = enumerate_tests(ncls)
-    N = len(tests)
+    full_tests = enumerate_tests(ncls)
+    family_of = {cid: fam for _ci, _c, _t, cid, fam in full_tests}
+    cell_names = [f'{c} {tf}' for c, tf in FD.CELLS]
 
     async def say(m):
         if progress:
             await progress(m)
-    await say(f'/factory: N={N} тестов, seed {SEED}, ячеек {len(FD.CELLS)}; инструментов {ncls}; rev {REV}')
+    await say(f'/factory: тестов до проверки смещения {len(full_tests)}, seed {SEED}, ячеек {len(FD.CELLS)}; инструментов {ncls}; rev {REV}')
+    # ── 0. проверка смещения правил (синтетика, без издержек) ──
+    per_cell = {}
+    for ci, (cls, tf) in enumerate(FD.CELLS):
+        bkey = f'bias:{REV}:{ci}'
+        saved = kv_get(bkey, d)
+        if saved is None:
+            series = cell_series(cls, tf, ctx)
+            if not series:
+                return f'⛔ /factory: ячейка {cls} {tf}: нет данных'
+            specs = specs_for_cell(cls, tf, len(series))
+            await say(f'проверка смещения {ci + 1}/{len(FD.CELLS)} {cls} {tf}: {len(specs)} конфигураций × {BIAS_REPS} повторов (синтетика)')
+            saved = RB.bias_cell(ci, series, specs, lambda spec, syn, _tf=tf, _cls=cls: run_config(spec, syn, _tf, _cls, spreads, pairs, 0.0),
+                                 lambda days, r: period_stats(days, r)['TRAIN']['t'], FD_trade_from(), SEED, reps=BIAS_REPS)
+            kv_set(bkey, saved, d)
+            series = None
+        per_cell[ci] = saved
+        await asyncio.sleep(0)
+    vd = RB.verdict(per_cell, family_of)
+    excluded = tuple(vd['excluded'])
+    tests = enumerate_tests(ncls, excluded)
+    N = len(tests)
+    await say('проверка смещения: исключены ' + (', '.join(excluded) if excluded else 'нет') + f'; N = {N}')
+    bias_lines = RB.report_section(vd, cell_names, BIAS_REPS, SEED)
     results = {}                                           # tid → статистика
     calib = {}
+    tag = ','.join(sorted(excluded)) or '-'
     for ci, (cls, tf) in enumerate(FD.CELLS):
-        key = f'cell:{REV}:{ci}'
+        key = f'cell:{REV}:{ci}:{tag}'
         saved = kv_get(key, d)
         if saved is None:
             series = cell_series(cls, tf, ctx)
-            await say(f'ячейка {ci + 1}/{len(FD.CELLS)} {cls} {tf}: инструментов {len(series)}, баров {sum(S["n"] for S in series)}')
+            await say(f'ячейка {ci + 1}/{len(FD.CELLS)} {cls} {tf}: инструментов (сегментов) {len(series)}, баров {sum(S["n"] for S in series)}')
             if not series:
                 return f'⛔ /factory: ячейка {cls} {tf}: нет данных'
             ncell = len(series)
             real, ent_freqs, durs_all = {}, [], []
             elig = eligible_bars(series)
-            for cid, fam, spec in specs_for_cell(cls, tf, ncell):
+            for cid, fam, spec in specs_for_cell(cls, tf, ncell, excluded):
                 out = run_config(spec, series, tf, cls, spreads, pairs)
                 real[tid(cls, tf, cid)] = period_stats(out['days'], out['r'])
                 ne, durs = trade_stats(out['trades'], series, tf)
@@ -496,15 +559,11 @@ async def run_factory(params, progress=None):
                     ent_freqs.append(ne / max(1, elig))
                     durs_all += durs
                 await asyncio.sleep(0)
-            for cfg in L.configs_for(ncell):                                                       # диагностика B-VC без отбора по исходу бара (не входит в N, BH и кандидаты)
-                if cfg.family == 'B-VC':
-                    o2 = run_config(('lib', cfg, 'oco'), series, tf, cls, spreads, pairs)
-                    real['diag:' + tid(cls, tf, 'B-VC-OCO')] = period_stats(o2['days'], o2['r'])
             p_entry = float(np.mean(ent_freqs)) if ent_freqs else 0.0
             rng = np.random.default_rng([SEED, ci, 999999])
             if len(durs_all) > DURS_KEEP:
                 durs_all = list(rng.choice(durs_all, DURS_KEEP, replace=False))
-            await say(f'  реальные конфигурации посчитаны (результаты скрыты до калибровки); частота входов {p_entry:.5f}, сделок в образце {len(durs_all)}; калибровка 200…')
+            await say(f'  реальные конфигурации посчитаны (результаты скрыты до калибровки); частота входов {p_entry:.5f}, сделок в образце {len(durs_all)}; калибровка {CALIB_N}…')
             cal = calibrate_cell(ci, cls, tf, series, spreads, p_entry, durs_all, n_rand=CALIB_N, progress=progress)
             cal.update({'p_entry': p_entry, 'durs_n': len(durs_all)})
             saved = {'real': real, 'calib': cal}
@@ -515,14 +574,20 @@ async def run_factory(params, progress=None):
         calib[ci] = saved['calib']
         if saved['calib']['fail']:
             break
-    return build_report(ctx, tests, N, results, calib, ncls, excl, spreads, pairs)
+    info = [f'Спред XAGUSD: {ctx["xag_src"]}.' if ctx.get('xag_src') else 'XAGUSD не участвует.']
+    gp = gaps_of(d, ctx['now_ms'], ctx['avail'])
+    info.append('Постоянные разрывы данных (сегментация §2.41.21): ' + ('; '.join(f'{k}: {", ".join(v)}' for k, v in gp.items()) if gp else 'нет') + '.')
+    return build_report(ctx, tests, N, results, calib, ncls, excl, spreads, pairs, bias_lines, excluded, info)
 
 
-def build_report(ctx, tests, N, results, calib, ncls, excl, spreads, pairs):
+def build_report(ctx, tests, N, results, calib, ncls, excl, spreads, pairs, bias_lines=(), excluded=(), info=()):
     d = ctx['fdir']
-    R = [f'📈 <b>/factory — этап 2 «фабрики» (BOT_SPEC §2.41 + поправка §2.41.17)</b> | код {REV} | N = {N} | seed калибровки {SEED}',
-         f'Инструменты по классам: {ncls}. Исключены: {excl or "нет"}. Время: {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC.', '',
-         '<b>КАЛИБРОВКА (200 случайных стратегий на ячейку, шаг A на TRAIN; порог ≤ 5% = ≤ 10 из 200)</b>']
+    R = [f'📈 <b>/factory — этап 2 «фабрики» (BOT_SPEC §2.41 + поправки §2.41.17, §2.41.19–21)</b> | код {REV} | N = {N} | seed калибровки {SEED}',
+         f'Инструменты по классам: {ncls}. Исключены инструменты: {excl or "нет"}. Исключены семейства (смещение): {", ".join(excluded) or "нет"}. Время: {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC.']
+    R += list(info)
+    R.append('')
+    R += list(bias_lines)
+    R += ['', f'<b>КАЛИБРОВКА ({CALIB_N} случайных стратегий на ячейку, шаг A на TRAIN; порог ≤ 5% = ≤ {int(L.CALIB_MAX_FRAC * CALIB_N)} из {CALIB_N})</b>']
     failed = []
     for ci, (cls, tf) in enumerate(FD.CELLS):
         c = calib.get(ci)
@@ -557,13 +622,9 @@ def build_report(ctx, tests, N, results, calib, ncls, excl, spreads, pairs):
     R.append('<b>КАНДИДАТЫ НА ФИНАЛ</b> (не более 3, по t на TRAIN+VALID): ' + ('нет — финал не запускается' if not cands else ''))
     for k in cands:
         r = results[ids[k]]
-        dg = results.get('diag:' + ids[k].replace('B-VC-NR7', 'B-VC-OCO')) if '|B-VC' in ids[k] else None
-        warn = ''
-        if '|B-VC' in ids[k]:
-            warn = ('  ⚠️ B-VC: правило «оба уровня — сделка не открывается» использует исход бара t+1 (оптимистичное смещение; на случайном блуждании даёт t > 5). '
-                    + ('Диагностика без отбора по исходу (OCO): TRAIN t %s, VALID t %s, TRAIN+VALID t %s.' % tuple('н/д' if x is None else '%.2f' % x for x in (dg['TRAIN']['t'], dg['VALID']['t'], dg['TV']['t'])) if dg else ''))
-        R.append(f'  {ids[k]}: t(TRAIN+VALID) {r["TV"]["t"]:.2f}, mean {r["TV"]["mean"] * 1e4:.2f} б.п./день; TRAIN t {r["TRAIN"]["t"]:.2f}, VALID t {r["VALID"]["t"]:.2f}' + warn)
+        R.append(f'  {ids[k]}: t(TRAIN+VALID) {r["TV"]["t"]:.2f}, mean {r["TV"]["mean"] * 1e4:.2f} б.п./день; TRAIN t {r["TRAIN"]["t"]:.2f}, VALID t {r["VALID"]["t"]:.2f}')
     kv_set('candidates', [ids[k] for k in cands], d)
+    kv_set('excluded_families', list(excluded), d)
     kv_set('factory_report_rev', REV, d)
     if cands:
         R.append('Шаг C — ТОЛЬКО вручную: подтвердите список и запустите /factory_final (один прогон, повтор запрещён).')
@@ -578,15 +639,8 @@ def build_report(ctx, tests, N, results, calib, ncls, excl, spreads, pairs):
         f = lambda x, nd=2: ('н/д' if x is None else f'{x:.{nd}f}')
         R.append(f'{cls} {tf} | {cid} | {r["TRAIN"]["mean"] * 1e4:.2f} | {f(r["TRAIN"]["t"])} | {pv[k]:.4f} | {r["VALID"]["mean"] * 1e4:.2f} | {f(r["VALID"]["t"])} | '
                  f'{"да" if passA[k] else "нет"} | {"да" if passB[k] else "нет"}')
-    dgs = [(k, v) for k, v in results.items() if k.startswith('diag:')]
-    if dgs:
-        R.append('')
-        R.append('<b>ДИАГНОСТИКА B-VC без отбора по исходу бара (OCO; НЕ входит в N, BH и список кандидатов)</b>')
-        for k, v in dgs:
-            R.append(f'  {k[5:]}: mean TRAIN {v["TRAIN"]["mean"] * 1e4:.2f} б.п./день, t {("н/д" if v["TRAIN"]["t"] is None else "%.2f" % v["TRAIN"]["t"])}; '
-                     f'VALID mean {v["VALID"]["mean"] * 1e4:.2f}, t {("н/д" if v["VALID"]["t"] is None else "%.2f" % v["VALID"]["t"])}')
     R.append('')
-    R.append('Оговорки: спреды/издержки — BOT_SPEC §2.41.17 (сценарий (б), перенос FIN_RATE_YR); данные до 2019-01-01 в расчётах не участвуют; B-VC имеет встроенное оптимистичное смещение (см. выше); '
+    R.append('Оговорки: спреды/издержки — BOT_SPEC §2.41.17 (сценарий (б), перенос FIN_RATE_YR); данные до 2019-01-01 в расчётах не участвуют; B-VC — правило §2.41.19 (оба уровня = −1R); '
              'WTI в 2020-04 может иметь аномальные цены — сделки с px ≤ 0 пропускаются; фандинг CRYPTO — по кэшу Binance (нет данных — без фандинга).')
     return '\n'.join(R)
 
@@ -655,7 +709,14 @@ async def run_final(params, progress=None):
         if progress:
             await progress(f'финал {t}: готово')
         await asyncio.sleep(0)
-    kv_set('final_result', {'rows': rows, 'rev': REV}, d)
+    lb_gaps = {}
+    for t in ids:
+        cls = parse_tid(t)[0]
+        for k in ([] if cls == 'CRYPTO' else [k for k in FD.CLASS_MEMBERS[cls] if k in ctx['avail']]):
+            g = FD.gaps_in_period(d, k, L.lockbox_start_ms())
+            if g:
+                lb_gaps[k] = g
+    kv_set('final_result', {'rows': rows, 'rev': REV, 'lockbox_gaps': lb_gaps}, d)
     kv_set('final_done', True, d)
     R = [f'🔒 <b>/factory_final — шаг C на LOCKBOX (2025+), единственный прогон</b> | код {REV}', 'Критерии: Шарп ≥ 0.5, mean > 0 при t ≥ 2.0, макс. просадка ≤ 15%, при издержках ×2 mean > 0.', '']
     for t, m in rows:
@@ -664,6 +725,7 @@ async def run_final(params, progress=None):
         st_s = 'н/д' if not math.isfinite(m['stress_mean']) else '%.2f' % (m['stress_mean'] * 1e4)
         verdict = 'ПРОЙДЕНО' if m['pass'] else 'НЕ ПРОЙДЕНО'
         R.append('%s: дней %d, mean %.2f б.п./день, t %s, Шарп %s, просадка %.1f%%, mean при издержках ×2 %s б.п./день — %s' % (t, m['n'], m['mean'] * 1e4, t_s, sh_s, m['dd'] * 100, st_s, verdict))
+    R.append('Постоянные разрывы данных в LOCKBOX-периоде (§2.41.21): ' + ('; '.join(f'{k}: {", ".join(v)}' for k, v in lb_gaps.items()) if lb_gaps else 'нет') + '.')
     R.append('')
     R.append('Решение (BOT_SPEC §2.41.10): прошедший финалист → shadow-форвард (отдельный пре-коммит); ни один → поиск простых систематических стратегий завершён для всех классов.')
     return '\n'.join(R)
