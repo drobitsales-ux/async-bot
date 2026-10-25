@@ -407,6 +407,15 @@ class Fetcher:
         return res
 
 
+def _forget_transient(self):
+    """Забывает в кэше ответы с временным сбоем (503/сеть) — для повторного прохода по «не определённым» инструментам в конце прогона."""
+    for k in [k for k, v in self.cache.items() if v.get('transient')]:
+        del self.cache[k]
+
+
+Fetcher.forget_transient = _forget_transient
+
+
 def last_complete_month(now_ms):
     now = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
     return (now.year, now.month - 2) if now.month >= 2 else (now.year - 1, 11)
@@ -452,6 +461,11 @@ async def probe_instrument(fx: Fetcher, info, now_ms, progress=None):
     m = await fx.month(folder, 'BID', ly, lm)
     if m['p'] is not None and sc:
         out['weekend'] = weekend_stats(scale_prices(m['p'], sc))
+        pm = scale_prices(m['p'], sc)
+        run = closure_mask(pm)
+        fl, zv = flat_mask(pm), pm['v'] == 0
+        out['weekend'].update({'flat_zero_outside_run': int(np.sum(fl & zv & ~run)), 'flat_live_outside_run': int(np.sum(fl & ~zv & ~run)),
+                               'zero_notflat': int(np.sum(zv & ~fl)), 'zero_total': int(zv.sum()), 'flat_total': int(fl.sum())})
         out['weekend'].pop('closed_mask', None); out['weekend'].pop('flat', None)
     parts = []
     for (y, mo) in list(SPREAD_SAMPLES) + [(ly, lm)]:
@@ -585,6 +599,9 @@ def build_report2(stooq, instruments, tz, daily, book, now_ms, disk_mb, requests
         R.append(f'  {key}: баров {w["n"]}, плоских {w["flat_share"] * 100:.0f}% (выходные Сб+Вс {w["flat_weekend"] * 100:.0f}%, будни {w["flat_weekday"] * 100:.0f}%); окна закрытия: {rng}; '
                  f'живых баров внутри окон {w["live_in_closed"]} из {w["closed_bars"]}; плоских вне окон {w["flat_outside_closed"]}; нулевой объём в окнах {w["zero_vol_closed"] * 100:.0f}% / вне {w["zero_vol_open"] * 100:.0f}%, '
                  f'средний объём в окнах {w["mean_vol_closed"]:.2f} / вне {w["mean_vol_open"]:.2f}')
+    R.append('  Плоский бар и объём (последний месяц): ' + '; '.join(
+        f'{k}: плоских {r["weekend"]["flat_total"]}, с нулевым объёмом {r["weekend"]["zero_total"]}, плоских с нулевым объёмом вне серий ≥ 12 ч {r["weekend"]["flat_zero_outside_run"]}, '
+        f'плоских с объёмом > 0 вне серий {r["weekend"]["flat_live_outside_run"]}, нулевой объём у НЕплоских {r["weekend"]["zero_notflat"]}' for k, r in instruments.items() if r.get('weekend')))
     R.append('  ПРЕДЛОЖЕНИЕ правила исключения: исключать бар, у которого O=H=L=C И который входит в серию ≥ 12 подряд идущих плоских часовых баров (закрытие рынка). Формулировка владельца «O=H=L=C и время в окне закрытия» '
              'уточнена: окно «день недели × час» плывёт с летним временем США (зимой и летом закрытие сдвинуто на час), и на длинной выборке в окно не попадают часы, плоские только в одном из сезонов — '
              'проверено на годовом образце; серии устойчивы. Одиночные и короткие (< 12 ч) плоские бары не исключаются. Исключено баров серией в образце: ' + ', '.join(f'{k} {r["weekend"]["run_excluded"]}' for k, r in instruments.items() if r.get('weekend')) + '.')
@@ -659,6 +676,17 @@ async def run_probe_ma2(payload, params, progress=None):
                 instruments[key] = await probe_instrument(fx, info, now_ms)
             else:
                 instruments[key] = info
+        redo = [k for k, i in infos.items() if not i['folder'] and i.get('undetermined')]
+        if redo:                                                                  # второй проход: инструменты, не определённые из-за временных сбоев (503/сеть)
+            if progress:
+                await progress('Dukascopy: повторный проход для ' + ', '.join(redo))
+            fx.forget_transient()
+            await asyncio.sleep(30)
+            for key in redo:
+                infos[key] = await discover(fx, key, now_ms)
+                instruments[key] = await probe_instrument(fx, infos[key], now_ms) if infos[key]['folder'] else infos[key]
+                if progress:
+                    await progress(f'Dukascopy {key} (повтор): ' + (f'папка {infos[key]["folder"]}' if infos[key]['folder'] else ('не найден' if not infos[key].get('undetermined') else 'не определён')))
         tz = await probe_tz(fx, infos)
         daily = await probe_daily_rules(fx, infos)
     try:
