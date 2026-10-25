@@ -159,7 +159,7 @@ def run_config(spec, series, tf, cls, spreads, pairs, mult=1.0, swap_yr=None, de
     """spec = ('lib', L.Config) | ('pair', Lb) | ('lag', H). → dict(days, r, trades=[(ключ, e, last, время)…]) — портфель ячейки (простая сумма вкладов).
     swap_yr — годовой перенос не-крипто (None → ENV FIN_RATE_YR); detail=True добавляет 'multi' (по дням: ret, c_side, c_swap, c_fund, expo) для /factory_decomp."""
     kind = spec[0]
-    parts, trades = [], []
+    parts, trades, pinfo = [], [], []
     by_key = {S['key']: S for S in series}
     t0 = FD_trade_from()
     if kind == 'lib':
@@ -173,6 +173,8 @@ def run_config(spec, series, tf, cls, spreads, pairs, mult=1.0, swap_yr=None, de
             r = E.simulate(S, g['sig'], cost_of(S, cls, spreads, mult, swap_yr), exit_l=g.get('exit_l'), exit_s=g.get('exit_s'), reverse=g.get('reverse', False),
                            hold=g.get('hold'), entry_px=g.get('entry_px'), detail=detail)
             parts.append(r)
+            if detail:
+                pinfo.append({'key': S['key'], 'day': r['day'], 'ret': r['ret']})
             trades += [(S['key'], tr[0], tr[1], S['ts'][tr[0]]) for tr in r['trades']]
     elif kind == 'pair':
         for a, b in pairs:
@@ -197,8 +199,9 @@ def run_config(spec, series, tf, cls, spreads, pairs, mult=1.0, swap_yr=None, de
     for S in series:
         S['_c'].clear()                                    # кэш индикаторов — только на время одной конфигурации (память: лимит RESEARCH_MEM_MB)
     if detail:
-        days, multi = E.portfolio_daily_multi(parts, ('ret', 'c_side', 'c_swap', 'c_fund', 'expo'))
-        return {'days': days, 'r': multi['ret'], 'trades': trades, 'multi': multi}
+        keys = ('ret', 'c_side', 'c_swap', 'c_fund', 'expo') + (('ret_long', 'ret_short') if parts and all('ret_long' in q for q in parts) else ())
+        days, multi = E.portfolio_daily_multi(parts, keys)
+        return {'days': days, 'r': multi['ret'], 'trades': trades, 'multi': multi, 'parts': pinfo}
     days, r = E.portfolio_daily(parts)
     return {'days': days, 'r': r, 'trades': trades}
 
