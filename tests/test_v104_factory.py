@@ -303,6 +303,14 @@ class SpecPairs(unittest.TestCase):
         self.assertIsNone(RF.read_spec_pairs(g.name))
         self.assertIsNone(RF.read_spec_pairs('/nonexistent/file.md'))
 
+    def test_repo_spec_pairs_recorded(self):
+        pairs = RF.read_spec_pairs()
+        self.assertEqual(len(pairs), RF.PAIR_N)
+        self.assertEqual(len(set(pairs)), RF.PAIR_N)
+        for p in pairs:
+            a, b = p.split('/')
+            self.assertTrue(a < b and a.endswith('USDT') and b.endswith('USDT'), p)
+
     def test_repo_spec_has_marker_and_amendments(self):
         spec = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         self.assertTrue(any(ln.startswith('PAIRS-FROZEN:') for ln in spec.splitlines()))
