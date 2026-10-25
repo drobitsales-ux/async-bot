@@ -203,12 +203,15 @@ class Final(Base):
         txt = run(RF.run_final(dict(self.params, ids=['FX|1D|T-MA-20-100'])))
         self.assertIn('/factory_final отказ', txt)
         self.assertIsNone(RF.kv_get('final_started', self.d))
-        # не выполнены условия (пары не подтверждены) — отказ, флаг НЕ взят
-        RF.kv_set('pairs_ack', False, self.d)
-        txt = run(RF.run_final(self.params))
+        # не выполнены условия (в данных пропуск месяца) — отказ, флаг НЕ взят
+        p_gap = FD.month_path(self.d, 'EURUSD', 2022, 5)
+        os.rename(p_gap, p_gap + '.bak')
+        try:
+            txt = run(RF.run_final(self.params))
+        finally:
+            os.rename(p_gap + '.bak', p_gap)
         self.assertIn('флаг финала НЕ взят', txt)
         self.assertIsNone(RF.kv_get('final_started', self.d))
-        RF.kv_set('pairs_ack', True, self.d)
         txt = run(RF.run_final(self.params))
         self.assertIn('шаг C на LOCKBOX', txt)
         self.assertIn('FX|1D|T-MA-10-50', txt)

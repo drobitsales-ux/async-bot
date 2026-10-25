@@ -218,11 +218,22 @@ async def _task_factory_final(ctx: Ctx):
     return {'text': await research_factory.run_final(ctx.params, progress=ctx.progress)}
 
 
+async def _task_factory_decomp(ctx: Ctx):
+    import research_factory                      # [v105] декомпозиция доходности (шаг 0 поправки §2.41.23), только чтение
+    return {'text': await research_factory.run_decomp(ctx.params, progress=ctx.progress)}
+
+
+async def _task_factory_nc(ctx: Ctx):
+    import research_factory                      # [v105] перезапуск не-крипто ячеек (поправка §2.41.23)
+    return {'text': await research_factory.run_nc(ctx.params, progress=ctx.progress)}
+
+
 TASKS = {
     '_selftest_mem': _task_selftest_mem, '_selftest_ok': _task_selftest_ok, '_selftest_kill': _task_selftest_kill,
     'edge_audit': _task_edge_audit, 'of_backtest': _task_of_backtest, 'htf_backtest': _task_htf_backtest, 'htf_wide': _task_htf_wide,
     'htf_xsmom': _task_htf_xsmom, 'wide_stop': _task_wide_stop, 'data_probe': _task_data_probe, 'carry_test': _task_carry_test, 'data_probe_ma': _task_data_probe_ma,
     'factory_load': _task_factory_load, 'factory_pairs': _task_factory_pairs, 'factory': _task_factory, 'factory_final': _task_factory_final,
+    'factory_decomp': _task_factory_decomp, 'factory_nc': _task_factory_nc,
 }
 
 
