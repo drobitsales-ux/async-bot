@@ -344,14 +344,16 @@ async def run_load(params, progress=None):
         except V.VisionError as e:
             return '\n'.join(head + [f'⛔ ЗАГРУЗКА ОСТАНОВЛЕНА: {e}'])
     cov = B.coverage(d)
-    lines = head + [f'Символов в архиве (…USDT, без дат поставки): {cov["n_symbols"]}; завершено {cov["n_done"]}; не завершено {len(cov["partial"])}; постоянных разрывов (месяцев) {cov["gaps"]}; '
+    lines = head + [f'Символов в архиве (…USDT, без дат поставки): {cov["n_symbols"]}; завершено {cov["n_done"]} из {cov["n_symbols"]}; начато, но не завершено {len(cov["partial"])}; не начато {len(cov["not_started"])}; постоянных разрывов (месяцев) {cov["gaps"]}; '
                     f'первый месяц {cov["first_month"]}, последний {cov["last_month"]}',
                     f'Делистингованных (последний месяц ≥ {B.DELIST_MONTHS} мес. раньше последнего в архиве): {len(cov["delisted"])}'
                     + ('' if cov['delisted'] else ' — ОШИБКА ВЫЖИВШЕГО: в архиве нет делистингованных (или листинг неполон) — результаты H1/H2 — оценка сверху')]
     if cov['delisted']:
         lines.append('  примеры: ' + ', '.join(cov['delisted'][:15]) + ('…' if len(cov['delisted']) > 15 else ''))
+    if cov['not_started']:
+        lines.append(f'Не обработано загрузчиком: {len(cov["not_started"])} символов (например {", ".join(cov["not_started"][:5])}) — это НЕ отсутствие файлов, до них не дошла очередь')
     if cov['no_files']:
-        lines.append(f'Символов без файлов D1 в листинге: {len(cov["no_files"])} ({", ".join(cov["no_files"][:10])}…)')
+        lines.append(f'В листинге архива нет файлов D1: {len(cov["no_files"])} ({", ".join(cov["no_files"][:10])}…)')
     lines.append('⏱ бюджет времени исчерпан — повторите /battery_load (продолжит с места остановки)' if r['stopped'] else
                  ('✅ загрузка завершена по всем символам — можно /battery' if cov['n_done'] == cov['n_symbols'] else f'Не завершено символов: {len(cov["partial"])} — повторите /battery_load'))
     return '\n'.join(lines)

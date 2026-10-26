@@ -291,15 +291,17 @@ def coverage(d, idx=None):
     last_global = 0
     last_of = {}
     first_of = {}
-    gaps, partial, nofile = 0, [], []
+    gaps, partial, nofile, notstarted = 0, [], [], []
     for s in syms:
         rec = idx['keys'].get(s, {})
         ms = rec.get('d1', [])
+        if 'd1' not in rec:
+            notstarted.append(s)
         if ms:
             last_of[s] = month_index(ms[-1])
             first_of[s] = ms[0]
             last_global = max(last_global, last_of[s])
-        else:
+        elif 'd1' in rec:
             nofile.append(s)
         for kind in ('d1', 'fr'):
             cur = (load_d1 if kind == 'd1' else load_fund)(d, s)
@@ -312,7 +314,7 @@ def coverage(d, idx=None):
                         partial.append(s)
     delisted = sorted(s for s, lm in last_of.items() if last_global - lm >= DELIST_MONTHS)
     return {'n_symbols': len(syms), 'n_done': sum(1 for s in syms if idx['done'].get(s)), 'partial': partial, 'gaps': gaps, 'delisted': delisted,
-            'first_month': min(first_of.values()) if first_of else None, 'last_month': (f'{last_global // 12}-{last_global % 12 + 1:02d}' if last_global else None), 'no_files': nofile}
+            'first_month': min(first_of.values()) if first_of else None, 'last_month': (f'{last_global // 12}-{last_global % 12 + 1:02d}' if last_global else None), 'no_files': nofile, 'not_started': notstarted}
 
 
 # ── панели ──────────────────────────────────────────────────────────────────────────────────────────

@@ -113,6 +113,11 @@ class H2NewList(unittest.TestCase):
         self.assertEqual(res['meta']['opened'], 1)
         self.assertTrue(np.isfinite(res['r']).all())
 
+    def test_preexisting_symbols_are_not_listings(self):
+        P = mini_panel(nd=100, ns=3, first=[0, 10, 0])
+        ctx = S.make_ctx(P)
+        self.assertEqual([(e, s) for e, s in S.h2_events(ctx, 3)], [(13, 1)])        # символы с первым баром в первый день архива — не листинги (§2.43.8)
+
     def test_fixture_with_delisted_symbols(self):
         d = tempfile.mkdtemp()
         BF.write_battery(d, n_syms=19, delist_n=3)
@@ -386,6 +391,7 @@ class Loader(unittest.TestCase):
             run(B.sync_all(fetch, d, refresh=(i == 0)))
         cov = B.coverage(d)
         self.assertEqual(cov['gaps'], 1)
+        self.assertEqual(cov['not_started'], [])
         self.assertEqual(cov['n_done'], 2)                                          # символ завершён (разрыв исчерпал попытки)
         self.assertEqual(cov['delisted'], ['OLDUSDT'])                              # последний месяц OLD — на 2 месяца раньше AAA
         z = B.load_d1(d, 'AAAUSDT')
@@ -402,6 +408,7 @@ class Loader(unittest.TestCase):
         r = run(B.sync_all(fetch, d, deadline=0.0))                                  # дедлайн в прошлом — ничего не загружено, остановлено
         self.assertTrue(r['stopped'])
         self.assertEqual(B.coverage(d)['n_done'], 0)
+        self.assertEqual(len(B.coverage(d)['not_started']), 4)                        # «не обработано» отличается от «нет файлов»
         run(B.sync_all(fetch, d))
         self.assertEqual(B.coverage(d)['n_done'], 4)
 
