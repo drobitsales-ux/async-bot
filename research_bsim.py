@@ -85,7 +85,7 @@ def h1_signal(ctx, d, L_days):
         return None, None
     avg = P['G'][lo:d].astype(np.float64).sum(0) / L_days
     cnt = P['GC'][lo:d].sum(0)
-    ok = ctx['liq'][d] & np.isfinite(ctx['atr'][d]) & np.isfinite(P['O'][d]) & (cnt > 0)
+    ok = ctx['liq'][d] & (ctx['atr'][d] > 0) & (P['O'][d] > 0) & (cnt > 0)               # ATR = 0 (плоский ряд) — позицию с весом RISK/(3·ATR) открыть нельзя
     return avg, ok
 
 
