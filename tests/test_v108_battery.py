@@ -173,6 +173,15 @@ class H1FundContra(unittest.TestCase):
         self.assertGreater(b['r'].sum(), a['r'].sum())                              # шорт при положительном фандинге и лонг при отрицательном — получают
         self.assertEqual(a['meta']['stops'], 0)
 
+    def test_flat_symbol_with_zero_atr_is_not_eligible(self):
+        P = self.setup_panel()
+        P['H'][:, 5] = P['L'][:, 5] = P['O'][:, 5] = P['C'][:, 5] = 100.0              # неподвижный ряд: ATR = 0 (ZeroDivisionError в /battery 2026-10-26)
+        ctx = S.make_ctx(P)
+        avg, ok = S.h1_signal(ctx, 40, 3)
+        self.assertFalse(bool(ok[5]))
+        for seed in range(5):
+            S.sim_h1(ctx, 3, FEES0, rand=True, rng=np.random.default_rng(seed), costs_on=False)   # не падает
+
     def test_random_strategy_is_independent_of_funding(self):
         P = self.setup_panel()
         ctx = S.make_ctx(P)
