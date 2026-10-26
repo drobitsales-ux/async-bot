@@ -359,7 +359,7 @@ class SqlVsMemory(unittest.TestCase):
 
 
 class StartupAndMemory(unittest.TestCase):
-    FLAGS = ('SMC_LIVE', 'SMC_SHADOW_ENABLED', 'SA_ENABLED', 'SA_LIVE', 'RSI_ENABLED', 'PB_ENABLED', 'PB_LIVE', 'MOMENTUM_ENABLED', 'MOMENTUM_LIVE',
+    FLAGS = ('SMC_LIVE', 'SMC_SIG_ENABLED', 'SMC_SHADOW_ENABLED', 'SA_ENABLED', 'SA_LIVE', 'RSI_ENABLED', 'PB_ENABLED', 'PB_LIVE', 'MOMENTUM_ENABLED', 'MOMENTUM_LIVE',
              'RB_ENABLED', 'ORB_ENABLED', 'PO3_ENABLED', 'SMC2_ENABLED', 'ORB_RT_ENABLED')
 
     def setUp(self):
@@ -375,7 +375,7 @@ class StartupAndMemory(unittest.TestCase):
             setattr(a, f, f in on)
 
     def test_shows_code_version_and_only_enabled(self):
-        self._flags(PO3_ENABLED=1, ORB_RT_ENABLED=1)
+        self._flags(SMC_SIG_ENABLED=1, PO3_ENABLED=1, ORB_RT_ENABLED=1)    # v107: SMC_SIG по умолчанию выключен — включаем явно
         t = a.startup_text()
         self.assertIn(a.CODE_VERSION, t)
         self.assertIn('Живые стратегии: нет (живые входы выключены)', t)

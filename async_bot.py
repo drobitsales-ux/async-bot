@@ -236,6 +236,12 @@ PO3_MAX_PER_DAY     = 40
 DOWNLONG_FORWARD_FROM = os.getenv('DOWNLONG_FORWARD_FROM', '2026-10-01')  # ISO-дата деплоя v75 (UTC)
 # ── [v79] ПАУЗА ЖИВОГО SMC → SMC_SIG (shadow) ───────────────────────────────
 SMC_LIVE = os.getenv('SMC_LIVE', 'false').lower() == 'true'
+# [v107] РЕЖИМ ОЖИДАНИЯ (BOT_SPEC §3, §2.42): поиск стратегий закрыт — запись сигналов замороженного SMC (SMC_SIG) по умолчанию выключена; скан SMC не запускается вовсе
+# (ни одного REST-запроса), пока не включён живой вход (SMC_LIVE) или запись сигналов (SMC_SIG_ENABLED). Возврат — только ENV.
+SMC_SIG_ENABLED = os.getenv('SMC_SIG_ENABLED', 'false').lower() == 'true'
+IDLE_CYCLE_SEC = max(60.0, float(os.getenv('IDLE_CYCLE_SEC', '300') or 300))   # [v107] полный цикл (эквити, breaker-ы, мониторинг, отчёты) в режиме ожидания — не чаще раза в IDLE_CYCLE_SEC
+IDLE_TICK_SEC = 10.0                                                             # [v107] в режиме ожидания между полными циклами опрашиваются только команды Telegram
+IDLE_TEXT = 'Режим ожидания: торговых и shadow-стратегий нет (поиск закрыт, BOT_SPEC §3)'
 # [v79] Пауза живого SMC: форвард PF net 0.88 (n=21), диагноз — вход в
 # погоне (см. §2.20.0). Возврат — ENV, но по правилам §2.20.3.
 # Логика сигнала smc_signal() НЕ менялась: при SMC_LIVE=false сигнал, прошедший ВСЕ
@@ -4626,6 +4632,8 @@ async def _scan_universe() -> list:
 
 async def scan_smc():
     """Сканер SMC: запускается каждые 60 сек в торговые сессии."""
+    if not (SMC_LIVE or SMC_SIG_ENABLED):                  # [v107] режим ожидания: ни живых входов, ни записи SMC_SIG — скан не запускается (0 REST)
+        return
     if not is_session():
         return  # вне торговой сессии — молчим
     # [v79] breaker гейтит ЖИВЫЕ входы; при паузе (SMC_LIVE=false) скан ничего не открывает,
@@ -6775,8 +6783,10 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-05-v106'
+CODE_VERSION = '2026-11-07-v108'
 CHANGELOG = [
+    ('2026-11-07-v108', 'ФИНАЛЬНАЯ СЕРИЯ «БАТАРЕЯ» (BOT_SPEC §2.43, N = 8; пре-регистрация записана ОТДЕЛЬНЫМИ коммитами ДО кода и ДО загрузки данных; bybit_worker.py, breaker-ы v76/v77, каналы v96, режим ожидания v107 не менялись; в research_runner добавлены только записи задач; расчёты — через research_runner). Владелец пересмотрел §2.32.8 для одной ограниченной серии; после неё правило действует для всего класса «публичные рыночные данные + розничный доступ» без исключений. Команды: /battery_load (все перпетуалы Binance USDT-M, включая делистингованные: D1-свечи с quote_volume и fundingRate по месяцам, листинг S3, продолжение с места остановки, бюджет времени, учёт постоянных разрывов; отчёт показывает число делистингованных и ошибку выжившего), /battery (шаг 0: мощность S_min = t_BH·√(365/D) > 2.0 → «непроверяема»; шаг 1: смещение правил на синтетике (мартингал по цене, σ и календарь реальные, 50 повторов) — смещённая гипотеза исключается из N; шаг 2: калибровка 200 случайных стратегий на ячейку, > 10 прошли шаг A → СТОП; шаг 3: TRAIN BH q = 0.05 по N и VALID mean > 0, t ≥ 1.5; ≤ 2 кандидата; LOCKBOX не читается), /battery_final confirm (один прогон на LOCKBOX, НОВЫЙ флаг серии battery_final_started берётся ДО чтения LOCKBOX, прежний флаг не затрагивается; критерии §2.41.7 + стресс ×2 + mean ≥ 0 в месяцы роста и падения BTC). Гипотезы: H1 FUND-CONTRA (1D, L ∈ {3,7}, шорт 5 с наибольшим положительным средним фандингом, лонг 5 с наименьшим отрицательным, удержание 3 дня, стоп 3·ATR20, фандинг в P&L), H2 NEW-LIST (шорт по close дня D ∈ {3,7} после листинга, удержание 30 дней, стоп +50%, риск 0.5%, не более 10% капитала в риске), H3 FUND-TIME (16 символов H-XS, моменты 00/08/16, «до» — против знака последней уже начисленной ставки, «после» — по знаку ставки момента), H5 GRID (недельная нейтральная сетка 10 уровней, диапазон ±m·ATR14, худший порядок внутри бара, maker на лимитных / taker на принудительном закрытии). Ликвидность «на дату» (PIT): средний оборот за 30 дней ДО сигнала ≥ 20 млн USDT; проскальзывание 0.0003 (топ-30) / 0.0005; стресс ×2. НАХОДКА на фикстуре (синтетика): H5 с правилом «худший порядок внутри бара» даёт отрицательное смещение на случайном блуждании (медианный |t| ≈ 3) — по критерию шага 1 вероятно исключение H5 до просмотра результатов; в отчёт добавлена диагностика при оптимистичном порядке (не для решений). Не проверено: реальный архив (состав, форматы), реальные время и память. Тесты: tests/test_v108_battery.py (32)'),
+    ('2026-11-06-v107', 'РЕЖИМ ОЖИДАНИЯ + ИТОГОВЫЙ ДОКУМЕНТ (breaker-ы v76/v77, каналы v96, живая логика, SMC_LIVE=false, bybit_worker.py не менялись). Итог §2.42 (/final_crypto4h confirm, 2026-10-25 20:46 UTC; цифры владельца записаны в BOT_SPEC §2.42б): НЕ ПРОЙДЕНО — t_adj 0.34 (t 0.39, k 1.151), Шарп 0.29, макс. просадка 70.6%, стресс ×2 mean +1.55 б.п./день, месяцы роста BTC −3.43 / падения +3.89, 2025 −3.78 / 2026 +17.39, QNT 4.27 из 5.28 б.п./день, лонг +6.62 / шорт −1.34; по §2.42 п. 4 и §2.32.8 поиск стратегий закрыт окончательно; флаг финала использован. ПРАВКА 1: все сканеры по умолчанию выключены — новый SMC_SIG_ENABLED (false) (раньше SMC_SIG писался всегда при SMC_LIVE=false); скан SMC не запускается без SMC_LIVE или SMC_SIG_ENABLED (0 REST); дефолты SMC2/PO3/ORB_RT/RB/SA/PB/MOM/RSI/ORB/SMC_SHADOW уже были false (проверено тестом в чистом окружении); открытые shadow-записи закрываются штатно (shadow_check). В режиме ожидания (нет ни живых, ни shadow-стратегий, позиций нет) полный цикл (эквити, breaker-ы, мониторинг, отчёты, дайджест) идёт раз в IDLE_CYCLE_SEC (ENV, по умолчанию 300 с), между ними каждые 10 с опрашиваются только команды Telegram (отклик на команды не растёт); при открытой позиции — прежний цикл 60 с. Стартовое сообщение и /status: «Режим ожидания: торговых и shadow-стратегий нет (поиск закрыт, BOT_SPEC §3)» (текст /status вынесен в status_text()). ПРАВКА 2: RESEARCH_SUMMARY.md (цель и условия, метод, таблица всех гипотез, дефекты измерений, выводы, условия возобновления, инфраструктура) + §3.0 в BOT_SPEC. Тесты: tests/test_v107_idle.py'),
     ('2026-11-05-v106', 'ОДИНОЧНЫЙ ФИНАЛ CRYPTO 4h T-MA-10-50 (BOT_SPEC §2.42, пре-регистрация записана ОТДЕЛЬНЫМ коммитом 3e1cbe8 ДО кода; живая торговля, breaker-ы, каналы v96, поведение research_runner, bybit_worker.py не менялись; LOCKBOX не открывался, флаг финала не взят). Итог /factory_decomp и /factory_nc (сообщены владельцем): не-крипто направление закрыто (перенос доминировал, диагностика «перенос 0» — лучший t ≈ 0.6), ограничение метода — мощность (Шарп 0.5 за 4 года даёт t ≈ 1.0 при пороге BH ≈ 3.5). /final_crypto4h: без аргументов — показ §2.42 и k (расчёт в research_runner, LOCKBOX не читается); confirm — единственный прогон на LOCKBOX по критериям: t_adj = t(NW лаг 5)/k ≥ 2.0, годовой Шарп ≥ 0.5, просадка ≤ 15%, при стрессе ×2 mean > 0, mean ≥ 0 отдельно в месяцы роста и падения BTC (справочно: ноги лонг/шорт, годы, символы, фандинг, плечо); k = max(1, m0/0.674), m0 — медианный |t| на синтетике нулевой гипотезы (200 повторов, seed 20261025; σ из данных до LOCKBOX — σ LOCKBOX недоступна без его открытия; длина — до конца кэша); confirm требует строку FINAL4H-K: в BOT_SPEC, совпадающую с пересчитанным k (иначе флаг не берётся); общий флаг финала с /factory_final (повтор запрещён). Кандидат считается той же функцией run_config, что ячейка CRYPTO 4h фабрики (тест — побитовое совпадение на TRAIN). Оговорка в BOT_SPEC: кандидат выбран по TRAIN/VALID (проклятие победителя), порог рассчитан на один заранее заданный тест. Тесты: tests/test_v106_final4h.py (10)'),
     ('2026-11-04-v105', 'ПОПРАВКА §2.41.23 К ПРЕ-РЕГИСТРАЦИИ (записана ОТДЕЛЬНЫМ коммитом 0ad7581 ДО кода и ДО /factory_nc; живая торговля, breaker-ы, каналы v96, поведение research_runner, bybit_worker.py не менялись; LOCKBOX не открывался, флаг финала не использован). Итог /factory (2026-10-25, v104): данные полны (18 × 93 мес.), B-VC исключён проверкой смещения (медиана |t| 24.7), N = 192, калибровка 0/200 во всех 12 ячейках, шаг A 0/192, финала нет. /factory_decomp (шаг 0, ТОЛЬКО ЧТЕНИЕ): по каждой ячейке и конфигурации на TRAIN и VALID — net, до издержек, вклад спреда/комиссий, переноса и фандинга (б.п./день капитала) и плечо по факту (среднее и p95); модель издержек не меняется. /factory_nc: перезапуск ТОЛЬКО 9 не-крипто ячеек (N_nc = 134), основной сценарий — перенос 0.025 годовых от номинала (диагностика «перенос 0» без права отбора), 1D — t Ньюи–Уэста лаг 5 и 20 с отбором по меньшему, калибровка заново, BH по N_nc и справочный BH по объединению двух прогонов (честная пометка: поправка принята после просмотра результатов, чистая выборка — только LOCKBOX); кандидаты (≤ 3) и сценарий переноса сохраняются для /factory_final (общий флаг, один раз; стресс ×2 включает перенос ×2; дополнительная проверка «0.025 + ставка ФРС» — только при заданной ENV FED_RATE_BY_YEAR, ставок в коде нет). Крипто-ячейки не перезапускаются (LOCKBOX для CRYPTO считается скомпрометированным). НАХОДКА: инфляция t трендовых конфигураций на синтетике НЕ зависит от лага Ньюи–Уэста (лаг 20 не лучше лага 5), а определяется волатильностью ряда (σ ≈ 6% — медиана |t| 1.2–1.4; σ ≈ 1% — ≤ 1.0): гипотеза «недостаточный лаг» не подтвердилась (BOT_SPEC §2.41.24). Заголовки отчётов показывают версию кода (раньше — ревизию кэша). Тесты: tests/test_v105_factory.py (13)'),
     ('2026-11-03-v104', 'ПОПРАВКИ К ПРЕ-РЕГИСТРАЦИИ §2.41.19–21 ДО /factory (записаны ОТДЕЛЬНЫМ коммитом d32b04e ДО кода; живая торговля, breaker-ы, каналы v96, research_runner, bybit_worker.py не менялись; ни одной доходности фабрики на реальных данных не рассчитано). 1) B-VC: удалено правило «оба уровня на t+1 — сделка не открывается» (отбор по исходу бара, ложный t ≈ 6.7 на случайном блуждании); новое: два стоп-ордера, срабатывает первый, если задеты оба — сделка открыта и закрыта по стопу, результат −1R плюс издержки обеих сторон; OCO-диагностика удалена, N не меняется. 2) Проверка смещения правил на синтетике (research_fbias.py) ПЕРЕД калибровкой: каждое семейство по всем конфигурациям на случайных блужданиях той же длины и σ (seed 20261025, 50 повторов, без издержек); медианный |t| > 1.0 или |t| > 3 в ≥ 10% повторов (по объединённой выборке семейства) — семейство исключается из N до шага A; отчёт /factory начинается с этого раздела. На фикстуре новое правило B-VC даёт долю двойных касаний ≈ 42% и сильный отрицательный t (≈ −31) → по критерию будет исключено (N = 192), если на реальных данных так же — решение владельца о другой трактовке нужно ДО /factory. 3) Полнота данных только с 2019-01 (раньше не загружается и не блокирует), месяц ≥ 2019-01, не полученный в 3 запусках /factory_load, — постоянный разрыв: ряд режется на сегменты (индикаторы с прогревом, позиция закрывается по close последнего бара перед разрывом, сигналов через разрыв нет), допустимо ≤ 2 на инструмент, иначе инструмент исключается с пересчётом N, разрыв в LOCKBOX-периоде указывается в отчёте финала; спред XAGUSD — измеренный, иначе 10.99 б.п. (значение владельца). 4) /factory и /factory_final отказывают, пока список пар в БД не совпадает со строкой PAIRS-FROZEN: в BOT_SPEC (подтверждение /factory_pairs ok было дано до записи списка — порядок §2.41.17 нарушен; список нужно прислать). Тесты: tests/test_v104_factory.py (15), правки tests/test_v103_*'),
@@ -7532,6 +7542,18 @@ async def final_crypto4h_gate(args):
     """[v106] /final_crypto4h: без аргументов — показ §2.42 и k (LOCKBOX не читается); с confirm — единственный прогон на LOCKBOX (общий флаг финала, повтор запрещён)."""
     confirm = bool(args) and args[0].lower() == 'confirm'
     await factory_job('/final_crypto4h', 'final_crypto4h', {'confirm': confirm})
+
+
+async def battery_job(cmd, task, extra=None, need_universe=True):
+    """[v108] Команды серии «батарея» (BOT_SPEC §2.43): расчёты и сеть — в дочернем процессе research_runner; комиссии (FEE_TAKER/FEE_MAKER) передаются параметрами."""
+    import research_bdata
+    await factory_job(cmd, task, dict(extra or {}, bdir=research_bdata.battery_dir(), fee_taker=FEE_TAKER, fee_maker=FEE_MAKER), need_universe)
+
+
+async def battery_final_gate(args):
+    """[v108] /battery_final: без аргументов — показ кандидатов и флага; с confirm — единственный прогон на LOCKBOX (флаг серии, повтор запрещён)."""
+    confirm = bool(args) and args[0].lower() == 'confirm'
+    await battery_job('/battery_final', 'battery_final', {'confirm': confirm})
 
 
 async def data_probe_ma_run():
@@ -9492,6 +9514,27 @@ def _unknown_command_text(text: str) -> str:
     return f'Неизвестная команда {esc(cmd)}. Версия бота: {esc(CODE_VERSION)}. /help — список команд'
 
 
+def status_text() -> str:
+    """[v107] Текст /status (вынесен из обработчика для теста); в режиме ожидания — строка IDLE_TEXT."""
+    all_pos = all_positions()
+    status_cb = '🔴 СТОП' if circuit_open else '🟢 OK'
+    if _mdd['tripped']:
+        status_cb += ' | 🔴 ОБЩИЙ breaker (просадка от пика, /maxdd_reset)'
+    return (
+        '📊 <b>Статус</b>\n'
+        + (f'{IDLE_TEXT}\n' if idle_mode() else '')
+        + f'Circuit: {status_cb}\n'
+        f'DD по эквити: {("%+.2f%%" % (dd_fraction()*100)) if dd_fraction() is not None else "нет данных"} '
+        f'(лимит: {DAILY_DD_LIMIT_PCT:.1f}%; старая метрика {daily_stats["pnl_pct"]*100:+.2f}%)\n'
+        f'Позиций: {len(all_pos)} '
+        f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
+        f'{health_status_line()}\n'
+        f'{esc(_rr.status_line())}\n'
+        f'Баланс: проверьте на бирже\n'
+        f'БД сделок: /stats | CSV: /csv'
+    )
+
+
 async def check_tg_commands():
     """
     Обработка команд управления из Telegram группы.
@@ -9589,22 +9632,7 @@ async def check_tg_commands():
                 await tg(('✅ База дня переснята.\n' if _ok else '❌ Эквити не получено — база НЕ изменена.\n') + dd_status_text())
 
             elif cmd == '/status':
-                all_pos = all_positions()
-                status_cb = '🔴 СТОП' if circuit_open else '🟢 OK'
-                if _mdd['tripped']:
-                    status_cb += ' | 🔴 ОБЩИЙ breaker (просадка от пика, /maxdd_reset)'
-                await tg(
-                    f'📊 <b>Статус</b>\n'
-                    f'Circuit: {status_cb}\n'
-                    f'DD по эквити: {("%+.2f%%" % (dd_fraction()*100)) if dd_fraction() is not None else "нет данных"} '
-                    f'(лимит: {DAILY_DD_LIMIT_PCT:.1f}%; старая метрика {daily_stats["pnl_pct"]*100:+.2f}%)\n'
-                    f'Позиций: {len(all_pos)} '
-                    f'(SMC:{len(smc_positions)} RSI:{len(rsi_positions)})\n'
-                    f'{health_status_line()}\n'
-                    f'{esc(_rr.status_line())}\n'
-                    f'Баланс: проверьте на бирже\n'
-                    f'БД сделок: /stats | CSV: /csv'
-                )
+                await tg(status_text())
 
             elif cmd == '/stop':
                 circuit_open = True
@@ -9697,6 +9725,7 @@ async def check_tg_commands():
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
                     '/net_probe — диагностика сети до BingX (DNS, публичный/приватный запрос напрямую и через ccxt, очередь), фоном\n'
                     '/data_probe_ma — проверка источников Stooq/Dukascopy/BingX для «фабрики» на металлах/FX/индексах (только метаданные, §2.41 этап 1), фоном; отчёт — /htf_report\n'
+                    '/battery_load — [v108] загрузка D1+фандинг всех перпетуалов Binance (§2.43), с места остановки; /battery — шаги 0–3 серии (мощность, смещение, калибровка, TRAIN/VALID, LOCKBOX не читается); /battery_final confirm — шаг 4 на LOCKBOX (один раз, флаг серии)\n'
                     '/final_crypto4h — [v106] одиночный финал CRYPTO 4h T-MA-10-50 (§2.42): без аргументов — показ и k, confirm — один прогон на LOCKBOX (общий флаг финала)\n'
                     '/factory_load — [v103] загрузка Dukascopy (18 инструментов) для «фабрики», с места остановки; /factory_pairs [ok] — 10 пар P-PAIR; /factory — калибровка + шаги A/B; /factory_decomp — декомпозиция доходности (только чтение); /factory_nc — перезапуск не-крипто ячеек (§2.41.23); /factory_final confirm — шаг C на LOCKBOX (один раз)\n'
                     '/carry_test — C1: сбор фандинга (лонг спот + шорт перп), только история, оценка APR (BOT_SPEC §2.40), фоном; отчёт — /htf_report\n'
@@ -9787,6 +9816,21 @@ async def check_tg_commands():
             elif cmd == '/final_crypto4h' or cmd.startswith('/final_crypto4h '):
                 # [v106] одиночный финал CRYPTO 4h T-MA-10-50 (BOT_SPEC §2.42): без аргументов — показ и k; confirm — один прогон на LOCKBOX
                 _t = asyncio.create_task(final_crypto4h_gate(text.split('@')[0].split()[1:]))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/battery_load':
+                # [v108] загрузка D1 + fundingRate всех перпетуалов Binance (BOT_SPEC §2.43), с места остановки, фоном
+                _t = asyncio.create_task(battery_job('/battery_load', 'battery_load', need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/battery':
+                # [v108] шаги 0–3 серии «батарея» (мощность, смещение, калибровка, TRAIN/VALID); LOCKBOX не читается, фоном
+                _t = asyncio.create_task(battery_job('/battery', 'battery'))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/battery_final' or cmd.startswith('/battery_final '):
+                # [v108] шаг 4 — только вручную, с confirm, один раз (новый флаг серии)
+                _t = asyncio.create_task(battery_final_gate(text.split('@')[0].split()[1:]))
                 _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/factory_decomp':
@@ -9890,7 +9934,7 @@ def active_strategies():
     live, shadow = [], []
     if SMC_LIVE:
         live.append('SMC')
-    else:
+    elif SMC_SIG_ENABLED:
         shadow.append('SMC_SIG (замер вместо живых входов, SMC_LIVE=false)')
     if SMC_SHADOW_ENABLED:
         shadow.append('SMC_SHADOW')
@@ -9908,13 +9952,34 @@ def active_strategies():
     return live, shadow
 
 
+def idle_mode() -> bool:
+    """[v107] Режим ожидания: нет ни живых, ни shadow-стратегий (все сканеры выключены флагами)."""
+    live, shadow = active_strategies()
+    return not live and not shadow
+
+
+_idle_state = {'last_full': 0.0}
+
+
+def idle_tick_only(now=None) -> bool:
+    """[v107] True — в этой итерации выполнять ТОЛЬКО опрос команд Telegram (режим ожидания, позиций нет, с прошлого полного цикла прошло меньше IDLE_CYCLE_SEC). False — полный цикл
+    (момент старта полного цикла запоминается). Вне режима ожидания или при открытых позициях полный цикл идёт каждую итерацию, как раньше."""
+    now = time.time() if now is None else now
+    if idle_mode() and not all_positions() and now - _idle_state['last_full'] < IDLE_CYCLE_SEC:
+        return True
+    _idle_state['last_full'] = now
+    return False
+
+
 def startup_text() -> str:
     """[v97] Стартовое сообщение: версия — CODE_VERSION, стратегии — только включённые (живые и shadow отдельно), параметры — из текущих констант."""
     live, shadow = active_strategies()
+    strat_lines = (f"{IDLE_TEXT}\n" if (not live and not shadow) else
+                   f"Живые стратегии: {esc(', '.join(live)) if live else 'нет (живые входы выключены)'}\n"
+                   f"Shadow (виртуальные): {esc(', '.join(shadow)) if shadow else 'нет'}\n")
     return (
         f"🟢 <b>Бот {esc(CODE_VERSION)}</b> запущен\n"
-        f"Живые стратегии: {esc(', '.join(live)) if live else 'нет (живые входы выключены)'}\n"
-        f"Shadow (виртуальные): {esc(', '.join(shadow)) if shadow else 'нет'}\n"
+        f"{strat_lines}"
         f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
         f"Сессия SMC: {SESSION_START_UTC}–{SESSION_END_UTC} UTC\n"
         f"Breaker'ы по эквити: дневной DD > {DAILY_DD_LIMIT_PCT:.1f}%/день, общий > {MAX_DD_LIMIT_PCT:.1f}% от пика"
@@ -9974,6 +10039,13 @@ async def main():
     cycle = 0
     try:
         while True:
+            if idle_tick_only():          # [v107] режим ожидания: между полными циклами (раз в IDLE_CYCLE_SEC) — только команды Telegram
+                try:
+                    await check_tg_commands()
+                except Exception as _e:
+                    logging.warning(f'[IDLE] check_tg_commands: {type(_e).__name__}: {_e}')
+                await asyncio.sleep(IDLE_TICK_SEC)
+                continue
             cycle += 1
             t0 = time.time()
             try:
@@ -10185,7 +10257,7 @@ async def main():
 
             # Динамическая пауза до следующего цикла
             elapsed = time.time() - t0
-            await asyncio.sleep(max(10.0, 60.0 - elapsed))
+            await asyncio.sleep(IDLE_TICK_SEC if idle_mode() else max(10.0, 60.0 - elapsed))
 
     finally:
         logging.info("Shutting down...")

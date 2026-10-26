@@ -233,6 +233,21 @@ async def _task_final_crypto4h(ctx: Ctx):
     return {'text': await research_ffinal.run_final4h(ctx.params, progress=ctx.progress)}
 
 
+async def _task_battery_load(ctx: Ctx):
+    import research_battery                      # [v108] загрузка D1 + fundingRate всех перпетуалов Binance USDT-M (BOT_SPEC §2.43)
+    return {'text': await research_battery.run_load(ctx.params, progress=ctx.progress)}
+
+
+async def _task_battery(ctx: Ctx):
+    import research_battery                      # [v108] шаги 0–3 серии «батарея», LOCKBOX не читается
+    return {'text': await research_battery.run_battery(ctx.params, progress=ctx.progress)}
+
+
+async def _task_battery_final(ctx: Ctx):
+    import research_battery                      # [v108] шаг 4: единственный прогон на LOCKBOX (флаг серии)
+    return {'text': await research_battery.run_battery_final(ctx.params, progress=ctx.progress)}
+
+
 TASKS = {
     '_selftest_mem': _task_selftest_mem, '_selftest_ok': _task_selftest_ok, '_selftest_kill': _task_selftest_kill,
     'edge_audit': _task_edge_audit, 'of_backtest': _task_of_backtest, 'htf_backtest': _task_htf_backtest, 'htf_wide': _task_htf_wide,
@@ -240,6 +255,7 @@ TASKS = {
     'factory_load': _task_factory_load, 'factory_pairs': _task_factory_pairs, 'factory': _task_factory, 'factory_final': _task_factory_final,
     'factory_decomp': _task_factory_decomp, 'factory_nc': _task_factory_nc,
     'final_crypto4h': _task_final_crypto4h,
+    'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
 }
 
 
