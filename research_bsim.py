@@ -181,6 +181,8 @@ def h2_events(ctx, D):
     P = ctx['P']
     ev = []
     for s in range(len(P['syms'])):
+        if int(P['first'][s]) <= 0:                                  # первый бар в первый день архива — символ существовал ранее, не листинг (§2.43.8)
+            continue
         e = int(P['first'][s]) + D
         if e > int(P['last'][s]) or not math.isfinite(float(P['C'][e, s])):
             continue
