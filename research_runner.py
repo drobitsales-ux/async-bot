@@ -248,6 +248,28 @@ async def _task_battery_final(ctx: Ctx):
     return {'text': await research_battery.run_battery_final(ctx.params, progress=ctx.progress)}
 
 
+async def _task_audit(ctx: Ctx):
+    import audit_sim                             # [v109] аудит внешнего источника сигналов: симуляция моделей A/B и отчёт (BOT_SPEC §2.44)
+    return {'text': await audit_sim.run_audit(ctx.params, progress=ctx.progress)}
+
+
+async def _task_audit_import(ctx: Ctx):
+    import audit_db                              # [v109] импорт экспорта Telegram Desktop (result.json) в неизменяемую таблицу аудита
+    p = ctx.params
+    try:
+        with open(p['path'], encoding='utf-8') as f:
+            data = json.load(f)
+        con = audit_db.connect(p.get('adb'))
+        res = audit_db.import_export(con, data, p.get('label'))
+    finally:
+        try:
+            os.remove(p['path'])
+        except OSError:
+            pass
+    return {'text': ('📥 /audit_import: сообщений {messages}, сигналов {signal}, отчётов о целях {report}, нераспознано {unparsed}, прочих {other}, уже было {dup}, служебных/без даты пропущено {skipped}, чатов {chats}. '
+                     'Источник «import» — только справочно (§2.44.1 п. 2). Список нераспознанных — /audit_unparsed.').format(**res)}
+
+
 TASKS = {
     '_selftest_mem': _task_selftest_mem, '_selftest_ok': _task_selftest_ok, '_selftest_kill': _task_selftest_kill,
     'edge_audit': _task_edge_audit, 'of_backtest': _task_of_backtest, 'htf_backtest': _task_htf_backtest, 'htf_wide': _task_htf_wide,
@@ -256,6 +278,7 @@ TASKS = {
     'factory_decomp': _task_factory_decomp, 'factory_nc': _task_factory_nc,
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
+    'audit': _task_audit, 'audit_import': _task_audit_import,
 }
 
 
