@@ -48,7 +48,8 @@ import statistics
 import time
 import aiohttp
 import numpy as np
-import research_runner as _rr   # [v97] RSS процесса и запуск исследований в дочернем процессе (лёгкий модуль, только stdlib)
+import research_runner as _rr
+import audit_bot   # [v97] RSS процесса и запуск исследований в дочернем процессе (лёгкий модуль, только stdlib)
 import ccxt.async_support as ccxt_async
 from datetime import datetime, timezone, timedelta
 from threading import Thread
@@ -6783,8 +6784,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-07-v108b'
+CODE_VERSION = '2026-11-08-v109'
 CHANGELOG = [
+    ('2026-11-08-v109', 'АУДИТ ВНЕШНЕГО ИСТОЧНИКА СИГНАЛОВ — «чёрный ящик» (BOT_SPEC §2.44; пре-регистрация записана ОТДЕЛЬНЫМ коммитом b7b05a3 ДО кода и ДО сбора данных, вместе с итогом /battery §2.43.10: поиск собственных стратегий для класса «публичные данные + розничный доступ» закрыт окончательно; bybit_worker.py, режим ожидания v107, breaker-ы v76/v77, каналы v96 не менялись; живой торговли нет). ЧАСТЬ 1: audit_parse.py — парсер текстовых сигналов (uk/ru/en, эмодзи): символ, направление, плечо, вход (точка/зона), цели 1–5, стоп; проверка геометрии; нераспознанное — в список с причиной (ничего не додумывается); отчёты о целях («цель 2 +85%») — отдельным видом для сверки; audit_db.py — НЕИЗМЕНЯЕМЫЕ таблицы audit_events/audit_signals/audit_other (триггеры запрещают UPDATE/DELETE), правки и удаления — события, исходный текст сохраняется, источники live/catchup/import; /audit_import — файл result.json (Telegram Desktop) документом, импорт в дочернем процессе (лимит скачивания ботом 20 МБ); audit_tg.py + audit_bot.py — чтение канала через Telethon под аккаунтом владельца (TG_API_ID, TG_API_HASH, AUDIT_CHANNELS, TG_PHONE, TG_2FA_PASSWORD; сессия /data/tg.session, права 600, .gitignore, не в логах; команда входа /tg_login [код с разделителями]; код входа в логи не пишется; ТОЛЬКО чтение: ни ответов, ни пересылок, ни реакций, ни подтверждений прочтения — тест на исходниках), догонка последних сообщений при старте (source=catchup — не форвард). ЧАСТЬ 2: audit_sim.py — 1m-свечи BingX (ccxt) с суточным кэшем, иначе Binance (архив) с пометкой, проверка масштаба цены; вход в окне 24 ч (зона — худшая граница), модель A (плечо, изолированная маржа, ликвидация ≈ 1/плечо − 0.5% раньше стопа → −100% маржи; равные доли по целям; стоп в безубыток после первой цели; таймаут 7 суток) и модель B (риск 1% до стопа, без ликвидации); приоритет стоп/ликвидация раньше цели; комиссии FEE_TAKER/FEE_MAKER + проскальзывание 0.0005 + фандинг по факту; отчёт /audit (форвард — основа решения, ретроспектива — справочно; WR, mean R net, PF net, t по сигналам и по дням, серия убытков, просадка при 1% риска, лонг/шорт, символы, месяцы роста/падения BTC, сверка заявлено vs рассчитано; критерии §2.44.2 п. 5 — вердикт «рано» до n ≥ 100). Команды: /audit, /audit_import, /audit_unparsed, /audit_status, /tg_login. requirements.txt: telethon>=1.34,<2. НЕ ПРОВЕРЕНО (сети нет): Telethon, вход по коду, реальные форматы сигналов (скриншоты не переданы — фикстуры по описанию), ответы BingX/Binance. Тесты: tests/test_v109_audit.py (27)'),
     ('2026-11-07-v108b', 'ИСПРАВЛЕНИЕ ОШИБКИ /battery (ZeroDivisionError на шаге 2 калибровки, прод 2026-10-26; bybit_worker.py, breaker-ы, каналы v96, режим ожидания, правила §2.43 не менялись): в H1 вес позиции RISK/(3·ATR20/цена) делился на нуль для символа с ATR20 = 0 (неподвижный ряд); случайная стратегия калибровки выбирала такой символ из допустимых. Теперь допустим только символ с ATR20 > 0 и open > 0 (для реальной стратегии это те же символы, плоский ряд позицию открыть не мог). Шаги 0–1 на проде прошли (391 символ, 50 повторов). Тест: test_v108_battery (34)'),
     ('2026-11-07-v108a', 'ПРАВКИ ПО ОТЧЁТУ /battery_load (BOT_SPEC §2.43.8, поправка записана отдельным коммитом ДО кода; bybit_worker.py, breaker-ы, каналы v96, режим ожидания не менялись): архив фьючерсных D1 начинается с 2020-01, поэтому символы с первым баром в первый день архива (существовали до него) больше не считаются новыми листингами в H2; в отчёте /battery_load «не обработано загрузчиком» (не дошла очередь) отделено от «в листинге нет файлов D1» (раньше 379 необработанных выглядели как отсутствующие файлы). Загрузка на момент отчёта: 500 из 880 символов, бюджет времени исчерпан — /battery откажет до завершения. Тест: test_v108_battery (33)'),
     ('2026-11-07-v108', 'ФИНАЛЬНАЯ СЕРИЯ «БАТАРЕЯ» (BOT_SPEC §2.43, N = 8; пре-регистрация записана ОТДЕЛЬНЫМИ коммитами ДО кода и ДО загрузки данных; bybit_worker.py, breaker-ы v76/v77, каналы v96, режим ожидания v107 не менялись; в research_runner добавлены только записи задач; расчёты — через research_runner). Владелец пересмотрел §2.32.8 для одной ограниченной серии; после неё правило действует для всего класса «публичные рыночные данные + розничный доступ» без исключений. Команды: /battery_load (все перпетуалы Binance USDT-M, включая делистингованные: D1-свечи с quote_volume и fundingRate по месяцам, листинг S3, продолжение с места остановки, бюджет времени, учёт постоянных разрывов; отчёт показывает число делистингованных и ошибку выжившего), /battery (шаг 0: мощность S_min = t_BH·√(365/D) > 2.0 → «непроверяема»; шаг 1: смещение правил на синтетике (мартингал по цене, σ и календарь реальные, 50 повторов) — смещённая гипотеза исключается из N; шаг 2: калибровка 200 случайных стратегий на ячейку, > 10 прошли шаг A → СТОП; шаг 3: TRAIN BH q = 0.05 по N и VALID mean > 0, t ≥ 1.5; ≤ 2 кандидата; LOCKBOX не читается), /battery_final confirm (один прогон на LOCKBOX, НОВЫЙ флаг серии battery_final_started берётся ДО чтения LOCKBOX, прежний флаг не затрагивается; критерии §2.41.7 + стресс ×2 + mean ≥ 0 в месяцы роста и падения BTC). Гипотезы: H1 FUND-CONTRA (1D, L ∈ {3,7}, шорт 5 с наибольшим положительным средним фандингом, лонг 5 с наименьшим отрицательным, удержание 3 дня, стоп 3·ATR20, фандинг в P&L), H2 NEW-LIST (шорт по close дня D ∈ {3,7} после листинга, удержание 30 дней, стоп +50%, риск 0.5%, не более 10% капитала в риске), H3 FUND-TIME (16 символов H-XS, моменты 00/08/16, «до» — против знака последней уже начисленной ставки, «после» — по знаку ставки момента), H5 GRID (недельная нейтральная сетка 10 уровней, диапазон ±m·ATR14, худший порядок внутри бара, maker на лимитных / taker на принудительном закрытии). Ликвидность «на дату» (PIT): средний оборот за 30 дней ДО сигнала ≥ 20 млн USDT; проскальзывание 0.0003 (топ-30) / 0.0005; стресс ×2. НАХОДКА на фикстуре (синтетика): H5 с правилом «худший порядок внутри бара» даёт отрицательное смещение на случайном блуждании (медианный |t| ≈ 3) — по критерию шага 1 вероятно исключение H5 до просмотра результатов; в отчёт добавлена диагностика при оптимистичном порядке (не для решений). Не проверено: реальный архив (состав, форматы), реальные время и память. Тесты: tests/test_v108_battery.py (32)'),
@@ -7556,6 +7558,22 @@ async def battery_final_gate(args):
     """[v108] /battery_final: без аргументов — показ кандидатов и флага; с confirm — единственный прогон на LOCKBOX (флаг серии, повтор запрещён)."""
     confirm = bool(args) and args[0].lower() == 'confirm'
     await battery_job('/battery_final', 'battery_final', {'confirm': confirm})
+
+
+async def audit_job():
+    """[v109] /audit: симуляция моделей A/B по сигналам внешнего источника и отчёт (BOT_SPEC §2.44) — в дочернем процессе research_runner."""
+    await factory_job('/audit', 'audit', {'adb': audit_bot.AD.db_path(), 'fee_taker': FEE_TAKER, 'fee_maker': FEE_MAKER}, need_universe=False)
+
+
+async def audit_import_run(msg, label=None):
+    """[v109] /audit_import: файл result.json (Telegram Desktop) → импорт в неизменяемую таблицу аудита (дочерний процесс)."""
+    async def _job(cmd, task, params):
+        return await _research_job(cmd, task, params)
+    try:
+        await audit_bot.import_document(msg, TOKEN, http, _job, tg, label)
+    except Exception as e:
+        logging.warning(f'[AUDIT] импорт: {type(e).__name__}')
+        await tg(f'❌ /audit_import: {esc(type(e).__name__)}')
 
 
 async def data_probe_ma_run():
@@ -9562,7 +9580,7 @@ async def check_tg_commands():
             msg  = upd.get('message') or upd.get('edited_message', {})
             if not msg:
                 continue
-            text = (msg.get('text') or '').strip()
+            text = (msg.get('text') or msg.get('caption') or '').strip()      # [v109] подпись к документу (/audit_import)
             chat = msg.get('chat', {}).get('id')
 
             # Принимаем из нашей группы (int или str сравнение)
@@ -9570,7 +9588,7 @@ async def check_tg_commands():
                 continue
 
             cmd = text.lower().split('@')[0].strip()
-            logging.info(f'📨 [CMD] команда: {repr(cmd)} от chat={chat}')
+            logging.info(f'📨 [CMD] команда: {repr(audit_bot.redact_cmd(cmd))} от chat={chat}')       # [v109] код входа в Telegram в лог не попадает
 
             if cmd == '/reset':
                 circuit_open = False
@@ -9727,6 +9745,7 @@ async def check_tg_commands():
                     '/data_probe — доступность данных Binance/архива/BingX с сервера (только метаданные), фоном\n'
                     '/net_probe — диагностика сети до BingX (DNS, публичный/приватный запрос напрямую и через ccxt, очередь), фоном\n'
                     '/data_probe_ma — проверка источников Stooq/Dukascopy/BingX для «фабрики» на металлах/FX/индексах (только метаданные, §2.41 этап 1), фоном; отчёт — /htf_report\n'
+                    '/audit — [v109] аудит внешнего источника сигналов (§2.44): симуляция A/B, критерии по форварду; /audit_import — файл result.json документом (ретроспектива, справочно); /audit_unparsed — нераспознанные; /audit_status — состояние; /tg_login [код] — вход для чтения каналов (только чтение)\n'
                     '/battery_load — [v108] загрузка D1+фандинг всех перпетуалов Binance (§2.43), с места остановки; /battery — шаги 0–3 серии (мощность, смещение, калибровка, TRAIN/VALID, LOCKBOX не читается); /battery_final confirm — шаг 4 на LOCKBOX (один раз, флаг серии)\n'
                     '/final_crypto4h — [v106] одиночный финал CRYPTO 4h T-MA-10-50 (§2.42): без аргументов — показ и k, confirm — один прогон на LOCKBOX (общий флаг финала)\n'
                     '/factory_load — [v103] загрузка Dukascopy (18 инструментов) для «фабрики», с места остановки; /factory_pairs [ok] — 10 пар P-PAIR; /factory — калибровка + шаги A/B; /factory_decomp — декомпозиция доходности (только чтение); /factory_nc — перезапуск не-крипто ячеек (§2.41.23); /factory_final confirm — шаг C на LOCKBOX (один раз)\n'
@@ -9819,6 +9838,38 @@ async def check_tg_commands():
                 # [v106] одиночный финал CRYPTO 4h T-MA-10-50 (BOT_SPEC §2.42): без аргументов — показ и k; confirm — один прогон на LOCKBOX
                 _t = asyncio.create_task(final_crypto4h_gate(text.split('@')[0].split()[1:]))
                 _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/tg_login' or cmd.startswith('/tg_login '):
+                # [v109] вход аккаунта владельца в Telegram для ЧТЕНИЯ каналов аудита (§2.44.1 п. 3): без аргументов — запрос кода, с аргументом — код (цифры через дефис)
+                _t = asyncio.create_task(audit_bot.login(text.split('@')[0].split()[1:], tg))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+                if cmd.startswith('/tg_login ') and msg.get('message_id'):
+                    try:                                                   # best-effort: убрать сообщение с кодом из чата (нужно право бота удалять сообщения)
+                        async with http.get(f'https://api.telegram.org/bot{TOKEN}/deleteMessage', params={'chat_id': chat, 'message_id': msg['message_id']}, timeout=aiohttp.ClientTimeout(total=5)):
+                            pass
+                    except Exception:
+                        pass
+
+            elif cmd == '/audit_status':
+                await tg(audit_bot.status_text())
+
+            elif cmd == '/audit_unparsed':
+                await tg(esc(audit_bot.unparsed_text()))
+
+            elif cmd == '/audit':
+                _t = asyncio.create_task(audit_job())
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd.split(' ')[0] == '/audit_import' or (msg.get('document') and time.time() < audit_bot.STATE['import_wait']):
+                # [v109] файл экспорта (result.json) документом с подписью /audit_import либо следующим сообщением после команды (15 мин)
+                if msg.get('document'):
+                    audit_bot.STATE['import_wait'] = 0.0
+                    _lbl = text.split(None, 1)[1].strip() if cmd.startswith('/audit_import ') else None
+                    _t = asyncio.create_task(audit_import_run(msg, _lbl))
+                    _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+                else:
+                    audit_bot.STATE['import_wait'] = time.time() + audit_bot.IMPORT_WAIT_S
+                    await tg('📥 Пришлите файл result.json (экспорт Telegram Desktop) документом в течение 15 минут (до 20 МБ). Подпись можно не писать; /audit_import <имя> задаёт имя канала.')
 
             elif cmd == '/battery_load':
                 # [v108] загрузка D1 + fundingRate всех перпетуалов Binance (BOT_SPEC §2.43), с места остановки, фоном
@@ -10037,6 +10088,9 @@ async def main():
 
     await tg(startup_text())
     logging.info(f"🚀 Bot {CODE_VERSION} started")
+    if audit_bot.configured():          # [v109] чтение каналов аудита (только чтение; без настройки ENV ничего не запускается)
+        _t_audit = asyncio.create_task(audit_bot.start(tg))
+        _bg_tasks.add(_t_audit); _t_audit.add_done_callback(_bg_tasks.discard)
 
     cycle = 0
     try:

@@ -47,6 +47,7 @@ n — число сделок (или недель/дней, где указан
 | Фабрика: 192 теста (CRYPTO + не-крипто) | Dukascopy 2019–2026 + кэш Binance | N = 192 (B-VC исключён проверкой смещения) | калибровка 0/200 во всех 12 ячейках; шаг A 0/192; финала нет | не пройдена | §2.41.22а (со слов владельца) |
 | Фабрика, перезапуск не-крипто (перенос 2.5%, NW лаг 5/20) | MULTI, FX, INDICES, COMMODITIES, BONDS | N_nc = 134 | калибровка 0/200 в 9 ячейках; шаг A 0/134; диагностика «перенос 0» — лучший MULTI t ≈ 0.6 | не-крипто закрыто | §2.41.24а (со слов владельца) |
 | **Финал §2.42: CRYPTO 4h, T-MA-10-50, LOCKBOX 2025+** | кэш Binance, 16 символов, 3827 4h-баров ≈ 638 суток | 1 тест | **НЕ ПРОЙДЕНО:** t_adj 0.34 (t 0.39, k 1.151); Шарп 0.29; макс. просадка 70.6%; стресс ×2 mean +1.55 б.п./день; месяцы роста BTC −3.43, падения +3.89; 2025 −3.78, 2026 +17.39; QNT 4.27 из 5.28 б.п./день; лонг +6.62, шорт −1.34 | **поиск закрыт окончательно** | §2.42 (со слов владельца) |
+| **Серия «батарея» §2.43 (H1 FUND-CONTRA, H2 NEW-LIST, H3 FUND-TIME, H5 GRID)** | Binance USDT-M D1 + fundingRate, все перпетуалы (в т. ч. делистингованные), часовые ряды H-XS | 8 тестов | мощность ок (S_min 1.25–1.37); смещение на синтетике — норма; калибровка 0/200; шаг A 0/8 (по сообщению владельца 2026-10-26, v108b); лучшие: H2-D3 TRAIN +0.98 (t 1.73) / VALID +1.12 (t 0.57), H1-L3 TRAIN +1.50 (t 1.46) / VALID −2.74 | не пройдено; поиск собственных стратегий для класса «публичные данные + розничный доступ» закрыт окончательно. Предупреждение: бэктест сетки при оптимистичном порядке внутри бара даёт t 5.23 на случайном блуждании | §2.43.10 (со слов владельца) |
 
 ## 2.4. Найденные дефекты измерений и как исправлены
 
@@ -85,18 +86,19 @@ n — число сделок (или недель/дней, где указан
 5. Нетронутая выборка (LOCKBOX) с флагом «один раз»; число тестов фиксируется заранее; поправка на множественные проверки (BH) и на выбор конфигурации (проклятие победителя) учитывается в критериях.
 6. Издержки и перенос — по внешним фактам, записанным до данных; не подгонять модель издержек под результат.
 
-## 2.7. Состояние инфраструктуры (v107)
+## 2.7. Состояние инфраструктуры (v107; дополнено v109)
 
 **Работает:**
 - `async_bot.py` на BingX в **режиме ожидания**: торговых и shadow-стратегий нет, сканеры выключены по умолчанию; живой вход выключен (`SMC_LIVE=false`).
 - Мониторинг эквити и breaker'ы (дневной DD > 1.5%/день, общий > 6% от пика, v76/v77), отдельный канал приватных вызовов (v96), самодиагностика и суточный дайджест (раз в сутки), замер задержек (`/lat_status`), `/net_probe`.
-- Исследования — по ручному запуску, в дочернем процессе с лимитом памяти (v97): `/edge_audit`, `/carry_test`, `/data_probe`, `/data_probe_ma`, `/factory_load`, `/factory_pairs`, `/factory`, `/factory_decomp`, `/factory_nc`, `/factory_final`, `/final_crypto4h`, `/htf_*`, `/of_backtest`, `/wide_stop_test`. **Финальный флаг LOCKBOX уже использован — `/factory_final` и `/final_crypto4h confirm` повторить нельзя.**
+- Исследования — по ручному запуску, в дочернем процессе с лимитом памяти (v97): `/edge_audit`, `/carry_test`, `/data_probe`, `/data_probe_ma`, `/factory_load`, `/factory_pairs`, `/factory`, `/factory_decomp`, `/factory_nc`, `/factory_final`, `/final_crypto4h`, `/battery_load`, `/battery`, `/battery_final`, `/htf_*`, `/of_backtest`, `/wide_stop_test`. **Финальный флаг LOCKBOX уже использован — `/factory_final` и `/final_crypto4h confirm` повторить нельзя.**
 
 **Известно сломанным / не использовать:**
 - `bybit_worker.py` — **не использовать до исправления** (владелец, 2026-10-25): единицы DD, нет общей просадки (equity-breaker'ы есть только в `async_bot`; воркер не синхронизирован с v69), HTTP 503 при запросе баланса (дайджест 2026-10-24). Детали «единицы DD» мной не проверялись; воркер не менялся с v69.
 - Корневой фикс цикла `monitor_all` (дубли закрытий, §2.22.1, бэклог п. 11) — отложен.
 - REST BingX: приватные таймауты баланса в старых логах (эпоха до v96) — актуальную картину даёт `/lat_status` и `/net_probe`.
 
-**Команды (все):** `/status /dd_status /dd_reset /maxdd_reset /lat_status /net_probe /stats /stats_analyze /shadow /shadow_analyze /shadow_recalc /shadow_reset /report /csv /logs /sync /stop /reset /trades_dups /trades_dups_mark /dups_impact /regime_backfill /smc_entry_audit /smc_regime_check /analysis_pack /htf_backtest /htf_backtest_wide /htf_xsmom /htf_report /wide_stop_test /data_probe /data_probe_ma /of_backtest /edge_audit /carry_test /factory_load /factory_pairs /factory /factory_decomp /factory_nc /factory_final /final_crypto4h`.
+- **Аудит внешнего источника сигналов (v109, BOT_SPEC §2.44):** не поиск стратегии, а оценка чужого канала как чёрного ящика (парсер, неизменяемая БД, симуляция моделей A/B, критерии только по форвард-сигналам); чтение канала — Telethon под аккаунтом владельца, только чтение.
+**Команды (все):** `/status /dd_status /dd_reset /maxdd_reset /lat_status /net_probe /stats /stats_analyze /shadow /shadow_analyze /shadow_recalc /shadow_reset /report /csv /logs /sync /stop /reset /trades_dups /trades_dups_mark /dups_impact /regime_backfill /smc_entry_audit /smc_regime_check /analysis_pack /htf_backtest /htf_backtest_wide /htf_xsmom /htf_report /wide_stop_test /data_probe /data_probe_ma /of_backtest /edge_audit /carry_test /factory_load /factory_pairs /factory /factory_decomp /factory_nc /factory_final /final_crypto4h /battery_load /battery /battery_final /audit /audit_import /audit_unparsed /audit_status /tg_login`.
 
 **Возврат стратегий** (если будет решение владельца): только через ENV (`SMC_SIG_ENABLED`, `SMC2_ENABLED`, `PO3_ENABLED`, `ORB_RT_ENABLED`, `RB_ENABLED`, `ORB_ENABLED`, `SA_ENABLED`, `PB_ENABLED`, `MOMENTUM_ENABLED`, `RSI_ENABLED`, `SMC_LIVE`); интервал полного цикла в режиме ожидания — `IDLE_CYCLE_SEC` (по умолчанию 300 с).
