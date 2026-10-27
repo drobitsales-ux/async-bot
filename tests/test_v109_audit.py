@@ -468,6 +468,18 @@ class Telegram(unittest.TestCase):
         run(a.request_code(force=True))
         self.assertEqual(self.client.calls.count('send_code_request'), 2)
 
+    def test_send_code_unavailable_points_to_qr_session(self):
+        class SendCodeUnavailableError(Exception):
+            pass
+        a = self.make()
+
+        async def boom(phone):
+            raise SendCodeUnavailableError(f'all options used for {phone}')
+        self.client.send_code_request = boom
+        out = run(a.request_code())
+        self.assertIn('QR', out)
+        self.assertNotIn(self.PHONE, out)
+
     def test_invalid_code_gives_hint(self):
         class PhoneCodeInvalidError(Exception):
             pass
@@ -578,6 +590,50 @@ class Telegram(unittest.TestCase):
         self.assertNotIn(self.HASH, txt)
         self.assertNotIn(self.PHONE, txt)
         self.assertIn('каналов в AUDIT_CHANNELS: 2', txt)
+
+
+class QrLoginTest(unittest.TestCase):
+    def test_qr_login_refreshes_on_expiry_and_handles_password(self):
+        import tg_make_session as TM
+
+        class QR:
+            url = 'tg://login?token=T'
+
+            def __init__(self, script):
+                self.script, self.recreated = list(script), 0
+
+            async def wait(self):
+                x = self.script.pop(0)
+                if x == 'timeout':
+                    raise asyncio.TimeoutError()
+                if x == '2fa':
+                    raise SessionPasswordNeededError('2FA')
+                return 'user'
+
+            async def recreate(self):
+                self.recreated += 1
+
+        class Client:
+            def __init__(self, qr):
+                self.qr, self.pwd = qr, None
+
+            async def qr_login(self):
+                return self.qr
+
+            async def sign_in(self, password=None):
+                self.pwd = password
+
+        shown = []
+        qr = QR(['timeout', 'timeout', 'ok'])
+        self.assertTrue(run(TM.login_qr(Client(qr), show=shown.append)))
+        self.assertEqual((qr.recreated, len(shown)), (2, 3))                          # QR обновляется при истечении токена
+        qr2 = QR(['2fa'])
+        c2 = Client(qr2)
+        self.assertTrue(run(TM.login_qr(c2, show=lambda u: None, ask_password=lambda: 'pw')))
+        self.assertEqual(c2.pwd, 'pw')
+        self.assertFalse(run(TM.login_qr(Client(QR(['timeout'] * 3)), show=lambda u: None, max_rounds=3)))
+        src = open(os.path.join(ROOT, 'tg_make_session.py'), encoding='utf-8').read()
+        self.assertNotIn('log_out', src)                                              # выход из аккаунта аннулировал бы сессию
 
 
 class FakeSource:

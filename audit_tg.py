@@ -107,10 +107,14 @@ class AuditTG:
             self._hash = getattr(sent, 'phone_code_hash', None)
             self._code_ts = time.time()
         except Exception as e:
-            return '❌ Не удалось запросить код: ' + self.safe_err(e)
+            hint = ''
+            if type(e).__name__ == 'SendCodeUnavailableError':
+                hint = (' — Telegram исчерпал способы доставки кода для этого номера (слишком много запросов): через бота код больше не запрашивайте (срок снятия ограничения мне неизвестен, '
+                        'по сообщениям — часы). Вход без кода: QR-сессия на компьютере/в Colab — tg_make_session.py → ENV TG_SESSION_STRING')
+            return '❌ Не удалось запросить код: ' + self.safe_err(e) + hint
         return ('📨 Код отправлен в приложение Telegram: чат «Telegram» (служебные уведомления) — не в этот чат; без приложения — SMS. Пришлите <code>/tg_login КОД</code>, цифры через дефис '
                 '(например 1-2-3-4-5), в течение пары минут и НЕ запрашивайте код повторно — каждый новый обнуляет прежний. Если Telegram считает код «опубликованным в чате», он блокирует его '
-                '(по моим сведениям, не проверено) — тогда используйте сессию, созданную на компьютере: tg_make_session.py → ENV TG_SESSION_STRING. Облачный пароль — в ENV TG_2FA_PASSWORD.')
+                '(по моим сведениям, не проверено) — тогда вход без кода: QR-сессия (tg_make_session.py, сканируется из приложения) → ENV TG_SESSION_STRING. Облачный пароль — в ENV TG_2FA_PASSWORD.')
 
     async def sign_in(self, code_text):
         code = code_from_text(code_text)
