@@ -55,8 +55,8 @@ async def login(args, tg):
         await tg('⛔ Аудит не настроен: нужны TG_API_ID, TG_API_HASH, AUDIT_CHANNELS (и TG_PHONE для входа) в ENV')
         return
     a = get_client()
-    if not args:
-        await tg(await a.request_code())
+    if not args or [x.lower() for x in args] == ['new']:
+        await tg(await a.request_code(force=bool(args)))
         return
     text = await a.sign_in(' '.join(args))
     await tg(text)
@@ -70,7 +70,9 @@ def status_text():
     L = ['📋 <b>Аудит внешнего источника (BOT_SPEC §2.44)</b>',
          f'Настройка: TG_API_ID {"задан" if c["api_id"] else "НЕТ"}, TG_API_HASH {"задан" if c["api_hash"] else "НЕТ"}, TG_PHONE {"задан" if c["phone"] else "нет"}, каналов в AUDIT_CHANNELS: {len(c["channels"])}']
     sf = AT.session_file(c['session'])
-    if os.path.exists(sf):
+    if os.getenv('TG_SESSION_STRING'):
+        L.append('Сессия: строка из ENV TG_SESSION_STRING (значение не показывается)')
+    elif os.path.exists(sf):
         mode = os.stat(sf).st_mode & 0o777
         L.append(f'Файл сессии: есть, права {mode:o}' + ('' if mode == 0o600 else ' ⚠️ должны быть 600'))
     else:

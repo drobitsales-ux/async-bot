@@ -7,12 +7,17 @@ NUM = r'\d{1,3}(?: \d{3})+(?:[.,]\d+)?(?!\d)|\d+(?:[.,]\d+)?'
 NUM_RE = re.compile('(?:' + NUM + ')')
 NUMG = '(?:' + NUM + ')'
 RANGE_SEP = r'\s*(?:[-–—~]|\bдо\b|\bto\b|…|\.{2,3})\s*'
-LABEL_ENTRY = r'(?:зон[аыуе]\s+вход[а-я]*|точк[аиуе]\s+вход[а-я]*|вход[а-я]*|вх[іи]д[а-я]*|entry\s*zone|buy\s*zone|entry|enter|вход|т\.?\s?в\.?\s?х\.?|твх)'
-LABEL_TARGET = r'(?:цел[ьиейях]+|ц[іi]л[ьіи]+|targets?|tp|тейк[а-я\-]*|take[\s\-]*profits?|тп)'
-LABEL_STOP = r'(?:стоп[\s\-]*лосс[а-я]*|стоп[а-я]*|stop[\s\-]*loss|stop|sl)'
-LABEL_LEV = r'(?:кредитн[а-я]+\s+плеч[а-я]+|плеч[а-я]+|leverage|lev)'
-LONG_RE = re.compile(r'\blong\b|лонг|\bbuy\b|покупк|купівл|купить|купити', re.I)
-SHORT_RE = re.compile(r'\bshort\b|шорт|\bsell\b|продаж|продать|продати', re.I)
+LABEL_ENTRY = r'(?:зон[аыуе]\s+вход[а-яіїєґ]*|точк[аиуе]\s+вход[а-яіїєґ]*|вход[а-яіїєґ]*|вх[іи]д[а-яіїєґ]*|entry\s*zone|buy\s*zone|entry|enter|вход|т\.?\s?в\.?\s?х\.?|твх)'
+LABEL_TARGET = r'(?:цел[ьиейях]+|ц[іi]л[ьіи]+|targets?|tp|тейк[а-яіїєґ\-]*|take[\s\-]*profits?|тп)'
+LABEL_STOP = r'(?:стоп[\s\-]*лосс[а-яіїєґ]*|стоп[а-яіїєґ]*|stop[\s\-]*loss|stop|sl)'
+LABEL_LEV = r'(?:кредитн[а-яіїєґ]+\s+плеч[а-яіїєґ]+|плеч[а-яіїєґ]+|leverage|lev)'
+LONG_WORD = re.compile(r'\blong\b|лонг', re.I)
+SHORT_WORD = re.compile(r'\bshort\b|шорт', re.I)
+LONG_RE = re.compile(r'\bbuy\b|покупк|купівл|купить|купити', re.I)
+SHORT_RE = re.compile(r'\bsell\b|продаж|продать|продати', re.I)
+SIDE_LIQ = re.compile(r'\b(?:buy|sell)[\s\-]*side\b|\b(?:buy|sell)[\s\-]*(?:stops?|liquidity|walls?)\b', re.I)
+WORD_BEFORE_SIDE = re.compile(r'(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,9})\s+(?:long|short)\b', re.I)
+LOWER_STOP = {'the', 'and', 'for', 'now', 'any', 'big', 'new', 'my', 'to', 'go', 'in', 'on', 'at', 'is', 'it', 'of', 'a', 'cross', 'isolated', 'take', 'stop'}
 SKIP_SYMS = {'USDT', 'USD', 'PERP', 'LONG', 'SHORT', 'SIGNAL', 'BUY', 'SELL', 'TP', 'SL', 'ENTRY', 'STOP', 'TARGET', 'TARGETS', 'CROSS', 'ISOLATED', 'X'}
 TAG_SKIP = {'signal', 'long', 'short', 'сигнал', 'лонг', 'шорт', 'crypto', 'futures', 'binance', 'bingx', 'bybit', 'trade', 'free', 'vip'}
 EMOJI_RE = re.compile('[\U0001F000-\U0001FAFF☀-➿️‍⬀-⯿←-⇿■-◿]+')
@@ -51,7 +56,7 @@ def find_symbol(t):
     m = re.search(r'(?:coin|pair|монета|пара|актив|токен|символ|тикер)\s*[:\-]\s*#?\$?([A-Za-z0-9]{2,15})', t, re.I)
     if m and m.group(1).upper() not in SKIP_SYMS:
         return m.group(1).upper()
-    for m in re.finditer(r'[#$]([A-Za-zА-Яа-я0-9]{2,15})', t):
+    for m in re.finditer(r'[#$]([A-Za-zА-Яа-яІіЇїЄєҐґіїєґ0-9]{2,15})', t):
         w = m.group(1)
         if w.lower() not in TAG_SKIP and re.fullmatch(r'[A-Za-z0-9]+', w):
             return w.upper()
@@ -61,11 +66,18 @@ def find_symbol(t):
     m = re.search(r'(?<![A-Za-z0-9])#?\$?([A-Z0-9]{2,15})\s*(?:long|short|лонг|шорт)\b', t, re.I)
     if m and m.group(1).upper() not in SKIP_SYMS and m.group(1).upper() == m.group(1) and not m.group(1).isdigit():
         return m.group(1)
+    m = WORD_BEFORE_SIDE.search(t)                                     # «заходжу в inj long 30x»: символ строчными перед направлением
+    if m and m.group(1).lower() not in LOWER_STOP and m.group(1).upper() not in SKIP_SYMS and not m.group(1).isdigit():
+        return m.group(1).upper()
     return None
 
 
 def find_side(t):
-    lg, sh = bool(LONG_RE.search(t)), bool(SHORT_RE.search(t))
+    """Направление: слова long/short/лонг/шорт важнее buy/sell; фразы «buy side liquidity» в комментариях (SMC-лексика) направлением не считаются."""
+    t2 = SIDE_LIQ.sub(' ', t)
+    lg, sh = bool(LONG_WORD.search(t2)), bool(SHORT_WORD.search(t2))
+    if not (lg or sh):
+        lg, sh = bool(LONG_RE.search(t2)), bool(SHORT_RE.search(t2))
     if lg and sh:
         return None, 'оба направления в тексте'
     if lg:
@@ -117,7 +129,7 @@ def find_entry(t):
 
 def find_stop(t):
     for line in t.split('\n'):
-        m = re.search(r'(?<![а-яa-z])' + LABEL_STOP + r'(?![а-яa-z])[^\d\n%]{0,25}?(?=\d)', line, re.I)
+        m = re.search(r'(?<![а-яіїєґa-z])' + LABEL_STOP + r'(?![а-яіїєґa-z])[^\d\n%]{0,25}?(?=\d)', line, re.I)
         if m:
             tail = line[m.end():]
             mm = NUM_RE.search(tail)
@@ -141,7 +153,7 @@ def find_targets(t):
     i = 0
     while i < len(lines):
         line = lines[i]
-        m = re.search(r'(?<![а-яa-z])' + LABEL_TARGET + r'(?![а-яa-z])', line, re.I)
+        m = re.search(r'(?<![а-яіїєґa-z])' + LABEL_TARGET + r'(?![а-яіїєґa-z])', line, re.I)
         if m:
             tail = line[m.end():]
             idx_m = re.match(r'\s*#?(\d)\s*(?:[:)\-–.]|\s)\s*(?=\d)', tail)           # 'tp1: 0.5' / 'цель 2 - 0.5'
@@ -199,7 +211,7 @@ def parse(text):
     entry = find_entry(t)
     stop = find_stop(t)
     targets = find_targets(t)
-    has_stop_label = bool(re.search(r'(?<![а-яa-z])' + LABEL_STOP + r'(?![а-яa-z])', t, re.I))
+    has_stop_label = bool(re.search(r'(?<![а-яіїєґa-z])' + LABEL_STOP + r'(?![а-яіїєґa-z])', t, re.I))
     signalish = entry is not None or (side is not None and (targets or has_stop_label)) or (sym and targets and has_stop_label)
     if not signalish:
         rep = _parse_report(t, sym)

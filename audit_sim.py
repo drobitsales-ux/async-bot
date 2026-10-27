@@ -334,11 +334,11 @@ class PriceSource:
                     c = self._join([await self._bingx_day(sym, d, now_ms) for d in range(d0, d1 + 1)])
                 except Exception:
                     c = None
-                if c is not None and scale_ok(c, ref_price * (1000 if sym.startswith('1000') else 1)):
+                if c is not None and scale_ok(c, ref_price):
                     return c, 'BingX ' + sym
         for sym in (f'{base}USDT', f'1000{base}USDT'):
             c = self._join([await self._binance_day(sym, d, now_ms) for d in range(d0, d1 + 1)])
-            if c is not None and scale_ok(c, ref_price * (1000 if sym.startswith('1000') else 1)):
+            if c is not None and scale_ok(c, ref_price):
                 return c, 'Binance архив (не BingX) ' + sym
         return None, 'нет данных'
 

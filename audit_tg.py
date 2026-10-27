@@ -4,11 +4,13 @@
 import logging
 import os
 import re
+import time
 
 import audit_db as AD
 
 log = logging.getLogger('audit')
 CATCHUP_LIMIT = 200
+CODE_REUSE_S = 120                         # повторный /tg_login без аргументов в течение 2 минут код НЕ пересылает (новый код обнуляет прежний)
 
 
 def session_file(session_path):
@@ -41,6 +43,7 @@ class AuditTG:
         self.client_factory = client_factory or self._default_factory
         self.client = None
         self._hash = None
+        self._code_ts = 0.0
         self.labels = {}
         self.started = False
         self.con = None
@@ -48,7 +51,7 @@ class AuditTG:
 
     # ── служебное ─────────────────────────────────────────────────────────────────────────────
     def _secrets(self):
-        return [x for x in (self.api_hash, self.phone, self.password, self._hash, str(self.api_id) if self.api_id else None) if x]
+        return [x for x in (self.api_hash, self.phone, self.password, self._hash, os.getenv('TG_SESSION_STRING') or None, str(self.api_id) if self.api_id else None) if x]
 
     def safe_err(self, e):
         """Текст ошибки без значений секретов (и без длинных цифровых последовательностей — телефон/код)."""
@@ -61,6 +64,10 @@ class AuditTG:
     def _default_factory(self):
         from telethon import TelegramClient
         logging.getLogger('telethon').setLevel(logging.WARNING)
+        sess = os.getenv('TG_SESSION_STRING', '').strip()
+        if sess:                                                      # сессия, созданная на компьютере владельца (tg_make_session.py): код входа в чат не передаётся
+            from telethon.sessions import StringSession
+            return TelegramClient(StringSession(sess), int(self.api_id), self.api_hash)
         return TelegramClient(self.session_path, int(self.api_id), self.api_hash)
 
     def _db(self):
@@ -84,20 +91,26 @@ class AuditTG:
             log.warning('[AUDIT] проверка авторизации: %s', self.safe_err(e))
             return False
 
-    async def request_code(self):
-        """Запрос кода подтверждения (приходит в приложение Telegram владельца). → текст для чата (без секретов)."""
+    async def request_code(self, force=False):
+        """Запрос кода подтверждения. Код приходит В ПРИЛОЖЕНИЕ Telegram владельца (служебный чат «Telegram», аккаунт 777000), а при неактивном приложении — по SMS. Каждый запрос
+        делает прежний код недействительным, поэтому повторный запрос в течение CODE_REUSE_S без force не отправляется. → текст для чата (без секретов)."""
         if not self.phone:
             return '❌ TG_PHONE не задан в ENV (телефон аккаунта владельца в международном формате)'
+        if self._hash and not force and time.time() - self._code_ts < CODE_REUSE_S:
+            return (f'ℹ️ Код уже запрошен {int(time.time() - self._code_ts)} с назад — берите ПОСЛЕДНЕЕ сообщение от «Telegram» в приложении. Новый код (старый станет недействительным): '
+                    '<code>/tg_login new</code>')
         try:
             c = await self._client()
             if await c.is_user_authorized():
                 return '✅ Сессия уже авторизована'
             sent = await c.send_code_request(self.phone)
             self._hash = getattr(sent, 'phone_code_hash', None)
+            self._code_ts = time.time()
         except Exception as e:
             return '❌ Не удалось запросить код: ' + self.safe_err(e)
-        return ('📨 Код отправлен в Telegram. Пришлите <code>/tg_login КОД</code>, цифры через дефис или пробелы (например 1-2-3-4-5): '
-                'Telegram может заблокировать код, написанный обычным числом в чате (по моим сведениям, не проверено). Если включён облачный пароль — задайте TG_2FA_PASSWORD в ENV.')
+        return ('📨 Код отправлен в приложение Telegram: чат «Telegram» (служебные уведомления) — не в этот чат; без приложения — SMS. Пришлите <code>/tg_login КОД</code>, цифры через дефис '
+                '(например 1-2-3-4-5), в течение пары минут и НЕ запрашивайте код повторно — каждый новый обнуляет прежний. Если Telegram считает код «опубликованным в чате», он блокирует его '
+                '(по моим сведениям, не проверено) — тогда используйте сессию, созданную на компьютере: tg_make_session.py → ENV TG_SESSION_STRING. Облачный пароль — в ENV TG_2FA_PASSWORD.')
 
     async def sign_in(self, code_text):
         code = code_from_text(code_text)
@@ -117,7 +130,13 @@ class AuditTG:
                 else:
                     raise
         except Exception as e:
-            return '❌ Вход не выполнен: ' + self.safe_err(e)
+            name = type(e).__name__
+            hint = ''
+            if name == 'PhoneCodeInvalidError':
+                hint = ' — код неверен: возьмите ПОСЛЕДНИЙ код из чата «Telegram» (старые недействительны; каждый /tg_login new отправляет новый) либо Telegram заблокировал код, написанный в чате: тогда сессия с компьютера (TG_SESSION_STRING)'
+            elif name == 'PhoneCodeExpiredError':
+                hint = ' — код истёк: /tg_login new'
+            return '❌ Вход не выполнен: ' + self.safe_err(e) + hint
         self._hash = None
         chmod_session(self.session_path)
         return '✅ Вход выполнен, сессия сохранена (права 600). Запускаю чтение каналов.'
