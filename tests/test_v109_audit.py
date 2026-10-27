@@ -99,6 +99,77 @@ class Parser(unittest.TestCase):
         self.assertEqual(AP.to_float('1,234,567'), 1234567.0)
 
 
+# ── реальные форматы со скриншотов владельца (2026-10-27): публичный канал (одна сделка с графиком) и закрытый (3 сделки в день) ──
+REAL_INJ = """заходжу в inj long 30x 📉
+
+📢 точка входу: 8.034- 7.422
+✅ тейк-профіт: 8.155,8.395,8.959
+✋ стоп-лосс: 7.233
+
+📝 на графіку бачимо бичий наратив також зміну характеру ціни, зверху buy side liquidity, зараз знаходимось в зоні 1h брейкер блоку ордерів, звідси хочу побачити подальший рух!"""
+REAL_PENGU = REAL_INJ.replace('inj', 'pengu').replace('8.034- 7.422', '0.008169- 0.007416').replace('8.155,8.395,8.959', '0.008275,0.008737,0.009032').replace('7.233', '0.007169') + '\n\nзаходимо в угоду на BingX ✖️'
+REAL_C2 = ["🔹 INJ Long Cross 25X\n\n📝 entry: 7.980\n\n📈 targets: 8.087,8.178,8.333,8.529\n\n✋ stop: 7.062",
+           "🔹 PEPE Short Cross 25X\n\n📝 entry: 0.0043218\n\n📈 targets: 0.0042524,0.0041831,0.0040876,0.0039613\n\n✋ stop: 0.0048841",
+           "🔹 ONDO Long Cross 25X\n\n📝 entry: 0.4140\n\n📈 targets: 0.4186,0.4235,0.4284,0.4407\n\n✋ stop: 0.3679"]
+
+
+class RealFormats(unittest.TestCase):
+    def test_public_channel_zone_entry_ukrainian(self):
+        p = AP.parse(REAL_INJ)
+        self.assertEqual((p['kind'], p['symbol'], p['side'], p['leverage'], p['entry_lo'], p['entry_hi'], p['stop']), ('signal', 'INJ', 'long', 30, 7.422, 8.034, 7.233))
+        self.assertEqual(p['targets'], [8.155, 8.395, 8.959])                          # «8.155,8.395,8.959» без пробелов, «тейк-профіт» с украинской «і»
+        p = AP.parse(REAL_PENGU)
+        self.assertEqual((p['kind'], p['symbol'], p['entry_lo'], p['entry_hi'], p['stop']), ('signal', 'PENGU', 0.007416, 0.008169, 0.007169))
+
+    def test_private_channel_three_signals(self):
+        got = [AP.parse(x) for x in REAL_C2]
+        self.assertEqual([(g['symbol'], g['side'], g['leverage']) for g in got], [('INJ', 'long', 25), ('PEPE', 'short', 25), ('ONDO', 'long', 25)])
+        self.assertEqual(got[1]['targets'], [0.0042524, 0.0041831, 0.0040876, 0.0039613])
+        self.assertEqual((got[1]['entry_lo'], got[1]['stop']), (0.0043218, 0.0048841))
+        self.assertTrue(all(g['kind'] == 'signal' for g in got))
+
+    def test_buy_side_liquidity_comment_does_not_flip_direction(self):
+        txt = REAL_INJ.replace('long', 'short').replace('8.034- 7.422', '7.422- 8.034').replace('8.155,8.395,8.959', '7.3,7.1,6.9').replace('7.233', '8.200').replace('buy side', 'sell side liquidity, buy side')
+        p = AP.parse(txt)
+        self.assertEqual((p['kind'], p['side']), ('signal', 'short'))
+
+    def test_management_messages_are_not_signals(self):
+        for t in ('полетіли!\n\nфіксую частину та стоп на твх)', 'гарний рух!\n\nфіксуємо ще частину)'):
+            self.assertEqual(AP.parse(t)['kind'], 'other')
+
+
+class FakeEx:
+    def __init__(self, base_price):
+        self.base_price = base_price
+        self.calls = []
+
+    async def fetch_ohlcv(self, sym, tf, since, limit):
+        self.calls.append(sym)
+        px = self.base_price[sym]
+        n = 600
+        return [[since + i * MIN, px, px * 1.001, px * 0.999, px] for i in range(n)]
+
+
+class PriceMapping(unittest.TestCase):
+    def test_1000_prefix_contract_is_chosen_by_price_scale(self):
+        # PEPE в сигнале = цена контракта 1000PEPE (0.0043); контракт PEPE (4.3e-6) — другой масштаб и отклоняется
+        src = AS.PriceSource(tempfile.mkdtemp())
+
+        async def no_binance(*a):
+            return None
+        src._binance_day = no_binance                                              # архив Binance в тесте недоступен (сети нет)
+        src.markets = {'PEPE/USDT:USDT': {}, '1000PEPE/USDT:USDT': {}}
+        src.ex = FakeEx({'PEPE/USDT:USDT': 4.3e-6, '1000PEPE/USDT:USDT': 0.0043})
+        t0 = 1_760_000_000_000
+        c, note = run(src.candles('PEPE', t0, t0 + 3_600_000, 0.0043, t0 + 10 ** 10))
+        self.assertIsNotNone(c)
+        self.assertIn('1000PEPE', note)
+        src.ex = FakeEx({'PEPE/USDT:USDT': 4.3e-6})
+        src.markets = {'PEPE/USDT:USDT': {}}
+        c2, note2 = run(AS.PriceSource.candles(src, 'PEPE', t0 + 10 ** 9, t0 + 10 ** 9 + 3_600_000, 0.0043, t0 + 10 ** 10))
+        self.assertIsNone(c2)
+
+
 def candles(rows, ts0=0):
     a = np.array(rows, float)
     n = len(a)
@@ -386,6 +457,61 @@ class Telegram(unittest.TestCase):
             self.assertNotIn(secret, blob)
         self.assertTrue(out[1].startswith('✅'))
         self.assertEqual(os.stat(sess1 + '.session').st_mode & 0o777, 0o600)          # права сессии 600
+
+    def test_code_request_is_not_repeated_and_new_forces(self):
+        a = self.make()
+        first = run(a.request_code())
+        self.assertIn('приложение Telegram', first)
+        again = run(a.request_code())
+        self.assertIn('уже запрошен', again)
+        self.assertEqual(self.client.calls.count('send_code_request'), 1)          # повторный запрос код не пересылает (он бы обнулил прежний)
+        run(a.request_code(force=True))
+        self.assertEqual(self.client.calls.count('send_code_request'), 2)
+
+    def test_invalid_code_gives_hint(self):
+        class PhoneCodeInvalidError(Exception):
+            pass
+        a = self.make()
+        run(a.request_code())
+
+        async def bad(**kw):
+            raise PhoneCodeInvalidError('The phone code entered was invalid')
+        self.client.sign_in = bad
+        out = run(a.sign_in('1-2-3-4-5'))
+        self.assertIn('ПОСЛЕДНИЙ', out)
+        self.assertIn('TG_SESSION_STRING', out)
+
+    def test_string_session_from_env(self):
+        import sys
+        import types
+        made = {}
+
+        class TC:
+            def __init__(self, sess, api_id, api_hash):
+                made['sess'] = sess
+
+        class SS:
+            def __init__(self, s):
+                self.s = s
+        tel, ses = types.ModuleType('telethon'), types.ModuleType('telethon.sessions')
+        tel.TelegramClient, ses.StringSession = TC, SS
+        old = {k: sys.modules.get(k) for k in ('telethon', 'telethon.sessions')}
+        sys.modules['telethon'], sys.modules['telethon.sessions'] = tel, ses
+        os.environ['TG_SESSION_STRING'] = 'STRING_SECRET_VALUE'
+        try:
+            a = AT.AuditTG('1', self.HASH, ['@c'], os.path.join(tempfile.mkdtemp(), 'tg'))
+            a._default_factory()
+            self.assertIsInstance(made['sess'], SS)
+            self.assertEqual(made['sess'].s, 'STRING_SECRET_VALUE')
+            self.assertNotIn('STRING_SECRET_VALUE', a.safe_err(RuntimeError('boom STRING_SECRET_VALUE')))      # значение сессии маскируется в ошибках
+            self.assertNotIn('STRING_SECRET_VALUE', AB.status_text())
+        finally:
+            os.environ.pop('TG_SESSION_STRING', None)
+            for k, v in old.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
 
     def test_password_from_env_only(self):
         a = self.make(password_needed=True)
