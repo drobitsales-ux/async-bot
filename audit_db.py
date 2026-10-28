@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS audit_other (
     id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, msg_id INTEGER NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, pub_ts INTEGER, recv_ts REAL NOT NULL,
     symbol TEXT, reply_to INTEGER, payload TEXT, text TEXT, UNIQUE(channel, msg_id));
 '''
+MUTABLE_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS audit_progress (channel TEXT PRIMARY KEY, last_id INTEGER NOT NULL, n INTEGER NOT NULL, done INTEGER NOT NULL, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS audit_meta (k TEXT PRIMARY KEY, v TEXT);
+'''
 IMMUTABLE = ('audit_events', 'audit_signals', 'audit_other')
 
 
@@ -36,6 +40,7 @@ def connect(path=None):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     con = sqlite3.connect(path)
     con.executescript(SCHEMA)
+    con.executescript(MUTABLE_SCHEMA)                       # служебные (изменяемые) таблицы: прогресс backfill и флаги; данные аудита — только в неизменяемых
     for t in IMMUTABLE:
         for op in ('UPDATE', 'DELETE'):
             con.execute(f"CREATE TRIGGER IF NOT EXISTS {t}_no_{op.lower()} BEFORE {op} ON {t} BEGIN SELECT RAISE(ABORT, 'audit: таблица неизменяема'); END")
@@ -72,6 +77,30 @@ def record_event(con, channel, msg_id, ev, text=None, source='live', ts=None):
     if ev not in ('edit', 'delete'):
         raise ValueError(ev)
     con.execute('INSERT INTO audit_events (channel, msg_id, ev, msg_ts, recv_ts, source, text) VALUES (?,?,?,?,?,?,?)', (str(channel), int(msg_id), ev, ts, time.time(), source, text))
+    con.commit()
+
+
+def progress_get(con, channel):
+    """Прогресс backfill по каналу: (last_id, n, done); нет записи → (0, 0, 0)."""
+    r = con.execute('SELECT last_id, n, done FROM audit_progress WHERE channel=?', (str(channel),)).fetchone()
+    return r if r else (0, 0, 0)
+
+
+def progress_set(con, channel, last_id, n, done):
+    con.execute('INSERT OR REPLACE INTO audit_progress (channel, last_id, n, done, updated) VALUES (?,?,?,?,?)', (str(channel), int(last_id), int(n), int(done), time.time()))
+    con.commit()
+
+
+def meta_get(con, k, default=None):
+    r = con.execute('SELECT v FROM audit_meta WHERE k=?', (k,)).fetchone()
+    return r[0] if r else default
+
+
+def meta_set(con, k, v):
+    if v is None:
+        con.execute('DELETE FROM audit_meta WHERE k=?', (k,))
+    else:
+        con.execute('INSERT OR REPLACE INTO audit_meta (k, v) VALUES (?, ?)', (k, str(v)))
     con.commit()
 
 

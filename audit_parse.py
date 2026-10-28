@@ -236,14 +236,16 @@ def parse(text):
 
 
 def _parse_report(t, sym):
-    """Отчёт о цели: «ENA цель 2 достигнута +85%»: символ, номер цели (если есть), заявленный процент."""
+    """Отчёт о цели: «Ціль 2 (85%)», «ENA цель 2 достигнута +85%»: номер цели (если есть), заявленный процент, символ и направление (если названы). Символ может отсутствовать —
+    тогда привязка только по reply_to."""
     if not re.search(r'достигнут|досягнут|reached|hit|выполнен|виконан|профит|profit|прибыл|прибут|✅|цел|ціл|target|tp', t, re.I):
         return None
     m = REPORT_PCT.search(t)
+    if not m:
+        return None
     if not sym:
         b = re.match(r'\W*([A-Z0-9]{2,10})\b', t)
         sym = b.group(1) if b and b.group(1) not in SKIP_SYMS and not b.group(1).isdigit() else None
-    if not m or not sym:
-        return None
     tn = re.search(r'(?:цел[ьиейя]+|ціл[ьіи]+|target|tp)\s*#?(\d)', t, re.I) or re.search(r'(\d)\s*(?:-?[яйе]|st|nd|rd|th)?\s*(?:цел|ціл|target|tp)', t, re.I)
-    return {'kind': 'report', 'symbol': sym, 'target_no': int(tn.group(1)) if tn else None, 'claimed_pct': to_float(m.group(1))}
+    side, _why = find_side(t)
+    return {'kind': 'report', 'symbol': sym, 'side': side, 'target_no': int(tn.group(1)) if tn else None, 'claimed_pct': to_float(m.group(1))}
