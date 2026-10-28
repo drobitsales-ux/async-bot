@@ -308,12 +308,6 @@ class Stats(unittest.TestCase):
         self.assertFalse(few['crit']['n'])
         self.assertFalse(few['pass'])
 
-    def test_claimed_vs_computed(self):
-        sigs = [{'channel': 'c', 'msg_id': 1, 'symbol': 'ENA', 'side': 'short', 'leverage': 25, 'entry_lo': 0.285, 'entry_hi': 0.29, 'targets': [0.28, 0.275], 'pub_ts': 100}]
-        reps = [{'channel': 'c', 'msg_id': 2, 'symbol': 'ENA', 'reply_to': None, 'pub_ts': 200, 'payload': {'target_no': 1, 'claimed_pct': 85.0}}]
-        rows = AS.claimed_vs_computed(reps, sigs)
-        self.assertAlmostEqual(rows[0]['computed'], (1 - 0.28 / 0.285) * 100 * 25, places=6)
-
 
 class Store(unittest.TestCase):
     def setUp(self):

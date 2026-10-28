@@ -11,7 +11,8 @@ import audit_tg as AT
 
 IMPORT_MAX_BYTES = 20 * 1024 * 1024          # лимит скачивания файла ботом (Bot API)
 IMPORT_WAIT_S = 900
-STATE = {'tg': None, 'import_wait': 0.0, 'start_msg': ''}
+STATE = {'tg': None, 'import_wait': 0.0, 'start_msg': '', 'bf_task': None}
+BACKFILL_DEFAULT = 20000
 
 
 def config():
@@ -83,6 +84,19 @@ def status_text():
         L.append(re.sub(r'<[^>]+>', '', STATE['start_msg']))
     try:
         if os.path.exists(c['db']):
+            _con = AD.connect(c['db'])
+            since = AD.meta_get(_con, 'listening_since')
+            if AD.meta_get(_con, 'stopped') == '1':
+                L.append('Сессия: чтение ОСТАНОВЛЕНО (/audit_stop; возобновить — /audit_start)')
+            elif since:
+                from datetime import datetime, timezone
+                L.append('Сессия активна с ' + datetime.fromtimestamp(int(since), timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))
+            for ch, last_id, n, done, _u in _con.execute('SELECT channel, last_id, n, done, updated FROM audit_progress'):
+                L.append(f'backfill {ch}: обработано {n}, последний id {last_id}, {"прочитано до конца" if done else "не завершено"}')
+    except Exception as e:
+        L.append('Сессия/backfill: ошибка чтения ' + type(e).__name__)
+    try:
+        if os.path.exists(c['db']):
             cn = AD.counts(AD.connect(c['db']))
             L.append(f'БД: сигналов {cn["signals"]}; прочее {cn["other"]}; события {cn["events"]}')
         else:
@@ -135,3 +149,48 @@ async def import_document(msg, token, http, run_job, tg, label=None):
     text = await run_job('/audit_import', 'audit_import', {'path': path, 'adb': AD.db_path(), 'label': label})
     if text:
         await tg(text)
+
+
+def backfill_max():
+    try:
+        return max(1, int(os.getenv('AUDIT_BACKFILL_MAX', str(BACKFILL_DEFAULT))))
+    except ValueError:
+        return BACKFILL_DEFAULT
+
+
+async def backfill(tg):
+    """/audit_backfill: вся история каналов (только чтение), прогресс в Telegram, продолжение с места остановки."""
+    if not configured():
+        await tg('⛔ Аудит не настроен (TG_API_ID, TG_API_HASH, AUDIT_CHANNELS)')
+        return
+    a = get_client()
+    await tg(f'📥 /audit_backfill: читаю историю каналов (до {backfill_max()} сообщений на канал, от старых к новым; только чтение; повторный запуск продолжит с места остановки)')
+    try:
+        await tg(await a.backfill(backfill_max(), tg))
+    except Exception as e:
+        logging.warning('[AUDIT] backfill: %s', type(e).__name__)
+        await tg('❌ backfill: ' + a.safe_err(e))
+
+
+async def stop(tg):
+    """/audit_stop: остановить чтение и backfill, отключить клиент Telethon (без выхода из аккаунта), поставить флаг; напомнить про ENV и сессию."""
+    a = get_client() if configured() else STATE['tg']
+    if a is not None:
+        await a.stop(persist=True)
+    else:
+        AD.meta_set(AD.connect(config()['db']), 'stopped', 1)
+    await tg('⏹ Чтение каналов остановлено, клиент Telethon отключён (из аккаунта не выходил). После перезапуска бота чтение само не стартует (флаг в БД; возобновить — /audit_start).\n'
+             'Гигиена сессии — сделайте сами: 1) удалите <code>TG_SESSION_STRING</code> из ENV Render (и при желании TG_API_HASH/TG_PHONE); 2) в Telegram: Настройки → Устройства → завершите сессию, '
+             'созданную для бота. Накопленная БД аудита (/audit) остаётся.')
+
+
+async def resume(tg):
+    """/audit_start: снять флаг остановки и запустить чтение каналов."""
+    if not configured():
+        await tg('⛔ Аудит не настроен')
+        return
+    AD.meta_set(AD.connect(config()['db']), 'stopped', None)
+    a = get_client()
+    a.stopped = False
+    await start(tg)
+    await tg(re.sub(r'<[^>]+>', '', STATE['start_msg']) or 'запуск выполнен')

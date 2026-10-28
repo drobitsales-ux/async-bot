@@ -1,6 +1,7 @@
 """audit_tg.py — чтение канала(ов) через аккаунт владельца (Telethon), BOT_SPEC §2.44.1 п. 3. ТОЛЬКО ЧТЕНИЕ: никаких ответов, пересылок, реакций, подтверждений прочтения.
 Секреты (api_hash, телефон, код, пароль 2FA, файл сессии) не пишутся в логи и не отправляются в чат; ошибки показываются без значений секретов (safe_err).
 Файл сессии — SESSION.session (права 600), вне git (.gitignore). Клиент создаётся фабрикой — в тестах подменяется фейком (сети нет)."""
+import asyncio
 import logging
 import os
 import re
@@ -46,6 +47,9 @@ class AuditTG:
         self._code_ts = 0.0
         self.labels = {}
         self.started = False
+        self.stopped = False
+        self._stop = False
+        self.backfilling = False
         self.con = None
         self.stats = {'live': 0, 'edit': 0, 'delete': 0, 'catchup': 0}
 
@@ -146,6 +150,9 @@ class AuditTG:
         """Подключение, регистрация обработчиков (только чтение), догонка последних сообщений. → текст статуса (без секретов)."""
         if not self.channels:
             return '⚠️ AUDIT_CHANNELS не задан — чтение каналов не запущено'
+        if AD.meta_get(self._db(), 'stopped') == '1':
+            return '⏹ Чтение каналов остановлено командой /audit_stop (флаг в БД) — после перезапуска оно само не стартует; возобновить: /audit_start'
+        self.stopped, self._stop = False, False
         if not await self.authorized():
             return '⚠️ Сессия Telegram не авторизована — выполните /tg_login'
         try:
@@ -171,6 +178,8 @@ class AuditTG:
             c.add_event_handler(self._on_deleted, events.MessageDeleted(chats=ents))
         await self.catchup(ents)
         self.started = True
+        if AD.meta_get(self._db(), 'listening_since') is None:
+            AD.meta_set(self._db(), 'listening_since', int(time.time()))
         return f'✅ Чтение каналов запущено: {len(ents)} (только чтение); догнано сообщений: {self.stats["catchup"]}'
 
     def _label(self, chat_id):
@@ -222,12 +231,90 @@ class AuditTG:
         except Exception as e:
             log.warning('[AUDIT] обработка удаления: %s', self.safe_err(e))
 
-    async def stop(self):
+    async def stop(self, persist=True):
+        """/audit_stop: остановить backfill и чтение, отключить клиент (БЕЗ выхода из аккаунта); флаг «остановлено» — в БД (после перезапуска бота чтение не стартует)."""
+        self._stop = True
+        self.stopped = True
+        self.started = False
         if self.client is not None:
             try:
                 await self.client.disconnect()
             except Exception:
                 pass
+        if persist:
+            con = self._db()
+            AD.meta_set(con, 'stopped', 1)
+            AD.meta_set(con, 'listening_since', None)
+
+    # ── полная история (/audit_backfill) ──────────────────────────────────────────────────────
+    async def _entities(self):
+        c = await self._client()
+        ents = []
+        for ch in self.channels:
+            try:
+                key = int(ch) if re.fullmatch(r'-?\d+', ch.strip()) else ch.strip()
+                ent = await c.get_entity(key)
+                self.labels.setdefault(getattr(ent, 'id', ch), ch)
+                ents.append(ent)
+            except Exception as e:
+                log.warning('[AUDIT] канал недоступен: %s', self.safe_err(e))
+        return ents
+
+    async def backfill(self, max_per_channel, say, sleep=asyncio.sleep, batch=500):
+        """Вся доступная история каналов (от СТАРЫХ к новым, до max_per_channel сообщений на канал), ТОЛЬКО чтение. FloodWait — ждём указанное время и продолжаем с последнего id;
+        прогресс (last_id, n, done) хранится в audit_progress → повторный запуск продолжает; уже сохранённые сообщения не дублируются (канал + id); источник 'catchup' (не форвард)."""
+        if self.backfilling:
+            return '⏳ backfill уже выполняется'
+        if AD.meta_get(self._db(), 'stopped') == '1' or self.stopped:
+            return '⏹ Чтение остановлено (/audit_stop) — сначала /audit_start'
+        if not await self.authorized():
+            return '⚠️ Сессия Telegram не авторизована'
+        self.backfilling, self._stop = True, False
+        con = self._db()
+        c = await self._client()
+        lines = []
+        try:
+            for ent in await self._entities():
+                label = str(self.labels.get(getattr(ent, 'id', None), getattr(ent, 'id', '?')))
+                last, n, done = AD.progress_get(con, label)
+                new = dup = 0
+                exhausted = False
+                while n < max_per_channel and not self._stop:
+                    try:
+                        async for m in c.iter_messages(ent, limit=max_per_channel - n, reverse=True, offset_id=last):
+                            if self._stop:
+                                break
+                            n += 1
+                            last = m.id
+                            if (m.raw_text or '').strip():
+                                k = AD.ingest(con, label, m.id, int(m.date.timestamp()), m.raw_text, 'catchup', reply_to=getattr(m, 'reply_to_msg_id', None))
+                                if k == 'dup':
+                                    dup += 1
+                                else:
+                                    new += 1
+                            if n % 100 == 0:
+                                AD.progress_set(con, label, last, n, 0)
+                            if n % batch == 0:
+                                await say(f'📥 backfill {label}: обработано {n}, новых {new}, уже были {dup} (id до {last})')
+                        else:
+                            exhausted = n < max_per_channel            # итератор закончился: история прочитана до конца, если не упёрлись в лимит
+                        break
+                    except Exception as e:
+                        if type(e).__name__ == 'FloodWaitError':
+                            sec = int(getattr(e, 'seconds', 60) or 60)
+                            AD.progress_set(con, label, last, n, 0)
+                            await say(f'⏳ backfill {label}: Telegram просит подождать {sec} с (FloodWait) — жду и продолжаю с id {last}')
+                            await sleep(sec + 1)
+                            continue
+                        log.warning('[AUDIT] backfill: %s', self.safe_err(e))
+                        await say('❌ backfill ' + label + ': ' + self.safe_err(e))
+                        break
+                AD.progress_set(con, label, last, n, 1 if exhausted else 0)
+                st = 'история прочитана до конца' if exhausted else ('остановлено' if self._stop else f'достигнут лимит {max_per_channel} (поднимите AUDIT_BACKFILL_MAX)')
+                lines.append(f'{label}: обработано {n} (новых {new}, уже были {dup}), последний id {last} — {st}')
+        finally:
+            self.backfilling = False
+        return '✅ backfill завершён (источник catchup — ретроспектива, в форвард не входит)\n' + '\n'.join(lines)
 
 
 def abs_id(chat_id):

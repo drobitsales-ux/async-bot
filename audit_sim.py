@@ -114,7 +114,7 @@ def simulate(sig, c, fees, now_ms, funding=None):
     wb = walk(side, c, i_fill, level, sig['targets'], sig['stop'], None, now_ms)
     sd = abs(sig['stop'] - level) / level
     pb = unit_pnl(side, level, wb['fills'], fees, funding, fill_ts)
-    out['B'] = {'R': pb / sd if sd > 0 else float('nan'), 'closed': wb['closed']}
+    out['B'] = {'R': pb / sd if sd > 0 else float('nan'), 'closed': wb['closed'], 'kinds': [f[0] for f in wb['fills']]}
     out['hit'] = wb['hit']
     out['closed'] = wb['closed']
     out['exit_ts'] = max((f[3] for f in wb['fills']), default=fill_ts)
@@ -125,7 +125,7 @@ def simulate(sig, c, fees, now_ms, funding=None):
             ret = -1.0
         else:
             ret = max(-1.0, lev * unit_pnl(side, level, wa['fills'], fees, funding, fill_ts))
-        out['A'] = {'ret': ret, 'liq': wa['liq'], 'closed': wa['closed']}
+        out['A'] = {'ret': ret, 'liq': wa['liq'], 'closed': wa['closed'], 'liq_ts': (wa['fills'][0][3] if wa['liq'] else None)}
         out['hit_A'] = wa['hit']
     else:
         out['A'] = None
@@ -211,32 +211,6 @@ def verdict(rows, months_ret):
             'up': (None if grp['up']['mean'] is None else grp['up']['mean'] >= 0), 'down': (None if grp['down']['mean'] is None else grp['down']['mean'] >= 0)}
     ok = all(v for v in crit.values() if v is not None)
     return {'stats': st, 't_day': td, 'n_days': nd, 'groups': grp, 'crit': crit, 'pass': bool(ok)}
-
-
-# ── сверка «заявлено vs рассчитано» ─────────────────────────────────────────────────────────────────
-def claimed_vs_computed(reports, sigs):
-    """Для отчётов о цели: привязка к сигналу (reply_to либо последний сигнал символа до отчёта); рассчитано = доходность на маржу до издержек при плече сигнала в цене заявленной цели."""
-    rows = []
-    for rp in reports:
-        pl = rp['payload']
-        k = pl.get('target_no')
-        cand = [s for s in sigs if s['channel'] == rp['channel'] and (s['msg_id'] == rp['reply_to'] or (s['symbol'] == rp['symbol'] and s['pub_ts'] <= (rp['pub_ts'] or 0)))]
-        if rp['reply_to']:
-            byr = [s for s in cand if s['msg_id'] == rp['reply_to']]
-            cand = byr or cand
-        if not cand or not k:
-            rows.append({'symbol': rp['symbol'], 'claimed': pl.get('claimed_pct'), 'computed': None, 'why': 'нет сигнала или номера цели'})
-            continue
-        s = max(cand, key=lambda x: x['pub_ts'])
-        if k > len(s['targets']):
-            rows.append({'symbol': rp['symbol'], 'claimed': pl.get('claimed_pct'), 'computed': None, 'why': 'номер цели больше числа целей'})
-            continue
-        lev = s['leverage']
-        lvl = s['entry_lo'] if s['side'] == 'short' else s['entry_hi']
-        d = 1.0 if s['side'] == 'long' else -1.0
-        comp = d * (s['targets'][k - 1] / lvl - 1.0) * 100.0 * (lev or 1)
-        rows.append({'symbol': rp['symbol'], 'claimed': pl.get('claimed_pct'), 'computed': comp, 'lev': lev, 'k': k, 'why': '' if lev else 'плечо не указано — расчёт без плеча'})
-    return rows
 
 
 # ── цены ────────────────────────────────────────────────────────────────────────────────────────────
@@ -355,9 +329,21 @@ class PriceSource:
         return None
 
     async def btc_daily(self, since_ms, now_ms):
+        """Дневные свечи BTC за весь период (постранично по 1000 дней)."""
         try:
-            got = await self.ex.fetch_ohlcv('BTC/USDT:USDT', '1d', since_ms, 1000)
-            return [r[0] for r in got], [r[4] for r in got]
+            ts, cl, since = [], [], since_ms
+            while since < now_ms:
+                got = await self.ex.fetch_ohlcv('BTC/USDT:USDT', '1d', since, 1000)
+                if not got:
+                    break
+                ts += [r[0] for r in got]
+                cl += [r[4] for r in got]
+                if got[-1][0] + DAY <= since:
+                    break
+                since = got[-1][0] + DAY
+                if len(got) < 2:
+                    break
+            return (ts, cl) if ts else None
         except Exception:
             return None
 
@@ -371,9 +357,109 @@ def load_signals(con):
 
 
 def load_reports(con):
-    out = []
-    for r in con.execute("SELECT channel, msg_id, source, pub_ts, symbol, reply_to, payload FROM audit_other WHERE kind='report'"):
-        out.append({'channel': r[0], 'msg_id': r[1], 'source': r[2], 'pub_ts': r[3], 'symbol': r[4], 'reply_to': r[5], 'payload': json.loads(r[6] or '{}')})
+    """Отчёты о целях: все сохранённые сообщения-не-сигналы разбираются ЗАНОВО текущим парсером (таблицы неизменяемы, поэтому переклассификация — при чтении). → (reports, reply_map {(канал, id): reply_to})."""
+    import audit_parse as AP
+    out, reply_map = [], {}
+    for r in con.execute("SELECT channel, msg_id, source, pub_ts, symbol, reply_to, text FROM audit_other WHERE kind IN ('report','other')"):
+        if r[5]:
+            reply_map[(r[0], r[1])] = r[5]
+        p = AP.parse(r[6] or '')
+        if p['kind'] == 'report':
+            out.append({'channel': r[0], 'msg_id': r[1], 'source': r[2], 'pub_ts': r[3], 'symbol': p.get('symbol') or r[4], 'reply_to': r[5], 'side': p.get('side'),
+                        'target_no': p.get('target_no'), 'claimed_pct': p.get('claimed_pct')})
+    return out, reply_map
+
+
+LINK_MAX_AGE_S = 14 * 86400
+REPLY_HOPS = 5
+MATCH_REL = 0.10
+
+
+def link_reports(reports, sigs, reply_map=None):
+    """Привязка отчёта к сигналу (BOT_SPEC §2.44.8 п. 2): (а) по reply_to (по цепочке ответов до сигнала, ≤ 5 звеньев); (б) иначе — последний сигнал того же символа (и направления, если названо)
+    в том же канале не старше 14 суток. → список dict(report, signal|None, how='reply'|'symbol'|None, why)."""
+    reply_map = reply_map or {}
+    by_key = {(s['channel'], s['msg_id']): s for s in sigs}
+    links = []
+    for rp in reports:
+        sig, how = None, None
+        cur = rp.get('reply_to')
+        for _ in range(REPLY_HOPS):
+            if not cur:
+                break
+            if (rp['channel'], cur) in by_key:
+                sig, how = by_key[(rp['channel'], cur)], 'reply'
+                break
+            cur = reply_map.get((rp['channel'], cur))
+        if sig is None and rp.get('symbol'):
+            cand = [s for s in sigs if s['channel'] == rp['channel'] and s['symbol'] == rp['symbol'] and 0 <= (rp['pub_ts'] or 0) - s['pub_ts'] <= LINK_MAX_AGE_S
+                    and (not rp.get('side') or s['side'] == rp['side'])]
+            if cand:
+                sig, how = max(cand, key=lambda x: x['pub_ts']), 'symbol'
+        links.append({'report': rp, 'signal': sig, 'how': how, 'why': '' if sig else ('нет reply_to и символа' if not rp.get('symbol') and not rp.get('reply_to') else 'сигнал не найден (14 суток / символ)')})
+    return links
+
+
+def report_check(links, results):
+    """Сверка по привязкам: results — {(канал, id сигнала): итог simulate}. Для каждой привязки с номером цели: заявленный %, рассчитанный по модели A % до издержек, достигнута ли цель до ликвидации/стопа,
+    ликвидирован ли сигнал к моменту отчёта. → (rows, итоги)."""
+    rows = []
+    for l in links:
+        rp, s = l['report'], l['signal']
+        if s is None:
+            continue
+        k = rp.get('target_no')
+        res = results.get((s['channel'], s['msg_id']))
+        row = {'symbol': s['symbol'], 'k': k, 'claimed': rp.get('claimed_pct'), 'how': l['how'], 'computed': None, 'reached': None, 'match': None, 'after_liq': None, 'lev': s['leverage']}
+        if k and 1 <= k <= len(s['targets']):
+            lvl = s['entry_lo'] if s['side'] == 'short' else s['entry_hi']
+            d = 1.0 if s['side'] == 'long' else -1.0
+            row['computed'] = d * (s['targets'][k - 1] / lvl - 1.0) * 100.0 * (s['leverage'] or 1)
+        if res is not None and res.get('status') == 'filled':
+            hit = res.get('hit_A') if res.get('A') else res.get('hit')
+            row['reached'] = bool(k) and k in (hit or [])
+            if res.get('A') and res['A'].get('liq'):
+                row['after_liq'] = res['A']['liq_ts'] is not None and res['A']['liq_ts'] <= (rp['pub_ts'] or 0) * 1000
+            else:
+                row['after_liq'] = False
+        elif res is not None:
+            row['reached'] = False
+            row['after_liq'] = False
+        if row['computed'] is not None and rp.get('claimed_pct') is not None:
+            row['match'] = abs(rp['claimed_pct'] - row['computed']) <= MATCH_REL * abs(row['computed'])
+        rows.append(row)
+    n = len(rows)
+    with_k = [r for r in rows if r['k'] and r['computed'] is not None]
+    ev = [r for r in with_k if r['reached'] is not None]
+    summ = {'n_reports': len(links), 'n_linked': n, 'n_reply': sum(1 for r in rows if r['how'] == 'reply'), 'n_symbol': sum(1 for r in rows if r['how'] == 'symbol'),
+            'n_no_k': n - len(with_k), 'n_eval': len(ev),
+            'reached': sum(1 for r in ev if r['reached']), 'match': sum(1 for r in with_k if r['match']), 'n_match': len(with_k),
+            'after_liq': sum(1 for r in ev if r['after_liq']), 'abs_med': (float(np.median([abs(r['claimed'] - r['computed']) for r in with_k])) if with_k else None)}
+    return rows, summ
+
+
+def expectancy(closed):
+    """Расшифровка ожидания модели B (BOT_SPEC §2.44.8 п. 3): средний R выигрыша и проигрыша, доля безубытков после первой цели, вклад полных стопов; строка-пояснение."""
+    R = [r['B']['R'] for r in closed if math.isfinite(r['B']['R'])]
+    kinds = [r['B'].get('kinds') or [] for r in closed if math.isfinite(r['B']['R'])]
+    n = len(R)
+    if not n:
+        return None
+    arr = np.asarray(R)
+    wins, losses = arr[arr > 0], arr[arr < 0]
+    w_avg = float(wins.mean()) if len(wins) else 0.0
+    l_avg = float(-losses.mean()) if len(losses) else 0.0
+    be = sum(1 for k in kinds if 'be' in k and 'tp' in k)
+    stops = [x for x, k in zip(R, kinds) if 'stop' in k and 'tp' not in k]
+    timeouts = [x for x, k in zip(R, kinds) if 'timeout' in k]
+    out = {'n': n, 'wr': float((arr > 0).mean()), 'w_avg': w_avg, 'l_avg': l_avg, 'ratio': (l_avg / w_avg if w_avg > 0 else None), 'be_share': be / n, 'n_be': be,
+           'n_stop': len(stops), 'sum_stop': float(sum(stops)), 'mean_stop': (float(np.mean(stops)) if stops else None), 'n_timeout': len(timeouts), 'sum_all': float(arr.sum()),
+           'sum_rest': float(arr.sum() - sum(stops)), 'mean': float(arr.mean())}
+    if out['ratio'] is not None and l_avg > 0:
+        out['text'] = (f'WR {out["wr"] * 100:.0f}%, но средний проигрыш в {out["ratio"]:.1f} раза ' + ('больше' if out['ratio'] >= 1 else 'меньше') + f' среднего выигрыша '
+                       f'(выигрыш {w_avg:+.3f} R, проигрыш −{l_avg:.3f} R) → ожидание {out["mean"]:+.3f} R на сделку')
+    else:
+        out['text'] = f'WR {out["wr"] * 100:.0f}%, ожидание {out["mean"]:+.3f} R на сделку'
     return out
 
 
@@ -389,7 +475,7 @@ async def run_simulation(sigs, source, fees, now_ms, progress=None):
         c, note = await source.candles(s['symbol'], pub_ms, pub_ms + ENTRY_WINDOW_MS + HOLD_MS, ref, now_ms)
         fund = await source.funding(s['symbol'], pub_ms, pub_ms + ENTRY_WINDOW_MS + HOLD_MS) if c is not None and note.startswith('BingX') else None
         sim = simulate(dict(s, pub_ms=pub_ms), c, fees, now_ms, fund)
-        sim.update({'pub_ms': pub_ms, 'source': s['source'], 'symbol': s['symbol'], 'side': s['side'], 'lev': s['leverage'], 'note': note, 'fund_missing': fund is None})
+        sim.update({'key': (s['channel'], s['msg_id']), 'pub_ms': pub_ms, 'source': s['source'], 'symbol': s['symbol'], 'side': s['side'], 'lev': s['leverage'], 'note': note, 'fund_missing': fund is None})
         rows.append(sim)
         if progress and (i + 1) % 20 == 0:
             await progress(f'/audit: просчитано сигналов {i + 1}/{len(sigs)}')
@@ -426,9 +512,16 @@ def section(title, rows, months_ret):
             by.setdefault(r['symbol'], []).append(r['B']['R'])
         top = sorted(by.items(), key=lambda kv: -len(kv[1]))[:8]
         L.append('    по символам (топ-8 по числу): ' + '; '.join(f'{k} n={len(v)} mean R {np.mean(v):+.2f}' for k, v in top))
+        ex = expectancy(closed)
+        if ex:
+            L.append(f'    расшифровка ожидания: {ex["text"]}')
+            L.append(f'      средний выигрыш {ex["w_avg"]:+.3f} R, средний проигрыш −{ex["l_avg"]:.3f} R; закрыто в безубыток после первой цели: {ex["n_be"]} ({ex["be_share"] * 100:.0f}%); '
+                     f'полные стопы (без единой цели): {ex["n_stop"]} шт., ΣR {ex["sum_stop"]:+.2f} (среднее {fm(ex["mean_stop"], 2)}), остальные сделки ΣR {ex["sum_rest"]:+.2f}, итого ΣR {ex["sum_all"]:+.2f}; по таймауту: {ex["n_timeout"]}')
         g = month_groups(closed, months_ret)
         for nm, lab in (('up', 'месяцы роста BTC'), ('down', 'месяцы падения BTC')):
-            L.append(f'    {lab}: месяцев {g[nm]["n_months"]}, сигналов {g[nm]["n"]}, mean R {fm(g[nm]["mean"], 3) if g[nm]["mean"] is not None else "н/п"}')
+            sub = [r['B']['R'] for r in closed if month_key(r['pub_ms']) in {m for m, x in months_ret.items() if (x > 0) == (nm == 'up') and x != 0} and math.isfinite(r['B']['R'])]
+            pf = r_stats(sub)['pf'] if sub else None
+            L.append(f'    {lab}: месяцев {g[nm]["n_months"]}, сигналов {g[nm]["n"]}, mean R {fm(g[nm]["mean"], 3) if g[nm]["mean"] is not None else "н/п"}, PF {fm(pf)}')
     else:
         L.append('  модель B: нет закрытых исполненных сигналов')
     miss = sum(1 for r in filled if r.get('fund_missing'))
@@ -447,13 +540,13 @@ async def run_audit(params, progress=None, source=None):
     now_ms = int(params.get('now_ms') or time.time() * 1000)
     sigs = load_signals(con)
     cnts = AD.counts(con)
-    reports = load_reports(con)
+    reports, reply_map = load_reports(con)
     head = [f'📋 <b>/audit — аудит внешнего источника сигналов (BOT_SPEC §2.44)</b> | код {params.get("version", "")}',
             f'комиссии: FEE_TAKER {fees["taker"] * 100:.4f}%, FEE_MAKER {fees["maker"] * 100:.4f}%, проскальзывание {SLIP * 100:.2f}% на сторону']
     unp = sum(sum(v.values()) for k, v in cnts['other'].items() if k == 'unparsed')
     rep = sum(sum(v.values()) for k, v in cnts['other'].items() if k == 'report')
     head.append(f'Сообщений-сигналов: {sum(cnts["signals"].values())} (live {cnts["signals"].get("live", 0)}, догонка {cnts["signals"].get("catchup", 0)}, импорт {cnts["signals"].get("import", 0)}); '
-                f'нераспознано {unp}; отчётов о целях {rep}; событий правок {cnts["events"].get("edit", 0)}, удалений {cnts["events"].get("delete", 0)}')
+                f'нераспознано {unp}; отчётов о целях (по текущему парсеру) {len(reports)} (при записи {rep}); событий правок {cnts["events"].get("edit", 0)}, удалений {cnts["events"].get("delete", 0)}')
     if not sigs:
         return '\n'.join(head + ['Сигналов нет — нечего считать.'])
     own = source is None
@@ -489,15 +582,18 @@ async def run_audit(params, progress=None, source=None):
         L.append(f'  <b>Вердикт: рано — набрано {v["stats"]["n"]} из {MIN_N}</b> (решение невозможно до n ≥ {MIN_N}).')
     else:
         L.append('  <b>Вердикт: ' + ('ПРОЙДЕНО → отдельный пре-коммит автоисполнения (не в этом деплое)' if v['pass'] else 'НЕ ПРОЙДЕНО → канал отклонён') + '</b>')
-    cc = claimed_vs_computed(reports, sigs)
-    if cc:
-        L += ['', f'<b>Сверка «заявлено каналом (%) vs рассчитано (%)»</b> (отчётов {len(cc)}; рассчитано = доходность на маржу до издержек в цене заявленной цели)']
-        ok = [x for x in cc if x['computed'] is not None]
-        for x in ok[:15]:
-            L.append(f'  {x["symbol"]} цель {x["k"]}: заявлено {x["claimed"]:+.0f}%, рассчитано {x["computed"]:+.0f}%' + (f' ({x["why"]})' if x['why'] else ''))
-        if len(ok) > 15:
-            L.append(f'  … ещё {len(ok) - 15}')
-        if ok:
-            L.append(f'  расхождение: медиана заявлено/рассчитано = {np.median([x["claimed"] / x["computed"] for x in ok if x["computed"]]):.2f}')
-        L.append(f'  без привязки: {len(cc) - len(ok)}')
+    links = link_reports(reports, sigs, reply_map)
+    results = {r['key']: r for r in rows if r.get('key')}
+    rrows, sm = report_check(links, results)
+    if links:
+        pct = lambda a, b: f'{a} из {b} ({a / b * 100:.0f}%)' if b else 'н/д'
+        L += ['', f'<b>Сверка отчётов о целях с расчётом</b> (§2.44.8 п. 2): отчётов {sm["n_reports"]}; привязано {sm["n_linked"]} (по reply_to {sm["n_reply"]}, по символу ≤ 14 суток {sm["n_symbol"]}); '
+                  f'без привязки {sm["n_reports"] - sm["n_linked"]}; привязано, но без номера цели/расчёта {sm["n_no_k"]}',
+              f'  (1) цель реально достигнута по ценам до ликвидации/стопа: {pct(sm["reached"], sm["n_eval"])}',
+              f'  (2) заявленный % совпадает с расчётным модели A до издержек в пределах ±10% от расчётного: {pct(sm["match"], sm["n_match"])}; медиана |заявлено − рассчитано| {fm(sm["abs_med"], 1)} п. п.',
+              f'  (3) отчёт опубликован по сигналу, уже ликвидированному в модели A: {pct(sm["after_liq"], sm["n_eval"])}']
+        shown = [x for x in rrows if x['computed'] is not None][:12]
+        for x in shown:
+            L.append(f'    {x["symbol"]} цель {x["k"]}: заявлено {x["claimed"]:+.0f}%, рассчитано {x["computed"]:+.0f}%' + (' (без плеча)' if not x['lev'] else '') +
+                     f'; достигнута: {"да" if x["reached"] else ("нет" if x["reached"] is not None else "н/д")}' + ('; сигнал уже ликвидирован' if x['after_liq'] else ''))
     return '\n'.join(L)
