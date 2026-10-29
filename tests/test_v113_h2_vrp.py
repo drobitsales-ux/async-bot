@@ -95,7 +95,7 @@ class H2Final(unittest.TestCase):
     def test_confirm_requires_matching_k_single_run_and_other_flags_untouched(self):
         self.reset()
         no = run(H2.run_final_h2(dict(self.params, spec_path=spec_file('не записан'))))
-        self.assertIn('свободен', no)
+        self.assertIn('free', no)
         self.assertIn('k = ', no)
         self.assertIsNone(RF.kv_get(H2.KV_FLAG, self.fdir))
         refused = run(H2.run_final_h2(dict(self.params, confirm=True, spec_path=spec_file('не записан'))))
@@ -118,6 +118,7 @@ class H2Final(unittest.TestCase):
         self.assertIsNone(RF.kv_get('final_started', self.fdir))            # общий флаг §2.41/§2.42 не затронут
         again = run(H2.run_final_h2(dict(self.params, confirm=True, spec_path=spec_file('%.3f' % k))))
         self.assertIn('уже взят', again)                                    # повтор запрещён
+        self.assertEqual(RF.kv_get('finalstate:final_h2', self.fdir)['state'], 'done')
 
     def test_criteria_strict(self):
         lo = H2.E.day_bounds('LOCKBOX')[0]
@@ -394,7 +395,7 @@ class MemoryFix(unittest.TestCase):
         self.assertIn('флаг НЕ взят', txt)
         self.assertIsNone(RF.kv_get(H2.KV_FLAG, fdir))
 
-    def test_crash_after_flag_is_recorded_and_flag_stays(self):
+    def test_crash_after_flag_is_recorded_as_tech_fail_no_output(self):
         old_reps, old_eval = H2.K_REPS, H2.lockbox_eval
         H2.K_REPS = 3
         fdir = tempfile.mkdtemp()
@@ -405,11 +406,11 @@ class MemoryFix(unittest.TestCase):
         H2.lockbox_eval = boom
         try:
             k = H2.compute_k({'bdir': self.bdir}, reps=3)['k']
-            with self.assertRaises(MemoryError):
-                run(H2.run_final_h2({'bdir': self.bdir, 'fdir': fdir, 'confirm': True, 'spec_path': spec_file('%.3f' % k)}))
+            txt = run(H2.run_final_h2({'bdir': self.bdir, 'fdir': fdir, 'confirm': True, 'spec_path': spec_file('%.3f' % k)}))
         finally:
             H2.lockbox_eval, H2.K_REPS = old_eval, old_reps
-        self.assertIsNotNone(RF.kv_get(H2.KV_FLAG, fdir))                   # флаг остаётся (повтор запрещён, снять может только владелец)
+        self.assertIn('tech_fail_no_output', txt)
+        self.assertIsNotNone(RF.kv_get(H2.KV_FLAG, fdir))                   # старый ключ записан (совместимость), но источник истины — состояние
         self.assertIn('MemoryError', RF.kv_get(H2.KV_CRASH, fdir)['error'])
         self.assertIsNone(RF.kv_get(H2.KV_DONE, fdir))                      # результата нет
         self.assertIsNone(RF.kv_get(H2.KV_RESULT, fdir))
