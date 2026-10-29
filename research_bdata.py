@@ -414,9 +414,17 @@ def load_panel(d, mode='pre', session=None, syms=None, exclude_stable=True, with
         return None
     ns = len(names)
     nd = max(last) + 1
-    out = {k: v[:nd, :ns].copy() for k, v in P.items()}
+    out = {}
+    for k in list(P):                                                               # [v114] обрезка по одной матрице с освобождением исходной (пик памяти: +1 матрица, а не ×2)
+        out[k] = P.pop(k)[:nd, :ns].copy()
     del P
-    out.update({'F': F[:nd, :ns].copy(), 'G': G[:nd, :ns].copy(), 'GC': GC[:nd, :ns].copy(), 'syms': names, 'day0': day0, 'nd': nd, 'first': np.array(first, np.int64),
+    out['F'] = F[:nd, :ns].copy()
+    del F
+    out['G'] = G[:nd, :ns].copy()
+    del G
+    out['GC'] = GC[:nd, :ns].copy()
+    del GC
+    out.update({'syms': names, 'day0': day0, 'nd': nd, 'first': np.array(first, np.int64),
                 'last': np.array(last, np.int64), 'excluded_stable': excl, 'has_fund': np.array(has_fund)})
     return out
 

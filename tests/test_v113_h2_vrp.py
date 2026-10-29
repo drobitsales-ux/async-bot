@@ -95,7 +95,7 @@ class H2Final(unittest.TestCase):
     def test_confirm_requires_matching_k_single_run_and_other_flags_untouched(self):
         self.reset()
         no = run(H2.run_final_h2(dict(self.params, spec_path=spec_file('не записан'))))
-        self.assertIn('свободен', no)
+        self.assertIn('free', no)
         self.assertIn('k = ', no)
         self.assertIsNone(RF.kv_get(H2.KV_FLAG, self.fdir))
         refused = run(H2.run_final_h2(dict(self.params, confirm=True, spec_path=spec_file('не записан'))))
@@ -118,6 +118,7 @@ class H2Final(unittest.TestCase):
         self.assertIsNone(RF.kv_get('final_started', self.fdir))            # общий флаг §2.41/§2.42 не затронут
         again = run(H2.run_final_h2(dict(self.params, confirm=True, spec_path=spec_file('%.3f' % k))))
         self.assertIn('уже взят', again)                                    # повтор запрещён
+        self.assertEqual(RF.kv_get('finalstate:final_h2', self.fdir)['state'], 'done')
 
     def test_criteria_strict(self):
         lo = H2.E.day_bounds('LOCKBOX')[0]
@@ -342,7 +343,7 @@ class Wiring(unittest.TestCase):
         for t in ('final_h2', 'vrp_probe', 'vrp_measure', 'vrp_sim'):
             self.assertIn(t, RR.TASKS)
         src = open(os.path.join(ROOT, 'async_bot.py'), encoding='utf-8').read()
-        for c in ("cmd == '/final_h2'", "cmd == '/vrp_probe'", "cmd == '/vrp_measure'", "cmd == '/vrp_sim'", "'2026-11-12-v113'"):
+        for c in ("cmd == '/final_h2'", "cmd == '/vrp_probe'", "cmd == '/vrp_measure'", "cmd == '/vrp_sim'", "'2026-11-12-v113'", "'2026-11-13-v114'"):
             self.assertIn(c, src)
         import subprocess
         out = subprocess.run(['git', 'diff', '--name-only', '478834e', '--', 'bybit_worker.py'], cwd=ROOT, capture_output=True, text=True).stdout
@@ -351,3 +352,86 @@ class Wiring(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ── v114: память финального пути и сбой после взятия флага (BOT_SPEC §2.43.13–14) ──────────────────
+class MemoryFix(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bdir = tempfile.mkdtemp()
+        BF.write_battery(cls.bdir, n_syms=60, delist_n=3, list_hi=1900)
+        cls.fdir = tempfile.mkdtemp()
+
+    def test_blockwise_masks_equal_make_ctx_and_results_identical(self):
+        P = B.load_panel(self.bdir, 'pre')
+        full = H2.S.make_ctx(P)
+        liq, top = full['liq'].copy(), full['top'].copy()
+        P2 = B.load_panel(self.bdir, 'pre')
+        ctx = H2.make_ctx_h2(P2)
+        self.assertTrue(np.array_equal(ctx['liq'], liq))
+        self.assertTrue(np.array_equal(ctx['top'], top))
+        for k in ('QV', 'L', 'G', 'GC'):
+            self.assertNotIn(k, P2)                                      # неиспользуемое в H2 освобождено
+        fees = {'taker': 0.0005, 'maker': 0.0002}
+        env_old = {'P': P, 'ctx': full, 'days': np.arange(P['day0'], P['day0'] + P['nd'], dtype=np.int64)}
+        env_new = {'P': P2, 'ctx': ctx, 'days': env_old['days']}
+        for mult in (1.0, 2.0):
+            a, b = H2.RB.run_cell(H2.CELL, env_old, fees, mult), H2.RB.run_cell(H2.CELL, env_new, fees, mult)
+            self.assertTrue(np.array_equal(a['r'], b['r']))              # H2-D3 даёт побитово тот же результат
+            self.assertEqual(a['meta'], b['meta'])
+
+    def test_estimate_guard_refuses_before_flag(self):
+        fdir = tempfile.mkdtemp()
+        old_reps = H2.K_REPS
+        H2.K_REPS = 2
+        os.environ['RESEARCH_MEM_MB'] = '100'
+        try:
+            k = H2.compute_k({'bdir': self.bdir}, reps=2)['k']
+            txt = run(H2.run_final_h2({'bdir': self.bdir, 'fdir': fdir, 'confirm': True, 'spec_path': spec_file('%.3f' % k)}))
+        finally:
+            del os.environ['RESEARCH_MEM_MB']
+            H2.K_REPS = old_reps
+        self.assertIn('оценка пика памяти', txt)                            # k совпал, отказ именно по памяти
+        self.assertIn('флаг НЕ взят', txt)
+        self.assertIsNone(RF.kv_get(H2.KV_FLAG, fdir))
+
+    def test_crash_after_flag_is_recorded_as_tech_fail_no_output(self):
+        old_reps, old_eval = H2.K_REPS, H2.lockbox_eval
+        H2.K_REPS = 3
+        fdir = tempfile.mkdtemp()
+        L._lockbox_session_state['opened'] = False
+
+        def boom(*a, **kw):
+            raise MemoryError('имитация нехватки памяти')
+        H2.lockbox_eval = boom
+        try:
+            k = H2.compute_k({'bdir': self.bdir}, reps=3)['k']
+            txt = run(H2.run_final_h2({'bdir': self.bdir, 'fdir': fdir, 'confirm': True, 'spec_path': spec_file('%.3f' % k)}))
+        finally:
+            H2.lockbox_eval, H2.K_REPS = old_eval, old_reps
+        self.assertIn('tech_fail_no_output', txt)
+        self.assertIsNotNone(RF.kv_get(H2.KV_FLAG, fdir))                   # старый ключ записан (совместимость), но источник истины — состояние
+        self.assertIn('MemoryError', RF.kv_get(H2.KV_CRASH, fdir)['error'])
+        self.assertIsNone(RF.kv_get(H2.KV_DONE, fdir))                      # результата нет
+        self.assertIsNone(RF.kv_get(H2.KV_RESULT, fdir))
+        self.assertIsNone(RF.kv_get(H2.KV_EXHAUSTED, fdir))                 # «исчерпан» не записывается без результата
+
+    def test_full_panel_fits_300mb_address_space(self):
+        """Воспроизведение падения 2026-10-29: полная панель ≈ 700 символов под RLIMIT_AS = 300 МБ (в дочернем процессе, как в research_runner)."""
+        import subprocess
+        import sys
+        d = tempfile.mkdtemp()
+        BF.write_battery(d, n_syms=700, first_day='2020-01-01', last_day='2026-09-30', delist_n=20, list_hi=2400)
+        code = (
+            "import resource, sys\n"
+            "lim = 300 * 1024 * 1024\n"
+            "resource.setrlimit(resource.RLIMIT_AS, (lim, lim))\n"
+            f"sys.path[:0] = [{ROOT!r}]\n"
+            "import research_h2final as H2, research_battery as RB, research_ma_lib as L\n"
+            f"out = H2.lockbox_eval({d!r}, RB.fees_of({{}}), 1.122, L.open_lockbox_session(final=True))\n"
+            "print('OK', out['ev']['n'])\n")
+        env = dict(os.environ, MALLOC_ARENA_MAX='2', OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1')
+        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env, timeout=600)
+        self.assertIn('OK 638', r.stdout, r.stderr[-500:])
+        est, cells = H2.estimate_peak_mb(d)
+        self.assertLess(est, 0.85 * 300)                                    # такая панель проходит предохранитель
