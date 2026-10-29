@@ -253,6 +253,16 @@ async def _task_audit(ctx: Ctx):
     return {'text': await audit_sim.run_audit(ctx.params, progress=ctx.progress)}
 
 
+async def _task_signal_study(ctx: Ctx):
+    import audit_study                           # [v111] поиск по данным канала, части 1–3 на DISCOVERY (BOT_SPEC §2.45)
+    return {'text': await audit_study.run_study(ctx.params, progress=ctx.progress)}
+
+
+async def _task_signal_final(ctx: Ctx):
+    import audit_study                           # [v111] финал на HOLDOUT: единственный прогон (флаг в БД аудита)
+    return {'text': await audit_study.run_final(ctx.params, progress=ctx.progress)}
+
+
 async def _task_audit_import(ctx: Ctx):
     import audit_db                              # [v109] импорт экспорта Telegram Desktop (result.json) в неизменяемую таблицу аудита
     p = ctx.params
@@ -278,7 +288,7 @@ TASKS = {
     'factory_decomp': _task_factory_decomp, 'factory_nc': _task_factory_nc,
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
-    'audit': _task_audit, 'audit_import': _task_audit_import,
+    'audit': _task_audit, 'audit_import': _task_audit_import, 'signal_study': _task_signal_study, 'signal_final': _task_signal_final,
 }
 
 
