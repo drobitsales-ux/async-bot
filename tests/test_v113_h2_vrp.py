@@ -38,7 +38,7 @@ class SpecK(unittest.TestCase):
         self.assertIsNone(H2.read_spec_k(spec_file('не записан')))
         self.assertAlmostEqual(H2.read_spec_k(spec_file('1.234 (m0=0.8)')), 1.234)
         real = H2.read_spec_k()
-        self.assertIsNone(real)                                   # в репозитории до прогона на проде k не записан (запись — отдельным коммитом после отчёта)
+        self.assertAlmostEqual(real, 1.122)                       # k записан отдельным коммитом по отчёту /final_h2 2026-10-29 (v113)
         text = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         self.assertIn('FINALH2-K:', text)
         self.assertIn('#### 2.43.11.', text)
