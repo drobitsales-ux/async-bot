@@ -248,6 +248,26 @@ async def _task_battery_final(ctx: Ctx):
     return {'text': await research_battery.run_battery_final(ctx.params, progress=ctx.progress)}
 
 
+async def _task_final_h2(ctx: Ctx):
+    import research_h2final                      # [v113] одиночный финал H2-D3: k на синтетике и единственный прогон на LOCKBOX (BOT_SPEC §2.43.11, флаг final_h2_started)
+    return {'text': await research_h2final.run_final_h2(ctx.params, progress=ctx.progress)}
+
+
+async def _task_vrp_probe(ctx: Ctx):
+    import research_vrp                          # [v113] доступность DVOL Deribit с сервера (BOT_SPEC §2.46 п. 1)
+    return {'text': await research_vrp.run_probe(ctx.params, progress=ctx.progress)}
+
+
+async def _task_vrp_measure(ctx: Ctx):
+    import research_vrp                          # [v113] VRP_t = DVOL_t − RV(t, t+30), неперекрывающиеся точки (§2.46 п. 2)
+    return {'text': await research_vrp.run_measure(ctx.params, progress=ctx.progress)}
+
+
+async def _task_vrp_sim(ctx: Ctx):
+    import research_vrp                          # [v113] приближённая симуляция недельного железного кондора, только при пройденном гейте (§2.46 п. 3)
+    return {'text': await research_vrp.run_sim(ctx.params, progress=ctx.progress)}
+
+
 async def _task_audit(ctx: Ctx):
     import audit_sim                             # [v109] аудит внешнего источника сигналов: симуляция моделей A/B и отчёт (BOT_SPEC §2.44)
     return {'text': await audit_sim.run_audit(ctx.params, progress=ctx.progress)}
@@ -288,6 +308,7 @@ TASKS = {
     'factory_decomp': _task_factory_decomp, 'factory_nc': _task_factory_nc,
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
+    'final_h2': _task_final_h2, 'vrp_probe': _task_vrp_probe, 'vrp_measure': _task_vrp_measure, 'vrp_sim': _task_vrp_sim,
     'audit': _task_audit, 'audit_import': _task_audit_import, 'signal_study': _task_signal_study, 'signal_final': _task_signal_final,
 }
 
