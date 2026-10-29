@@ -361,7 +361,7 @@ class Wiring(unittest.TestCase):
         src = open(os.path.join(_common.ROOT, 'async_bot.py'), encoding='utf-8').read()
         self.assertIn("cmd == '/signal_study'", src)
         self.assertIn("cmd.startswith('/signal_final ')", src)
-        self.assertIn("CODE_VERSION = '2026-11-10-v111'", src)
+        self.assertIn("'2026-11-10-v111'", src)                                            # запись в CHANGELOG остаётся; номер текущей версии растёт
 
     def test_worker_untouched(self):
         import subprocess
