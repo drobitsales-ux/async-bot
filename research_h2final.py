@@ -22,6 +22,10 @@ SPEC_K_KEY = 'FINALH2-K:'
 KV_FLAG, KV_DONE, KV_RESULT, KV_K, KV_EXHAUSTED = 'final_h2_started', 'final_h2_done', 'final_h2_result', 'final_h2_k', 'lockbox_battery_exhausted'
 DAY = B.DAY_MS
 MIN_LOCK_DAYS = 50
+KV_CRASH = 'final_h2_crash'
+COL_BLOCK, ROW_BLOCK = 64, 256                 # [v114] блоки для масок ликвидности/топ-30 (экономия памяти, результаты побитово те же)
+MEM_BASE_MB, MEM_PER_MCELL_MB = 120.0, 43.0    # [v114] оценка пика памяти финального пути: база + коэффициент × миллионы ячеек «день × символ» (калибровка — BOT_SPEC §2.43.14)
+MEM_SAFETY = 0.85
 
 
 def read_spec_k(path=None):
@@ -51,6 +55,44 @@ def lockbox_days(d):
 
 def make_env(P):
     return {'P': P, 'ctx': S.make_ctx(P), 'days': np.arange(P['day0'], P['day0'] + P['nd'], dtype=np.int64)}
+
+
+def make_ctx_h2(P):
+    """[v114] Контекст H2 без неиспользуемого: H2 читает только P (O, H, C, F, first, last) и маски `liq` (допуск по ликвидности PIT) и `top` (проскальзывание топ-30); `atr` и `adv` в H2 не читаются.
+    Маски те же, что в `research_bsim.make_ctx`, но считаются блоками (pit_adv — по столбцам, top_n_mask — по строкам; операции независимы по блокам → результаты побитово те же, тест сравнивает).
+    После расчёта освобождаются матрицы, которые H2 не читает (QV, L, G, GC)."""
+    qv = P['QV']
+    nd, ns = qv.shape
+    adv = np.empty((nd, ns), np.float64)
+    for c0 in range(0, ns, COL_BLOCK):
+        adv[:, c0:c0 + COL_BLOCK] = B.pit_adv(qv[:, c0:c0 + COL_BLOCK])[0]
+    liq = B.liquid_mask(adv)
+    top = np.empty((nd, ns), bool)
+    for r0 in range(0, nd, ROW_BLOCK):
+        top[r0:r0 + ROW_BLOCK] = B.top_n_mask(adv[r0:r0 + ROW_BLOCK])
+    del adv
+    for k in ('QV', 'L', 'G', 'GC'):
+        P.pop(k, None)
+    return {'P': P, 'adv': None, 'liq': liq, 'top': top, 'atr': None}
+
+
+def make_env_final(P):
+    return {'P': P, 'ctx': make_ctx_h2(P), 'days': np.arange(P['day0'], P['day0'] + P['nd'], dtype=np.int64)}
+
+
+def estimate_peak_mb(d):
+    """Оценка пика памяти полной панели по ИНДЕКСУ архива (имена файлов; данные не читаются): ячейки = (суток от первого месяца до конца последнего) × (символов с файлами D1). → (МБ, ячеек)."""
+    idx = B.load_index(d)
+    syms = [s_ for s_ in idx['symbols'] if idx['keys'].get(s_, {}).get('d1')]
+    if not syms:
+        return 0.0, 0
+    firsts = [idx['keys'][s_]['d1'][0] for s_ in syms]
+    lasts = [idx['keys'][s_]['d1'][-1] for s_ in syms]
+    y, m = max(lasts).split('-')
+    ny, nm = (int(y) + 1, 1) if int(m) == 12 else (int(y), int(m) + 1)
+    nd = B._month_start_day(f'{ny}-{nm:02d}') - B._month_start_day(min(firsts))
+    cells = max(0, nd) * len(syms)
+    return MEM_BASE_MB + MEM_PER_MCELL_MB * cells / 1e6, cells
 
 
 def compute_k(params, reps=K_REPS, progress=None):
@@ -127,6 +169,30 @@ def reference(env, base, fees):
     return {'years': years, 'listings': n_list, 'meta': diff, 'stop_share': (diff['stops'] / diff['opened'] if diff['opened'] else None)}
 
 
+def mem_limit_mb():
+    import research_runner as RR
+    return RR.mem_limit_mb()
+
+
+def lockbox_eval(d, fees, k, session):
+    """Единственный расчёт на LOCKBOX (вызывается только после взятия флага и открытия сессии): полная панель → H2-D3 базовый и стресс ×2 → критерии и справочные счётчики. → dict | None (нет данных)."""
+    P = B.load_panel(d, 'full', session)
+    if P is None:
+        return None
+    env = make_env_final(P)
+    base = RB.run_cell(CELL, env, fees, 1.0)
+    stress = RB.run_cell(CELL, env, fees, 2.0)
+    months = {}
+    if 'BTCUSDT' in P['syms']:
+        j = P['syms'].index('BTCUSDT')
+        ts = (P['day0'] + np.arange(P['nd'])) * DAY
+        ok = np.isfinite(P['C'][:, j])
+        months = FF.btc_months(ts[ok], P['C'][ok, j].astype(float), int(ts[-1]) + DAY)
+    ev = evaluate(base, stress, k, months)
+    ref = reference(env, base, fees)
+    return {'ev': ev, 'ref': ref, 'months': months, 'meta': base['meta']}
+
+
 # ── команда ──────────────────────────────────────────────────────────────────────────────────────────
 def fm(x, nd=2):
     return 'н/д' if x is None or (isinstance(x, float) and not math.isfinite(x)) else f'{x:.{nd}f}'
@@ -179,30 +245,29 @@ async def run_final_h2(params, progress=None):
         return '⛔ /final_h2 отказ: флаг финала H2 уже взят — финал выполняется один раз, повтор запрещён (BOT_SPEC §2.43.11 п. 4)'
     if not k_ok:
         return '⛔ /final_h2 отказ: k не записан в BOT_SPEC или не совпадает с расчётом (флаг НЕ взят)\n' + '\n'.join(head[-3:])
+    est, cells = estimate_peak_mb(d)
+    limit = mem_limit_mb()
+    if est > MEM_SAFETY * limit:
+        return (f'⛔ /final_h2 отказ: оценка пика памяти полной панели {est:.0f} МБ ({cells / 1e6:.2f} млн ячеек) выше {MEM_SAFETY * 100:.0f}% лимита RESEARCH_MEM_MB={limit:.0f} — '
+                f'поднимите RESEARCH_MEM_MB в ENV и повторите (флаг НЕ взят)')
     if not RF.kv_set_if_absent(KV_FLAG, {'t': time.time(), 'kind': 'final_h2', 'k': kres['k'], 'version': version}, fdir):
         return '⛔ /final_h2 отказ: флаг финала H2 уже взят параллельным запуском'
     session = L.open_lockbox_session(final=True)
     await say('LOCKBOX открыт (единственный прогон)…')
-    P = B.load_panel(d, 'full', session)
-    if P is None:
+    try:
+        out = lockbox_eval(d, fees, kres['k'], session)
+    except Exception as e:                                          # [v114] сбой ПОСЛЕ взятия флага: причина — в БД (результата нет; сброс флага — только решением владельца, §2.43.13)
+        RF.kv_set(KV_CRASH, {'t': time.time(), 'error': f'{type(e).__name__}: {str(e)[:200]}', 'version': version}, fdir)
+        raise
+    if out is None:
         RF.kv_set(KV_DONE, True, fdir)
         return '⛔ /final_h2: LOCKBOX прочитать не удалось — нет данных D1 (флаг финала H2 взят)'
-    env = make_env(P)
-    base = RB.run_cell(CELL, env, fees, 1.0)
-    stress = RB.run_cell(CELL, env, fees, 2.0)
-    months = {}
-    if 'BTCUSDT' in P['syms']:
-        j = P['syms'].index('BTCUSDT')
-        ts = (P['day0'] + np.arange(P['nd'])) * DAY
-        ok = np.isfinite(P['C'][:, j])
-        months = FF.btc_months(ts[ok], P['C'][ok, j].astype(float), int(ts[-1]) + DAY)
-    ev = evaluate(base, stress, kres['k'], months)
-    ref = reference(env, base, fees)
+    ev, ref, months, base_meta = out['ev'], out['ref'], out['months'], out['meta']
     RF.kv_set(KV_RESULT, {'eval': ev, 'ref': ref, 'months': {str(k_): v for k_, v in months.items()}, 'k': kres['k'], 'version': version}, fdir)
     RF.kv_set(KV_DONE, True, fdir)
     if not ev['pass']:
         RF.kv_set(KV_EXHAUSTED, {'t': time.time(), 'by': 'final_h2'}, fdir)
-    return build_final_report(version, head, ev, ref, months, base['meta'])
+    return build_final_report(version, head, ev, ref, months, base_meta)
 
 
 def build_final_report(version, head, ev, ref, months, meta):
