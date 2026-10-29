@@ -17,7 +17,7 @@ def month_list(first, last):
     return out
 
 
-def write_battery(d, n_syms=40, first_day='2019-12-01', last_day='2025-03-31', seed=7, vol=0.04, delist_n=3, qv=60e6, listings=True, fund_persist=0.9, stable=0):
+def write_battery(d, n_syms=40, first_day='2019-12-01', last_day='2025-03-31', seed=7, vol=0.04, delist_n=3, qv=60e6, listings=True, fund_persist=0.9, stable=0, list_hi=None):
     """Синтетический кэш: n_syms символов; первые 16 — H16 (с начала); остальные листятся в разные даты (если listings), delist_n из них обрывается рано. Фандинг: AR(1) на 8-часовых расчётах.
     qv — средний дневной оборот (USDT). → список символов."""
     rng = np.random.default_rng(seed)
@@ -32,7 +32,7 @@ def write_battery(d, n_syms=40, first_day='2019-12-01', last_day='2025-03-31', s
         if i < len(H16) or not listings:
             f = 0
         else:
-            f = int(rng.integers(30, nd - 400))
+            f = int(rng.integers(30, list_hi or (nd - 400)))
         l = nd - 1
         if i >= len(H16) and i - len(H16) < delist_n:
             l = min(nd - 1, f + int(rng.integers(150, 500)))
