@@ -216,6 +216,8 @@ LEGACY = {'started': KV_FLAG, 'done': KV_DONE}
 KV_REPORT = 'final_h2_report'
 # Маркеры итогового отчёта H2 (строки, которых нет ни в показе k, ни в сообщениях об ошибках): их присутствие в любом хранилище = вывод по LOCKBOX существует (BOT_SPEC §2.43.15)
 MARKERS = ('РЕЗУЛЬТАТ: ПРОЙДЕНО', 'РЕЗУЛЬТАТ: НЕ ПРОЙДЕНО', 'mean при издержках ×2 =', 'листингов в LOCKBOX', 'месяцы BTC (UTC → доходность)', 'финал H2-D3 на LOCKBOX (2025+)')
+GENERIC = (0, 1, 2)                                                 # индексы маркеров, общих с форматом отчёта /final_crypto4h (BOT_SPEC §2.43.18): находка, только если в том же тексте есть H2_CTX
+H2_CTX = 'H2-D3'
 TEXT_EXT = ('.log', '.jsonl', '.json', '.txt', '.md', '.csv', '.html')
 SKIP_DIRS = ('sym', 'vision', 'audit_cache', '__pycache__', '.git')
 AUDIT_DEADLINE_S = 90.0
@@ -260,7 +262,10 @@ def leak_audit(params, fdir, d, deadline_s=AUDIT_DEADLINE_S):
             dn[:] = [x for x in dn if x not in SKIP_DIRS] if depth < 4 else []
             scanned['dirs'] += 1
             if os.path.basename(dp).startswith('final_h2_'):
-                jobs.append(dp)
+                try:
+                    jobs.append((dp, [(x, os.path.getsize(os.path.join(dp, x))) for x in sorted(fn)], time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(os.path.getmtime(dp)))))
+                except OSError:
+                    jobs.append((dp, [], '?'))
             for f in fn:
                 if time.time() - t0 > deadline_s:
                     truncated = True
@@ -282,7 +287,8 @@ def leak_audit(params, fdir, d, deadline_s=AUDIT_DEADLINE_S):
                                 for c in cols:
                                     scanned['columns'] += 1
                                     for i, m in enumerate(MARKERS):
-                                        n = con.execute(f'SELECT count(*) FROM "{tn}" WHERE instr("{c}", ?) > 0', (m,)).fetchone()[0]
+                                        extra = f' AND instr("{c}", ?) > 0' if i in GENERIC else ''
+                                        n = con.execute(f'SELECT count(*) FROM "{tn}" WHERE instr("{c}", ?) > 0{extra}', (m, H2_CTX) if i in GENERIC else (m,)).fetchone()[0]
                                         if n:
                                             hits.append((f'{path} :: {tn}.{c}', i + 1, int(n)))
                         finally:
@@ -292,8 +298,9 @@ def leak_audit(params, fdir, d, deadline_s=AUDIT_DEADLINE_S):
                             data = fh.read()
                         scanned['files'] += 1
                         scanned['bytes'] += len(data)
+                        has_ctx = H2_CTX.encode('utf-8') in data
                         for i, m in enumerate(enc):
-                            n = data.count(m)
+                            n = data.count(m) if (i not in GENERIC or has_ctx) else 0
                             if n:
                                 hits.append((path, i + 1, n))
                 except Exception:
@@ -307,10 +314,12 @@ def leak_audit(params, fdir, d, deadline_s=AUDIT_DEADLINE_S):
 
 def audit_text(res):
     L_ = ['🔎 <b>/final_h2 audit — проверка утечки вывода по LOCKBOX (BOT_SPEC §2.43.15), только чтение</b>',
-          'Маркеры итогового отчёта H2 (' + str(len(MARKERS)) + '): ' + ', '.join(f'{i + 1}) {_short(m)}' for i, m in enumerate(MARKERS)),
+          'Маркеры итогового отчёта H2 (' + str(len(MARKERS)) + '; №' + ','.join(str(i + 1) for i in GENERIC) + ' — общие с отчётом crypto4h: находка только вместе с «' + H2_CTX + '» в том же тексте): ' + ', '.join(f'{i + 1}) {_short(m)}' for i, m in enumerate(MARKERS)),
           'Проверено: каталоги ' + ', '.join(res['roots']) + f'; просмотрено каталогов {res["scanned"]["dirs"]}, SQLite-баз {res["scanned"]["dbs"]} (таблиц {res["scanned"]["tables"]}, текстовых колонок {res["scanned"]["columns"]}), '
           f'текстовых файлов {res["scanned"]["files"]} ({res["scanned"]["bytes"] / 1e6:.1f} МБ); оставшихся каталогов задач final_h2: {len(res["jobs"])}',
           'Ключи factory.db: ' + ', '.join(f'{k_} — {"ЕСТЬ" if v else "нет"}' for k_, v in res['kv'].items())]
+    for dp, files, mt in res['jobs']:
+        L_.append(f'  каталог задачи {dp} (изменён {mt} UTC): ' + (', '.join(f'{x} {sz} Б' for x, sz in files) or 'пуст'))
     if res['truncated']:
         L_.append('⚠ проверка прервана по времени — вердикт невозможен, повторите.')
     if res['hits']:
