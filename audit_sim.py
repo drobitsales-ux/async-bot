@@ -95,6 +95,15 @@ def unit_pnl(side, level, fills, fees, funding=None, fill_ts=None):
     return pnl
 
 
+def geometry(side, level, targets, stop):
+    """(a, b) в % от фактического входа: a — до первой цели, b — до стопа; цель не в сторону прибыли или стоп не в сторону убытка → None (§2.44.10)."""
+    d = 1.0 if side == 'long' else -1.0
+    t1 = targets[0]
+    if not (d * (t1 - level) > 0 and d * (level - stop) > 0):
+        return None
+    return abs(t1 - level) / level * 100.0, abs(stop - level) / level * 100.0
+
+
 def liq_price(side, level, lev):
     dist = 1.0 / lev - 0.005
     return level * (1.0 + dist) if side == 'short' else level * (1.0 - dist)
@@ -110,7 +119,7 @@ def simulate(sig, c, fees, now_ms, funding=None):
     if i_fill is None:
         return {'status': 'pending' if now_ms < sig['pub_ms'] + ENTRY_WINDOW_MS else 'not_filled'}
     fill_ts = int(c['ts'][i_fill])
-    out = {'status': 'filled', 'fill_ts': fill_ts, 'level': level}
+    out = {'status': 'filled', 'fill_ts': fill_ts, 'level': level, 'geo': geometry(side, level, sig['targets'], sig['stop'])}
     wb = walk(side, c, i_fill, level, sig['targets'], sig['stop'], None, now_ms)
     sd = abs(sig['stop'] - level) / level
     pb = unit_pnl(side, level, wb['fills'], fees, funding, fill_ts)
@@ -463,6 +472,35 @@ def expectancy(closed):
     return out
 
 
+def base_rate(rows):
+    """Проверка базовой ставки (BOT_SPEC §2.44.10) по исполненным закрытым сигналам: p_i = b / (a + b) — вероятность первой цели раньше стопа при случайном блуждании без сноса;
+    z = (достигнуто − Σp) / √Σp(1−p). → dict(n, n_skip, exp, act, diff, z, verdict) | None (нет сигналов)."""
+    ps, hits, skip = [], 0, 0
+    for r in rows:
+        if r.get('status') != 'filled' or not r.get('B') or not r['B']['closed']:
+            continue
+        g = r.get('geo')
+        if not g or g[0] + g[1] <= 0:
+            skip += 1
+            continue
+        ps.append(g[1] / (g[0] + g[1]))
+        hits += 1 if r.get('hit') else 0
+    n = len(ps)
+    if not n:
+        return None
+    sp = float(sum(ps))
+    var = float(sum(p * (1.0 - p) for p in ps))
+    z = (hits - sp) / math.sqrt(var) if var > 0 else float('nan')
+    diff = (hits / n - sp / n) * 100.0
+    if math.isfinite(z) and z >= 2.0 and diff > 0:
+        verdict = f'первая цель достигается чаще случайного входа на {diff:.1f} п. п. (z = {z:.2f})'
+    elif math.isfinite(z) and z <= -2.0:
+        verdict = f'первая цель достигается реже случайного входа на {-diff:.1f} п. п. (z = {z:.2f})'
+    else:
+        verdict = 'первая цель достигается не чаще случайного входа с той же геометрией'
+    return {'n': n, 'n_skip': skip, 'exp': sp / n, 'act': hits / n, 'diff': diff, 'z': z, 'verdict': verdict}
+
+
 def fm(x, nd=2):
     return 'н/д' if x is None or (isinstance(x, float) and not math.isfinite(x)) else f'{x:.{nd}f}'
 
@@ -517,6 +555,11 @@ def section(title, rows, months_ret):
             L.append(f'    расшифровка ожидания: {ex["text"]}')
             L.append(f'      средний выигрыш {ex["w_avg"]:+.3f} R, средний проигрыш −{ex["l_avg"]:.3f} R; закрыто в безубыток после первой цели: {ex["n_be"]} ({ex["be_share"] * 100:.0f}%); '
                      f'полные стопы (без единой цели): {ex["n_stop"]} шт., ΣR {ex["sum_stop"]:+.2f} (среднее {fm(ex["mean_stop"], 2)}), остальные сделки ΣR {ex["sum_rest"]:+.2f}, итого ΣR {ex["sum_all"]:+.2f}; по таймауту: {ex["n_timeout"]}')
+        br = base_rate(closed)
+        if br:
+            L.append(f'    проверка базовой ставки (§2.44.10): n {br["n"]}' + (f' (геометрия «не по сторонам»: {br["n_skip"]})' if br['n_skip'] else '') +
+                     f'; ожидаемая доля первой цели при случайном блуждании {br["exp"] * 100:.1f}%, фактическая {br["act"] * 100:.1f}%, разность {br["diff"]:+.1f} п. п., z = {fm(br["z"])}')
+            L.append(f'      → {br["verdict"]}. Оценка: не учитывает таймаут (7 суток) и тренд.')
         g = month_groups(closed, months_ret)
         for nm, lab in (('up', 'месяцы роста BTC'), ('down', 'месяцы падения BTC')):
             sub = [r['B']['R'] for r in closed if month_key(r['pub_ms']) in {m for m, x in months_ret.items() if (x > 0) == (nm == 'up') and x != 0} and math.isfinite(r['B']['R'])]
