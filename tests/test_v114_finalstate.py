@@ -159,7 +159,7 @@ class H2Flow(unittest.TestCase):
         run(H2.run_final_h2(self.p(mode='confirm')))
         H2.lockbox_eval = self.orig_eval
         with open(os.path.join(self.scan, 'leak.log'), 'w', encoding='utf-8') as f:
-            f.write('что-то\n' + H2.MARKERS[1] + '\n')
+            f.write('что-то H2-D3\n' + H2.MARKERS[1] + '\n')
         t = run(H2.run_final_h2(self.p(mode='retry')))
         self.assertIn('УТЕЧКА', t)
         self.assertIn('повтор ЗАПРЕЩЁН', t)
@@ -184,6 +184,50 @@ class H2Flow(unittest.TestCase):
         self.assertFalse(res['clean'])
         self.assertTrue(any('htf_reports.text' in w for w, _i, _n in res['hits']))
         self.assertIn('УТЕЧКА', H2.audit_text(res))
+
+    def test_crypto4h_report_format_is_not_a_hit_but_h2_report_is(self):
+        """Первый audit на проде (2026-10-29 20:30) дал ложные находки в отчёте /final_crypto4h от 2026-10-25 (§2.43.18): общие маркеры считаются находкой только вместе с «H2-D3»."""
+        c4 = ('шапка\n<b>РЕЗУЛЬТАТ: НЕ ПРОЙДЕНО</b> (дней 600, k = 1.151)\n  mean при издержках ×2 = 1.55 б.п./день > 0: да\n'
+              '  месяцы BTC (индекс месяца UTC → доходность): 2025-01: +11.8%')
+        with open(os.path.join(self.scan, 'htf_backtest_2026-10-25_2046.txt'), 'w', encoding='utf-8') as f:
+            f.write(c4)
+        db = os.path.join(self.scan, 'trades.db')
+        con = sqlite3.connect(db)
+        con.execute('CREATE TABLE htf_reports (id INTEGER, text TEXT)')
+        con.execute('INSERT INTO htf_reports VALUES (1, ?)', (c4,))
+        con.commit()
+        con.close()
+        res = H2.leak_audit(self.p(), self.fdir, self.bdir)
+        self.assertTrue(res['clean'], res['hits'])
+        con = sqlite3.connect(db)
+        con.execute('INSERT INTO htf_reports VALUES (2, ?)', ('<b>РЕЗУЛЬТАТ: ПРОЙДЕНО</b> H2-D3 (дней 90)',))
+        con.commit()
+        con.close()
+        res2 = H2.leak_audit(self.p(), self.fdir, self.bdir)
+        self.assertFalse(res2['clean'])
+        self.assertEqual([i for _w, i, _n in res2['hits']], [1])
+        with open(os.path.join(self.scan, 'spec.log'), 'w', encoding='utf-8') as f:
+            f.write('финал H2-D3 на LOCKBOX (2025+)')                       # специфичный маркер — находка без контекста
+        self.assertIn(6, [i for _w, i, _n in H2.leak_audit(self.p(), self.fdir, self.bdir)['hits']])
+
+    def test_specific_markers_do_not_occur_in_other_finals_source(self):
+        specific = [m for i, m in enumerate(H2.MARKERS) if i not in H2.GENERIC]
+        for f in ('research_ffinal.py', 'research_factory.py', 'research_battery.py'):
+            src = open(os.path.join(ROOT, f), encoding='utf-8').read()
+            for m in specific:
+                self.assertNotIn(m, src, f)
+        ffinal = open(os.path.join(ROOT, 'research_ffinal.py'), encoding='utf-8').read()
+        for i in H2.GENERIC:
+            self.assertIn(H2.MARKERS[i].split(':')[0], ffinal)                  # общие маркеры действительно есть в формате crypto4h
+
+    def test_audit_lists_leftover_job_dirs(self):
+        jd = os.path.join(self.scan, 'final_h2_abc123')
+        os.makedirs(jd)
+        with open(os.path.join(jd, 'progress.jsonl'), 'w', encoding='utf-8') as f:
+            f.write('{"msg": "LOCKBOX открыт"}\n')
+        txt = H2.audit_text(H2.leak_audit(self.p(), self.fdir, self.bdir))
+        self.assertIn('final_h2_abc123', txt)
+        self.assertIn('progress.jsonl', txt)
 
     def test_audit_after_success_sees_the_result_itself(self):
         run(H2.run_final_h2(self.p(mode='confirm')))
