@@ -38,6 +38,7 @@ import json
 import math
 import os
 import re
+import sys
 import html
 import hmac
 import hashlib
@@ -933,24 +934,109 @@ def safe_exc_reason(e, maxlen: int = 160) -> str:
     return out[:maxlen]
 
 
+EQ_FIELDS = (('equity', None), ('balance', 'unrealizedProfit'), ('crossWalletBalance', 'crossUnPnl'),
+             ('availableMargin', None))                    # (поле, поле нереализованного PnL): кандидаты в порядке приоритета
+
+
+def _eq_candidates(bal):
+    """Словари баланса USDT из ответа fetch_balance(): info.data.balance (dict или list), info.data.balances, info.data (list)."""
+    data = (((bal or {}).get('info') or {}).get('data'))
+    cands = []
+    for node in ((data.get('balance'), data.get('balances')) if isinstance(data, dict) else (data,)):
+        if isinstance(node, dict):
+            cands.append(node)
+        elif isinstance(node, list):
+            cands += [x for x in node if isinstance(x, dict)]
+    return [c for c in cands if str(c.get('asset') or 'USDT').upper() == 'USDT']
+
+
+def _extract_equity_ex(bal):
+    """[v119] → (эквити USDT, статус): 'ok' | 'zero' (поля распознаны, но баланс фьючерсов ≤ 0) | 'unrecognized' (ни одного известного поля) | 'empty'
+    (ответа нет). НЕ ПРОВЕРЕНО на живом ответе BingX (структура ответа прода не известна — её снимает /net_probe, §2.51.1)."""
+    if not bal:
+        return 0.0, 'empty'
+    seen = False
+    try:
+        for c in _eq_candidates(bal):
+            for fld, upnl in EQ_FIELDS:
+                if c.get(fld) in (None, ''):
+                    continue
+                seen = True
+                x = float(c[fld]) + (float(c.get(upnl) or 0) if upnl else 0.0)
+                if fld == 'availableMargin':               # свободная маржа + занятая/замороженная
+                    x += float(c.get('usedMargin') or 0) + float(c.get('freezedMargin') or 0) + float(c.get('unrealizedProfit') or 0)
+                if x > 0:
+                    return x, 'ok'
+        t = ((bal or {}).get('USDT') or {})
+        for k in ('total', 'free'):
+            if t.get(k) not in (None, ''):
+                seen = True
+                if float(t[k]) > 0:
+                    return float(t[k]), 'ok'
+    except Exception:
+        return 0.0, 'unrecognized'
+    return 0.0, ('zero' if seen else 'unrecognized')
+
+
 def _extract_equity(bal) -> float:
     """Эквити (USDT) из ответа fetch_balance(); 0.0 — не удалось."""
+    return _extract_equity_ex(bal)[0]
+
+
+def _equity_fail_text(bal, status) -> str:
+    """Причина «эквити не получено» для /status и алертов (только ключи, без значений полей)."""
+    if status == 'zero':
+        return 'баланс фьючерсов USDT-M: 0; проверьте кошелёк (средства на другом кошельке или суб-аккаунте?)'
+    if status == 'unrecognized':
+        info = (bal or {}).get('info') if isinstance(bal, dict) else None
+        data = info.get('data') if isinstance(info, dict) else None
+        ks = lambda x: ','.join(sorted(map(str, x)))[:60] if isinstance(x, dict) else type(x).__name__
+        return f'структура ответа баланса не распознана (info: {ks(info)}; data: {ks(data)}) — см. /net_probe'
+    return 'пустой ответ'
+
+
+_BAL_SKIP = re.compile(r'(?i)(id$|uid|key|sign|secret|token|addr)')
+
+
+def balance_shape(obj, depth: int = 4, path: str = '', out=None, limit: int = 60) -> list:
+    """[v119] Структура ответа баланса: ключи всех уровней, типы и ЧИСЛА полей (короткие буквенные строки вроде asset — тоже); поля вида *id/uid/key/sign/secret/token
+    пропускаются. Секретов в выводе нет."""
+    out = [] if out is None else out
+    if len(out) >= limit:
+        return out
+    if isinstance(obj, dict):
+        out.append(f'{path or "·"}: {{{",".join(sorted(map(str, obj)))[:150]}}}')
+        for k in sorted(obj, key=str)[:14]:
+            if _BAL_SKIP.search(str(k)):
+                continue
+            v = obj[k]
+            if isinstance(v, (dict, list)):
+                if depth > 0:
+                    balance_shape(v, depth - 1, f'{path}.{k}' if path else str(k), out, limit)
+            else:
+                out.append(f'{path}.{k} = {_bal_scalar(v)}')
+    elif isinstance(obj, list):
+        out.append(f'{path}: список из {len(obj)}')
+        if obj and depth > 0:
+            balance_shape(obj[0], depth - 1, f'{path}[0]', out, limit)
+    else:
+        out.append(f'{path} = {_bal_scalar(obj)}')
+    return out[:limit]
+
+
+def _bal_scalar(v) -> str:
+    if v is None:
+        return 'None'
+    if isinstance(v, bool):
+        return f'bool {v}'
+    if isinstance(v, (int, float)):
+        return f'{type(v).__name__} {v}'
+    t = str(v)
     try:
-        b = (((bal or {}).get('info') or {}).get('data') or {}).get('balance')
-        if isinstance(b, dict):
-            v = b.get('equity')
-            if v not in (None, '') and float(v) > 0:
-                return float(v)
-            if b.get('balance') not in (None, ''):
-                x = float(b['balance']) + float(b.get('unrealizedProfit') or 0)
-                if x > 0:
-                    return x
-        t = ((bal or {}).get('USDT') or {}).get('total')
-        if t and float(t) > 0:
-            return float(t)
-    except Exception:
-        pass
-    return 0.0
+        float(t)
+        return f'str {t[:24]}'
+    except ValueError:
+        return f'str {t[:10]}' if (t.isalpha() and len(t) <= 10) else f'str(len {len(t)})'
 
 
 # [v94] Повторы запроса эквити: пауза 5/15/30 с перед 2-й/3-й/4-й попыткой, и только потом сбой.
@@ -964,10 +1050,11 @@ async def _fetch_equity(retry: bool = True):
     pauses = EQUITY_RETRY_PAUSES if retry else ()
     for i in range(len(pauses) + 1):
         try:
-            eq = _extract_equity(await asyncio.wait_for(exchange_priv.fetch_balance(), EQUITY_ATTEMPT_TIMEOUT))
+            bal = await asyncio.wait_for(exchange_priv.fetch_balance(), EQUITY_ATTEMPT_TIMEOUT)
+            eq, st = _extract_equity_ex(bal)
             if eq > 0:
                 return eq
-            err = 'пустой ответ'
+            err = _equity_fail_text(bal, st)                 # [v119] «баланс 0» / «структура не распознана» вместо «пустой ответ»
         except Exception as _e:
             err = safe_exc_reason(_e)
         _dd['last_err'] = err
@@ -6680,6 +6767,7 @@ async def build_daily_digest(date_str: str = None):
     lines.append('')
     lines.append('── ЗДОРОВЬЕ ДАННЫХ ──')
     lines.append(health_status_line())
+    lines.append(esc(runtime_versions_text()))   # [v119] версии Python/ccxt одной строкой
     lines.append('Условия тревог сейчас: ' + ('; '.join(t for _k, t in h_conds) if h_conds else 'нет'))
 
     text = '\n'.join(lines)
@@ -6867,8 +6955,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-20-v118'
+CODE_VERSION = '2026-11-20-v119'
 CHANGELOG = [
+    ('2026-11-20-v119', 'ЭКВИТИ «ПУСТОЙ ОТВЕТ», OKX БЕЗ CCXT, МАРКЕРЫ ПРЕ-РЕГИСТРАЦИЙ, ПОДСКАЗКИ КОМАНД (BOT_SPEC §2.51; прод-факты, маркеры и поправка §2.47 внесены ОТДЕЛЬНЫМ коммитом ДО кода и ДО загрузки данных). bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет. Шаг 0 на проде: Bybit — гео-блок (HTTP 403 CloudFront), OKX — aiohttp доступен, ccxt load_markets падает TypeError. Маркеры в BOT_SPEC: X1-MAIN-PAIR: BingX/Binance, H2REPL-VENUES: bingx,okx; §2.47: вселенная H2-репликации — перпетуалы BingX и OKX вне архива Binance (монета на обеих — биржа с большим оборотом за 30 суток), фандинг OKX = 0 там, где истории для окна позиции нет, счётчик в отчёте. ЭКВИТИ: _extract_equity_ex → (значение, статус ok/zero/unrecognized/empty), разбор dict/list/balances; при нулевом балансе фьючерсов — «баланс фьючерсов USDT-M: 0; проверьте кошелёк», при неизвестной структуре — «структура ответа баланса не распознана (ключи)» вместо «пустой ответ»; /net_probe шлёт третье сообщение со структурой ответа ccxt fetch_balance и прямого /openApi/swap/v2/user/balance (ключи и числа, без id/ключей/подписей, balance_shape); версии Python/ccxt — строкой в /status. OKX: research_okx.OkxPublic — прямой REST aiohttp (instruments SWAP, listTime, history-candles назад с кэшем, funding-rate-history назад, ставка realizedRate), интерфейс ccxt-подмножества для Fetcher/fetch_bars/fetch_funding; глубина истории фандинга OKX измеряется загрузкой (строка в отчёте). load_index дополняет индекс прошлых версий ключом okx. Команды: /help — порядок «load → без аргумента → confirm»; неизвестная команда, похожая на известную (Левенштейн ≤ 2), → «возможно, вы имели в виду /…» (к штатному ответу v96; /cmd@other_bot игнорируется); /xdata → подсказка про /xfund_test load и /h2_replicate load. НЕ ПРОВЕРЕНО (сети нет): реальная структура ответа баланса BingX и причина нулевого эквити, форматы полей OKX v5 (взяты из документации по памяти), глубина фандинга OKX, причина TypeError ccxt.okx. Тесты: tests/test_v119_okx_equity.py'),
     ('2026-11-20-v118', 'ДОСТУП К BYBIT/OKX, ПРИЧИНА СБОЯ ЭКВИТИ, УСТОЙЧИВАЯ ЗАГРУЗКА (BOT_SPEC §2.50; прод-факты и шаг 0 записаны ОТДЕЛЬНЫМ коммитом ДО кода). bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет. ШАГ 0: /net_probe дополнен пробой Bybit (v5 рынки/тикер) и OKX (тикер): aiohttp — HTTP-код, заголовки Server/X-Cache/Via/Retry-After, первые 300 байт тела; ccxt load_markets — имя класса исключения; вердикт «гео-блок» / «лимит частоты» / «доступно» (access_probe.py; ответ отдельным сообщением). Вердикт получает владелец на проде; из среды разработки (сети нет) он недостижим, поэтому условные поправки пре-регистраций (X1-MAIN-PAIR, H2REPL-VENUES) в BOT_SPEC НЕ внесены — код ведёт себя по исходным §2.47/§2.48, пока маркеров нет. ПРАВКА 1: строка эквити в /status, /dd_status и алерты «3 сбоя»/«эквити не получено» показывают причину последнего сбоя — класс исключения + код биржи (safe_exc_reason: «AuthenticationError 100413 Incorrect apiKey»; ключ/секрет/signature/длинные токены/query вырезаются); при успехе причина сбрасывается. ПРАВКА 2: /xdata load — недоступная биржа помечается «недоступна (вердикт пробы)» и загрузка остальных продолжается (в индексе unavailable); все недоступны — явный отказ; параметр venues исключает площадку по пре-регистрации. Binance — из архива data.binance.vision: новый вид h1 (1h-свечи месяцами, только high/low/close float32, продолжение с места остановки, батарею /battery_load не меняет), X1 с основной парой BingX/Binance (включается маркером X1-MAIN-PAIR: BingX/Binance в BOT_SPEC): ставки Binance — fundingRate архива с фактическими отметками времени, свечи — архив (1h для базиса и хода против ноги, 1D иначе), комиссия Binance — FEE_DEFAULT 0.05% (правило «FEE_TAKER биржи, иначе 0.05%»). H2-репликация: маркер H2REPL-VENUES: bingx ограничивает вселенную BingX. НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/OKX с прода, фактическая комиссия Binance, объём и время загрузки 1h-архива. Тесты: tests/test_v118_access.py'),
     ('2026-11-20-v117', 'РАЗВЯЗКА ПУБЛИЧНЫХ ДАННЫХ BINGX И КЛЮЧА (BOT_SPEC §2.49; запись инцидента — отдельным коммитом ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет). Прод 2026-11-18…19: ключ BingX недействителен (100413 «Incorrect apiKey»), а load_markets() у экземпляра с ключом вызывает fetch_currencies() через ПРИВАТНЫЙ walletsV1PrivateGetCapitalConfigGetall — не грузились даже публичные рынки, сканеры и исследования стояли. По исходнику ccxt 4.2.14 bingx.fetch_currencies без ключей возвращает None (приватный запрос не выполняется). Новый экземпляр exchange_pub БЕЗ ключей — для ВСЕХ публичных данных (рынки, свечи, тикеры, фандинг, стаканы) в боте и во всех исследовательских командах (h2_replicate, xfund_test, exec_check, htf/carry/ws/ma2 prepare_*); ключевой exchange оставлен только для сравнения в /net_probe (priv_shared), все приватные вызовы — через exchange_priv (exchange_priv.set_markets берёт рынки у exchange_pub). 100413 на приватном канале → ОДИН алерт «ключ BingX недействителен» не чаще раза в час (key_error_note в обёртке _lat_make), публичные данные, сканеры и исследования от ключа не зависят. Версии: .python-version = 3.13.18 (на ней проходят тесты; в трейсе прода — 3.14), ccxt==4.2.14 (уже закреплена в requirements.txt; фактическая версия на проде не проверена — старт пишет Python и ccxt в лог и в стартовое сообщение и предупреждает о расхождении). Дайджест: воркер Bybit опрашивается только при WORKER_ENABLED=true (по умолчанию false), вместо «н/д (HTTP 503)» — «воркер выключен». ПОПРАВКА X1 (BOT_SPEC §2.48.6, записана ОТДЕЛЬНЫМ коммитом ДО кода; данные X1 ещё не загружались): 3 порога входа T ∈ {0.02%, 0.05%, 0.10%} за 8 ч; базис на входе и выходе — по close 1h-свечи часа сигнала на обеих биржах (время сделки 01:00 UTC), при отсутствии часовых свечей — дневной close с пометкой и счётчиком таких сделок; аварийное закрытие: ход против ноги ≥ 30% от входа (по hi/lo часов, иначе дней) — обе ноги закрываются (сработавшая по уровню + проскальзывание, вторая по close бара), гэп ≥ 45% в одном баре — нога ликвидирована (−100% маржи), вторая по close бара (заменяет прежнее правило 40%); фандинг строго по фактическим отметкам времени каждой биржи в (вход, выход], приведение к 8 ч — только для сигнала d. /xfund_test load теперь грузит и 1h-свечи (high/low/close) общих грубо ликвидных символов; отчёт показывает базис по 1h / запасной, аварийные закрытия и гэпы. Тесты: tests/test_v117_decouple.py, tests/test_v116_h2x1.py (X1)'),
     ('2026-11-19-v116', 'H2: ПРОВЕРКА ФАНДИНГА И РЕПЛИКАЦИЯ НА НЕЗАВИСИМЫХ МОНЕТАХ (BOT_SPEC §2.47) И МЕЖБИРЖЕВОЙ АРБИТРАЖ ФАНДИНГА X1 (§2.48); пре-регистрации записаны ОТДЕЛЬНЫМИ коммитами ДО загрузки данных и ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; НИ ОДНОГО реального ордера (методов создания ордеров нет — тест на исходниках); расчёты — через research_runner. Часть 0 документации (отдельный коммит): итог /final_h2 retry confirm (§2.43.20: НЕ ПРОЙДЕНО только по значимости, t_adj 1.25 < 2.0; Шарп 1.18, просадка 10.1%, стресс +3.05, месяцы роста +3.51 / падения +2.71, LOCKBOX +3.13 б.п./день; LOCKBOX батареи исчерпан), итог /vrp_measure (§2.46.5), строки H2/VRP в RESEARCH_SUMMARY. /h2_funding_check: ответ по коду — фандинг в исходном H2 УЧИТЫВАЛСЯ (sim_h2 начисляет +w·F шорту, fund_on=True по умолчанию), поэтому LOCKBOX не пересчитывается и не читается; команда считает H2-D3 на TRAIN и VALID «без фандинга / с фандингом» (mean, t, Шарп, просадка), средний фандинг за 30 суток после листинга и решение владельца (mean VALID+LOCKBOX с фандингом ≤ 0 → H2 закрыт). /h2_replicate [load|confirm|report]: вселенная — USDT-перпетуалы Bybit/BingX, базы которых НИКОГДА не было в архиве Binance (нормализация 1000X → X), монета на обеих биржах — биржа с большим оборотом за первые 30 суток; та же run_cell(H2-D3) на панели того же формата (тест побитово), фандинг учитывается; шаг 0 мощность (D < 365 → непроверяема), k по синтетике панели записывается в BOT_SPEC ДО расчёта (строки H2REPL-UNIVERSE и H2REPL-K), критерии на всём периоде панели, один расчёт (флаг h2_repl_*). /xfund_test [load]: X1 BingX/Bybit — приведение ставок к 8 ч (сумма за [t−72 ч, t) ÷ 9), T ∈ {0.02%, 0.05%}, выход при d < 0.005% или 14 сут., ≤ 5 позиций, плечо 2x, 4 исполнения комиссии + проскальзывание, фандинг по начислениям ног, разница цен бирж в P&L, ликвидация ноги при ходе ≥ 40%, отчёт APR/Шарп/просадка/худший месяц/доли/издержки/по годам/ёмкость, справочно пары с Binance. /exec_check h2|x1 [start|stop|report]: почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (стакан, спред, проскальзывание по размерам, фандинг), старт только после пройденной проверки. Данные: research_xdata.py (ccxt, только публичные методы, кэш XDATA_DIR, повторы, пауза HTF_FETCH_PAUSE_SEC, продолжение с места остановки). НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/BingX (глубина истории, пагинация фандинга назад: Bybit until / BingX endTime, закрытые инструменты), реальные время и память. Тесты: tests/test_v116_h2x1.py'),
@@ -7279,19 +7368,23 @@ async def _np_dns(host: str) -> dict:
         return {'ok': False, 'dt': time.time() - t0, 'err': f'{type(e).__name__}: {e}'}
 
 
-async def _np_http_get(session, url: str, headers: dict = None) -> dict:
+async def _np_http_get(session, url: str, headers: dict = None, keep_json: bool = False) -> dict:
     """Один GET напрямую через aiohttp (в обход ccxt). Не бросает исключений."""
     t0 = time.time()
     try:
         async with session.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=NET_PROBE_TIMEOUT)) as r:
             body = await r.text()
-            code, msg = None, ''
+            code, msg, jj = None, '', None
             try:
                 j = json.loads(body)
                 code, msg = j.get('code'), str(j.get('msg', ''))[:100]
+                jj = j if keep_json else None
             except Exception:
                 msg = body[:100]
-            return {'dt': time.time() - t0, 'status': r.status, 'api_code': code, 'msg': msg, 'err': None}
+            res = {'dt': time.time() - t0, 'status': r.status, 'api_code': code, 'msg': msg, 'err': None}
+            if keep_json:
+                res['json'] = jj                                     # [v119] только для приватного баланса; в текст попадает через balance_shape (без id/ключей)
+            return res
     except Exception as e:
         return {'dt': time.time() - t0, 'status': None, 'api_code': None, 'msg': '',
                 'err': f'{type(e).__name__}: {e}'.strip(': ')}
@@ -7414,7 +7507,7 @@ async def net_probe_collect() -> dict:
                 q = f'timestamp={int(time.time() * 1000)}'
                 sig = hmac.new(BINGX_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
                 res['direct_priv'].append(await _np_http_get(
-                    sess, f'{base}/openApi/swap/v2/user/balance?{q}&signature={sig}', {'X-BX-APIKEY': BINGX_KEY}))
+                    sess, f'{base}/openApi/swap/v2/user/balance?{q}&signature={sig}', {'X-BX-APIKEY': BINGX_KEY}, keep_json=(not res['direct_priv'])))
     except Exception as e:
         res['direct_pub'].append({'dt': 0.0, 'status': None, 'api_code': None, 'msg': '',
                                   'err': f'session: {type(e).__name__}: {e}'})
@@ -7422,6 +7515,18 @@ async def net_probe_collect() -> dict:
         res['ccxt_pub'].append(await _np_ccxt_call('pub'))
     for _ in range(NET_PROBE_N):
         res['ccxt_priv'].append(await _np_ccxt_call('priv'))            # [v96] боевой путь: exchange_priv со своей очередью
+    try:                                                                # [v119] структура ответа баланса ccxt (§2.51.1): только ключи и числа
+        _b = await asyncio.wait_for(exchange_priv.fetch_balance(), 60)
+        res['bal_ccxt'] = balance_shape({k: v for k, v in (_b or {}).items() if k in ('info', 'USDT', 'free', 'used', 'total')})
+        _v, _st = _extract_equity_ex(_b)
+        res['bal_ccxt'].append(f'→ _extract_equity_ex: {_v:.4f} / {_st}')
+    except Exception as e:
+        res['bal_ccxt'] = [f'ОШИБКА {safe_exc_reason(e)}']
+    try:
+        _dj = next((x.get('json') for x in res['direct_priv'] if x.get('json') is not None), None)
+        res['bal_direct'] = balance_shape(_dj) if _dj is not None else ['JSON не получен (ключи не заданы или ответ не JSON)']
+    except Exception as e:
+        res['bal_direct'] = [f'ОШИБКА {safe_exc_reason(e)}']
     try:
         res['access'] = await _ap.probe_all()                           # [v118] шаг 0 (§2.50): Bybit/OKX — доступность с сервера
     except Exception as e:
@@ -7454,6 +7559,15 @@ def net_probe_access_text(res: dict) -> str:
     return '🌐 <b>Доступ к Bybit/OKX с сервера бота</b> (шаг 0, §2.50)\n' + '\n'.join(_ap.format_probe(a, esc))
 
 
+def net_probe_balance_text(res: dict) -> str:
+    """[v119] Структура ответа баланса BingX (§2.51.1): ccxt fetch_balance и прямой /openApi/swap/v2/user/balance — ключи и числа, без ключей API и подписей."""
+    if not res.get('bal_ccxt') and not res.get('bal_direct'):
+        return ''
+    t = '🧾 <b>Структура ответа баланса BingX</b> (только ключи и числа)\n<b>ccxt fetch_balance (exchange_priv):</b>\n' + '\n'.join(esc(x) for x in res.get('bal_ccxt', []))
+    t += '\n<b>прямой /openApi/swap/v2/user/balance:</b>\n' + '\n'.join(esc(x) for x in res.get('bal_direct', []))
+    return t[:3900]
+
+
 async def net_probe_run():
     """[v94] /net_probe (фон): замеры → вердикт → Telegram. Не бросает исключений."""
     if _net_probe_running[0]:
@@ -7466,6 +7580,9 @@ async def net_probe_run():
         _acc = net_probe_access_text(res)
         if _acc:
             await tg(_acc)
+        _bal = net_probe_balance_text(res)
+        if _bal:
+            await tg(_bal)
     except Exception as e:
         logging.exception('net_probe')
         try:
@@ -9718,7 +9835,9 @@ def _is_unknown_command(text: str) -> bool:
 
 def _unknown_command_text(text: str) -> str:
     cmd = (text or '').strip().lower().split()[0][:40]
-    return f'Неизвестная команда {esc(cmd)}. Версия бота: {esc(CODE_VERSION)}. /help — список команд'
+    base = f'Неизвестная команда {esc(cmd)}. Версия бота: {esc(CODE_VERSION)}. /help — список команд'
+    hint = command_hint(text)                       # [v119] опечатка (Левенштейн ≤ 2) → «возможно, вы имели в виду /…»
+    return (esc(hint.lstrip('❓ ')) + f'. Версия бота: {esc(CODE_VERSION)}. /help — список команд') if hint else base
 
 
 def status_text() -> str:
@@ -9935,7 +10054,10 @@ async def check_tg_commands():
                     '/audit_backfill — [v110] вся история каналов аудита (только чтение, до AUDIT_BACKFILL_MAX на канал, FloodWait, продолжение с места остановки; источник catchup); /audit_stop — остановить чтение и отключить Telethon (напоминание удалить TG_SESSION_STRING); /audit_start — возобновить\n'
                     '/final_h2 [confirm | retry confirm | audit | report] — [v113/v114] одиночный финал H2-D3 (§2.43.11): без аргумента k, сверка с BOT_SPEC и состояние флага; confirm — один прогон на LOCKBOX; retry confirm — ровно одна техническая повторная попытка после сбоя без вывода (§2.43.16–17); audit — проверка утечки (только чтение); report — сохранённый отчёт; /vrp_probe, /vrp_measure, /vrp_sim — премия за волатильность по DVOL Deribit (§2.46): доступность, VRP, приближённый кондор (только при пройденном гейте); торговых модулей опционов нет\n'
                     '/signal_study — [v111] поиск по данным канала (§2.45), только DISCOVERY: «его вход + наш стоп» (12 вариантов), портрет метода, признаки полных стопов; /signal_final [confirm] — кандидаты / единственный прогон на HOLDOUT\n'
-                    '/h2_funding_check — [v116] фандинг в исходном H2-D3: по коду и «без / с фандингом» на TRAIN и VALID (LOCKBOX не читается, §2.47.1); /h2_replicate [load|confirm|report] — репликация H2-D3 на независимых монетах Bybit/BingX (§2.47); /xfund_test [load] — межбиржевой арбитраж фандинга X1 BingX/Bybit (§2.48); /exec_check h2|x1 [start|stop|report] — почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (только после пройденной проверки)\n'
+                    '/h2_funding_check — [v116] фандинг в исходном H2-D3: по коду и «без / с фандингом» на TRAIN и VALID (LOCKBOX не читается, §2.47.1)\n'
+                    '/h2_replicate [load|confirm|report] — [v116/v119] репликация H2-D3 на независимых монетах BingX и OKX (§2.47, §2.51). Порядок: /h2_replicate load → /h2_replicate (без аргумента: вселенная, мощность, k) → /h2_replicate confirm\n'
+                    '/xfund_test [load] — [v116/v119] межбиржевой арбитраж фандинга X1, основная пара BingX/Binance (§2.48, §2.51). Порядок: /xfund_test load → /xfund_test (без аргумента: расчёт)\n'
+                    '/exec_check h2|x1 [start|stop|report] — почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (только после пройденной проверки)\n'
                     '/audit — [v109] аудит внешнего источника сигналов (§2.44): симуляция A/B, критерии по форварду; /audit_import — файл result.json документом (ретроспектива, справочно); /audit_unparsed — нераспознанные; /audit_status — состояние; /tg_login [код] — вход для чтения каналов (только чтение)\n'
                     '/battery_load — [v108] загрузка D1+фандинг всех перпетуалов Binance (§2.43), с места остановки; /battery — шаги 0–3 серии (мощность, смещение, калибровка, TRAIN/VALID, LOCKBOX не читается); /battery_final confirm — шаг 4 на LOCKBOX (один раз, флаг серии)\n'
                     '/final_crypto4h — [v106] одиночный финал CRYPTO 4h T-MA-10-50 (§2.42): без аргументов — показ и k, confirm — один прогон на LOCKBOX (общий флаг финала)\n'
@@ -10286,6 +10408,58 @@ def idle_tick_only(now=None) -> bool:
 
 PINNED_CCXT = '4.2.14'                 # [v117] версия, под которую написан код и тесты (requirements.txt)
 PINNED_PYTHON = '3.13'                 # [v117] .python-version = 3.13.18 (на ней проходят тесты); в трейсе прода 2026-11-18 был 3.14
+
+
+CMD_ALIASES = {'/xdata': 'Загрузка данных: /xfund_test load (X1) или /h2_replicate load (H2); порядок: load → без аргумента → confirm.'}
+_CMD_POOL = [None, None]     # [кэш: пул подсказок, кэш: все литералы /команд]
+
+
+def levenshtein(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def command_pools():
+    """[v119] (пул подсказок, все литералы команд): пул — команды из условий диспетчера (cmd == / startswith / in) и из /help; «все литералы» — любая строка '/слово' в коде
+    (команда, которая где-то обработана, не может считаться неизвестной)."""
+    if _CMD_POOL[0] is None:
+        import inspect
+        src = inspect.getsource(sys.modules[__name__])
+        pool, allv = set(), set(re.findall(r"""['"](/[a-z][a-z0-9_]*)""", src))
+        for ln in src.splitlines():
+            if 'cmd' in ln and ('==' in ln or 'startswith' in ln or ' in (' in ln):
+                pool.update(re.findall(r"""['"](/[a-z][a-z0-9_]*)""", ln))
+            m = re.match(r"""\s*['"](/[a-z][a-z0-9_]*)[ \[]""", ln)
+            if m:
+                pool.add(m.group(1))
+        _CMD_POOL[0], _CMD_POOL[1] = pool, allv
+    return _CMD_POOL[0], _CMD_POOL[1]
+
+
+def command_hint(text: str):
+    """[v119] «возможно, вы имели в виду /…» для опечатки в команде (расстояние Левенштейна ≤ 2 до известной); None — не команда, известная команда или нет похожей."""
+    t = (text or '').strip().lower()
+    if not t.startswith('/'):
+        return None
+    if '@' in t.split()[0]:                              # адресовано другому боту — не наше дело (v96)
+        return None
+    word = t.split()[0]
+    if len(word) < 3:
+        return None
+    if word in CMD_ALIASES:                              # прежнее/ошибочное имя из прод-логов: команды /xdata нет
+        return f'❓ Команды {word} нет. {CMD_ALIASES[word]}'
+    pool, allv = command_pools()
+    if word in allv:
+        return None
+    best = sorted(((levenshtein(word, c), c) for c in pool), key=lambda x: (x[0], x[1]))
+    if not best or best[0][0] > 2:
+        return None
+    return f'❓ Неизвестная команда {word}. Возможно, вы имели в виду {best[0][1]}'
 
 
 def runtime_versions_text() -> str:

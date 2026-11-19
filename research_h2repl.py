@@ -128,10 +128,10 @@ def funding_check(params, progress=None):
 
 
 # ── ШАГ 1.1–1.2: вселенная, панель, k, критерии ──────────────────────────────────────────────────────
-def build_repl_panel(xdir, bdir=None):
+def build_repl_panel(xdir, bdir=None, venues=None):
     """Загруженный кэш → (панель, вселенная, справка). Имена символов в панели — `биржа:символ`."""
     idx = X.load_index(xdir)
-    vn = X.venues_from_spec()                                          # [v118] H2REPL-VENUES (BOT_SPEC §2.50): без маркера — обе площадки
+    vn = tuple(venues) if venues else X.venues_from_spec()                                          # [v118] H2REPL-VENUES (BOT_SPEC §2.50): без маркера — обе площадки
     mk = {ex: ({s: dict(v) for s, v in idx['markets'].get(ex, {}).items()} if ex in vn else {}) for ex in X.EXCHANGES}
     bars = {ex: {} for ex in X.EXCHANGES}
     for ex in vn:
@@ -148,6 +148,8 @@ def build_repl_panel(xdir, bdir=None):
         if f is not None:
             fund[name] = f
     P = X.panel_from_series(series, fund)
+    if P is not None:                                                  # [v119, §2.51] первый день с фандингом по символу (−1 — истории нет): счётчик «фандинг = 0»
+        P['fund_first'] = np.array([(int(fund[nm][0][0]) // DAY - P['day0']) if (nm in fund and len(fund[nm][0])) else -1 for nm in P['syms']], np.int64)
     return P, uni, ref
 
 
@@ -250,13 +252,17 @@ def reference(env, base, fees, uni, seg):
         if sub:
             r = S.sim_h2(ctx, sub, fees)
             by_ex[ex] = {'events': len(sub), 'opened': r['meta']['opened'], 'mean': float(r['r'][seg].mean()), 'stops': r['meta']['stops']}
+            ff = P.get('fund_first')
+            if ff is not None:                                         # [v119, §2.51] окно позиции (дни e+1…e+H2_HOLD): фандинг не загружен → в симуляции фандинг = 0 (консервативно)
+                by_ex[ex]['fund_none'] = sum(1 for e, s_ in sub if ff[s_] < 0 or ff[s_] > e + S.H2_HOLD)
+                by_ex[ex]['fund_part'] = sum(1 for e, s_ in sub if 0 <= ff[s_] and e + 1 < ff[s_] <= e + S.H2_HOLD)
     return {'years': years, 'by_ex': by_ex, 'listings': len(uni), 'admitted': len(ev), 'opened': meta['opened'], 'stops': meta['stops'], 'skipped_cap': meta['skipped_cap'], 'delist': meta['delist'],
             'funding30': listing_funding(P, ctx), 'stop_share': (meta['stops'] / meta['opened'] if meta['opened'] else None)}
 
 
 def report_lines(P, uni, ref, pw, kres, spec_k, spec_u, u_line, head=None):
     R = list(head or [])
-    R += [f'Вселенная: символов {len(uni)} (Bybit {sum(1 for u in uni if u["ex"] == "bybit")}, BingX {sum(1 for u in uni if u["ex"] == "bingx")}); монет на обеих биржах {ref["both"]}; '
+    R += [f'Вселенная: символов {len(uni)} (Bybit {sum(1 for u in uni if u["ex"] == "bybit")}, BingX {sum(1 for u in uni if u["ex"] == "bingx")}, OKX {sum(1 for u in uni if u["ex"] == "okx")}); монет на обеих биржах {ref["both"]}; '
           f'исключено: стейблкоин-подобных {len(ref["stable"])}, существовавших до начала истории биржи {len(ref["pre_existing"])}.',
           f'Панель: суток {P["nd"]}, символов {len(P["syms"])}; с историей фандинга {int(np.sum(P["has_fund"]))}.',
           f'Мощность (шаг 0): D = {pw["D"]} суток с позициями, S_min = {fm(pw["s_min"])} → ' + ('проверяема' if pw['testable'] else '<b>НЕПРОВЕРЯЕМА</b> (D < 365)')]
@@ -280,6 +286,9 @@ def final_report(P, ev, ref_, head):
                       '<b>Справочно</b>']
     R.append('  по годам (mean б.п./день): ' + '; '.join(f'{y}: {bp(v["mean"])} (n={v["n"]})' for y, v in ref_['years'].items()))
     R.append('  по биржам: ' + '; '.join(f'{ex}: событий {v["events"]}, позиций {v["opened"]}, стопов {v["stops"]}, mean {bp(v["mean"])}' for ex, v in ref_['by_ex'].items()))
+    nf = [f'{ex}: окно позиции без истории фандинга целиком — {v["fund_none"]} из {v["events"]} допущенных событий, частично — {v["fund_part"]}' for ex, v in ref_['by_ex'].items() if v.get('fund_none') or v.get('fund_part')]
+    if nf:
+        R.append('  фандинг = 0 там, где истории нет (консервативно для H2, §2.51; счёт по допущенным событиям, окно — 30 суток после входа): ' + '; '.join(nf))
     R.append(f'  листингов {ref_["listings"]}, допущено по ликвидности {ref_["admitted"]}, позиций {ref_["opened"]}, стопов +50% {ref_["stops"]}' + (f' ({ref_["stop_share"] * 100:.0f}%)' if ref_['stop_share'] is not None else '') +
              f', пропусков по лимиту риска {ref_["skipped_cap"]}, делистингов {ref_["delist"]}')
     f30 = ref_['funding30']
@@ -309,7 +318,7 @@ async def run_h2repl(params, progress=None):
         return '⛔ /h2_replicate отказ: сначала /h2_funding_check с решением «репликация разрешена» (§2.47.1)'
     if RF.kv_get(KV_DONE, fdir):
         return '⛔ /h2_replicate: расчёт уже выполнен (повтор запрещён, §2.47.3 п. 3)\n' + (RF.kv_get(KV_REPORT, fdir) or '')
-    P, uni, ref = build_repl_panel(xdir, params.get('bdir'))
+    P, uni, ref = build_repl_panel(xdir, params.get('bdir'), params.get('venues'))
     if P is None or not uni:
         return '⛔ /h2_replicate отказ: нет данных репликации — выполните /h2_replicate load до сообщения «загрузка завершена»'
     u_line = X.universe_line(uni)

@@ -244,14 +244,16 @@ class SpecMarkers(unittest.TestCase):
         p = os.path.join(d, 'spec.md')
         open(p, 'w', encoding='utf-8').write('текст\n')
         self.assertEqual(X.x1_pair_from_spec(p), 'bybit')
-        self.assertEqual(X.venues_from_spec(p), X.EXCHANGES)
+        self.assertEqual(X.venues_from_spec(p), ('bybit', 'bingx'))
         open(p, 'w', encoding='utf-8').write('X1-MAIN-PAIR: BingX/Binance\nH2REPL-VENUES: bingx\n')
         self.assertEqual(X.x1_pair_from_spec(p), 'binance')
         self.assertEqual(X.venues_from_spec(p), ('bingx',))
+        open(p, 'w', encoding='utf-8').write('H2REPL-VENUES: bingx,okx\n')
+        self.assertEqual(X.venues_from_spec(p), ('bingx', 'okx'))
         self.assertEqual(X.x1_pair_from_spec(os.path.join(d, 'нет.md')), 'bybit')
-        # в самом BOT_SPEC маркеров ещё нет: условные поправки применяются только после вердикта пробы (§2.50)
-        self.assertEqual(X.x1_pair_from_spec(), 'bybit')
-        self.assertEqual(X.venues_from_spec(), X.EXCHANGES)
+        # §2.51 (v119): Bybit недоступен по шагу 0 — маркеры внесены в BOT_SPEC отдельным коммитом ДО кода
+        self.assertEqual(X.x1_pair_from_spec(), 'binance')
+        self.assertEqual(X.venues_from_spec(), ('bingx', 'okx'))
 
 
 def make_zip(name, text):

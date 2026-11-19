@@ -14,7 +14,7 @@ import research_vision as V
 
 DAY = 86_400_000
 HOUR = 3_600_000
-EXCHANGES = ('bybit', 'bingx')
+EXCHANGES = ('bybit', 'bingx', 'okx')
 RETRY_DELAYS = (2, 6, 15)
 LIQ_COARSE = 20_000_000.0               # грубый фильтр загрузки фандинга: максимум 30-дневного среднего оборота ≥ 20 млн USDT
 FIRST30 = 30
@@ -41,9 +41,10 @@ def spec_line(key, path=None):
 
 
 def venues_from_spec(path=None):
-    """H2-репликация: площадки вселенной. `H2REPL-VENUES: bingx` → только BingX; иначе обе (исходный §2.47)."""
-    v = (spec_line('H2REPL-VENUES:', path) or '').lower()
-    return ('bingx',) if v.split()[:1] == ['bingx'] else EXCHANGES
+    """H2-репликация: площадки вселенной по маркеру `H2REPL-VENUES: bingx,okx` (§2.51; допустимы bybit, bingx, okx; v119). Без маркера — исходный §2.47: Bybit и BingX."""
+    v = (spec_line('H2REPL-VENUES:', path) or '').lower().replace(' ', '')
+    got = tuple(x for x in v.split(',') if x in EXCHANGES)
+    return got if got else ('bybit', 'bingx')
 
 
 def x1_pair_from_spec(path=None):
@@ -92,6 +93,9 @@ def load_index(d):
         idx = {}
     for k in ('markets', 'bars', 'fund', 'hbars', 'fail'):
         idx.setdefault(k, {ex: {} for ex in EXCHANGES} if k != 'fail' else {})
+        if k != 'fail':
+            for ex in EXCHANGES:                                   # [v119] индекс прошлых версий без ключа новой площадки (okx)
+                idx[k].setdefault(ex, {})
     idx.setdefault('t', 0)
     return idx
 
@@ -206,7 +210,7 @@ async def fetch_bars(f, sym, since_ms, now_ms, limit=1000, tf='1d'):
 async def fetch_funding(f, ex_id, sym, stop_ms, limit=None):
     """История фандинга постранично НАЗАД (параметры конца интервала `until`/`endTime`), до stop_ms (первый бар символа) либо пока страница не даёт более ранних записей.
     → (ts, rate) по возрастанию, время округлено до секунды."""
-    lim = limit or (200 if ex_id == 'bybit' else 1000)
+    lim = limit or {'bybit': 200, 'okx': 100}.get(ex_id, 1000)
     ev, end, earliest = {}, None, None
     for _ in range(MAX_FUND_PAGES):
         params = {} if end is None else ({'until': end} if ex_id == 'bybit' else {'endTime': end})   # BingX в ccxt 4.2.14: 'until' кладётся в startTime — конец передаём сырым endTime (как research_htf)
@@ -326,15 +330,16 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
     own = exchanges is None
     if own:
         import ccxt.async_support as ccxt
-        exchanges = {'bybit': ccxt.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}), 'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
+        import research_okx
+        exchanges = {'okx': research_okx.OkxPublic(), 'bybit': ccxt.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}), 'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
     idx = load_index(d)
-    L = [f'📥 <b>/xdata load</b> — Bybit/BingX (публичные методы ccxt) → {d}']
+    L = [f'📥 <b>загрузка данных бирж</b> — Bybit/BingX (публичные методы ccxt), OKX (прямой REST без ccxt) → {d}']
     stopped = ''
     try:
         fx = {ex: Fetcher(c, sleep=sleep) for ex, c in exchanges.items()}
         mk = {}
         unavailable = {}
-        venues = tuple(params.get('venues') or EXCHANGES)
+        venues = tuple(params.get('venues') or ('bybit', 'bingx'))
         for ex, c in exchanges.items():
             if ex not in venues:                                    # [v118] площадка исключена пре-регистрацией (H2REPL-VENUES, §2.50)
                 mk[ex] = {}
@@ -371,7 +376,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             for s_, v in mk.get('bingx', {}).items():
                 if v['norm'] in bnorm and s_ not in want['bingx']:
                     want['bingx'].append(s_)
-        L.append(f'  вселенная H2 (базы вне архива Binance): {sum(1 for n in set(norms["bybit"]) | set(norms["bingx"]) if n not in bnorm)} баз; общих баз Bybit∩BingX: {len(common)}; символов к загрузке свечей: ' + ', '.join(f'{ex} {len(want[ex])}' for ex in EXCHANGES))
+        L.append(f'  вселенная H2 (базы вне архива Binance): {sum(1 for n in set().union(*[set(v) for v in norms.values()]) if n not in bnorm)} баз; общих баз Bybit∩BingX: {len(common)}; символов к загрузке свечей: ' + ', '.join(f'{ex} {len(want[ex])}' for ex in EXCHANGES))
         # 1. свечи
         n_new = 0
         for ex in EXCHANGES:
@@ -504,6 +509,11 @@ def coverage_lines(d, idx, now_ms):
         if fs:
             fl = [v['first'] for v in fs.values() if v.get('first')]
             out.append(f'    фандинг по {len(fs)} символам; самое раннее событие {time.strftime("%Y-%m-%d", time.gmtime(min(fl) / 1000)) if fl else "н/д"}')
+        if ex == 'okx' and fs:                                      # [v119] измеренная глубина истории фандинга OKX (§2.51): сколько суток отдаёт API
+            dep = sorted((v['last'] - v['first']) / DAY for v in fs.values() if v.get('first') and v.get('last'))
+            if dep:
+                out.append(f'    OKX: глубина истории фандинга (последняя − первая отметка) по {len(dep)} символам: мин {dep[0]:.0f}, медиана {dep[len(dep) // 2]:.0f}, макс {dep[-1]:.0f} сут. '
+                           f'(окно позиции H2 вне этой глубины → фандинг = 0 со счётчиком, §2.51)')
         mk = idx['markets'].get(ex, {})
         inactive = [s for s, v in mk.items() if not v.get('active')]
         out.append(f'    неактивных рынков в markets: {len(inactive)}' + ('' if inactive else ' — закрытых инструментов API не отдаёт: ОШИБКА ВЫЖИВШЕГО (делистинги отсутствуют; смещение ПРОТИВ шорт-стратегии)'))
