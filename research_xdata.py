@@ -27,6 +27,31 @@ def xdata_dir():
     return os.getenv('XDATA_DIR') or ('/data/xdata' if os.path.exists('/data') else '/tmp/xdata')
 
 
+def spec_line(key, path=None):
+    """Последняя строка BOT_SPEC, начинающаяся с `key` → остаток строки | None. [v118] Маркеры условных поправок §2.50 (X1-MAIN-PAIR:, H2REPL-VENUES:)."""
+    val = None
+    try:
+        with open(path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'BOT_SPEC.md'), encoding='utf-8') as f:
+            for ln in f:
+                if ln.startswith(key):
+                    val = ln[len(key):].strip()
+    except OSError:
+        return None
+    return val
+
+
+def venues_from_spec(path=None):
+    """H2-репликация: площадки вселенной. `H2REPL-VENUES: bingx` → только BingX; иначе обе (исходный §2.47)."""
+    v = (spec_line('H2REPL-VENUES:', path) or '').lower()
+    return ('bingx',) if v.split()[:1] == ['bingx'] else EXCHANGES
+
+
+def x1_pair_from_spec(path=None):
+    """X1: основная пара. `X1-MAIN-PAIR: BingX/Binance` → 'binance'; иначе 'bybit' (исходный §2.48)."""
+    v = (spec_line('X1-MAIN-PAIR:', path) or '').lower().replace(' ', '')
+    return 'binance' if v.startswith('bingx/binance') else 'bybit'
+
+
 def norm_base(base):
     """Нормализованная база: заглавные буквы без числового множителя (1000PEPE, 10000SATS, 1MBABYDOGE → PEPE, SATS, BABYDOGE)."""
     b = (base or '').upper().strip()
@@ -308,14 +333,28 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
     try:
         fx = {ex: Fetcher(c, sleep=sleep) for ex, c in exchanges.items()}
         mk = {}
+        unavailable = {}
+        venues = tuple(params.get('venues') or EXCHANGES)
         for ex, c in exchanges.items():
+            if ex not in venues:                                    # [v118] площадка исключена пре-регистрацией (H2REPL-VENUES, §2.50)
+                mk[ex] = {}
+                L.append(f'  {ex}: пропущена по пре-регистрации (H2REPL-VENUES)')
+                continue
             try:
                 m = await fx[ex].call('load_markets')
-            except Exception as e:
-                return '\n'.join(L + [f'⛔ {ex}: load_markets не удался: {type(e).__name__}'])
+            except Exception as e:                                  # [v118] одна недоступная биржа не останавливает загрузку остальных (§2.50)
+                unavailable[ex] = type(e).__name__
+                mk[ex] = {}
+                L.append(f'  ⛔ {ex}: недоступна (вердикт пробы /net_probe — гео-блок или лимит частоты): load_markets {type(e).__name__}; '
+                         f'загрузка остальных продолжается')
+                continue
             mk[ex] = usdt_swaps(m)
             idx['markets'][ex] = {s: {'base': v['base'], 'norm': v['norm'], 'active': v['active'], 'created': v['created']} for s, v in mk[ex].items()}
             L.append(f'  {ex}: линейных USDT-перпетуалов {len(mk[ex])} (неактивных {sum(1 for v in mk[ex].values() if not v["active"])})')
+        if exchanges and not any(mk.get(ex) for ex in exchanges) and (unavailable or len(venues) < len(exchanges)):
+            save_index(d, idx)
+            return '\n'.join(L + ['⛔ все биржи недоступны — загружать нечего (Binance — из архива /battery_load, не отсюда)'])
+        idx['unavailable'] = dict(unavailable)
         bnorm = binance_norm_set(params.get('bdir'))
         norms = {ex: {} for ex in EXCHANGES}
         for ex in EXCHANGES:
@@ -327,6 +366,11 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             for s, v in mk.get(ex, {}).items():
                 if v['norm'] not in bnorm or v['norm'] in common:
                     want[ex].append(s)
+        x1_main = bool(params.get('x1_main'))                        # [v118] X1 (BingX, Binance): BingX-символы с базой из архива Binance (§2.50)
+        if x1_main:
+            for s_, v in mk.get('bingx', {}).items():
+                if v['norm'] in bnorm and s_ not in want['bingx']:
+                    want['bingx'].append(s_)
         L.append(f'  вселенная H2 (базы вне архива Binance): {sum(1 for n in set(norms["bybit"]) | set(norms["bingx"]) if n not in bnorm)} баз; общих баз Bybit∩BingX: {len(common)}; символов к загрузке свечей: ' + ', '.join(f'{ex} {len(want[ex])}' for ex in EXCHANGES))
         # 1. свечи
         n_new = 0
@@ -401,7 +445,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             L.append(f'  фандинг запрошен для {len(todo)} грубо ликвидных символов (загружено в этом прогоне {n_f})')
             # 3. часовые свечи для X1: общие базы Bybit∩BingX, грубо ликвидные (BOT_SPEC §2.48.6 п. 2)
             if params.get('hourly', True) and not stopped:
-                htodo = [(ex, sym, b) for ex, sym, b in todo if mk[ex][sym]['norm'] in common]
+                htodo = [(ex, sym, b) for ex, sym, b in todo if mk[ex][sym]['norm'] in common or (x1_main and ex == 'bingx' and mk[ex][sym]['norm'] in bnorm)]
                 n_h = 0
                 for ex, sym, b in htodo:
                     if time.time() > deadline:

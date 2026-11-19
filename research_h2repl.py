@@ -131,9 +131,10 @@ def funding_check(params, progress=None):
 def build_repl_panel(xdir, bdir=None):
     """Загруженный кэш → (панель, вселенная, справка). Имена символов в панели — `биржа:символ`."""
     idx = X.load_index(xdir)
-    mk = {ex: {s: dict(v) for s, v in idx['markets'].get(ex, {}).items()} for ex in X.EXCHANGES}
+    vn = X.venues_from_spec()                                          # [v118] H2REPL-VENUES (BOT_SPEC §2.50): без маркера — обе площадки
+    mk = {ex: ({s: dict(v) for s, v in idx['markets'].get(ex, {}).items()} if ex in vn else {}) for ex in X.EXCHANGES}
     bars = {ex: {} for ex in X.EXCHANGES}
-    for ex in X.EXCHANGES:
+    for ex in vn:
         for s in idx['bars'].get(ex, {}):
             b = X.load_bars(xdir, ex, s)
             if b is not None and len(b['ts']):
@@ -300,7 +301,7 @@ async def run_h2repl(params, progress=None):
         if progress:
             await progress(m)
     if mode == 'load':
-        return await X.run_xload(params, progress)
+        return await X.run_xload(dict(params, venues=params.get('venues') or X.venues_from_spec()), progress)
     if mode == 'report':
         return RF.kv_get(KV_REPORT, fdir) or 'Сохранённого отчёта нет'
     chk = RF.kv_get('h2_funding_check', fdir)

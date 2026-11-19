@@ -49,6 +49,7 @@ import time
 import aiohttp
 import numpy as np
 import research_runner as _rr
+import access_probe as _ap
 import audit_bot   # [v97] RSS процесса и запуск исследований в дочернем процессе (лёгкий модуль, только stdlib)
 import ccxt.async_support as ccxt_async
 from datetime import datetime, timezone, timedelta
@@ -895,8 +896,41 @@ MAX_DD_LIMIT_PCT = float(os.getenv('MAX_DD_LIMIT_PCT', '6.0'))
 # но из условия breaker убрана. ДЕЙСТВИЕ breaker (circuit_open, TG, остановка
 # скана) не менялось — только условие срабатывания.
 _dd = {'start_equity': 0.0, 'start_date': '', 'equity': 0.0, 'ok_ts': 0.0,
-       'fails': 0, 'min_dd': 0.0, 'fail_since': 0.0}   # [v94] fail_since — начало текущей серии сбоев эквити
+       'fails': 0, 'min_dd': 0.0, 'fail_since': 0.0,   # [v94] fail_since — начало текущей серии сбоев эквити
+       'last_err': ''}                                  # [v118] причина последнего сбоя: класс + код биржи, без секретов
 _mdd = {'peak': 0.0, 'tripped': False}   # [v77] общая просадка от пика эквити
+
+
+def safe_exc_reason(e, maxlen: int = 160) -> str:
+    """[v118] Причина сбоя для /status и алертов: «Класс код сообщение». Секреты (ключ/секрет BingX, signature=, apiKey=…, длинные токены,
+    query-строки URL) вырезаются; код биржи берётся из JSON ответа ({"code":100413,"msg":"Incorrect apiKey"}) либо из текста."""
+    raw = str(e) if e is not None else ''
+    code = ''
+    msg = ''
+    m = re.search(r'"code"\s*:\s*"?(-?\d+)', raw)
+    if m:
+        code = m.group(1)
+    m = re.search(r'"msg"\s*:\s*"([^"]*)"', raw)
+    if m:
+        msg = m.group(1)
+    if not msg:
+        msg = raw
+    for sec in (BINGX_KEY, BINGX_SECRET):
+        if sec and len(sec) >= 6:
+            msg = msg.replace(sec, '***')
+    msg = re.sub(r'(?i)(api[_-]?key|signature|secret|sign|token|X-BX-APIKEY)\s*[=:]\s*["\']?[A-Za-z0-9_\-]{6,}', r'\1=***', msg)
+    msg = re.sub(r'\?[^\s"\']*(timestamp|signature)=[^\s"\']*', '?***', msg)
+    msg = re.sub(r'\b[A-Za-z0-9]{32,}\b', '***', msg)
+    if not code:
+        m = re.search(r'\b(1\d{5}|\d{5,6})\b', msg)
+        if m:
+            code = m.group(1)
+    msg = re.sub(r'\s+', ' ', msg).strip()
+    if code and msg.startswith(code):
+        msg = msg[len(code):].strip(' :')
+    cls = type(e).__name__ if e is not None else ''
+    out = ' '.join(x for x in (cls, code, msg) if x)
+    return out[:maxlen]
 
 
 def _extract_equity(bal) -> float:
@@ -935,11 +969,19 @@ async def _fetch_equity(retry: bool = True):
                 return eq
             err = 'пустой ответ'
         except Exception as _e:
-            err = f'{type(_e).__name__}: {_e}'
+            err = safe_exc_reason(_e)
+        _dd['last_err'] = err
         logging.warning(f'[DD] эквити не получено (попытка {i + 1}/{len(pauses) + 1}): {err}')
         if i < len(pauses):
             await asyncio.sleep(pauses[i])
     return None
+
+
+def _dd_err_suffix(raw: bool = False) -> str:
+    """[v118] « — причина: …» для строк статуса, пока идёт серия сбоев эквити (raw=True — без HTML-экранирования: текст экранируется позже)."""
+    if not (_dd.get('fails') and _dd.get('last_err')):
+        return ''
+    return f" — причина: {_dd['last_err'] if raw else esc(_dd['last_err'])}"
 
 
 def _dd_save():
@@ -1047,10 +1089,12 @@ async def dd_update(force_rebase: bool = False) -> bool:
             if _dd['fails'] == 3:
                 age = f"{(time.time() - _dd['ok_ts']) / 60:.0f} мин назад" if _dd['ok_ts'] else 'ни разу'
                 await tg(f"⚠️ <b>DD-контроль</b>: 3 сбоя подряд получения эквити BingX. Breaker использует "
-                         f"последнее известное значение (успешное обновление: {age}).")
+                         f"последнее известное значение (успешное обновление: {age}).\n"
+                         f"Причина: <code>{esc(_dd.get('last_err') or 'н/д')}</code>")
             return False
         _dd['fails'] = 0
         _dd['fail_since'] = 0.0
+        _dd['last_err'] = ''
         _dd['equity'] = eq
         _dd['ok_ts'] = time.time()
         await _mdd_update(eq)   # [v77] пик/общий breaker — только по успешному эквити
@@ -2056,7 +2100,7 @@ def _dd_status_core() -> str:
     old = daily_stats['pnl_pct'] * 100
     if dd is None:
         return (f"📉 <b>DD по эквити</b>: нет данных (база дня: {_dd['start_equity']:.2f}, "
-                f"дата базы: {_dd['start_date'] or '—'}, сбоев подряд: {_dd['fails']})\n"
+                f"дата базы: {_dd['start_date'] or '—'}, сбоев подряд: {_dd['fails']}{_dd_err_suffix()})\n"
                 f"Лимит: -{DAILY_DD_LIMIT_PCT:.1f}% | Breaker: {'🔴 СТОП' if circuit_open else '🟢 OK'}\n"
                 f"Старая метрика (сумма движений цены, только для сравнения): {old:+.2f}%")
     ts = datetime.fromtimestamp(_dd['ok_ts'], timezone.utc).strftime('%H:%M:%S') if _dd['ok_ts'] else '—'
@@ -2065,7 +2109,7 @@ def _dd_status_core() -> str:
             f"Эквити на начало дня: <code>{_dd['start_equity']:.2f} USDT</code>\n"
             f"Эквити сейчас: <code>{_dd['equity']:.2f} USDT</code> (обновлено {ts} UTC, {age})\n"
             f"DD: <b>{dd*100:+.2f}%</b> | минимум за день: {_dd['min_dd']*100:+.2f}% | лимит: -{DAILY_DD_LIMIT_PCT:.1f}%\n"
-            f"Сбоев получения подряд: {_dd['fails']} | Breaker: {'🔴 СТОП' if circuit_open else '🟢 OK'}\n"
+            f"Сбоев получения подряд: {_dd['fails']}{_dd_err_suffix()} | Breaker: {'🔴 СТОП' if circuit_open else '🟢 OK'}\n"
             f"Старая метрика (сумма движений цены, только для сравнения): {old:+.2f}%")
 
 # ═══════════════════════════════════════════════════════
@@ -6303,7 +6347,7 @@ def health_conditions(now: float = None) -> list:
     out = []
     if snap['eq_fails'] > 0 and snap['eq_down_sec'] > HEALTH_EQUITY_SEC:
         out.append(('equity', f"эквити BingX не получено {snap['eq_down_sec'] / 60:.0f} мин подряд "
-                              f"(сбоев подряд: {snap['eq_fails']}) — breaker-ы дневного DD и просадки от пика работают вслепую"))
+                              f"(сбоев подряд: {snap['eq_fails']}{_dd_err_suffix(True)}) — breaker-ы дневного DD и просадки от пика работают вслепую"))
     if snap['ctx_ratio'] is not None and snap['ctx_cycles'] >= HEALTH_MIN_CYCLES and snap['ctx_ratio'] > HEALTH_RATIO:
         out.append(('ctx_fail', f"контекст BTC не загружается: ctx_fail в {snap['ctx_ratio'] * 100:.0f}% циклов SMC за час "
                                 f"({snap['ctx_cycles']} циклов) — гейт alt_score работает на заглушке"))
@@ -6348,7 +6392,7 @@ def health_status_line(now: float = None) -> str:
     else:
         eq = 'эквити ещё не получено'
     if snap['eq_fails']:
-        eq += f" (сбоев подряд: {snap['eq_fails']})"
+        eq += f" (сбоев подряд: {snap['eq_fails']}{_dd_err_suffix()})"
     ctx = (f"ctx_fail {snap['ctx_ratio'] * 100:.0f}% ({snap['ctx_cycles']} циклов)"
            if snap['ctx_ratio'] is not None else 'ctx_fail н/д (SMC не сканировал за час)')
     fe = ', '.join(f'{k} {v[0] * 100:.0f}%' for k, v in sorted(snap['fetch_err'].items())) or 'н/д'
@@ -6823,8 +6867,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-20-v117'
+CODE_VERSION = '2026-11-20-v118'
 CHANGELOG = [
+    ('2026-11-20-v118', 'ДОСТУП К BYBIT/OKX, ПРИЧИНА СБОЯ ЭКВИТИ, УСТОЙЧИВАЯ ЗАГРУЗКА (BOT_SPEC §2.50; прод-факты и шаг 0 записаны ОТДЕЛЬНЫМ коммитом ДО кода). bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет. ШАГ 0: /net_probe дополнен пробой Bybit (v5 рынки/тикер) и OKX (тикер): aiohttp — HTTP-код, заголовки Server/X-Cache/Via/Retry-After, первые 300 байт тела; ccxt load_markets — имя класса исключения; вердикт «гео-блок» / «лимит частоты» / «доступно» (access_probe.py; ответ отдельным сообщением). Вердикт получает владелец на проде; из среды разработки (сети нет) он недостижим, поэтому условные поправки пре-регистраций (X1-MAIN-PAIR, H2REPL-VENUES) в BOT_SPEC НЕ внесены — код ведёт себя по исходным §2.47/§2.48, пока маркеров нет. ПРАВКА 1: строка эквити в /status, /dd_status и алерты «3 сбоя»/«эквити не получено» показывают причину последнего сбоя — класс исключения + код биржи (safe_exc_reason: «AuthenticationError 100413 Incorrect apiKey»; ключ/секрет/signature/длинные токены/query вырезаются); при успехе причина сбрасывается. ПРАВКА 2: /xdata load — недоступная биржа помечается «недоступна (вердикт пробы)» и загрузка остальных продолжается (в индексе unavailable); все недоступны — явный отказ; параметр venues исключает площадку по пре-регистрации. Binance — из архива data.binance.vision: новый вид h1 (1h-свечи месяцами, только high/low/close float32, продолжение с места остановки, батарею /battery_load не меняет), X1 с основной парой BingX/Binance (включается маркером X1-MAIN-PAIR: BingX/Binance в BOT_SPEC): ставки Binance — fundingRate архива с фактическими отметками времени, свечи — архив (1h для базиса и хода против ноги, 1D иначе), комиссия Binance — FEE_DEFAULT 0.05% (правило «FEE_TAKER биржи, иначе 0.05%»). H2-репликация: маркер H2REPL-VENUES: bingx ограничивает вселенную BingX. НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/OKX с прода, фактическая комиссия Binance, объём и время загрузки 1h-архива. Тесты: tests/test_v118_access.py'),
     ('2026-11-20-v117', 'РАЗВЯЗКА ПУБЛИЧНЫХ ДАННЫХ BINGX И КЛЮЧА (BOT_SPEC §2.49; запись инцидента — отдельным коммитом ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет). Прод 2026-11-18…19: ключ BingX недействителен (100413 «Incorrect apiKey»), а load_markets() у экземпляра с ключом вызывает fetch_currencies() через ПРИВАТНЫЙ walletsV1PrivateGetCapitalConfigGetall — не грузились даже публичные рынки, сканеры и исследования стояли. По исходнику ccxt 4.2.14 bingx.fetch_currencies без ключей возвращает None (приватный запрос не выполняется). Новый экземпляр exchange_pub БЕЗ ключей — для ВСЕХ публичных данных (рынки, свечи, тикеры, фандинг, стаканы) в боте и во всех исследовательских командах (h2_replicate, xfund_test, exec_check, htf/carry/ws/ma2 prepare_*); ключевой exchange оставлен только для сравнения в /net_probe (priv_shared), все приватные вызовы — через exchange_priv (exchange_priv.set_markets берёт рынки у exchange_pub). 100413 на приватном канале → ОДИН алерт «ключ BingX недействителен» не чаще раза в час (key_error_note в обёртке _lat_make), публичные данные, сканеры и исследования от ключа не зависят. Версии: .python-version = 3.13.18 (на ней проходят тесты; в трейсе прода — 3.14), ccxt==4.2.14 (уже закреплена в requirements.txt; фактическая версия на проде не проверена — старт пишет Python и ccxt в лог и в стартовое сообщение и предупреждает о расхождении). Дайджест: воркер Bybit опрашивается только при WORKER_ENABLED=true (по умолчанию false), вместо «н/д (HTTP 503)» — «воркер выключен». ПОПРАВКА X1 (BOT_SPEC §2.48.6, записана ОТДЕЛЬНЫМ коммитом ДО кода; данные X1 ещё не загружались): 3 порога входа T ∈ {0.02%, 0.05%, 0.10%} за 8 ч; базис на входе и выходе — по close 1h-свечи часа сигнала на обеих биржах (время сделки 01:00 UTC), при отсутствии часовых свечей — дневной close с пометкой и счётчиком таких сделок; аварийное закрытие: ход против ноги ≥ 30% от входа (по hi/lo часов, иначе дней) — обе ноги закрываются (сработавшая по уровню + проскальзывание, вторая по close бара), гэп ≥ 45% в одном баре — нога ликвидирована (−100% маржи), вторая по close бара (заменяет прежнее правило 40%); фандинг строго по фактическим отметкам времени каждой биржи в (вход, выход], приведение к 8 ч — только для сигнала d. /xfund_test load теперь грузит и 1h-свечи (high/low/close) общих грубо ликвидных символов; отчёт показывает базис по 1h / запасной, аварийные закрытия и гэпы. Тесты: tests/test_v117_decouple.py, tests/test_v116_h2x1.py (X1)'),
     ('2026-11-19-v116', 'H2: ПРОВЕРКА ФАНДИНГА И РЕПЛИКАЦИЯ НА НЕЗАВИСИМЫХ МОНЕТАХ (BOT_SPEC §2.47) И МЕЖБИРЖЕВОЙ АРБИТРАЖ ФАНДИНГА X1 (§2.48); пре-регистрации записаны ОТДЕЛЬНЫМИ коммитами ДО загрузки данных и ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; НИ ОДНОГО реального ордера (методов создания ордеров нет — тест на исходниках); расчёты — через research_runner. Часть 0 документации (отдельный коммит): итог /final_h2 retry confirm (§2.43.20: НЕ ПРОЙДЕНО только по значимости, t_adj 1.25 < 2.0; Шарп 1.18, просадка 10.1%, стресс +3.05, месяцы роста +3.51 / падения +2.71, LOCKBOX +3.13 б.п./день; LOCKBOX батареи исчерпан), итог /vrp_measure (§2.46.5), строки H2/VRP в RESEARCH_SUMMARY. /h2_funding_check: ответ по коду — фандинг в исходном H2 УЧИТЫВАЛСЯ (sim_h2 начисляет +w·F шорту, fund_on=True по умолчанию), поэтому LOCKBOX не пересчитывается и не читается; команда считает H2-D3 на TRAIN и VALID «без фандинга / с фандингом» (mean, t, Шарп, просадка), средний фандинг за 30 суток после листинга и решение владельца (mean VALID+LOCKBOX с фандингом ≤ 0 → H2 закрыт). /h2_replicate [load|confirm|report]: вселенная — USDT-перпетуалы Bybit/BingX, базы которых НИКОГДА не было в архиве Binance (нормализация 1000X → X), монета на обеих биржах — биржа с большим оборотом за первые 30 суток; та же run_cell(H2-D3) на панели того же формата (тест побитово), фандинг учитывается; шаг 0 мощность (D < 365 → непроверяема), k по синтетике панели записывается в BOT_SPEC ДО расчёта (строки H2REPL-UNIVERSE и H2REPL-K), критерии на всём периоде панели, один расчёт (флаг h2_repl_*). /xfund_test [load]: X1 BingX/Bybit — приведение ставок к 8 ч (сумма за [t−72 ч, t) ÷ 9), T ∈ {0.02%, 0.05%}, выход при d < 0.005% или 14 сут., ≤ 5 позиций, плечо 2x, 4 исполнения комиссии + проскальзывание, фандинг по начислениям ног, разница цен бирж в P&L, ликвидация ноги при ходе ≥ 40%, отчёт APR/Шарп/просадка/худший месяц/доли/издержки/по годам/ёмкость, справочно пары с Binance. /exec_check h2|x1 [start|stop|report]: почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (стакан, спред, проскальзывание по размерам, фандинг), старт только после пройденной проверки. Данные: research_xdata.py (ccxt, только публичные методы, кэш XDATA_DIR, повторы, пауза HTF_FETCH_PAUSE_SEC, продолжение с места остановки). НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/BingX (глубина истории, пагинация фандинга назад: Bybit until / BingX endTime, закрытые инструменты), реальные время и память. Тесты: tests/test_v116_h2x1.py'),
     ('2026-11-14-v115', 'ПОПРАВКА /final_h2 audit: ЛОЖНОЕ СРАБАТЫВАНИЕ МАРКЕРОВ (BOT_SPEC §2.43.18; запись — ОТДЕЛЬНЫМ коммитом ДО исправления; bybit_worker.py, режим ожидания, breaker-ы, кандидат H2-D3, k = 1.122, критерии §2.43.11, состояния флага не менялись). Первый audit на проде (2026-10-29 20:30 UTC, v114) нашёл маркеры «РЕЗУЛЬТАТ: НЕ ПРОЙДЕНО» и «mean при издержках ×2 =» в отчёте /final_crypto4h от 2026-10-25 20:46 (htf_reports и htf_backtest_2026-10-25_2046.txt): эти строки общие с форматом отчёта crypto4h, который H2 копирует; H2-специфичные маркеры (листингов в LOCKBOX, месяцы BTC (UTC → доходность), заголовок финала H2-D3) не найдены. Исправлено: общие маркеры считаются находкой только при «H2-D3» в том же тексте (ячейка БД или файл), специфичные — всегда; audit выводит состав оставшихся каталогов задач final_h2_* (имена, размеры). Критерии «утечки» не ослаблены. Вердикт «утечки нет» выносится по повторному /final_h2 audit v115 и ручной проверке логов Render за окно сбоя (≈ 19:40–19:55 UTC). Тесты: tests/test_v114_finalstate.py (+3)'),
@@ -7377,6 +7422,10 @@ async def net_probe_collect() -> dict:
         res['ccxt_pub'].append(await _np_ccxt_call('pub'))
     for _ in range(NET_PROBE_N):
         res['ccxt_priv'].append(await _np_ccxt_call('priv'))            # [v96] боевой путь: exchange_priv со своей очередью
+    try:
+        res['access'] = await _ap.probe_all()                           # [v118] шаг 0 (§2.50): Bybit/OKX — доступность с сервера
+    except Exception as e:
+        res['access'] = {'_error': f'{type(e).__name__}: {e}'}
     for _ in range(NET_PROBE_N):
         res['ccxt_priv_shared'].append(await _np_ccxt_call('priv_shared'))   # [v96] для сравнения: тот же вызов через общую очередь
     return res
@@ -7397,6 +7446,14 @@ def net_probe_text(res: dict) -> str:
     return '\n'.join(lines)
 
 
+def net_probe_access_text(res: dict) -> str:
+    """[v118] Шаг 0 (BOT_SPEC §2.50): блок доступности Bybit/OKX отдельным сообщением (длинные тела ответов)."""
+    a = res.get('access') or {}
+    if not a:
+        return ''
+    return '🌐 <b>Доступ к Bybit/OKX с сервера бота</b> (шаг 0, §2.50)\n' + '\n'.join(_ap.format_probe(a, esc))
+
+
 async def net_probe_run():
     """[v94] /net_probe (фон): замеры → вердикт → Telegram. Не бросает исключений."""
     if _net_probe_running[0]:
@@ -7406,6 +7463,9 @@ async def net_probe_run():
         await tg(f'📡 /net_probe запущен (DNS + {NET_PROBE_N} замеров × 5 видов; до ~2–5 мин)…')
         res = await net_probe_collect()
         await tg(net_probe_text(res))
+        _acc = net_probe_access_text(res)
+        if _acc:
+            await tg(_acc)
     except Exception as e:
         logging.exception('net_probe')
         try:

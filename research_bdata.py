@@ -40,6 +40,10 @@ def d1_path(d, sym):
     return os.path.join(sym_dir(d, sym), 'd1.npz')
 
 
+def h1_path(d, sym):
+    return os.path.join(sym_dir(d, sym), 'h1.npz')
+
+
 def fr_path(d, sym):
     return os.path.join(sym_dir(d, sym), 'fund.npz')
 
@@ -179,8 +183,22 @@ def save_fund(d, sym, ts, cols, months):
     V._atomic_savez(fr_path(d, sym), ts=ts.astype(np.int64), months=np.array(months, dtype='U7'), rate=cols['rate'].astype(np.float64))
 
 
+def load_h1(d, sym):
+    """[v118] Часовые свечи архива (только high/low/close; для X1 с Binance, BOT_SPEC §2.50). Не входят в sync_all/symbol_done (батарею не меняют)."""
+    z = V._load_npz(h1_path(d, sym))
+    if z is None:
+        return None
+    return {'ts': z['ts'], 'h': z['h'], 'l': z['l'], 'c': z['c'], 'months': [str(x) for x in z['months']]}
+
+
+def save_h1(d, sym, ts, cols, months):
+    V._atomic_savez(h1_path(d, sym), ts=ts.astype(np.int64), months=np.array(months, dtype='U7'), **{k: cols[k].astype(np.float32) for k in ('h', 'l', 'c')})
+
+
 KINDS = {'d1': (KL_PREFIX, parse_d1, ('o', 'h', 'l', 'c', 'qv'), load_d1, save_d1, lambda s: f'{s}/1d/'),
-         'fr': (FR_PREFIX, parse_funding, ('rate',), load_fund, save_fund, lambda s: f'{s}/')}
+         'fr': (FR_PREFIX, parse_funding, ('rate',), load_fund, save_fund, lambda s: f'{s}/'),
+         'h1': (KL_PREFIX, parse_d1, ('h', 'l', 'c'), load_h1, save_h1, lambda s: f'{s}/1h/')}
+KEY_NAME = {'d1': '1d', 'h1': '1h', 'fr': 'fundingRate'}
 
 
 async def sync_kind(fetch, d, idx, sym, kind, deadline=None, refresh=False):
@@ -206,7 +224,7 @@ async def sync_kind(fetch, d, idx, sym, kind, deadline=None, refresh=False):
         async with sem:
             V.check_space(d)
             y, mo = m.split('-')
-            key = f'{full_prefix}{sym}-{"1d" if kind == "d1" else "fundingRate"}-{m}.zip'
+            key = f'{full_prefix}{sym}-{KEY_NAME[kind]}-{m}.zip'
             try:
                 body = await V.download_zip(fetch, key)
                 parsed = parser(V.unzip_text(body))
@@ -234,6 +252,27 @@ async def sync_kind(fetch, d, idx, sym, kind, deadline=None, refresh=False):
         saver(d, sym, ts, cc, months)
         res['loaded'] += 1
     return res
+
+
+async def sync_h1(fetch, d, syms, deadline=None, progress=None):
+    """[v118] Догрузка 1h-свечей (месяцами) заданных символов; продолжение с места остановки (месяцы с попытками ≥ GAP_ATTEMPTS пропускаются). → dict(symbols, loaded, failed, stopped)."""
+    idx = load_index(d)
+    out = {'symbols': len(syms), 'loaded': 0, 'failed': 0, 'stopped': False, 'processed': 0}
+    for sym in syms:
+        if deadline is not None and time.time() > deadline:
+            out['stopped'] = True
+            break
+        r = await sync_kind(fetch, d, idx, sym, 'h1', deadline)
+        out['loaded'] += r['loaded']
+        out['failed'] += r['failed']
+        out['stopped'] = out['stopped'] or r['stopped']
+        out['processed'] += 1
+        save_index(d, idx)
+        if out['stopped']:
+            break
+        if progress and out['processed'] % 5 == 0:
+            await progress(f'1h Binance: символов {out["processed"]}/{len(syms)}')
+    return out
 
 
 def symbol_done(d, idx, sym):
