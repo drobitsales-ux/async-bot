@@ -107,6 +107,9 @@ def build_inputs(venA, venB, pairs):
         if a is None or b is None:
             rejected.append((lab, 'нет данных'))
             continue
+        if B.stable_like(a['c']) or B.stable_like(b['c']):             # [v120, §2.52] стейблкоин-подобные не входят в X1
+            rejected.append((lab, 'стейблкоин-подобный'))
+            continue
         ok, corr, n = pair_ok(a, b)
         (keep if ok else rejected).append((lab, sa, sb) if ok else (lab, f'корреляция {corr:.2f} на {n} сутках'))
     if not keep:
@@ -397,11 +400,20 @@ def load_venues(xdir, bdir, fee_taker):
     return ven
 
 
+def _non_crypto(mk_, sym):
+    """[v120, §2.52] Не-крипто по записи markets (поле excl от загрузки v120) либо по префиксу базы (кэш прошлых версий)."""
+    return bool((mk_ or {}).get('excl') or X.noncrypto_reason((mk_ or {}).get('base') or sym.split('/')[0]))
+
+
 def common_pairs(ven, a='bingx', b='bybit'):
     na, nb = {}, {}
     for sym in ven[a]['bars']:
+        if _non_crypto(ven[a]['markets'].get(sym), sym):
+            continue
         na.setdefault(ven[a]['markets'].get(sym, {}).get('norm') or X.norm_base(sym.split('/')[0]), []).append(sym)
     for sym in ven[b]['bars']:
+        if _non_crypto(ven[b]['markets'].get(sym), sym):
+            continue
         nb.setdefault(ven[b]['markets'].get(sym, {}).get('norm') or X.norm_base(sym.split('/')[0]), []).append(sym)
     out = []
     for norm in sorted(set(na) & set(nb)):
@@ -443,7 +455,10 @@ def main_pairs_binance(ven_bingx, bn):
     """[v118] Пары (метка, символ BingX, база Binance): база есть в обеих площадках; несколько рынков одной базы на BingX — с большим оборотом."""
     nm = {}
     for sym in ven_bingx['bars']:
-        nm.setdefault(ven_bingx['markets'].get(sym, {}).get('norm') or X.norm_base(sym.split('/')[0]), []).append(sym)
+        mk_ = ven_bingx['markets'].get(sym, {})
+        if mk_.get('excl') or X.noncrypto_reason(mk_.get('base') or sym.split('/')[0]):          # [v120, §2.52] не-крипто исключены из X1
+            continue
+        nm.setdefault(mk_.get('norm') or X.norm_base(sym.split('/')[0]), []).append(sym)
     return [(norm, max(nm[norm], key=lambda s: float(np.mean(ven_bingx['bars'][s]['qv']))), norm) for norm in sorted(set(nm) & set(bn['bars']))]
 
 
@@ -561,6 +576,8 @@ def scan_list(xdir, limit=40):
     nm = {ex: {} for ex in X.EXCHANGES}
     for ex in X.EXCHANGES:
         for sym in idx['fund'].get(ex, {}):
+            if _non_crypto(idx['markets'].get(ex, {}).get(sym), sym):
+                continue
             nm[ex].setdefault(idx['markets'].get(ex, {}).get(sym, {}).get('norm') or X.norm_base(sym.split('/')[0]), sym)
     out = []
     for norm in sorted(set(nm['bingx']) & set(nm['bybit'])):

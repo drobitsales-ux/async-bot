@@ -263,7 +263,8 @@ def reference(env, base, fees, uni, seg):
 def report_lines(P, uni, ref, pw, kres, spec_k, spec_u, u_line, head=None):
     R = list(head or [])
     R += [f'Вселенная: символов {len(uni)} (Bybit {sum(1 for u in uni if u["ex"] == "bybit")}, BingX {sum(1 for u in uni if u["ex"] == "bingx")}, OKX {sum(1 for u in uni if u["ex"] == "okx")}); монет на обеих биржах {ref["both"]}; '
-          f'исключено: стейблкоин-подобных {len(ref["stable"])}, существовавших до начала истории биржи {len(ref["pre_existing"])}.',
+          f'исключено: стейблкоин-подобных {len(ref["stable"])}, существовавших до начала истории биржи {len(ref["pre_existing"])}; '
+          f'не-крипто (§2.52): ' + (', '.join(f'{k}: {len(v)}' for k, v in sorted(ref.get('noncrypto', {}).items())) or 'нет') + '.',
           f'Панель: суток {P["nd"]}, символов {len(P["syms"])}; с историей фандинга {int(np.sum(P["has_fund"]))}.',
           f'Мощность (шаг 0): D = {pw["D"]} суток с позициями, S_min = {fm(pw["s_min"])} → ' + ('проверяема' if pw['testable'] else '<b>НЕПРОВЕРЯЕМА</b> (D < 365)')]
     if kres:
