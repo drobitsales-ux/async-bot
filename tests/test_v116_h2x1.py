@@ -95,7 +95,7 @@ class Universe(unittest.TestCase):
         BF.write_battery(bdir, n_syms=18)
         xdir = tempfile.mkdtemp()
         write_xdata(xdir)
-        P, uni, ref = H2R.build_repl_panel(xdir, bdir)
+        P, uni, ref = H2R.build_repl_panel(xdir, bdir, ('bybit', 'bingx'))
         bnorm = X.binance_norm_set(bdir)
         self.assertTrue({'COIN00', 'COIN01', 'BTC'} <= bnorm)
         self.assertTrue(all(u['norm'] not in bnorm for u in uni))                         # вселенная НЕ пересекается с Binance (включая нормализацию 1000X)
@@ -206,7 +206,7 @@ class Replicate(unittest.TestCase):
         BF.write_battery(cls.bdir, n_syms=18)
         write_xdata(cls.xdir)
         RF.kv_set('h2_funding_check', {'allow': True, 'comb': 1.0}, cls.fdir)
-        cls.params = {'bdir': cls.bdir, 'xdir': cls.xdir, 'fdir': cls.fdir, 'fee_taker': 0.0005, 'fee_maker': 0.0002, 'version': 'vT'}
+        cls.params = {'bdir': cls.bdir, 'xdir': cls.xdir, 'fdir': cls.fdir, 'fee_taker': 0.0005, 'fee_maker': 0.0002, 'version': 'vT', 'venues': ('bybit', 'bingx')}
 
     @classmethod
     def tearDownClass(cls):
@@ -240,7 +240,7 @@ class Replicate(unittest.TestCase):
             self.assertIn('не записаны', refused)
             self.assertEqual(calls, [])
             self.assertIsNone(RF.kv_get(H2R.KV_STARTED, self.fdir))                        # флаг не взят
-            P, uni, ref = H2R.build_repl_panel(self.xdir, self.bdir)
+            P, uni, ref = H2R.build_repl_panel(self.xdir, self.bdir, ('bybit', 'bingx'))
             env = H2R.make_env(P)
             kres = H2R.compute_k(env, RB.fees_of(self.params), 6)
             self.assertTrue(kres['k'] >= 1.0)
@@ -576,7 +576,7 @@ class X1(unittest.TestCase):
                 mk[ex][sym] = {'base': f'N{i}', 'norm': f'N{i}', 'active': True, 'created': None}
         idx['markets'] = mk
         X.save_index(xdir, idx)
-        txt = run(XF.run_xfund({'xdir': xdir, 'bdir': bdir, 'fdir': fdir, 'fee_taker': 0.0005, 'version': 'vT'}))
+        txt = run(XF.run_xfund({'xdir': xdir, 'bdir': bdir, 'fdir': fdir, 'fee_taker': 0.0005, 'version': 'vT', 'x1_pair': 'bybit'}))
         for needle in ('межбиржевой арбитраж фандинга X1', 'T = 0.02%', 'T = 0.05%', 'T = 0.10%', 'ликвидаций ног', 'аварийных закрытий', 'по дневному close — запасной вариант', 'по годам', 'Решение (§2.48.3', 'Интервалы начисления', 'НЕТ часовых данных'):
             self.assertIn(needle, txt)
         self.assertIsNotNone(RF.kv_get(XF.KV_PASSED, fdir))
