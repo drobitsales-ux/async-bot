@@ -139,12 +139,12 @@ class NetProbe(unittest.TestCase):
         class _Ex:
             fetch_ticker = staticmethod(boom)
             fetch_balance = staticmethod(boom)
-        saved = (a.exchange, a.exchange_priv, a._np_dns, a._np_http_get)
-        a.exchange, a.exchange_priv, a._np_dns, a._np_http_get = _Ex(), _Ex(), boom, boom
+        saved = (a.exchange_pub, a.exchange, a.exchange_priv, a._np_dns, a._np_http_get)
+        a.exchange_pub, a.exchange, a.exchange_priv, a._np_dns, a._np_http_get = _Ex(), _Ex(), _Ex(), boom, boom
         try:
             run(a.net_probe_run())
         finally:
-            a.exchange, a.exchange_priv, a._np_dns, a._np_http_get = saved
+            a.exchange_pub, a.exchange, a.exchange_priv, a._np_dns, a._np_http_get = saved
         self.assertFalse(a._net_probe_running[0])
         self.assertTrue(any('СЕТЬ НЕДОСТУПНА' in m for m in self.sent), self.sent)
 
@@ -155,12 +155,12 @@ class NetProbe(unittest.TestCase):
         class _Ex:
             fetch_ticker = staticmethod(boom)
             fetch_balance = staticmethod(boom)
-        saved = (a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N)
-        a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N = _Ex(), _Ex(), 'unreachable.invalid', 1
+        saved = (a.exchange_pub, a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N)
+        a.exchange_pub, a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N = _Ex(), _Ex(), _Ex(), 'unreachable.invalid', 1
         try:
             run(a.net_probe_run())
         finally:
-            a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N = saved
+            a.exchange_pub, a.exchange, a.exchange_priv, a.NET_PROBE_HOST, a.NET_PROBE_N = saved
         self.assertTrue(any('СЕТЬ НЕДОСТУПНА' in m for m in self.sent), self.sent)
 
     def _ok(self, dt=0.3):

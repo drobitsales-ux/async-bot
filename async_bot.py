@@ -428,6 +428,7 @@ MIN_LOT_USDT     = 1.0      # Минимальный размер позиции
 _worker_urls: list = [u.strip() for u in
                       os.getenv('WORKER_URLS', '').split(',') if u.strip()]
 WORKER_SECRET = os.getenv('WORKER_SECRET', 'change-me-secret')  # общий секрет
+WORKER_ENABLED = os.getenv('WORKER_ENABLED', 'false').lower() == 'true'   # [v117] опрос воркера Bybit в дайджесте; по умолчанию выключен (воркер простаивает, §2.49 п. 4)
 
 # ── SMC-параметры ───────────────────────────────────────
 SMC_TF          = '15m'
@@ -520,6 +521,14 @@ exchange = ccxt_async.bingx({
 # в очереди за сканерами (90–200 публичных REST за цикл при 1 запросе/с), прямой aiohttp — 0.2 с. Рыночные данные остаются на `exchange`.
 exchange_priv = ccxt_async.bingx({
     'apiKey': BINGX_KEY, 'secret': BINGX_SECRET,
+    'options': {'defaultType': 'swap', 'marginMode': 'isolated'},
+    'enableRateLimit': True,
+})
+# [v117] ПУБЛИЧНЫЙ экземпляр БЕЗ ключей — для ВСЕХ публичных данных (рынки, свечи, тикеры, фандинг, стаканы) в боте и во всех исследовательских командах. Прод 2026-11-18…19: ключ стал
+# недействителен (100413), а load_markets() у экземпляра с ключом вызывает fetch_currencies() через ПРИВАТНЫЙ walletsV1PrivateGetCapitalConfigGetall — не грузились даже публичные рынки,
+# сканеры и исследования стояли. В ccxt 4.2.14 bingx.fetch_currencies без ключей возвращает None (приватный запрос не выполняется) — BOT_SPEC §2.49. `exchange` (с ключом) оставлен только для
+# сравнения в /net_probe (путь priv_shared); все приватные вызовы — через exchange_priv.
+exchange_pub = ccxt_async.bingx({
     'options': {'defaultType': 'swap', 'marginMode': 'isolated'},
     'enableRateLimit': True,
 })
@@ -1191,6 +1200,32 @@ def _lat_note(op: str, sym: str, dur: float, ok: bool, q: int):
         logging.debug(f'[LAT] note fail: {_e}')
 
 
+KEY_ALERT_SEC = 3600                   # [v117] алерт «ключ BingX недействителен» — не чаще раза в час
+_key_alert = {'t': 0.0}
+
+
+def is_key_error(e) -> bool:
+    """Ошибка BingX 100413 «Incorrect apiKey» (недействительный ключ)."""
+    t = str(e)
+    return '100413' in t or 'incorrect apikey' in t.lower()
+
+
+def key_error_note(e, now=None) -> bool:
+    """[v117] Недействительный ключ на ПРИВАТНОМ вызове: один алерт в Telegram не чаще раза в час; публичные данные и исследования от ключа не зависят. → True, если алерт отправлен."""
+    if not is_key_error(e):
+        return False
+    now = time.time() if now is None else now
+    if now - _key_alert['t'] < KEY_ALERT_SEC:
+        return False
+    _key_alert['t'] = now
+    try:
+        asyncio.get_running_loop().create_task(tg('🔑 <b>Ключ BingX недействителен</b> (100413 «Incorrect apiKey»): приватные вызовы (эквити, позиции, ордера) не работают; '
+                                                  'публичные данные, сканеры и исследования работают без ключа. Проверьте ключ/права/IP-whitelist в BingX и ENV BINGX_API_KEY/BINGX_SECRET_KEY. Повтор алерта — не чаще раза в час.'))
+    except RuntimeError:
+        logging.warning('[KEY] ключ BingX недействителен (100413); нет цикла событий для алерта')
+    return True
+
+
 def _lat_make(ex, name: str, orig):
     every = _LAT_SAMPLE.get(name, 1)
 
@@ -1204,8 +1239,10 @@ def _lat_make(ex, name: str, orig):
         t0 = time.time()
         try:
             r = await orig(*a, **kw)
-        except BaseException:
+        except BaseException as _e:
             _lat_note(op, sym, time.time() - t0, False, q)
+            if ex is not exchange_pub:
+                key_error_note(_e)                      # [v117] 100413 на приватном канале → один алерт в час, остальное работает
             raise
         _lat_note(op, sym, time.time() - t0, True, q)
         return r
@@ -1215,7 +1252,7 @@ def _lat_make(ex, name: str, orig):
 
 def lat_install(ex=None):
     """Ставит обёртки на методы exchange и счётчик REST (на ccxt fetch). Идемпотентно."""
-    ex = ex or exchange
+    ex = ex or exchange_pub
     if getattr(ex, '_lat_installed', False):
         return
     for name in _LAT_METHODS:
@@ -1259,7 +1296,7 @@ def _pct(vals, p):
 
 def lat_report_text(hours: float = 24) -> str:
     """По каждой операции за период: n, медиана, p95, максимум; окно без стопа: n, медиана, максимум. [v96] Отдельно ПРИВАТНЫЙ канал
-    (exchange_priv) и ПУБЛИЧНЫЙ (exchange) + глубина очереди throttler (медиана/максимум в момент вызова)."""
+    (exchange_priv) и ПУБЛИЧНЫЙ (exchange_pub) + глубина очереди throttler (медиана/максимум в момент вызова)."""
     lat_flush()
     try:
         con = sqlite3.connect(TRADES_DB)
@@ -2317,10 +2354,10 @@ async def get_markets() -> dict:
     global markets_cache, markets_ts
     if markets_cache and time.time() - markets_ts < 3600:
         return markets_cache
-    markets_cache = await exchange.load_markets()
+    markets_cache = await exchange_pub.load_markets()
     markets_ts    = time.time()
     try:
-        exchange_priv.set_markets(exchange.markets, exchange.currencies)   # [v96] без собственного load_markets (лишний запрос в очереди)
+        exchange_priv.set_markets(exchange_pub.markets, exchange_pub.currencies)   # [v96] без собственного load_markets (лишний запрос в очереди)
     except Exception as _me:
         logging.warning(f'[PRIV] set_markets: {type(_me).__name__}: {_me}')
     logging.info(f"🗺 Markets cache updated: {len(markets_cache)} symbols")
@@ -2340,13 +2377,13 @@ async def get_btc_context() -> dict:
     # комментарий-контракт у SA_ATR_DIST выше/ORB). fetch_funding_rate дёшев,
     # кэшируем на цикл вместе с остальным btc_ctx — один раз, не на символ.
     try:
-        _fr = await exchange.fetch_funding_rate(SA_SYMBOL)
+        _fr = await exchange_pub.fetch_funding_rate(SA_SYMBOL)
         funding_rate = float(_fr.get('fundingRate') or 0.0)
     except Exception as _fe:
         funding_rate = 0.0  # НИКОГДА не блокирует — отсутствие данных = нейтрально
         logging.debug(f'[FUNDING] fetch fail: {_fe}')
     try:
-        btc_ohlcv = await exchange.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
+        btc_ohlcv = await exchange_pub.fetch_ohlcv('BTC/USDT:USDT', SMC_TF, limit=205)
         if not btc_ohlcv or len(btc_ohlcv) < 200:
             return {'btc_trend': 'Flat', 'altseason': False, 'eth_btc_spread': 0.0,
                     'alt_score': 50, 'htf_slope': 'Flat', 'funding_rate': funding_rate,
@@ -2369,7 +2406,7 @@ async def get_btc_context() -> dict:
         altseason = False
         eth_btc_spread = 0.0   # [ALT] спред доходности ETH vs BTC за 50 баров
         try:
-            eth_ohlcv = await exchange.fetch_ohlcv('ETH/USDT:USDT', SMC_TF, limit=55)
+            eth_ohlcv = await exchange_pub.fetch_ohlcv('ETH/USDT:USDT', SMC_TF, limit=55)
             if eth_ohlcv and len(eth_ohlcv) >= 50:
                 eth_c = np.array([x[4] for x in eth_ohlcv], dtype=float)
                 eth_ret = (eth_c[-1] - eth_c[-50]) / eth_c[-50] * 100
@@ -2419,7 +2456,7 @@ async def smc_signal(sym: str, btc_ctx: dict = None):
         return None, 'news'
 
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, SMC_TF, limit=60)  # [PERF-3] 100→60
+        ohlcv = await exchange_pub.fetch_ohlcv(sym, SMC_TF, limit=60)  # [PERF-3] 100→60
     except:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 45:
@@ -2604,7 +2641,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
         return None, 'news'
 
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)   # [PERF] 100→60, SMA60 достаточно
+        ohlcv = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=60)   # [PERF] 100→60, SMA60 достаточно
     except:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 45:  # limit=100, нужно минимум 45
@@ -2830,7 +2867,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
     # 1h RSI confirmation
     htf_rsi, htf_confirmed = rsi_now, False
     try:
-        _htf = await exchange.fetch_ohlcv(sym, '1h', limit=20)
+        _htf = await exchange_pub.fetch_ohlcv(sym, '1h', limit=20)
         if _htf and len(_htf) >= 16:
             htf_rsi = calc_rsi(np.array([float(x[4]) for x in _htf])[:-1], RSI_PERIOD)
             htf_confirmed = (mode=='Long' and htf_rsi<35) or (mode=='Short' and htf_rsi>65)
@@ -2841,7 +2878,7 @@ async def rsi_signal(sym: str, btc_ctx: dict):
 
     # Funding rate — защита от шорт-сквиза
     try:
-        fr = await exchange.fetch_funding_rate(sym)
+        fr = await exchange_pub.fetch_funding_rate(sym)
         funding = float(fr.get('fundingRate', 0))
     except:
         funding = 0.0
@@ -2875,7 +2912,7 @@ async def momentum_signal(sym: str, btc_ctx: dict):
     if is_news_now():
         return None, 'news'
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)
+        ohlcv = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=60)
     except Exception:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 55:
@@ -2965,7 +3002,7 @@ async def pullback_signal(sym: str, btc_ctx: dict):
     if is_news_now():
         return None, 'news'
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)
+        ohlcv = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=60)
     except Exception:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 55:
@@ -3053,7 +3090,7 @@ async def rb_signal(sym: str, btc_ctx: dict, range_stats: list = None):
     range_stats: если передан список — в него добавляется range_w_atr
     ДО применения гейта флэта (для сбора реального распределения метрики)."""
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=RB_RANGE_BARS + 5)
+        ohlcv = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=RB_RANGE_BARS + 5)
     except Exception:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < RB_RANGE_BARS + 3:
@@ -3160,7 +3197,7 @@ async def orb_signal(sym: str, btc_ctx: dict):
     if not _orb_in_window():
         return None, 'no_window'
     try:
-        ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=60)
+        ohlcv = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=60)
     except Exception:
         return None, 'fetch_err'
     if not ohlcv or len(ohlcv) < 30:
@@ -3276,7 +3313,7 @@ async def single_asset_signal(btc_ctx: dict):
         return None, 'news', {}
     try:
         # дневной VWAP: берём бары с начала суток UTC. На 15m это <=96 баров.
-        ohlcv = await exchange.fetch_ohlcv(SA_SYMBOL, RSI_TF, limit=120)
+        ohlcv = await exchange_pub.fetch_ohlcv(SA_SYMBOL, RSI_TF, limit=120)
     except Exception:
         return None, 'fetch_err', {}
     if not ohlcv or len(ohlcv) < 30:
@@ -3569,13 +3606,13 @@ async def execute(sym: str, sig: dict, strategy: str,
     # умолчанию TRUNCATE (обрезал бы 0.0018 → 0.001 при шаге 0.001 = −44% позиции).
     qty_ideal = risk_usdt / sl_dist
     try:
-        if not exchange.markets or sym not in exchange.markets:
-            await exchange.load_markets()
-        _mkt     = exchange.market(sym)
+        if not exchange_pub.markets or sym not in exchange_pub.markets:
+            await exchange_pub.load_markets()
+        _mkt     = exchange_pub.market(sym)
         _min_qty = float((_mkt.get('limits', {}).get('amount', {}) or {}).get('min') or 0)
-        qty = float(exchange.decimal_to_precision(
+        qty = float(exchange_pub.decimal_to_precision(
             qty_ideal, ccxt_async.ROUND, _mkt['precision']['amount'],
-            exchange.precisionMode, exchange.paddingMode))
+            exchange_pub.precisionMode, exchange_pub.paddingMode))
     except Exception as _me:
         logging.warning(f'[{strategy}] {sym}: market info недоступен ({_me}) — fallback round(,4)')
         _min_qty = 0.0
@@ -3629,10 +3666,10 @@ async def execute(sym: str, sig: dict, strategy: str,
         # округление ТОЛЬКО вниз (TRUNCATE) — иначе снова вылезем за лимит
         try:
             if '_mkt' not in dir() or _mkt is None:
-                _mkt = exchange.market(sym)
-            qty_new = float(exchange.decimal_to_precision(
+                _mkt = exchange_pub.market(sym)
+            qty_new = float(exchange_pub.decimal_to_precision(
                 _qty_capped, ccxt_async.TRUNCATE, _mkt['precision']['amount'],
-                exchange.precisionMode, exchange.paddingMode))
+                exchange_pub.precisionMode, exchange_pub.paddingMode))
         except Exception:
             qty_new = float(int(_qty_capped * 10000)) / 10000
         _notional_new = qty_new * price
@@ -3790,11 +3827,11 @@ async def _qty_precision_check(sym: str, qty: float):
     При сбое загрузки market info — (0.0, 0.0): безопасный отказ, вызывающий
     код обязан трактовать это как "ниже минимума" и защитить позицию."""
     try:
-        if not exchange.markets or sym not in exchange.markets:
-            await exchange.load_markets()
-        mkt = exchange.market(sym)
+        if not exchange_pub.markets or sym not in exchange_pub.markets:
+            await exchange_pub.load_markets()
+        mkt = exchange_pub.market(sym)
         min_qty = float((mkt.get('limits', {}).get('amount', {}) or {}).get('min') or 0)
-        qty_p = float(exchange.amount_to_precision(sym, qty))
+        qty_p = float(exchange_pub.amount_to_precision(sym, qty))
         return qty_p, min_qty
     except Exception as _e:
         logging.debug(f'{sym}: precision check fail: {_e}')
@@ -3846,7 +3883,7 @@ async def monitor_all():
     syms = list({p['symbol'] for p in all_pos})
     try:
         pos_raw = await exchange_priv.fetch_positions(syms)
-        tickers = await exchange.fetch_tickers(syms)
+        tickers = await exchange_pub.fetch_tickers(syms)
     except Exception as e:
         logging.error(f"Monitor fetch error: {e}")
         return
@@ -4589,7 +4626,7 @@ async def get_tickers_cached() -> dict:
     if _tickers_cache and time.time() - _tickers_cache_ts < TICKERS_CACHE_TTL:
         return _tickers_cache
     try:
-        _tickers_cache = await exchange.fetch_tickers()
+        _tickers_cache = await exchange_pub.fetch_tickers()
         _tickers_cache_ts = time.time()
         logging.debug(f'[TICKERS] Кэш обновлён: {len(_tickers_cache)} инструментов')
     except Exception as e:
@@ -4945,7 +4982,7 @@ async def po3_signal(sym: str):
         bars4 = await _get_4h_bars(sym)
         if not bars4:
             return nodata('no_4h')
-        raw = await exchange.fetch_ohlcv(sym, RSI_TF, limit=64)
+        raw = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=64)
     except Exception:
         return nodata('fetch_err')
     closed = [b for b in (raw or []) if int(b[0]) + tf <= now_ms]
@@ -5054,7 +5091,7 @@ async def scan_po3():
                 _po3_day['n'] += 1                       # резерв до await
                 fr = 0.0
                 try:
-                    fr = float((await exchange.fetch_funding_rate(sym)).get('fundingRate') or 0)
+                    fr = float((await exchange_pub.fetch_funding_rate(sym)).get('fundingRate') or 0)
                 except Exception:
                     fr = 0.0
                 await shadow_record(sym, mode, sig['entry'], sig,
@@ -5349,7 +5386,7 @@ async def scan_smc2():
     async def check(sym):
         try:
             async with sem:
-                raw = await exchange.fetch_ohlcv(sym, SMC_TF, limit=64)
+                raw = await exchange_pub.fetch_ohlcv(sym, SMC_TF, limit=64)
         except Exception:
             st['fetch_err'] += 1
             return
@@ -5601,7 +5638,7 @@ async def scan_orb_rt():
     async def check(sym):
         try:
             async with sem:
-                raw = await exchange.fetch_ohlcv(sym, RSI_TF, limit=64)
+                raw = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=64)
         except Exception:
             st['fetch_err'] += 1
             return
@@ -6477,6 +6514,8 @@ async def _fetch_worker_status() -> str:
     эндпоинт (do_GET в bybit_worker.py, обновляет last_known_balance раз/
     сутки в 19:00 UTC). _worker_urls хранит POST-адрес .../signal —
     для GET берём базовый URL без этого суффикса."""
+    if not WORKER_ENABLED:
+        return 'воркер выключен (WORKER_ENABLED=false)'
     if not _worker_urls or not http:
         return 'н/д (WORKER_URLS не задан)'
     url = _worker_urls[0]
@@ -6784,8 +6823,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-19-v116'
+CODE_VERSION = '2026-11-20-v117'
 CHANGELOG = [
+    ('2026-11-20-v117', 'РАЗВЯЗКА ПУБЛИЧНЫХ ДАННЫХ BINGX И КЛЮЧА (BOT_SPEC §2.49; запись инцидента — отдельным коммитом ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет). Прод 2026-11-18…19: ключ BingX недействителен (100413 «Incorrect apiKey»), а load_markets() у экземпляра с ключом вызывает fetch_currencies() через ПРИВАТНЫЙ walletsV1PrivateGetCapitalConfigGetall — не грузились даже публичные рынки, сканеры и исследования стояли. По исходнику ccxt 4.2.14 bingx.fetch_currencies без ключей возвращает None (приватный запрос не выполняется). Новый экземпляр exchange_pub БЕЗ ключей — для ВСЕХ публичных данных (рынки, свечи, тикеры, фандинг, стаканы) в боте и во всех исследовательских командах (h2_replicate, xfund_test, exec_check, htf/carry/ws/ma2 prepare_*); ключевой exchange оставлен только для сравнения в /net_probe (priv_shared), все приватные вызовы — через exchange_priv (exchange_priv.set_markets берёт рынки у exchange_pub). 100413 на приватном канале → ОДИН алерт «ключ BingX недействителен» не чаще раза в час (key_error_note в обёртке _lat_make), публичные данные, сканеры и исследования от ключа не зависят. Версии: .python-version = 3.13.18 (на ней проходят тесты; в трейсе прода — 3.14), ccxt==4.2.14 (уже закреплена в requirements.txt; фактическая версия на проде не проверена — старт пишет Python и ccxt в лог и в стартовое сообщение и предупреждает о расхождении). Дайджест: воркер Bybit опрашивается только при WORKER_ENABLED=true (по умолчанию false), вместо «н/д (HTTP 503)» — «воркер выключен». Тесты: tests/test_v117_decouple.py'),
     ('2026-11-19-v116', 'H2: ПРОВЕРКА ФАНДИНГА И РЕПЛИКАЦИЯ НА НЕЗАВИСИМЫХ МОНЕТАХ (BOT_SPEC §2.47) И МЕЖБИРЖЕВОЙ АРБИТРАЖ ФАНДИНГА X1 (§2.48); пре-регистрации записаны ОТДЕЛЬНЫМИ коммитами ДО загрузки данных и ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; НИ ОДНОГО реального ордера (методов создания ордеров нет — тест на исходниках); расчёты — через research_runner. Часть 0 документации (отдельный коммит): итог /final_h2 retry confirm (§2.43.20: НЕ ПРОЙДЕНО только по значимости, t_adj 1.25 < 2.0; Шарп 1.18, просадка 10.1%, стресс +3.05, месяцы роста +3.51 / падения +2.71, LOCKBOX +3.13 б.п./день; LOCKBOX батареи исчерпан), итог /vrp_measure (§2.46.5), строки H2/VRP в RESEARCH_SUMMARY. /h2_funding_check: ответ по коду — фандинг в исходном H2 УЧИТЫВАЛСЯ (sim_h2 начисляет +w·F шорту, fund_on=True по умолчанию), поэтому LOCKBOX не пересчитывается и не читается; команда считает H2-D3 на TRAIN и VALID «без фандинга / с фандингом» (mean, t, Шарп, просадка), средний фандинг за 30 суток после листинга и решение владельца (mean VALID+LOCKBOX с фандингом ≤ 0 → H2 закрыт). /h2_replicate [load|confirm|report]: вселенная — USDT-перпетуалы Bybit/BingX, базы которых НИКОГДА не было в архиве Binance (нормализация 1000X → X), монета на обеих биржах — биржа с большим оборотом за первые 30 суток; та же run_cell(H2-D3) на панели того же формата (тест побитово), фандинг учитывается; шаг 0 мощность (D < 365 → непроверяема), k по синтетике панели записывается в BOT_SPEC ДО расчёта (строки H2REPL-UNIVERSE и H2REPL-K), критерии на всём периоде панели, один расчёт (флаг h2_repl_*). /xfund_test [load]: X1 BingX/Bybit — приведение ставок к 8 ч (сумма за [t−72 ч, t) ÷ 9), T ∈ {0.02%, 0.05%}, выход при d < 0.005% или 14 сут., ≤ 5 позиций, плечо 2x, 4 исполнения комиссии + проскальзывание, фандинг по начислениям ног, разница цен бирж в P&L, ликвидация ноги при ходе ≥ 40%, отчёт APR/Шарп/просадка/худший месяц/доли/издержки/по годам/ёмкость, справочно пары с Binance. /exec_check h2|x1 [start|stop|report]: почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (стакан, спред, проскальзывание по размерам, фандинг), старт только после пройденной проверки. Данные: research_xdata.py (ccxt, только публичные методы, кэш XDATA_DIR, повторы, пауза HTF_FETCH_PAUSE_SEC, продолжение с места остановки). НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/BingX (глубина истории, пагинация фандинга назад: Bybit until / BingX endTime, закрытые инструменты), реальные время и память. Тесты: tests/test_v116_h2x1.py'),
     ('2026-11-14-v115', 'ПОПРАВКА /final_h2 audit: ЛОЖНОЕ СРАБАТЫВАНИЕ МАРКЕРОВ (BOT_SPEC §2.43.18; запись — ОТДЕЛЬНЫМ коммитом ДО исправления; bybit_worker.py, режим ожидания, breaker-ы, кандидат H2-D3, k = 1.122, критерии §2.43.11, состояния флага не менялись). Первый audit на проде (2026-10-29 20:30 UTC, v114) нашёл маркеры «РЕЗУЛЬТАТ: НЕ ПРОЙДЕНО» и «mean при издержках ×2 =» в отчёте /final_crypto4h от 2026-10-25 20:46 (htf_reports и htf_backtest_2026-10-25_2046.txt): эти строки общие с форматом отчёта crypto4h, который H2 копирует; H2-специфичные маркеры (листингов в LOCKBOX, месяцы BTC (UTC → доходность), заголовок финала H2-D3) не найдены. Исправлено: общие маркеры считаются находкой только при «H2-D3» в том же тексте (ячейка БД или файл), специфичные — всегда; audit выводит состав оставшихся каталогов задач final_h2_* (имена, размеры). Критерии «утечки» не ослаблены. Вердикт «утечки нет» выносится по повторному /final_h2 audit v115 и ручной проверке логов Render за окно сбоя (≈ 19:40–19:55 UTC). Тесты: tests/test_v114_finalstate.py (+3)'),
     ('2026-11-13-v114', 'ИСПРАВЛЕНИЕ ПАМЯТИ ФИНАЛЬНОГО ПУТИ /final_h2 (BOT_SPEC §2.43.13–14; инцидент и порядок восстановления записаны ОТДЕЛЬНЫМ коммитом ДО исправления; bybit_worker.py, режим ожидания, breaker-ы, research_bsim.py, research_battery.run_cell, кандидат, критерии, k = 1.122 и seed НЕ менялись). Инцидент 2026-10-29 19:45 UTC: после взятия флага final_h2_started и открытия LOCKBOX дочерний процесс упал с MemoryError (RESEARCH_MEM_MB=300) до расчёта; результата нет. Причина (воспроизведена на синтетике ≈ 650 символов): полная панель с листингами 2025+ в ≈ 1.6 раза больше пре-панели, make_ctx (pit_adv, atr_panel) держит десятки матриц float64, load_panel копировал все матрицы при живых исходных. Исправлено: load_panel обрезает матрицы по одной с освобождением исходной (числа те же); контекст финала make_ctx_h2 без неиспользуемого в H2 (atr, adv; после расчёта освобождаются QV, L, G, GC), маски ликвидности и топ-30 блоками (побитово те же, тест сравнивает с make_ctx и результаты H2-D3 базовый/стресс); перед взятием флага — оценка пика памяти по индексу архива (отказ без взятия флага, если выше 85% лимита; калибровка 120 МБ + 43 МБ на млн ячеек); сбой после взятия флага пишется в БД (final_h2_crash). На фикстуре 700 символов под RLIMIT_AS = 300 МБ полный путь проходит (пик ≈ 190–215 МБ). Флаг final_h2_started НЕ снят (снять может только владелец прямой правкой БД, порядок и условия — §2.43.13). СОСТОЯНИЯ ФЛАГА ФИНАЛА (§2.43.17, research_finalstate.py): free → running → done | tech_fail_no_output, ровно одна повторная попытка командой /final_h2 retry confirm (после чистого /final_h2 audit), далее done или tech_fail_final; done только после записи итогового отчёта в БД (/final_h2 report); сбой до вывода пишется в final_h2_crash, а не «взятым флагом»; ключ v113 final_h2_started без результата трактуется как зависший running (legacy). /final_h2 audit (§2.43.15, только чтение): маркеры итогового отчёта H2 в SQLite-базах, текстовых файлах, каталогах задач. Условное исключение §2.43.16 (одна повторная попытка при «утечки нет»). Не проверено: пик памяти на реальных данных, содержимое прод-хранилищ. Тесты: tests/test_v113_h2_vrp.py, tests/test_v114_finalstate.py'),
@@ -7089,7 +7129,7 @@ async def htf_backtest_run():
         import research_htf
         await tg('📈 /htf_backtest запущен (загрузка истории BTC/ETH/SOL 1D/4h с повторами и паузой '
                  f'{research_htf.fetch_pause():g} с между запросами; расчёт в фоне)…')
-        data, info = await research_htf.prepare_backtest(exchange, TRADES_DB, progress=_tg_plain)      # сеть через общий exchange — в процессе бота
+        data, info = await research_htf.prepare_backtest(exchange_pub, TRADES_DB, progress=_tg_plain)      # сеть через общий exchange — в процессе бота
         text = await _research_job('/htf_backtest', 'htf_backtest', {'fee': FEE_TAKER, 'runs': research_htf.BOOT_RUNS}, payload=(data, info))
         del data, info
         if text:
@@ -7112,7 +7152,7 @@ async def htf_backtest_wide_run():
         import research_htf
         await tg('📈 /htf_backtest_wide запущен (отбор вселенной правилом, загрузка 1D и фандинга с повторами и паузой '
                  f'{research_htf.fetch_pause():g} с между запросами; первый запуск — десятки минут, повторный — из кэша)…')
-        univ, data, info = await research_htf.prepare_wide(exchange, TRADES_DB, progress=_tg_plain)
+        univ, data, info = await research_htf.prepare_wide(exchange_pub, TRADES_DB, progress=_tg_plain)
         text = await _research_job('/htf_backtest_wide', 'htf_wide', {'fee': FEE_TAKER, 'runs': research_htf.BOOT_RUNS}, payload=(univ, data, info))
         del univ, data, info
         if text:
@@ -7135,7 +7175,7 @@ async def htf_xsmom_run():
         import research_htf
         await tg('📈 /htf_xsmom запущен (вселенная — 16 фиксированных символов, 1D из кэша с докачкой недостающего, пауза '
                  f'{research_htf.fetch_pause():g} с между запросами; расчёт в фоне)…')
-        syms, data, info = await research_htf.prepare_xs(exchange, TRADES_DB, progress=_tg_plain)
+        syms, data, info = await research_htf.prepare_xs(exchange_pub, TRADES_DB, progress=_tg_plain)
         text = await _research_job('/htf_xsmom', 'htf_xsmom', {'fee': FEE_TAKER, 'runs': research_htf.BOOT_RUNS}, payload=(syms, data, info))
         del syms, data, info
         if text:
@@ -7159,7 +7199,7 @@ async def wide_stop_test_run():
         import research_ws
         await tg('📈 /wide_stop_test запущен (пересимуляция выходов SMC2/SMC_SIG/PO3/ORB на 15m-барах 48 ч, кэш ws_bars, повторы и пауза '
                  f'{research_htf.fetch_pause():g} с между запросами; первый запуск — десятки минут)…')
-        payload = await research_ws.prepare_wide_stop(exchange, TRADES_DB, progress=_tg_plain)
+        payload = await research_ws.prepare_wide_stop(exchange_pub, TRADES_DB, progress=_tg_plain)
         text = await _research_job('/wide_stop_test', 'wide_stop', {'db_path': TRADES_DB, 'fee_maker': FEE_MAKER, 'fee_taker': FEE_TAKER}, payload=payload)
         payload = None
         if text:
@@ -7214,14 +7254,14 @@ async def _np_http_get(session, url: str, headers: dict = None) -> dict:
 
 async def _np_ccxt_call(kind: str) -> dict:
     """Один вызов через ccxt с текущими настройками; глубина очереди throttler ДО вызова (того экземпляра, который вызывается).
-    kind: 'pub' — публичный (exchange), 'priv' — приватный через exchange_priv (боевой путь с v96), 'priv_shared' — приватный через ОБЩИЙ
+    kind: 'pub' — публичный (exchange_pub), 'priv' — приватный через exchange_priv (боевой путь с v96), 'priv_shared' — приватный через ОБЩИЙ
     exchange (только для сравнения с прежним путём: показывает, как очередь сканеров задерживает подписанные запросы)."""
-    ex = exchange_priv if kind == 'priv' else exchange
+    ex = exchange_priv if kind == 'priv' else (exchange_pub if kind == 'pub' else exchange)
     q = _lat_qlen(ex)
     t0 = time.time()
     try:
         if kind == 'pub':
-            await asyncio.wait_for(exchange.fetch_ticker('BTC/USDT:USDT'), 120)
+            await asyncio.wait_for(exchange_pub.fetch_ticker('BTC/USDT:USDT'), 120)
         elif kind == 'priv':
             await asyncio.wait_for(exchange_priv.fetch_balance(), 120)
         else:
@@ -7308,7 +7348,7 @@ async def net_probe_collect() -> dict:
     res = {'dns': {}, 'direct_pub': [], 'direct_priv': [], 'ccxt_pub': [], 'ccxt_priv': [], 'ccxt_priv_shared': [],
            'queue_start': -1, 'queue_start_priv': -1}
     try:
-        res['queue_start'] = _lat_qlen(exchange)
+        res['queue_start'] = _lat_qlen(exchange_pub)
         res['queue_start_priv'] = _lat_qlen(exchange_priv)
     except Exception:
         pass
@@ -7386,7 +7426,7 @@ async def data_probe_run():
         import research_htf
         await tg('📡 /data_probe запущен (метаданные Binance fapi / data.binance.vision / BingX, пауза '
                  f'{research_htf.fetch_pause():g} с между запросами, ~1-3 минуты)…')
-        text = await _research_job('/data_probe', 'data_probe', {'db_path': TRADES_DB, 'has': dict(getattr(exchange, 'has', {}) or {}), 'version': CODE_VERSION})
+        text = await _research_job('/data_probe', 'data_probe', {'db_path': TRADES_DB, 'has': dict(getattr(exchange_pub, 'has', {}) or {}), 'version': CODE_VERSION})
         if text:
             research_htf.save_report(TRADES_DB, CODE_VERSION, text)
             await _htf_deliver(text)
@@ -7463,7 +7503,7 @@ async def edge_audit_run():
 
 async def carry_test_run():
     """[v98] /carry_test: сбор фандинга C1 (лонг спот + шорт перп) по BOT_SPEC §2.40 (research_carry.py), ТОЛЬКО история, оценка без критериев. Сеть (докачка 1D и
-    фандинга BingX через общий exchange) — в процессе бота, расчёт — в дочернем процессе (лимит RESEARCH_MEM_MB). Отчёт — в htf_reports ДО отправки."""
+    фандинга BingX через общий exchange_pub) — в процессе бота, расчёт — в дочернем процессе (лимит RESEARCH_MEM_MB). Отчёт — в htf_reports ДО отправки."""
     if _htf_running[0]:
         return
     _htf_running[0] = True
@@ -7478,7 +7518,7 @@ async def carry_test_run():
             return
         await tg('📈 /carry_test запущен (C1: сбор фандинга, только история, BOT_SPEC §2.40): докачка 1D и фандинга BingX по 16 символам с повторами и паузой '
                  f'{research_htf.fetch_pause():g} с (кэш v86–v88, первый запуск — десятки минут), затем расчёт в отдельном процессе. FEE_SPOT={FEE_SPOT} FEE_TAKER={FEE_TAKER}.')
-        data, info = await research_carry.prepare_carry(exchange, TRADES_DB, universe, progress=_tg_plain)
+        data, info = await research_carry.prepare_carry(exchange_pub, TRADES_DB, universe, progress=_tg_plain)
         text = await _research_job('/carry_test', 'carry_test', {'fee_spot': FEE_SPOT, 'fee_perp': FEE_TAKER, 'vision_dir': research_vision.vision_dir()}, payload=(data, info))
         data = info = None
         if text:
@@ -7607,7 +7647,7 @@ async def exec_check_cmd(args):
     try:
         if kind == 'x1':
             bybit = ccxt_async.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
-        sampler = research_exec.ExecSampler(kind, exchange, bybit, fee_bingx=FEE_TAKER)
+        sampler = research_exec.ExecSampler(kind, exchange_pub, bybit, fee_bingx=FEE_TAKER)
         scan = research_xfund.scan_list(research_xdata.xdata_dir()) if kind == 'x1' else None
         if kind == 'x1' and not scan:
             await tg('⛔ /exec_check x1: нет кэша фандинга (/xfund_test load)')
@@ -7665,7 +7705,7 @@ async def audit_import_run(msg, label=None):
 
 async def data_probe_ma_run():
     """[v99/v100] /data_probe_ma: проверка источников данных для «фабрики» (BOT_SPEC §2.41, этап 1); с v100 — ПРОБА v2 (research_ma2.py): Dukascopy (выходные, часовой пояс, спреды BID/ASK,
-    расширенный список, дневки), стакан BingX по АКТИВНЫМ контрактам (общий exchange, процесс бота), диагностика Stooq (дочерний процесс). ТОЛЬКО метаданные и образцы, доходностей нет.
+    расширенный список, дневки), стакан BingX по АКТИВНЫМ контрактам (общий exchange_pub, процесс бота), диагностика Stooq (дочерний процесс). ТОЛЬКО метаданные и образцы, доходностей нет.
     Отчёт — в htf_reports ДО отправки."""
     if _htf_running[0]:
         return
@@ -7676,7 +7716,7 @@ async def data_probe_ma_run():
         import research_vision
         await tg('📡 /data_probe_ma, ПРОБА v2 (§2.41.14: качество данных Dukascopy — выходные, часовой пояс, спреды BID/ASK, расширенный список инструментов, правило дневок; '
                  'стакан BingX по активным контрактам; диагностика Stooq; только метаданные и образцы, доходностей не считается; ~5–12 минут)…')
-        payload = await research_ma2.prepare_ma_bingx_book(exchange, progress=_tg_plain)
+        payload = await research_ma2.prepare_ma_bingx_book(exchange_pub, progress=_tg_plain)
         text = await _research_job('/data_probe_ma', 'data_probe_ma', {'vision_dir': research_vision.vision_dir(), 'version': CODE_VERSION}, payload=payload)
         payload = None
         if text:
@@ -7760,7 +7800,7 @@ async def _get_4h_bars(sym: str, timeout: float = None) -> list:
     hit = _bars4h_cache.get(sym)
     if hit and now < hit[0]:
         return hit[1]
-    bars = await asyncio.wait_for(exchange.fetch_ohlcv(sym, '4h', limit=300),
+    bars = await asyncio.wait_for(exchange_pub.fetch_ohlcv(sym, '4h', limit=300),
                                   _BARS4H_TIMEOUT if timeout is None else timeout)
     bars = bars or []
     _bars4h_cache[sym] = (((int(now * 1000) // _REGIME_TF_MS) + 1) * _REGIME_TF_MS / 1000, bars)
@@ -8122,7 +8162,7 @@ async def _shadow_fetch_path(sym: str, open_dt: datetime, upto_ts: float):
     bar0 = int(open_dt.timestamp() * 1000) // tf_ms * tf_ms
     n = int((upto_ts * 1000 - bar0) // tf_ms) + 1
     limit = max(3, min(200, n + 2))
-    bars = await exchange.fetch_ohlcv(sym, RSI_TF, since=bar0 - 1, limit=limit)
+    bars = await exchange_pub.fetch_ohlcv(sym, RSI_TF, since=bar0 - 1, limit=limit)
     bars = bars or []
     return bars, bool(bars) and int(bars[0][0]) <= bar0
 
@@ -8187,7 +8227,7 @@ async def shadow_check():
                 await _shadow_check_path(sid, sym, mode, entry, open_t, strat, tp_p, sl_p, tp2_p, btc_e or 0.0)
                 continue
 
-            ohlcv = await exchange.fetch_ohlcv(sym, RSI_TF, limit=3)
+            ohlcv = await exchange_pub.fetch_ohlcv(sym, RSI_TF, limit=3)
             if not ohlcv:
                 continue
             last = ohlcv[-1]
@@ -8462,7 +8502,7 @@ async def regime_backfill_run():
         async def _sym(sym, items):
             async with sem:
                 try:
-                    bars = await exchange.fetch_ohlcv(sym, '4h', limit=1000)
+                    bars = await exchange_pub.fetch_ohlcv(sym, '4h', limit=1000)
                 except Exception as _e:
                     logging.warning(f'[REGIME_BF] {sym}: {_e}')
                     stat['sym_err'] += 1
@@ -10184,6 +10224,23 @@ def idle_tick_only(now=None) -> bool:
     return False
 
 
+PINNED_CCXT = '4.2.14'                 # [v117] версия, под которую написан код и тесты (requirements.txt)
+PINNED_PYTHON = '3.13'                 # [v117] .python-version = 3.13.18 (на ней проходят тесты); в трейсе прода 2026-11-18 был 3.14
+
+
+def runtime_versions_text() -> str:
+    """[v117] Версии окружения для стартового сообщения и лога; предупреждение при расхождении с закреплёнными (BOT_SPEC §2.49 п. 3)."""
+    import platform
+    import ccxt as _cx
+    py, cx = platform.python_version(), getattr(_cx, '__version__', '?')
+    warn = []
+    if cx != PINNED_CCXT:
+        warn.append(f'ccxt {cx} ≠ закреплённой {PINNED_CCXT}')
+    if '.'.join(py.split('.')[:2]) != PINNED_PYTHON:
+        warn.append(f'Python {py} ≠ закреплённого {PINNED_PYTHON}.x (.python-version)')
+    return f'Окружение: Python {py}, ccxt {cx}' + (' ⚠️ ' + '; '.join(warn) if warn else '')
+
+
 def startup_text() -> str:
     """[v97] Стартовое сообщение: версия — CODE_VERSION, стратегии — только включённые (живые и shadow отдельно), параметры — из текущих констант."""
     live, shadow = active_strategies()
@@ -10195,7 +10252,8 @@ def startup_text() -> str:
         f"{strat_lines}"
         f"Риск: {RISK_PER_TRADE*100:.2f}%/сделку  Max поз: {MAX_TOTAL_POS}  Плечо: {LEVERAGE}x\n"
         f"Сессия SMC: {SESSION_START_UTC}–{SESSION_END_UTC} UTC\n"
-        f"Breaker'ы по эквити: дневной DD > {DAILY_DD_LIMIT_PCT:.1f}%/день, общий > {MAX_DD_LIMIT_PCT:.1f}% от пика"
+        f"Breaker'ы по эквити: дневной DD > {DAILY_DD_LIMIT_PCT:.1f}%/день, общий > {MAX_DD_LIMIT_PCT:.1f}% от пика\n"
+        f"{esc(runtime_versions_text())}"
     )
 
 
@@ -10205,6 +10263,7 @@ async def main():
     init_db()
     load_all()
     set_deploy_epoch()   # [EPOCH] метка времени деплоя для статистики 'Последнее'
+    logging.info(f'[ENV] {runtime_versions_text()}')
     logging.info(f'⏰ [REPORT] Итоги дня в {REPORT_HOUR_UTC}:00 UTC ежедневно')
     logging.info(f'⏰ [DIGEST] Суточный дайджест самодиагностики в {DIGEST_HOUR}:00 UTC ежедневно')
     http = aiohttp.ClientSession()
@@ -10233,7 +10292,7 @@ async def main():
     logging.info("=" * 60)
 
     await verify_risk_config_or_exit()   # [v85] недопустимый риск → старт блокируется
-    lat_install(exchange)        # [v77] замер задержки вызовов биржи + счётчик REST (публичный канал)
+    lat_install(exchange_pub)        # [v77] замер задержки вызовов биржи + счётчик REST (публичный канал)
     lat_install(exchange_priv)   # [v96] то же на приватном канале
     dd_load()   # [v76] база дня по эквити (рестарт в тот же день не обнуляет)
     mdd_load()  # [v77] пик эквити и флаг общего breaker
@@ -10480,6 +10539,7 @@ async def main():
         await tg(f"🔴 <b>Bot {esc(CODE_VERSION)}</b> остановлен")
         if http:
             await http.close()
+        await exchange_pub.close()
         await exchange.close()
         await exchange_priv.close()
         await binance.close()

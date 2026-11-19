@@ -64,9 +64,10 @@ class PrivateRouting(unittest.TestCase):
         self.assertEqual(len(re.findall(r'\bexchange\.fetch_balance\(', src)), 1)       # только сравнение в _np_ccxt_call
 
     def test_instance_config_matches_and_throttlers_are_separate(self):
-        e, p = a.exchange, a.exchange_priv
+        e, p = a.exchange_pub, a.exchange_priv
         self.assertIsNot(e, p)
-        self.assertEqual((p.apiKey, p.secret), (e.apiKey, e.secret))
+        self.assertEqual((p.apiKey, p.secret), (a.exchange.apiKey, a.exchange.secret))        # ключевой exchange и приватный — с одними ключами
+        self.assertFalse(e.apiKey or e.secret)                                                # публичный — без ключей (v117, §2.49)
         self.assertEqual(p.options['defaultType'], e.options['defaultType'])
         self.assertEqual(p.options.get('marginMode'), e.options.get('marginMode'))
         self.assertEqual((p.rateLimit, p.enableRateLimit, p.timeout), (e.rateLimit, e.enableRateLimit, e.timeout))
@@ -89,26 +90,26 @@ class PrivateRouting(unittest.TestCase):
 
             async def load_markets(self):
                 return self.markets
-        saved = (a.exchange, a.markets_cache, a.markets_ts, a.exchange_priv.markets, a.exchange_priv.markets_by_id)
-        a.exchange, a.markets_cache, a.markets_ts = _E(), None, 0
+        saved = (a.exchange_pub, a.markets_cache, a.markets_ts, a.exchange_priv.markets, a.exchange_priv.markets_by_id)
+        a.exchange_pub, a.markets_cache, a.markets_ts = _E(), None, 0
         try:
             run(a.get_markets())
             self.assertIn('BTC/USDT:USDT', a.exchange_priv.markets)
         finally:
-            a.exchange, a.markets_cache, a.markets_ts, a.exchange_priv.markets, a.exchange_priv.markets_by_id = saved
+            a.exchange_pub, a.markets_cache, a.markets_ts, a.exchange_priv.markets, a.exchange_priv.markets_by_id = saved
 
 
 class QueueIndependence(unittest.TestCase):
     """Приватный вызов не ждёт очередь публичного экземпляра (на проде: 47–120 с за сканерами)."""
 
     def setUp(self):
-        self.saved = (a.exchange.throttle, a.exchange_priv.fetch, a.exchange_priv.apiKey, a.exchange_priv.secret, a.exchange_priv.markets,
-                      a.exchange_priv.markets_by_id, a.exchange_priv.throttle, a.exchange.apiKey, a.exchange.secret)
+        self.saved = (a.exchange_pub.throttle, a.exchange_priv.fetch, a.exchange_priv.apiKey, a.exchange_priv.secret, a.exchange_priv.markets,
+                      a.exchange_priv.markets_by_id, a.exchange_priv.throttle, a.exchange_pub.apiKey, a.exchange_pub.secret)
         self.release = None
 
     def tearDown(self):
-        (a.exchange.throttle, a.exchange_priv.fetch, a.exchange_priv.apiKey, a.exchange_priv.secret, a.exchange_priv.markets,
-         a.exchange_priv.markets_by_id, a.exchange_priv.throttle, a.exchange.apiKey, a.exchange.secret) = self.saved
+        (a.exchange_pub.throttle, a.exchange_priv.fetch, a.exchange_priv.apiKey, a.exchange_priv.secret, a.exchange_priv.markets,
+         a.exchange_priv.markets_by_id, a.exchange_priv.throttle, a.exchange_pub.apiKey, a.exchange_pub.secret) = self.saved
 
     def _prepare(self):
         class FakeThrottle:                              # «100 запросов в очереди»: вызовы ждут, пока тест не отпустит
@@ -138,9 +139,9 @@ class QueueIndependence(unittest.TestCase):
     def test_private_call_does_not_wait_for_public_queue(self):
         async def main():
             ev = asyncio.Event()
-            a.exchange.throttle = self._prepare()(ev)
-            self.assertEqual(a._lat_qlen(a.exchange), 100)                       # публичная очередь забита
-            public = [asyncio.create_task(a.exchange.throttle(1)) for _ in range(100)]   # 100 запросов стоят в очереди
+            a.exchange_pub.throttle = self._prepare()(ev)
+            self.assertEqual(a._lat_qlen(a.exchange_pub), 100)                       # публичная очередь забита
+            public = [asyncio.create_task(a.exchange_pub.throttle(1)) for _ in range(100)]   # 100 запросов стоят в очереди
             await asyncio.sleep(0)
             t0 = time.time()
             bal = await asyncio.wait_for(a.exchange_priv.fetch_balance(), 2)         # приватный уходит сразу
@@ -149,9 +150,9 @@ class QueueIndependence(unittest.TestCase):
             self.assertLess(dt, 1.0)
             self.assertFalse(any(t.done() for t in public))                           # публичные всё ещё ждут
             # контроль: тот же вызов через ОБЩИЙ экземпляр застревает в этой очереди
-            a.exchange.apiKey, a.exchange.secret = 'k', 's'
+            a.exchange_pub.apiKey, a.exchange_pub.secret = 'k', 's'
             with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(a.exchange.fetch_balance(), 0.3)
+                await asyncio.wait_for(a.exchange_pub.fetch_balance(), 0.3)
             ev.set()
             await asyncio.gather(*public)
         run(main())
@@ -159,7 +160,7 @@ class QueueIndependence(unittest.TestCase):
     def test_equity_fetch_uses_priv_and_ignores_public_queue(self):
         async def main():
             ev = asyncio.Event()
-            a.exchange.throttle = self._prepare()(ev)
+            a.exchange_pub.throttle = self._prepare()(ev)
             eq = await asyncio.wait_for(a._fetch_equity(retry=False), 3)
             self.assertEqual(eq, 76.5)
             ev.set()

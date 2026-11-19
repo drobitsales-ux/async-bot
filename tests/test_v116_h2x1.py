@@ -602,7 +602,7 @@ class Wiring(unittest.TestCase):
         src = open(os.path.join(ROOT, 'async_bot.py'), encoding='utf-8').read()
         for c in ("cmd == '/h2_funding_check'", "cmd == '/h2_replicate'", "cmd == '/xfund_test'", "cmd == '/exec_check'", 'async def exec_check_cmd', '/exec_check h2|x1'):
             self.assertIn(c, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v116'))
+        self.assertGreaterEqual(int(re.search(r'v(\d+)$', a.CODE_VERSION).group(1)), 116)
 
 
 if __name__ == '__main__':
