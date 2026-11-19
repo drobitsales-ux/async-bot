@@ -12,12 +12,14 @@ import research_xdata as X
 
 DAY = X.DAY
 HOUR = 3_600_000
-THRESHOLDS = (0.0002, 0.0005)          # T ∈ {0.02%, 0.05%} за 8 ч (доли)
+THRESHOLDS = (0.0002, 0.0005, 0.0010)  # T ∈ {0.02%, 0.05%, 0.10%} за 8 ч (доли) — BOT_SPEC §2.48.6 п. 1
 EXIT_D = 0.00005                       # выход при d < 0.005%
 MAX_HOLD_DAYS = 14
 MAX_POS = 5
 LEV = 2.0
-LIQ_MOVE = 0.40
+EMERG_MOVE = 0.30                      # аварийное закрытие: ход против ноги ≥ 30% от входа (§2.48.6 п. 3)
+GAP_MOVE = 0.45                        # гэп ≥ 45% в одном баре — нога ликвидирована (−100% маржи)
+HOUR = 3_600_000
 SLIP = 0.0005
 FEE_DEFAULT = 0.0005                   # комиссия по умолчанию (формулировка владельца: «FEE_TAKER биржи, иначе 0.05%»)
 WINDOW_H = 72
@@ -73,9 +75,31 @@ def pair_ok(a, b):
     return bool(c >= CORR_MIN), c, len(ra)
 
 
+def _hseries(h, hb0):
+    """Часовые массивы пары: dict(off — индекс первого часа (абсолютный, часы с эпохи), h/l/c float32) | None."""
+    if h is None or len(h['ts']) == 0:
+        return None
+    hours = (np.asarray(h['ts']) // HOUR).astype(np.int64)
+    off, n = int(hours[0]), int(hours[-1] - hours[0] + 1)
+    out = {'off': off, 'n': n}
+    for k in 'hlc':
+        arr = np.full(n, np.nan, np.float32)
+        arr[hours - off] = np.asarray(h[k], np.float32)
+        out[k] = arr
+    return out
+
+
+def _hget(hs, k, hour):
+    """Значение часового ряда на абсолютном часе или NaN."""
+    if hs is None:
+        return float('nan')
+    i = hour - hs['off']
+    return float(hs[k][i]) if 0 <= i < hs['n'] else float('nan')
+
+
 def build_inputs(venA, venB, pairs):
-    """venX = {'bars': {sym: bars}, 'fund': {sym: (ts, rate)}, 'fee': доля}; pairs = [(метка, symA, symB)]. → inputs для simulate_x1: общая дневная сетка, массивы по парам, допуск (оба бара + ликвидность PIT ≥ 20 млн
-    на КАЖДОЙ площадке + ≥ 2 события в окне на каждой), avg8 по площадкам."""
+    """venX = {'bars': {sym: дневные}, 'hbars': {sym: часовые h/l/c} (необязательно), 'fund': {sym: (ts, rate)}, 'fee': доля}; pairs = [(метка, symA, symB)]. → inputs для simulate_x1: общая дневная сетка,
+    массивы по парам, допуск (оба бара + ликвидность PIT ≥ 20 млн на КАЖДОЙ площадке + ≥ 2 события в окне на каждой), avg8 по площадкам, часовые ряды (если есть)."""
     keep, rejected = [], []
     for lab, sa, sb in pairs:
         a, b = venA['bars'].get(sa), venB['bars'].get(sb)
@@ -91,6 +115,7 @@ def build_inputs(venA, venB, pairs):
     nd, n = day1 - day0 + 1, len(keep)
     M = {k: np.full((nd, n), np.nan) for k in ('OA', 'HA', 'LA', 'CA', 'QA', 'OB', 'HB', 'LB', 'CB', 'QB')}
     avg = {'A': np.full((nd, n), np.nan), 'B': np.full((nd, n), np.nan)}
+    hs = {'A': [], 'B': []}
     for j, (lab, sa, sb) in enumerate(keep):
         for tag, ven, sym in (('A', venA, sa), ('B', venB, sb)):
             x = ven['bars'][sym]
@@ -98,19 +123,21 @@ def build_inputs(venA, venB, pairs):
             for k, kk in zip('OHLCQ', ('o', 'h', 'l', 'c', 'qv')):
                 M[k + tag][di, j] = x[kk]
             avg[tag][:, j] = avg8_matrix(day0, nd, ven['fund'].get(sym))
+            hs[tag].append(_hseries((ven.get('hbars') or {}).get(sym), day0))
     liq = {}
     for tag in 'AB':
         adv, _c = B.pit_adv(M['Q' + tag].astype(np.float32))
         liq[tag] = B.liquid_mask(adv)
     present = np.isfinite(M['OA']) & np.isfinite(M['CA']) & np.isfinite(M['OB']) & np.isfinite(M['CB'])
     elig = present & liq['A'] & liq['B'] & np.isfinite(avg['A']) & np.isfinite(avg['B'])
-    return {'day0': day0, 'nd': nd, 'M': M, 'avg': avg, 'elig': elig, 'present': present, 'labels': [k[0] for k in keep], 'syms': [(k[1], k[2]) for k in keep],
+    return {'day0': day0, 'nd': nd, 'M': M, 'avg': avg, 'elig': elig, 'present': present, 'labels': [k[0] for k in keep], 'syms': [(k[1], k[2]) for k in keep], 'hs': hs,
             'fund': [(venA['fund'].get(sa), venB['fund'].get(sb)) for _l, sa, sb in keep], 'fees': (venA['fee'], venB['fee'])}, rejected
 
 
 # ── симуляция ───────────────────────────────────────────────────────────────────────────────────────
 def leg_funding(ev, t0, t1, short, c):
-    """События фандинга ноги в (t0, t1]: шорт получает положительную ставку (+rate·c), лонг платит (−rate·c). → [(индекс суток по правилу (ts, ts+сутки], сумма)]."""
+    """События фандинга ноги в (t0, t1] — СТРОГО по фактическим отметкам времени биржи ноги: шорт получает положительную ставку (+rate·c), лонг платит (−rate·c).
+    → [(индекс суток по правилу (ts, ts+сутки], сумма)]. Приведения к 8 ч здесь нет (оно только в avg8_matrix для сигнала d)."""
     if ev is None or len(ev[0]) == 0:
         return []
     ts, r = np.asarray(ev[0], np.int64), np.asarray(ev[1], float)
@@ -120,28 +147,92 @@ def leg_funding(ev, t0, t1, short, c):
 
 
 def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
-    """Суточная симуляция X1 (BOT_SPEC §2.48.2–2.48.4). Возвращает dict: pnl (доля капитала по суткам), fund, price, cost (по суткам), trades, liq."""
-    nd, M, elig = inp['nd'], inp['M'], inp['elig']
+    """Суточная симуляция X1 (BOT_SPEC §2.48.2–2.48.6). Сигнал — 00:00 UTC; вход/выход — по close 1h-свечи, начинающейся в 00:00 (время сделки 01:00), на обеих площадках; при отсутствии часовых
+    свечей — по дневному close (запасной вариант, счётчик n_fb). Аварийное закрытие: ход против ноги ≥ 30% от входа (по hi/lo часов, иначе дней) → обе ноги закрываются (сработавшая — по уровню, вторая —
+    по close бара); ≥ 45% в одном баре (гэп) — нога ликвидирована (−100% маржи). Возвращает dict: pnl/fund/price/cost (по суткам), trades, liq, emerg, n_h, n_fb, open_end."""
+    nd, M, elig, hs = inp['nd'], inp['M'], inp['elig'], inp['hs']
     n = len(inp['labels'])
     day0 = inp['day0']
     pnl, fund, price, cost = (np.zeros(nd) for _ in range(4))
     feeA, feeB = inp['fees']
     c = 1.0 / max_pos
     fills = (feeA * mult + SLIP * mult, feeB * mult + SLIP * mult)
-    pos, trades, liq_count = [], [], 0
+    pos, trades = [], []
+    cnt = {'liq': 0, 'emerg': 0, 'n_h': 0, 'n_fb': 0}
+    TAGS = (('A', 0), ('B', 1))
 
-    def accrue(p, k_end, t_end_day):
-        for leg, vi in ((0, 0), (1, 1)):
-            ev = inp['fund'][p['j']][vi]
+    def accrue(p, t0, t1):
+        for vi in (0, 1):
             short = p['short'] == vi
-            for d_idx, amt in leg_funding(ev, (day0 + p['e']) * DAY, (day0 + t_end_day) * DAY, short, c):
-                if 0 <= d_idx - day0 < nd:
-                    fund[d_idx - day0] += amt
-                    pnl[d_idx - day0] += amt
+            for d_idx, amt in leg_funding(inp['fund'][p['j']][vi], t0, t1, short, c):
+                k = d_idx - day0
+                if 0 <= k < nd:
+                    fund[k] += amt
+                    pnl[k] += amt
+
+    def hour_abs(d, h=0):
+        return (day0 + d) * 24 + h
+
+    def scan(p, d, bars):
+        """Контроль аварийного закрытия: bars — список (час | None, ...) → первый по времени бар, где сработал порог. Часовой режим: bars = часы (абс.), дневной: [None] (весь день).
+        → None | (idx, kinds[2], extremes) где kinds[vi] ∈ {None, 'emerg', 'gap'}."""
+        j = p['j']
+        for b in bars:
+            kinds = [None, None]
+            for tag, vi in TAGS:
+                short = p['short'] == vi
+                if b is None:
+                    hi_, lo_ = M['H' + tag][d, j], M['L' + tag][d, j]
+                else:
+                    hh = hs[tag][j]
+                    hi_, lo_ = _hget(hh, 'h', b), _hget(hh, 'l', b)
+                p0 = p['p0'][vi]
+                if short and math.isfinite(hi_) and hi_ >= p0 * (1.0 + EMERG_MOVE):
+                    kinds[vi] = 'gap' if hi_ >= p0 * (1.0 + GAP_MOVE) else 'emerg'
+                if (not short) and math.isfinite(lo_) and lo_ <= p0 * (1.0 - EMERG_MOVE):
+                    kinds[vi] = 'gap' if lo_ <= p0 * (1.0 - GAP_MOVE) else 'emerg'
+            if kinds[0] or kinds[1]:
+                return b, kinds
+        return None
+
+    def bar_close(p, tag, d, b):
+        j = p['j']
+        if b is None:
+            return M['C' + tag][d, j], (day0 + d + 1) * DAY
+        v = _hget(hs[tag][j], 'c', b)
+        return (v if math.isfinite(v) else M['C' + tag][d, j]), (b + 1) * HOUR
+
+    def emergency(p, d, hit):
+        """Закрытие по аварийному правилу в баре hit=(бар, kinds). Дневные P&L ног, издержки, фандинг до конца бара, учёт."""
+        b, kinds = hit
+        t_end = None
+        for tag, vi in TAGS:
+            d_dir = -1.0 if p['short'] == vi else 1.0
+            if kinds[vi] == 'gap':
+                day_pnl = -c / LEV - p['legpnl'][vi]
+                p['legpnl'][vi] = -c / LEV
+                cnt['liq'] += 1
+            elif kinds[vi] == 'emerg':
+                level = p['p0'][vi] * (1.0 + EMERG_MOVE) if p['short'] == vi else p['p0'][vi] * (1.0 - EMERG_MOVE)
+                day_pnl = d_dir * c * (level - p['ref'][vi]) / p['p0'][vi]
+                cost[d] += c * fills[vi]
+                pnl[d] -= c * fills[vi]
+                cnt['emerg'] += 1
+            else:                                                             # вторая нога — по close бара своей биржи
+                px, _t = bar_close(p, tag, d, b)
+                day_pnl = d_dir * c * (px - p['ref'][vi]) / p['p0'][vi]
+                cost[d] += c * fills[vi]
+                pnl[d] -= c * fills[vi]
+            _px, t_end = bar_close(p, tag, d, b)
+            pnl[d] += day_pnl
+            price[d] += day_pnl
+        accrue(p, p['te'], t_end)
+        trades.append({'sym': inp['labels'][p['j']], 'e': p['e'], 'x': d, 'reason': 'ликвидация (гэп)' if 'gap' in kinds else 'аварийное 30%', 'fb': p['fb']})
+        pos.remove(p)
 
     for d in range(nd):
         exited_today = set()
-        # 1. выходы по состоянию на 00:00 (open)
+        # 1. выходы (решение на 00:00; сделка — по close часа 00:00, время 01:00)
         for p in list(pos):
             j = p['j']
             held = d - p['e']
@@ -150,19 +241,31 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
             reason = 'время' if held >= MAX_HOLD_DAYS else ('данные' if gone else ('d' if (not math.isfinite(dnow) or dnow < EXIT_D) else None))
             if reason is None:
                 continue
-            for vi, tag in ((0, 'A'), (1, 'B')):
+            hourly = (p['mode'] == 'h') and all(math.isfinite(_hget(hs[t][j], 'c', hour_abs(d))) for t in 'AB')
+            if not gone:
+                hit = scan(p, d, [hour_abs(d)] if hourly else ([None] if p['mode'] == 'd' else []))
+                if hit is not None:
+                    emergency(p, d, hit)
+                    exited_today.add(j)
+                    continue
+            if hourly:
+                pxs = [_hget(hs[t][j], 'c', hour_abs(d)) for t in 'AB']
+                t_exit = (hour_abs(d) + 1) * HOUR
+            else:
+                pxs = [M['C' + t][d, j] if not gone else p['ref'][i] for i, t in enumerate('AB')]
+                t_exit = (day0 + d + 1) * DAY
+                if p['mode'] == 'h' and not gone:
+                    p['fb'] = True                                             # вход по часам, выход по дневному close — запасной вариант выхода
+            for vi in (0, 1):
                 d_dir = -1.0 if p['short'] == vi else 1.0
-                ref = p['ref'][vi]
-                if gone:
-                    pdl = 0.0                                                   # данных нет: закрытие по последней известной цене
-                else:
-                    pdl = d_dir * c * (M['O' + tag][d, j] - ref) / p['p0'][vi]
+                pdl = 0.0 if gone else d_dir * c * (pxs[vi] - p['ref'][vi]) / p['p0'][vi]
+                p['legpnl'][vi] += pdl
                 pnl[d] += pdl
                 price[d] += pdl
                 cost[d] += c * fills[vi]
                 pnl[d] -= c * fills[vi]
-            accrue(p, d, d)
-            trades.append({'sym': inp['labels'][j], 'e': p['e'], 'x': d, 'reason': reason})
+            accrue(p, p['te'], t_exit)
+            trades.append({'sym': inp['labels'][j], 'e': p['e'], 'x': d, 'reason': reason, 'fb': p['fb']})
             pos.remove(p)
             exited_today.add(j)
         # 2. входы
@@ -178,45 +281,46 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
                     cands.append((-dv, inp['labels'][j], j, 0 if diff >= 0 else 1))      # short на площадке с большей ставкой
             cands.sort()
             for _dv, _lab, j, sv in cands[:max_pos - len(pos)]:
-                p = {'j': j, 'short': sv, 'e': d, 'p0': (M['OA'][d, j], M['OB'][d, j]), 'ref': [M['OA'][d, j], M['OB'][d, j]], 'legpnl': [0.0, 0.0]}
-                pos.append(p)
+                ha = [_hget(hs[t][j], 'c', hour_abs(d)) for t in 'AB']
+                if all(math.isfinite(x) for x in ha):
+                    mode, p0, te, fb = 'h', (ha[0], ha[1]), (hour_abs(d) + 1) * HOUR, False
+                    cnt['n_h'] += 1
+                else:
+                    mode, p0, te, fb = 'd', (M['CA'][d, j], M['CB'][d, j]), (day0 + d + 1) * DAY, True
+                    cnt['n_fb'] += 1
+                pos.append({'j': j, 'short': sv, 'e': d, 'mode': mode, 'fb': fb, 'p0': p0, 'ref': [p0[0], p0[1]], 'legpnl': [0.0, 0.0], 'te': te})
                 for vi in (0, 1):
                     cost[d] += c * fills[vi]
                     pnl[d] -= c * fills[vi]
-        # 3. разметка дня и ликвидации
+        # 3. контроль аварийного закрытия внутри суток и разметка дня
         for p in list(pos):
             j = p['j']
             if not inp['present'][d, j]:
                 continue
-            liq_leg = []
-            for vi, tag in ((0, 'A'), (1, 'B')):
-                if p['short'] == vi and M['H' + tag][d, j] >= p['p0'][vi] * (1.0 + LIQ_MOVE):
-                    liq_leg.append(vi)
-                if p['short'] != vi and M['L' + tag][d, j] <= p['p0'][vi] * (1.0 - LIQ_MOVE):
-                    liq_leg.append(vi)
-            for vi, tag in ((0, 'A'), (1, 'B')):
+            if p['mode'] == 'h':
+                h0 = hour_abs(d) if d > p['e'] else hour_abs(d) + 1
+                hit = scan(p, d, range(h0, hour_abs(d) + 24))
+            else:
+                hit = scan(p, d, [None]) if d > p['e'] else None
+            if hit is None and p['mode'] == 'h':
+                # часовые бары могли отсутствовать: страховка по дневным high/low (запасной вариант с пометкой)
+                dh = scan(p, d, [None]) if d > p['e'] else None
+                if dh is not None:
+                    p['fb'] = True
+                    hit = dh
+            if hit is not None:
+                emergency(p, d, hit)
+                continue
+            for tag, vi in TAGS:
                 d_dir = -1.0 if p['short'] == vi else 1.0
-                if vi in liq_leg:
-                    day_pnl = -c / LEV - p['legpnl'][vi]                        # нога теряет 100% своей маржи (накопленно −c/2)
-                    p['legpnl'][vi] = -c / LEV
-                else:
-                    day_pnl = d_dir * c * (M['C' + tag][d, j] - p['ref'][vi]) / p['p0'][vi]
-                    p['legpnl'][vi] += day_pnl
-                    p['ref'][vi] = M['C' + tag][d, j]
+                day_pnl = d_dir * c * (M['C' + tag][d, j] - p['ref'][vi]) / p['p0'][vi]
+                p['legpnl'][vi] += day_pnl
+                p['ref'][vi] = M['C' + tag][d, j]
                 pnl[d] += day_pnl
                 price[d] += day_pnl
-            if liq_leg:
-                liq_count += 1
-                for vi in (0, 1):
-                    if vi not in liq_leg:
-                        cost[d] += c * fills[vi]
-                        pnl[d] -= c * fills[vi]
-                accrue(p, d, d)
-                trades.append({'sym': inp['labels'][j], 'e': p['e'], 'x': d, 'reason': 'ликвидация'})
-                pos.remove(p)
-    for p in pos:                                                                # позиции, открытые на конец данных: фандинг до конца, без издержек выхода
-        accrue(p, nd, nd)
-    return {'pnl': pnl, 'fund': fund, 'price': price, 'cost': cost, 'trades': trades, 'liq': liq_count, 'open_end': len(pos)}
+    for p in pos:                                                                # открытые на конец данных: фандинг до конца, издержки выхода не платятся
+        accrue(p, p['te'], (day0 + nd) * DAY)
+    return {'pnl': pnl, 'fund': fund, 'price': price, 'cost': cost, 'trades': trades, 'liq': cnt['liq'], 'emerg': cnt['emerg'], 'n_h': cnt['n_h'], 'n_fb': cnt['n_fb'], 'open_end': len(pos)}
 
 
 # ── метрики и отчёт ─────────────────────────────────────────────────────────────────────────────────
@@ -236,7 +340,8 @@ def metrics(res, inp):
     worst = min(months.values()) if months else 0.0
     f, pr, co = float(res['fund'][first:].sum()), float(res['price'][first:].sum()), float(res['cost'][first:].sum())
     durs = [t['x'] - t['e'] for t in res['trades']]
-    return {'apr': mean * 365, 'sharpe': sharpe, 'dd': dd, 'worst_month': worst, 'years': years, 'n_trades': len(res['trades']), 'avg_days': (float(np.mean(durs)) if durs else None),
+    n_fb = sum(1 for t in res['trades'] if t.get('fb'))
+    return {'n_fb': n_fb, 'emerg': res.get('emerg', 0), 'apr': mean * 365, 'sharpe': sharpe, 'dd': dd, 'worst_month': worst, 'years': years, 'n_trades': len(res['trades']), 'avg_days': (float(np.mean(durs)) if durs else None),
             'fund': f, 'price': pr, 'cost': co, 'fund_share': (f / (f + pr) if (f + pr) != 0 else None), 'cost_to_fund': (co / f if f > 0 else None), 'liq': res['liq'], 'n_days': len(x), 'open_end': res['open_end']}
 
 
@@ -264,7 +369,8 @@ def fmt_metrics(label, T, m, c, ok):
     mark = lambda v: 'да' if v else 'НЕТ'
     yrs = ', '.join(f'{y}: {v * 100:+.2f}%' for y, v in m['years'].items())
     return [f'<b>{label}, T = {T * 100:.2f}% за 8 ч</b>: APR {m["apr"] * 100:+.2f}% [{mark(c["apr"])}], Шарп {fm(m["sharpe"])} [{mark(c["sharpe"])}], просадка {m["dd"] * 100:.1f}% [{mark(c["dd"])}], худший месяц {m["worst_month"] * 100:+.2f}%',
-            f'  сделок {m["n_trades"]}, средняя длительность {fm(m["avg_days"], 1)} сут., ликвидаций {m["liq"]}, открыто на конец {m["open_end"]}; доход: фандинг {m["fund"] * 100:+.2f}%, разница цен {m["price"] * 100:+.2f}%, '
+            f'  сделок {m["n_trades"]} (базис по 1h: {m["n_trades"] - m["n_fb"]}, по дневному close — запасной вариант: {m["n_fb"]}), средняя длительность {fm(m["avg_days"], 1)} сут., '
+            f'аварийных закрытий (ход ≥ 30%): {m["emerg"]}, ликвидаций ног (гэп ≥ 45%): {m["liq"]}, открыто на конец {m["open_end"]}; доход: фандинг {m["fund"] * 100:+.2f}%, разница цен {m["price"] * 100:+.2f}%, '
             f'издержки {m["cost"] * 100:.2f}% (издержки / валовый фандинг {fm(m["cost_to_fund"], 2)}); доля фандинга в P&L {fm(m["fund_share"], 2) if m["fund_share"] is not None else "н/д"}',
             f'  по годам: {yrs}; 2025 [{mark(c["y2025"])}], 2026 [{mark(c["y2026"])}]; ' + ('<b>критерии выполнены</b>' if ok else 'критерии НЕ выполнены')]
 
@@ -275,7 +381,7 @@ def load_venues(xdir, bdir, fee_taker):
     idx = X.load_index(xdir)
     ven = {}
     for ex in X.EXCHANGES:
-        bars, fund = {}, {}
+        bars, fund, hbars = {}, {}, {}
         for sym in idx['bars'].get(ex, {}):
             b = X.load_bars(xdir, ex, sym)
             if b is not None and len(b['ts']):
@@ -283,7 +389,10 @@ def load_venues(xdir, bdir, fee_taker):
                 f = X.load_fund(xdir, ex, sym)
                 if f is not None:
                     fund[sym] = f
-        ven[ex] = {'bars': bars, 'fund': fund, 'fee': (fee_taker if ex == 'bingx' else FEE_DEFAULT), 'markets': idx['markets'].get(ex, {})}
+                hb = X.load_hbars(xdir, ex, sym)
+                if hb is not None:
+                    hbars[sym] = hb
+        ven[ex] = {'bars': bars, 'fund': fund, 'hbars': hbars, 'fee': (fee_taker if ex == 'bingx' else FEE_DEFAULT), 'markets': idx['markets'].get(ex, {})}
     return ven
 
 
@@ -346,6 +455,8 @@ async def run_xfund(params, progress=None):
     for tag, vv, ix in (('BingX', ven['bingx'], 0), ('Bybit', ven['bybit'], 1)):
         vals = [interval_hours(inp['fund'][j][ix][0]) for j in range(len(inp['labels'])) if inp['fund'][j][ix] is not None]
         ints[tag] = float(np.median([v for v in vals if v])) if vals else None
+    nh = sum(1 for vv in (ven['bingx'], ven['bybit']) for _ in vv['hbars'])
+    R.append(f'1h-свечи: символов с часовыми рядами BingX {len(ven["bingx"]["hbars"])}, Bybit {len(ven["bybit"]["hbars"])}' + (' — НЕТ часовых данных: весь базис по дневному close (запасной вариант)' if not nh else ''))
     R.append(f'Интервалы начисления (медиана по парам, ч): BingX {fm(ints["BingX"], 1)}, Bybit {fm(ints["Bybit"], 1)}; ставки приводятся к 8 ч (сумма за 72 ч ÷ 9)')
     first = int(np.argmax(inp['elig'].any(axis=1))) if inp['elig'].any() else 0
     R.append(f'Допущенных суток-пар (ликвидность ≥ 20 млн на обеих биржах и ≥ 2 события): {int(inp["elig"].sum())}; период {datetime.fromtimestamp((inp["day0"] + first) * DAY / 1000, timezone.utc):%Y-%m-%d} … {datetime.fromtimestamp((inp["day0"] + inp["nd"] - 1) * DAY / 1000, timezone.utc):%Y-%m-%d}')

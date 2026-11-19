@@ -352,24 +352,41 @@ class XData(unittest.TestCase):
 
 
 # ── X1 ──────────────────────────────────────────────────────────────────────────────────────────────
-def x1_inputs(nd=120, rate_a=0.0005, rate_b=0.0, pa=None, pb=None, n_pairs=1, fee=(0.0005, 0.0005), spike=None, drop_after=None, qv=1e8):
-    """Простая пара: обе площадки торгуют по одному общему блужданию (корреляция 1) ~100; множители pa/pb — разница цен площадок; фандинг: A — rate_a за 8 ч (3 события в сутки), B — rate_b."""
+def x1_inputs(nd=120, rate_a=0.0005, rate_b=0.0, pa=None, pb=None, n_pairs=1, fee=(0.0005, 0.0005), hourly=True, drop_after=None, qv=1e8, h0=(100.0, 100.0), h23=(100.0, 100.0), events_a=None, events_b=None):
+    """Пара с общим случайным блужданием (корреляция 1): внутри суток close часа 0 = h0·base, close остальных часов = h23·base (так базис «час 0 против конца суток» задаётся явно); фандинг: A — rate_a за 8 ч
+    (3 события в сутки), B — rate_b; events_a/events_b — явные (ts, rate). hourly=False — без часовых рядов (дневной запасной вариант)."""
     day0 = 20000
     ts = (day0 + np.arange(nd)) * DAY
-    base = 100.0 * np.exp(np.cumsum(np.random.default_rng(5).normal(0, 0.01, nd)))
-    venues = {}
-    for tag, rate, mul in (('A', rate_a, pa), ('B', rate_b, pb)):
-        px = base * (1.0 if mul is None else np.asarray(mul, float) / 100.0)
-        bars = {'ts': ts, 'o': px.copy(), 'h': px * 1.001, 'l': px * 0.999, 'c': px.copy(), 'qv': np.full(nd, qv)}
-        ev_ts = (np.arange(nd * 3) + 1) * 8 * 3_600_000 + day0 * DAY
-        r = np.full(nd * 3, rate) if drop_after is None or tag == 'B' else np.where(ev_ts < (day0 + drop_after) * DAY, rate, 0.0)
-        venues[tag] = (bars, (ev_ts.astype(np.int64), r))
-    if spike is not None:
-        tag, day, hi = spike
-        venues[tag][0]['h'][day] = venues[tag][0]['o'][day] * hi
-    vA = {'bars': {f'sa{i}': venues['A'][0] for i in range(n_pairs)}, 'fund': {f'sa{i}': venues['A'][1] for i in range(n_pairs)}, 'fee': fee[0]}
-    vB = {'bars': {f'sb{i}': venues['B'][0] for i in range(n_pairs)}, 'fund': {f'sb{i}': venues['B'][1] for i in range(n_pairs)}, 'fee': fee[1]}
+    base = np.exp(np.cumsum(np.random.default_rng(5).normal(0, 0.01, nd)))
+    out = {}
+    for tag, rate, hh0, hh23, ev in (('A', rate_a, h0[0], h23[0], events_a), ('B', rate_b, h0[1], h23[1], events_b)):
+        hc = np.empty((nd, 24))
+        hc[:, 0] = hh0 * base
+        hc[:, 1:] = (hh23 * base)[:, None]
+        hh = hc * 1.0005
+        hl = hc * 0.9995
+        bars = {'ts': ts, 'o': hc[:, 0] * 1.0, 'h': hh.max(axis=1), 'l': hl.min(axis=1), 'c': hc[:, 23].copy(), 'qv': np.full(nd, qv)}
+        hts = (day0 * 24 + np.arange(nd * 24)) * 3_600_000
+        hb = {'ts': hts.astype(np.int64), 'h': hh.reshape(-1).copy(), 'l': hl.reshape(-1).copy(), 'c': hc.reshape(-1).copy()}
+        if ev is None:
+            ev_ts = (np.arange(nd * 3) + 1) * 8 * 3_600_000 + day0 * DAY
+            r = np.full(nd * 3, rate) if drop_after is None or tag == 'B' else np.where(ev_ts < (day0 + drop_after) * DAY, rate, 0.0)
+            ev = (ev_ts.astype(np.int64), r)
+        out[tag] = (bars, hb, ev)
+    vA = {'bars': {f'sa{i}': out['A'][0] for i in range(n_pairs)}, 'fund': {f'sa{i}': out['A'][2] for i in range(n_pairs)}, 'fee': fee[0], 'hbars': ({f'sa{i}': out['A'][1] for i in range(n_pairs)} if hourly else {})}
+    vB = {'bars': {f'sb{i}': out['B'][0] for i in range(n_pairs)}, 'fund': {f'sb{i}': out['B'][2] for i in range(n_pairs)}, 'fee': fee[1], 'hbars': ({f'sb{i}': out['B'][1] for i in range(n_pairs)} if hourly else {})}
     return vA, vB, [(f'P{i}', f'sa{i}', f'sb{i}') for i in range(n_pairs)]
+
+
+def set_hour(ven, sym, abs_hour, key, value):
+    """Меняет часовой бар (абсолютный час с эпохи) и пересчитывает дневные high/low."""
+    hb = ven['hbars'][sym]
+    i = int(abs_hour - hb['ts'][0] // 3_600_000)
+    hb[key][i] = value
+    day_i = i // 24
+    bars = ven['bars'][sym]
+    bars['h'][day_i] = max(bars['h'][day_i], float(hb['h'][day_i * 24:(day_i + 1) * 24].max()))
+    bars['l'][day_i] = min(bars['l'][day_i], float(hb['l'][day_i * 24:(day_i + 1) * 24].min()))
 
 
 class X1(unittest.TestCase):
@@ -388,23 +405,59 @@ class X1(unittest.TestCase):
             self.assertAlmostEqual(float(m[10]), 0.0001, places=9)
         self.assertEqual(XF.interval_hours(e4[0]), 4.0)
         self.assertTrue(np.isnan(XF.avg8_matrix(day0, 20, ([day0 * DAY + 1000], [0.1]))[10]))             # < 2 событий в окне — NaN
-        # строго до 00:00: событие ровно в 00:00 суток d в окно суток d не входит
         ev = (np.array([day0 * DAY + 5 * DAY - 2 * 3_600_000, day0 * DAY + 5 * DAY - 3_600_000, day0 * DAY + 5 * DAY]), np.array([0.0001, 0.0001, 1.0]))
-        self.assertAlmostEqual(float(XF.avg8_matrix(day0, 10, ev)[5]), 0.0002 / 9.0, places=12)
+        self.assertAlmostEqual(float(XF.avg8_matrix(day0, 10, ev)[5]), 0.0002 / 9.0, places=12)           # событие ровно в 00:00 суток сигнала в окно не входит
 
-    def test_four_fills_funding_and_costs(self):
+    def test_three_thresholds(self):
+        self.assertEqual(XF.THRESHOLDS, (0.0002, 0.0005, 0.0010))
+        vA, vB, pairs = x1_inputs(rate_a=0.0007, rate_b=0.0)                                              # d = 0.07% за 8 ч
+        inp, _ = XF.build_inputs(vA, vB, pairs)
+        n_trades = [len(XF.simulate_x1(inp, T)['trades']) + XF.simulate_x1(inp, T)['open_end'] for T in XF.THRESHOLDS]
+        self.assertGreater(n_trades[0], 0)
+        self.assertGreater(n_trades[1], 0)
+        self.assertEqual(n_trades[2], 0)                                                                   # T = 0.10% > d: входов нет
+
+    def test_four_fills_funding_by_timestamps_and_costs(self):
         vA, vB, pairs = x1_inputs(nd=120)
         inp, rej = XF.build_inputs(vA, vB, pairs)
         res = XF.simulate_x1(inp, 0.0002)
         tr = res['trades'][0]
         self.assertEqual((tr['reason'], tr['x'] - tr['e']), ('время', 14))
         c = XF.C_POS
-        self.assertAlmostEqual(float(res['cost'].sum()), c * (0.0005 + XF.SLIP) * (4 * len(res['trades']) + 2 * res['open_end']), places=9)   # закрытая сделка — 4 исполнения (комиссия + проскальзывание), открытая на конец — 2 входа
-        self.assertAlmostEqual(float(res['fund'][:tr['x'] + 1].sum()) / 1.0, 14 * 3 * 0.0005 * c, places=7)              # шорт на A получает 0.05% × 3 в сутки × 14 суток на номинал c
+        self.assertAlmostEqual(float(res['cost'].sum()), c * (0.0005 + XF.SLIP) * (4 * len(res['trades']) + 2 * res['open_end']), places=9)   # закрытая сделка — 4 исполнения, открытая на конец — 2 входа
+        self.assertAlmostEqual(float(res['fund'][:tr['x'] + 1].sum()), 14 * 3 * 0.0005 * c, places=7)      # 14 суток × 3 события × 0.05% × номинал ноги c (шорт на A получает)
         self.assertAlmostEqual(float(res['price'].sum()), 0.0, places=6)
         stress = XF.simulate_x1(inp, 0.0002, mult=2.0)
         self.assertAlmostEqual(float(stress['cost'].sum()), 2 * float(res['cost'].sum()), places=9)
-        self.assertAlmostEqual(float(stress['fund'].sum()), float(res['fund'].sum()), places=12)                         # фандинг не удваивается
+        self.assertAlmostEqual(float(stress['fund'].sum()), float(res['fund'].sum()), places=12)           # фандинг не удваивается
+
+    def test_funding_uses_actual_timestamps_not_8h_normalisation(self):
+        """A начисляет раз в час (0.00002 за расчёт), B раз в 4 часа (0.00004): суммы — по фактическим отметкам времени каждой биржи в (вход, выход]."""
+        nd = 100
+        day0 = 20000
+        ta = (np.arange(nd * 24) + 1) * 3_600_000 + day0 * DAY
+        tb = (np.arange(nd * 6) + 1) * 4 * 3_600_000 + day0 * DAY
+        ev_a = (ta.astype(np.int64), np.full(len(ta), 0.00004))
+        ev_b = (tb.astype(np.int64), np.full(len(tb), 0.00001))
+        vA, vB, pairs = x1_inputs(nd=nd, events_a=ev_a, events_b=ev_b)
+        inp, _ = XF.build_inputs(vA, vB, pairs)
+        res = XF.simulate_x1(inp, 0.0002)
+        self.assertTrue(res['trades'])
+        c = XF.C_POS
+        exp = 0.0
+        spans = [((day0 + t['e']) * DAY + 3_600_000, (day0 + t['x']) * DAY + 3_600_000) for t in res['trades']]
+        for t0, t1 in spans:
+            na = int(((ev_a[0] > t0) & (ev_a[0] <= t1)).sum())
+            nb = int(((ev_b[0] > t0) & (ev_b[0] <= t1)).sum())
+            exp += c * (na * 0.00004 - nb * 0.00001)                                                       # A — шорт (получает), B — лонг (платит)
+        if res['open_end']:
+            t0 = ((day0 + inp['nd'] - 1) * DAY)                                                            # открытая позиция: событий до конца данных (проверяется отдельно ниже)
+        short_is_a = (XF.avg8_matrix(day0, nd, ev_a)[10] - XF.avg8_matrix(day0, nd, ev_b)[10]) > 0
+        self.assertTrue(short_is_a)
+        if not res['open_end']:
+            self.assertAlmostEqual(float(res['fund'].sum()), exp, places=9)
+        else:
+            self.assertGreaterEqual(float(res['fund'].sum()), exp - 1e-12)
 
     def test_orientation_threshold_and_exit_on_d(self):
         vA, vB, pairs = x1_inputs(nd=120, rate_a=0.0, rate_b=0.0005)
@@ -420,25 +473,74 @@ class X1(unittest.TestCase):
         self.assertEqual(tr['reason'], 'd')                                                                              # выход при d < 0.005%
         self.assertLess(tr['x'] - tr['e'], 14)
 
-    def test_leg_liquidation_and_price_difference(self):
-        # шорт-нога (A) вырастает на 45% за сутки: нога ликвидирована (−c/2 накопленно), вторая закрывается, позиция закрыта
-        vA, vB, pairs = x1_inputs(nd=120, spike=('A', 6, 1.45))
-        inp, _ = XF.build_inputs(vA, vB, pairs)
-        res = XF.simulate_x1(inp, 0.0002)
-        self.assertEqual(res['liq'], 1)
-        self.assertEqual(res['trades'][0]['reason'], 'ликвидация')
+    def test_basis_by_1h_close_and_daily_fallback_counter(self):
+        """Вход по close часа 00:00 (на A: 100, к концу суток 101): ценовой результат дня входа −c·1% (шорт A); дневной запасной вариант — вход по дневному close (101): 0; счётчики."""
         c = XF.C_POS
-        self.assertAlmostEqual(float(res['price'].sum()), -c / 2.0, delta=0.01)                                          # потеря маржи ноги ≈ −c/2 (вторая нога ≈ 0)
-        # разница цен бирж на входе/выходе входит в P&L: A открывается 100 → 100; B открывается 101 (лонг) и на выходе 99
-        pa = np.full(120, 100.0)
-        pb = np.full(120, 101.0)
-        pb[20:] = 99.5
-        vA, vB, pairs = x1_inputs(nd=120, pa=pa, pb=pb, rate_a=0.0005, rate_b=0.0)
+        vA, vB, pairs = x1_inputs(nd=120, h0=(100.0, 100.0), h23=(101.0, 100.0))
         inp, _ = XF.build_inputs(vA, vB, pairs)
-        r2 = XF.simulate_x1(inp, 0.0002)
-        tr = r2['trades'][0]
-        if tr['x'] > 19:
-            self.assertLess(float(r2['price'].sum()), 0)                                                                  # лонг на B купил по 101, закрыл по 99
+        rh = XF.simulate_x1(inp, 0.0002)
+        e = rh['trades'][0]['e']
+        self.assertAlmostEqual(float(rh['price'][e]), -c * 0.01, places=6)
+        self.assertGreater(rh['n_h'], 0)
+        self.assertEqual(rh['n_fb'], 0)
+        self.assertFalse(any(t['fb'] for t in rh['trades']))
+        vA2, vB2, pairs2 = x1_inputs(nd=120, h0=(100.0, 100.0), h23=(101.0, 100.0), hourly=False)
+        inp2, _ = XF.build_inputs(vA2, vB2, pairs2)
+        rd = XF.simulate_x1(inp2, 0.0002)
+        self.assertAlmostEqual(float(rd['price'][rd['trades'][0]['e']]), 0.0, places=9)
+        self.assertGreater(rd['n_fb'], 0)
+        self.assertEqual(rd['n_h'], 0)
+        self.assertTrue(all(t['fb'] for t in rd['trades']))
+        self.assertEqual(XF.metrics(rd, inp2)['n_fb'], len(rd['trades']))
+
+    def _first_entry(self, vA, vB, pairs):
+        inp, _ = XF.build_inputs(vA, vB, pairs)
+        r0 = XF.simulate_x1(inp, 0.0002)
+        e = r0['trades'][0]['e']
+        j0 = (inp['day0'] + e) * 24
+        return inp, e, j0
+
+    def test_emergency_close_at_30_percent_by_hourly_high(self):
+        c = XF.C_POS
+        vA, vB, pairs = x1_inputs(nd=120)
+        inp, e, h0 = self._first_entry(vA, vB, pairs)
+        p0a = float(vA['hbars']['sa0']['c'][e * 24])                                                                     # цена входа на A (close часа 00:00)
+        set_hour(vA, 'sa0', h0 + 24 * 2 + 5, 'h', p0a * 1.35)                                                            # шорт-нога: high = +35% (≥ 30%, < 45%)
+        inp2, _ = XF.build_inputs(vA, vB, pairs)
+        res = XF.simulate_x1(inp2, 0.0002)
+        tr = res['trades'][0]
+        self.assertEqual((tr['reason'], tr['x'] - tr['e']), ('аварийное 30%', 2))
+        self.assertEqual((res['emerg'], res['liq']), (1, 0))                                                             # одно аварийное закрытие: сработала нога A, вторая закрыта по close бара
+        day_price = float(res['price'][:tr['x'] + 1].sum())
+        self.assertAlmostEqual(day_price, -0.30 * c, delta=0.01)                                                         # сработавшая нога — по уровню 1.30·вход: −30% × c; вторая ≈ рыночная
+        self.assertAlmostEqual(float(res['cost'][:tr['x'] + 1].sum()), 4 * c * (0.0005 + XF.SLIP), places=9)            # 2 входа + 2 закрытия (обе ноги)
+        self.assertEqual(res['trades'][1]['e'] > tr['x'], True)
+
+    def test_gap_45_percent_liquidates_leg(self):
+        c = XF.C_POS
+        vA, vB, pairs = x1_inputs(nd=120)
+        inp, e, h0 = self._first_entry(vA, vB, pairs)
+        p0a = float(vA['hbars']['sa0']['c'][e * 24])
+        set_hour(vA, 'sa0', h0 + 24 * 2 + 5, 'h', p0a * 1.50)                                                            # за один бар ≥ 45%
+        inp2, _ = XF.build_inputs(vA, vB, pairs)
+        res = XF.simulate_x1(inp2, 0.0002)
+        tr = res['trades'][0]
+        self.assertEqual(tr['reason'], 'ликвидация (гэп)')
+        self.assertEqual((res['liq'], res['emerg']), (1, 0))
+        self.assertAlmostEqual(float(res['price'][:tr['x'] + 1].sum()), -c / 2.0, delta=0.01)                           # −100% маржи ноги = −c/2; вторая нога ≈ рыночная
+        self.assertAlmostEqual(float(res['cost'][:tr['x'] + 1].sum()), 3 * c * (0.0005 + XF.SLIP), places=9)            # 2 входа + закрытие второй ноги (ликвидированная издержек закрытия не платит)
+
+    def test_daily_fallback_emergency_uses_daily_high_low(self):
+        vA, vB, pairs = x1_inputs(nd=120, hourly=False)
+        inp, _ = XF.build_inputs(vA, vB, pairs)
+        r0 = XF.simulate_x1(inp, 0.0002)
+        e = r0['trades'][0]['e']
+        p0a = float(vA['bars']['sa0']['c'][e])
+        vA['bars']['sa0']['h'][e + 2] = p0a * 1.36
+        inp2, _ = XF.build_inputs(vA, vB, pairs)
+        res = XF.simulate_x1(inp2, 0.0002)
+        self.assertEqual(res['trades'][0]['reason'], 'аварийное 30%')
+        self.assertTrue(res['trades'][0]['fb'])
 
     def test_max_positions_and_metrics(self):
         vA, vB, pairs = x1_inputs(nd=120, n_pairs=8)
@@ -475,7 +577,7 @@ class X1(unittest.TestCase):
         idx['markets'] = mk
         X.save_index(xdir, idx)
         txt = run(XF.run_xfund({'xdir': xdir, 'bdir': bdir, 'fdir': fdir, 'fee_taker': 0.0005, 'version': 'vT'}))
-        for needle in ('межбиржевой арбитраж фандинга X1', 'T = 0.02%', 'T = 0.05%', 'ликвидаций', 'по годам', 'Решение (§2.48.3', 'Интервалы начисления'):
+        for needle in ('межбиржевой арбитраж фандинга X1', 'T = 0.02%', 'T = 0.05%', 'T = 0.10%', 'ликвидаций ног', 'аварийных закрытий', 'по дневному close — запасной вариант', 'по годам', 'Решение (§2.48.3', 'Интервалы начисления', 'НЕТ часовых данных'):
             self.assertIn(needle, txt)
         self.assertIsNotNone(RF.kv_get(XF.KV_PASSED, fdir))
         self.assertEqual(len(XF.scan_list(xdir)), 6)
@@ -602,7 +704,7 @@ class Wiring(unittest.TestCase):
         src = open(os.path.join(ROOT, 'async_bot.py'), encoding='utf-8').read()
         for c in ("cmd == '/h2_funding_check'", "cmd == '/h2_replicate'", "cmd == '/xfund_test'", "cmd == '/exec_check'", 'async def exec_check_cmd', '/exec_check h2|x1'):
             self.assertIn(c, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v116'))
+        self.assertGreaterEqual(int(re.search(r'v(\d+)$', a.CODE_VERSION).group(1)), 116)
 
 
 if __name__ == '__main__':

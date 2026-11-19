@@ -13,6 +13,7 @@ import research_bdata as B
 import research_vision as V
 
 DAY = 86_400_000
+HOUR = 3_600_000
 EXCHANGES = ('bybit', 'bingx')
 RETRY_DELAYS = (2, 6, 15)
 LIQ_COARSE = 20_000_000.0               # грубый фильтр загрузки фандинга: максимум 30-дневного среднего оборота ≥ 20 млн USDT
@@ -50,6 +51,10 @@ def fund_path(d, ex, sym):
     return os.path.join(d, ex, safe(sym) + '.fr.npz')
 
 
+def hbars_path(d, ex, sym):
+    return os.path.join(d, ex, safe(sym) + '.h1.npz')
+
+
 def index_path(d):
     return os.path.join(d, 'xindex.json')
 
@@ -60,7 +65,7 @@ def load_index(d):
             idx = json.load(f)
     except (OSError, ValueError):
         idx = {}
-    for k in ('markets', 'bars', 'fund', 'fail'):
+    for k in ('markets', 'bars', 'fund', 'hbars', 'fail'):
         idx.setdefault(k, {ex: {} for ex in EXCHANGES} if k != 'fail' else {})
     idx.setdefault('t', 0)
     return idx
@@ -83,6 +88,18 @@ def load_bars(d, ex, sym):
     if z is None:
         return None
     return {k: z[k] for k in ('ts', 'o', 'h', 'l', 'c', 'v')} | {'qv': z['v'] * z['c']}
+
+
+def save_hbars(d, ex, sym, ts, h, l, c):
+    """Часовые свечи для X1 (BOT_SPEC §2.48.6): только high/low/close (float32) — экономия памяти и диска."""
+    V._atomic_savez(hbars_path(d, ex, sym), ts=np.asarray(ts, np.int64), h=np.asarray(h, np.float32), l=np.asarray(l, np.float32), c=np.asarray(c, np.float32))
+
+
+def load_hbars(d, ex, sym):
+    z = V._load_npz(hbars_path(d, ex, sym))
+    if z is None:
+        return None
+    return {k: z[k] for k in ('ts', 'h', 'l', 'c')}
 
 
 def save_fund(d, ex, sym, ts, rate):
@@ -139,11 +156,12 @@ class Fetcher:
         raise last
 
 
-async def fetch_bars(f, sym, since_ms, now_ms, limit=1000):
-    """Дневные свечи вперёд от since_ms, только ЗАКРЫТЫЕ (бар с началом + сутки ≤ now). → (ts, o, h, l, c, v) массивы."""
+async def fetch_bars(f, sym, since_ms, now_ms, limit=1000, tf='1d'):
+    """Свечи вперёд от since_ms (tf '1d' или '1h'), только ЗАКРЫТЫЕ (начало + шаг ≤ now). → (ts, o, h, l, c, v) массивы."""
+    step = DAY if tf == '1d' else HOUR
     rows, since = {}, since_ms
-    for _ in range(200):
-        got = await f.call('fetch_ohlcv', sym, '1d', since, limit)
+    for _ in range(400 if tf == '1h' else 200):
+        got = await f.call('fetch_ohlcv', sym, tf, since, limit)
         if not got:
             break
         new = 0
@@ -151,11 +169,11 @@ async def fetch_bars(f, sym, since_ms, now_ms, limit=1000):
             if r[0] not in rows:
                 rows[int(r[0])] = r
                 new += 1
-        nxt = int(got[-1][0]) + DAY
+        nxt = int(got[-1][0]) + step
         if new == 0 or nxt <= since or nxt > now_ms:
             break
         since = nxt
-    ts = sorted(t for t in rows if t + DAY <= now_ms)
+    ts = sorted(t for t in rows if t + step <= now_ms)
     a = np.array([rows[t][1:6] for t in ts], float) if ts else np.zeros((0, 5))
     return np.array(ts, np.int64), a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4]
 
@@ -381,6 +399,35 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     save_index(d, idx)
             save_index(d, idx)
             L.append(f'  фандинг запрошен для {len(todo)} грубо ликвидных символов (загружено в этом прогоне {n_f})')
+            # 3. часовые свечи для X1: общие базы Bybit∩BingX, грубо ликвидные (BOT_SPEC §2.48.6 п. 2)
+            if params.get('hourly', True) and not stopped:
+                htodo = [(ex, sym, b) for ex, sym, b in todo if mk[ex][sym]['norm'] in common]
+                n_h = 0
+                for ex, sym, b in htodo:
+                    if time.time() > deadline:
+                        stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
+                        break
+                    rec = idx['hbars'][ex].get(sym)
+                    if rec and rec.get('last', 0) + 3 * HOUR >= now_ms - DAY:
+                        continue
+                    cur = load_hbars(d, ex, sym)
+                    since = (int(cur['ts'][-1]) + HOUR) if cur is not None and len(cur['ts']) else int(b['ts'][0])
+                    try:
+                        hts, _o, hh, hl, hc, _v = await fetch_bars(fx[ex], sym, since, now_ms, tf='1h')
+                    except Exception as e:
+                        idx['fail'][f'{ex}:{sym}:h1'] = type(e).__name__
+                        continue
+                    if cur is not None and len(cur['ts']):
+                        hts = np.concatenate([cur['ts'], hts]); hh = np.concatenate([cur['h'], hh]); hl = np.concatenate([cur['l'], hl]); hc = np.concatenate([cur['c'], hc])
+                    if len(hts):
+                        save_hbars(d, ex, sym, hts, hh, hl, hc)
+                        idx['hbars'][ex][sym] = {'first': int(hts[0]), 'last': int(hts[-1]), 'n': int(len(hts)), 't': now_ms}
+                    n_h += 1
+                    if progress and n_h % 5 == 0:
+                        await progress(f'1h-свечи: загружено символов {n_h}/{len(htodo)} ({ex}:{sym})')
+                        save_index(d, idx)
+                save_index(d, idx)
+                L.append(f'  1h-свечи X1 запрошены для {len(htodo)} символов (загружено в этом прогоне {n_h})')
         idx['t'] = now_ms
         save_index(d, idx)
     finally:
