@@ -257,6 +257,11 @@ class Hints(unittest.TestCase):
         self.assertIsNone(a.command_hint('/zzzzzzzz'))                                        # похожей нет — тишина, как раньше
         self.assertIsNone(a.command_hint('просто текст'))
         self.assertIn('/xfund_test load', a.command_hint('/xdata load'))                      # команды /xdata нет (прод-лог)
+        self.assertIsNone(a.command_hint('/h2_replicat@some_other_bot'))                      # чужой бот — молчим (v96)
+        txt = a._unknown_command_text('/h2_replicat')                                          # ответ диспетчера на неизвестную команду
+        self.assertIn('возможно, вы имели в виду /h2_replicate', txt.lower())
+        self.assertIn(a.CODE_VERSION, txt)
+        self.assertEqual(a._unknown_command_text('/zzzzzzzz'), f'Неизвестная команда /zzzzzzzz. Версия бота: {a.CODE_VERSION}. /help — список команд')
         self.assertEqual(a.levenshtein('kitten', 'sitting'), 3)
         self.assertEqual(a.levenshtein('/h2_replicat', '/h2_replicate'), 1)
 
