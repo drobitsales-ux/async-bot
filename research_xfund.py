@@ -1,5 +1,6 @@
 """research_xfund.py — X1: межбиржевой арбитраж фандинга (BingX/Bybit), BOT_SPEC §2.48. Нейтральная к направлению пара ног (шорт на бирже с более высокой ставкой, лонг на другой); суточная
 симуляция по дневным барам и событиям фандинга обеих бирж; ни одного реального ордера. Справочно — пары с Binance (архив v108)."""
+import asyncio
 import math
 import time
 from datetime import datetime, timezone
@@ -324,7 +325,7 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
                 price[d] += day_pnl
     for p in pos:                                                                # открытые на конец данных: фандинг до конца, издержки выхода не платятся
         accrue(p, p['te'], (day0 + nd) * DAY)
-    return {'pnl': pnl, 'fund': fund, 'price': price, 'cost': cost, 'trades': trades, 'liq': cnt['liq'], 'emerg': cnt['emerg'], 'n_h': cnt['n_h'], 'n_fb': cnt['n_fb'], 'open_end': len(pos)}
+    return {'pnl': pnl, 'fund': fund, 'price': price, 'cost': cost, 'trades': trades, 'liq': cnt['liq'], 'emerg': cnt['emerg'], 'n_h': cnt['n_h'], 'n_fb': cnt['n_fb'], 'open_end': len(pos), 'open_syms': [inp['labels'][p_['j']] for p_ in pos]}
 
 
 # ── метрики и отчёт ─────────────────────────────────────────────────────────────────────────────────
@@ -472,6 +473,8 @@ async def sync_binance_h1(params, progress=None, fetch=None):
     idx = X.load_index(xdir)
     norms = {idx['markets'].get('bingx', {}).get(s, {}).get('norm') for s in idx['fund'].get('bingx', {})}
     norms.discard(None)
+    if params.get('only_norms') is not None:                         # [v121] 1h архива — только для баз символов сделок (прогон назад по всем общим базам — часы)
+        norms &= set(params['only_norms'])
     syms = []
     for s in sorted(idx_b['symbols']):
         nb = X.norm_base(s[:-4] if s.endswith('USDT') else s)
@@ -490,6 +493,53 @@ async def sync_binance_h1(params, progress=None, fetch=None):
     return f'  Binance 1h-свечи (архив): символов {r["processed"]}/{len(syms)}, месяцев загружено {r["loaded"]}, не получено {r["failed"]}{tail}'
 
 
+def prelim_traded(xdir, bdir, fee):
+    """[v121, §2.53] Символы, попавшие в сделки X1 в предварительном прогоне на дневных данных (все пороги THRESHOLDS; закрытые и открытые на конец позиции):
+    → ([(метка, символ BingX)], число пар в прогоне). 1h-свечи нужны только им (базис и ход против ноги по 1h)."""
+    ven = load_venues(xdir, bdir, fee)
+    if not ven['bingx']['bars']:
+        return [], 0
+    norms = {X.norm_base(sym.split('/')[0]) for sym in ven['bingx']['bars']} | {v.get('norm') for v in ven['bingx']['markets'].values() if v.get('norm')}
+    bn = binance_venue(bdir, norms, FEE_DEFAULT, with_h1=False)
+    pairs = main_pairs_binance(ven['bingx'], bn)
+    inp, _rej = build_inputs(dict(ven['bingx'], hbars={}), bn, pairs)
+    if inp is None:
+        return [], len(pairs)
+    lab2sym = {p[0]: p[1] for p in pairs}
+    traded = set()
+    for T in THRESHOLDS:
+        res = simulate_x1(inp, T)
+        traded |= {t['sym'] for t in res['trades']} | set(res['open_syms'])
+    return sorted((lab, lab2sym[lab]) for lab in traded if lab in lab2sym), len(pairs)
+
+
+async def load_traded_hourly(params, progress=None, exchanges=None, now_ms=None, sleep=asyncio.sleep):
+    """[v121] 1h BingX для символов сделок предварительного прогона X1 (по одному символу, сразу в журнал; продолжение с места остановки). → строка отчёта."""
+    xdir = params.get('xdir') or X.xdata_dir()
+    bdir = params.get('bdir') or B.battery_dir()
+    fee = float(params.get('fee_taker', FEE_DEFAULT))
+    traded, npairs = prelim_traded(xdir, bdir, fee)
+    if not traded:
+        return f'  1h BingX: символов сделок в предварительном прогоне нет (пар {npairs})'
+    now_ms = int(now_ms or time.time() * 1000)
+    own = exchanges is None
+    if own:
+        import ccxt.async_support as ccxt
+        exchanges = {'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
+    try:
+        idx = X.load_index(xdir)
+        fx = {'bingx': X.Fetcher(exchanges['bingx'], sleep=sleep)}
+        dn, em, lf, stp = await X.load_hourly(xdir, idx, fx, 'bingx', [s_ for _l, s_ in traded], now_ms, time.time() + float(params.get('max_minutes', 150)) * 60, progress)
+        X.save_index(xdir, idx)
+    finally:
+        if own:
+            import access_probe
+            for c in exchanges.values():
+                await access_probe.close_ccxt(c)
+    return (f'  1h BingX по символам сделок предварительного прогона: загружено {dn} из {len(traded)}, осталось {lf}; подтверждённо пусто/постоянная ошибка: {em}'
+            + (' — ⏱ бюджет времени исчерпан, повторите команду' if stp else ''))
+
+
 async def run_xfund(params, progress=None):
     """`/xfund_test [load]`: load — загрузка данных; иначе симуляция X1 по T ∈ {0.02%, 0.05%} (+ справочно Binance-пары), критерии §2.48.3."""
     xdir = params.get('xdir') or X.xdata_dir()
@@ -500,7 +550,9 @@ async def run_xfund(params, progress=None):
     if params.get('mode') == 'load':
         txt = await X.run_xload(dict(params, x1_main=main_binance, venues=params.get('venues') or (('bingx',) if main_binance else None)), progress)
         if main_binance:
-            txt += '\n' + await sync_binance_h1(params, progress, params.get('b_fetch'))
+            traded, _np = prelim_traded(xdir, bdir, fee)                      # 1h — только по символам сделок (Binance из архива, BingX через ccxt)
+            txt += '\n' + await sync_binance_h1(dict(params, only_norms=[lab for lab, _s in traded]), progress, params.get('b_fetch'))
+            txt += '\n' + await load_traded_hourly(params, progress, params.get('ccxt_exchanges'))
         return txt
     ven = load_venues(xdir, bdir, fee)
     nameB = 'Binance' if main_binance else 'Bybit'
@@ -516,6 +568,11 @@ async def run_xfund(params, progress=None):
         if not ven['bingx']['bars'] or not ven['bybit']['bars']:
             return '⛔ /xfund_test отказ: нет данных Bybit/BingX — выполните /xfund_test load до сообщения «загрузка завершена»'
         pairs = common_pairs(ven)
+    if main_binance and float(params.get('coverage_min', X.COVERAGE_MIN)) > 0:
+        traded, _np = prelim_traded(xdir, bdir, fee)
+        cov = X.coverage_report(xdir, 'x1', bdir, hourly_syms=[('bingx', s_) for _l, s_ in traded], minimum=float(params.get('coverage_min', X.COVERAGE_MIN)))
+        if not cov['ok']:
+            return ('⛔ /xfund_test отказ: данные неполны: ' + '; '.join(cov['lines']) + '. Расчёта и вердикта нет (BOT_SPEC §2.53): выполните /xfund_test load (повторяйте до «✅ загрузка завершена»).')
     venB = ven['binance'] if main_binance else ven['bybit']
     inp, rej = build_inputs(ven['bingx'], venB, pairs)
     R = [f'🔗 <b>/xfund_test — межбиржевой арбитраж фандинга X1 (BOT_SPEC §2.48{", основная пара BingX/Binance — §2.50" if main_binance else ""})</b> | код {params.get("version", "")}; ордеров нет',

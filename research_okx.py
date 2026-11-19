@@ -68,7 +68,7 @@ class OkxPublic:
     def _inst(self, sym):
         return self._ids.get(sym) or sym.split('/')[0] + '-USDT-SWAP'
 
-    async def fetch_ohlcv(self, sym, tf, since=None, limit=1000):
+    async def fetch_ohlcv(self, sym, tf, since=None, limit=1000, params=None):
         """Свечи с ts ≥ since по возрастанию (до limit). OKX отдаёт history-candles только НАЗАД (after = «старше ts»): страницы собираются от
         свежих к старым до since и кэшируются на символ, поэтому последующие вызовы с большим since идут из кэша."""
         since = int(since or 0)

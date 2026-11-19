@@ -319,9 +319,20 @@ async def run_h2repl(params, progress=None):
         return '⛔ /h2_replicate отказ: сначала /h2_funding_check с решением «репликация разрешена» (§2.47.1)'
     if RF.kv_get(KV_DONE, fdir):
         return '⛔ /h2_replicate: расчёт уже выполнен (повтор запрещён, §2.47.3 п. 3)\n' + (RF.kv_get(KV_REPORT, fdir) or '')
-    P, uni, ref = build_repl_panel(xdir, params.get('bdir'), params.get('venues'))
+    vn = tuple(params.get('venues') or X.venues_from_spec())
+    cmin = float(params.get('coverage_min', X.COVERAGE_MIN))
+    if cmin > 0 and mode in ('show', 'confirm'):                       # [v121, §2.53 п. 3] полнота ПЕРЕД любым расчётом: < 90% — отказ без расчёта и без вердикта
+        cov = X.coverage_report(xdir, 'h2', params.get('bdir'), venues=vn, minimum=cmin)
+        if not cov['ok']:
+            return ('⛔ /h2_replicate отказ: данные неполны: ' + '; '.join(cov['lines']) + '. Расчёта и вердикта нет (BOT_SPEC §2.53): выполните /h2_replicate load (повторяйте до «✅ загрузка завершена»).')
+    P, uni, ref = build_repl_panel(xdir, params.get('bdir'), vn)
     if P is None or not uni:
         return '⛔ /h2_replicate отказ: нет данных репликации — выполните /h2_replicate load до сообщения «загрузка завершена»'
+    if cmin > 0 and mode in ('show', 'confirm'):
+        idx_ = X.load_index(xdir)
+        lost = [ex for ex in vn if idx_['bars'].get(ex) and not any(u['ex'] == ex for u in uni)]
+        if lost:                                                       # биржа с загруженными свечами не дала ни одного символа в панель
+            return f'⛔ /h2_replicate отказ: данные неполны: биржа(и) {", ".join(lost)} не попали в панель (свечи загружены, символов во вселенной 0). Расчёта и вердикта нет.'
     u_line = X.universe_line(uni)
     spec_u = spec_value(SPEC_U_KEY, params.get('spec_path'))
     spec_k = read_spec_k(params.get('spec_path'))

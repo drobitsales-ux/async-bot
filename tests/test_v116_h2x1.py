@@ -28,6 +28,14 @@ def run(c):
     return asyncio.run(c)
 
 
+def ohlcv_window(b, since, limit, params=None):
+    """Окно свечей как у биржи: since=None + endTime → последние limit свечей не позже endTime (проход назад, v121); since → вперёд от since."""
+    end = (params or {}).get('endTime')
+    rows = [[int(t), o, h, l, c, v] for t, o, h, l, c, v in zip(b['ts'], b['o'], b['h'], b['l'], b['c'], b['v'])
+            if (end is None or t <= end) and (since is None or t >= since)]
+    return rows[-limit:] if since is None else rows[:limit]
+
+
 async def nosleep(_s):
     return None
 
@@ -206,7 +214,7 @@ class Replicate(unittest.TestCase):
         BF.write_battery(cls.bdir, n_syms=18)
         write_xdata(cls.xdir)
         RF.kv_set('h2_funding_check', {'allow': True, 'comb': 1.0}, cls.fdir)
-        cls.params = {'bdir': cls.bdir, 'xdir': cls.xdir, 'fdir': cls.fdir, 'fee_taker': 0.0005, 'fee_maker': 0.0002, 'version': 'vT', 'venues': ('bybit', 'bingx')}
+        cls.params = {'bdir': cls.bdir, 'xdir': cls.xdir, 'fdir': cls.fdir, 'fee_taker': 0.0005, 'fee_maker': 0.0002, 'version': 'vT', 'venues': ('bybit', 'bingx'), 'coverage_min': 0.0}
 
     @classmethod
     def tearDownClass(cls):
@@ -283,9 +291,8 @@ class XData(unittest.TestCase):
             async def load_markets(self):
                 return markets
 
-            async def fetch_ohlcv(self, sym, tf, since, limit):
-                rows = [[int(t), o, h, l, c, v] for t, o, h, l, c, v in zip(bars[sym]['ts'], bars[sym]['o'], bars[sym]['h'], bars[sym]['l'], bars[sym]['c'], bars[sym]['v']) if t >= since]
-                return rows[:limit]
+            async def fetch_ohlcv(self, sym, tf, since=None, limit=None, params=None):
+                return ohlcv_window(bars[sym], since, limit, params)
 
             async def fetch_funding_rate_history(self, sym, since=None, limit=None, params=None):
                 params = params or {}

@@ -1058,14 +1058,52 @@ async def _fetch_equity(retry: bool = True):
             err = _equity_fail_text(bal, st)                 # [v119] «баланс 0» / «структура не распознана» вместо «пустой ответ»
         except Exception as _e:
             err, st = safe_exc_reason(_e), 'error'
+            if isinstance(_e, (KeyError, TypeError, IndexError, AttributeError, ValueError, RuntimeError)):
+                # [v121] внутренняя ошибка разбора (в ccxt/asyncio), а не ответ биржи: место падения — в причину; эквити берём прямым подписанным запросом
+                err = f'{err} @ {exc_where(_e)}'
+                try:
+                    dj = await asyncio.wait_for(_direct_balance(), EQUITY_ATTEMPT_TIMEOUT)
+                    eq, st2 = _extract_equity_ex({'info': dj})
+                    if eq > 0:
+                        _dd['last_status'] = 'ok'
+                        return eq
+                    if st2 in ('zero', 'unrecognized'):
+                        err, st = f'{_equity_fail_text({"info": dj}, st2)} (прямой запрос; ccxt: {err})', st2
+                except Exception as _e2:
+                    err = f'{err}; прямой запрос: {safe_exc_reason(_e2)}'
         _dd['last_err'] = err
         _dd['last_status'] = st
-        logging.warning(f'[DD] эквити не получено (попытка {i + 1}/{len(pauses) + 1}): {err}')
+        (logging.info if st == 'zero' else logging.warning)(f'[DD] эквити не получено (попытка {i + 1}/{len(pauses) + 1}): {err}')   # «баланс 0» — не ошибка: в счётчик ошибок не идёт
         if st == 'zero':                                     # [v120] определённый ответ «баланс 0», а не сбой доступа — повторы с паузами не нужны
             break
         if i < len(pauses):
             await asyncio.sleep(pauses[i])
     return None
+
+
+def exc_where(e) -> str:
+    """[v121] Место внутренней ошибки: «файл.py:строка функция» последнего кадра трассировки (без путей и значений)."""
+    import traceback
+    try:
+        fr = traceback.extract_tb(e.__traceback__)[-1]
+        return f'{os.path.basename(fr.filename)}:{fr.lineno} {fr.name}'
+    except Exception:
+        return 'место не определено'
+
+
+async def _direct_balance() -> dict:
+    """[v121] Прямой подписанный GET /openApi/swap/v2/user/balance (в обход ccxt) → JSON ответа. Ключи и подпись наружу не попадают."""
+    if not (BINGX_KEY and BINGX_SECRET):
+        raise RuntimeError('ключи BingX не заданы')
+    q = f'timestamp={int(time.time() * 1000)}'
+    sig = hmac.new(BINGX_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(f'https://{NET_PROBE_HOST}/openApi/swap/v2/user/balance?{q}&signature={sig}', headers={'X-BX-APIKEY': BINGX_KEY},
+                            timeout=aiohttp.ClientTimeout(total=NET_PROBE_TIMEOUT)) as r:
+            j = await r.json(content_type=None)
+            if r.status != 200 or str(j.get('code')) not in ('0', 'None'):
+                raise RuntimeError(f'HTTP {r.status} код {j.get("code")} {str(j.get("msg", ""))[:60]}')
+            return j
 
 
 def account_idle() -> bool:
@@ -1223,7 +1261,7 @@ async def dd_update(force_rebase: bool = False) -> bool:
             _dd['min_dd'] = min(_dd['min_dd'], dd)
         return True
     except Exception as _e:
-        logging.warning(f'[DD] update fail: {type(_e).__name__}: {_e}')
+        logging.warning(f'[DD] update fail: {type(_e).__name__}: {_e} @ {exc_where(_e)}')
         return False
 
 
@@ -6511,6 +6549,8 @@ def health_status_line(now: float = None) -> str:
     fe = ', '.join(f'{k} {v[0] * 100:.0f}%' for k, v in sorted(snap['fetch_err'].items())) or 'н/д'
     top = sorted(snap['errs_1h'].items(), key=lambda kv: -kv[1])[:2]
     er = ', '.join(f'{k}:{n}' for k, n in top) or '0'
+    if top:                                              # [v121] последнее сообщение главного типа — чтобы «KeyError:6» было видно, откуда
+        er += f" (последнее: {esc(_health_err_sample.get(top[0][0], '')[:110])})"
     return f'Данные (за час): {eq} | {ctx} | fetch_err: {fe} | ошибки: {er}'
 
 
@@ -6981,8 +7021,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-20-v120'
+CODE_VERSION = '2026-11-20-v121'
 CHANGELOG = [
+    ('2026-11-20-v121', 'ЗАГРУЗКА ДАННЫХ: ЖУРНАЛ ИНДЕКСА, ПРОДОЛЖЕНИЕ, ПОЛНОТА КАК УСЛОВИЕ РАСЧЁТА (BOT_SPEC §2.53; недействительность отчётов /xfund_test 21:37 и /h2_replicate 21:35 записана ОТДЕЛЬНЫМ коммитом ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96, пре-регистрации §2.47/§2.48 и их параметры не менялись; ордеров нет). ЗАГРУЗЧИК: индекс = снимок index.json + журнал index.journal — каждый символ пишется сразу после загрузки (дозапись одной строки; оборванная строка пропускается, снимок атомарный с уникальным временным файлом, процессы с разными символами не затирают друг друга), повторный запуск пропускает готовые; порядок — сортировка; отчёт «загружено X из Y, осталось Z», «✅ загрузка завершена» — отдельной последней строкой только при Z = 0 и без ошибок сети; записи индекса прошлых версий (без признака complete) загружаются заново. ПРИЧИНА «~550 символов — в индексе 9» (по коду; НА ПРОДЕ НЕ ПРОВЕРЕНО, сети нет): счётчик «загружено» считал ВСЕ ответы без исключения, а в индекс попадали только непустые; т. е. ~540 из ~550 ответов были ПУСТЫМИ — прямой проход от since = 2019-01-01 с limit = 1000 запрашивает окно [2019-01-01, +1000 суток], а пустой ответ принимался за «данных нет» (гипотеза: BingX отдаёт [] на окно без данных); пустые и ошибочные символы не запоминались и перезапрашивались на каждом прогоне, а любая ошибка стоила 2+6+15 с повторов. ИСПРАВЛЕНИЕ: свечи проходом НАЗАД от настоящего (endTime/until, не зависит от даты листинга; признак complete — дошли до начала истории), повторы только для сетевых ошибок (постоянная ошибка символа — сразу), отрицательный кэш «пусто / постоянная ошибка» на 7 суток. ПОЛНОТА ДАННЫХ: X1 — фандинг и свечи BingX для ВСЕХ символов, общих с архивом Binance (без предфильтра «грубо ликвидные»), фандинг до самого раннего события (complete), кэш v86–v88 htf_funding объединяется по времени события; H2 — все символы вселенной; 1h — Binance (архив) и BingX (ccxt) только для символов сделок предварительного прогона X1 на дневных данных (prelim_traded; в simulate_x1 добавлен open_syms); контроль полноты coverage_report ПЕРЕД расчётом: /xfund_test и /h2_replicate (без аргумента и confirm) отказывают «данные неполны: …» без расчёта и вердикта, если любая доля (свечи, фандинг, глубина — свечи и фандинг до начала истории, для OKX глубина фандинга не требуется; 1h по символам сделок для X1) < 90%, либо биржа с загруженными свечами не попала в панель H2. ЭКВИТИ: «KeyError:6» в /status — это СЧЁТЧИК ошибок в строке данных («ошибки: тип:число за час»), а не строка эквити; источник 6 KeyError за час НЕ установлен (разбор ответа /net_probe через настоящий parse_balance ccxt не падает) — теперь /status показывает последнее сообщение главного типа ошибки, предупреждение [DD] update fail содержит файл:строку, ответ «баланс 0» пишется на уровне INFO (в счётчик ошибок не идёт); при внутренней ошибке ccxt (KeyError/TypeError/IndexError/AttributeError/ValueError/RuntimeError) эквити берётся прямым подписанным запросом /openApi/swap/v2/user/balance (место ошибки — в причину). НЕ ПРОВЕРЕНО (сети нет): поведение BingX на окна свечей и endTime, объём/время полной загрузки (оценка: ~2 запроса на символ-страницу), память расчёта X1 на ~400 парах при лимите RESEARCH_MEM_MB, источник KeyError на проде. Тесты: tests/test_v121_loader_coverage.py'),
     ('2026-11-20-v120', 'ИСКЛЮЧЕНИЕ НЕ-КРИПТО ИЗ H2/X1, «СЧЁТ ПУСТ — РЕЖИМ ОЖИДАНИЯ», СТРОКА «ОКРУЖЕНИЕ» В /STATUS (BOT_SPEC §2.52; прод-факты и поправка §2.47/§2.48 внесены ОТДЕЛЬНЫМ коммитом ДО кода и ДО расчёта вселенной, k и доходностей). bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет. ИСКЛЮЧЕНИЕ: noncrypto_reason — базы с префиксом NC (NCSK, NCSI, NCFX, NCCO …), поле markets info.instCategory (OKX: не «1» — не-крипто; по документации по памяти, НЕ проверено), info.category/assetType/productType по словам stock/equity/index/forex/commodity/metal/bond/etf; стейблкоин-подобные — stable_like (σ < 0.5%) в вселенной H2 и на уровне пары X1. Загрузки (/h2_replicate load, /xfund_test load) данные по исключённым символам НЕ запрашивают; отчёт загрузки печатает число исключённых по признакам, NC-базы списком (ложные срабатывания вроде реального токена NCT видны) и распределение значений найденных полей «класс актива» по биржам; h2_universe и X1 (common_pairs, main_pairs_binance, scan_list) фильтруют и кэш v119 (по префиксу базы); отчёт репликации — «не-крипто (§2.52): …». СЧЁТ ПУСТ: эквити == 0 (поля баланса распознаны) И позиций нет И живых стратегий нет → состояние empty_account: в /status, /dd_status и сводке данных — «счёт пуст — режим ожидания», тревоги «эквити не получено»/«breaker-ы работают вслепую» не шлются, счётчик сбоев не растёт, повторов с паузами нет (ответ «баланс 0» — определённый, не сбой); при эквити > 0, позиции или живой стратегии — обычный режим автоматически; ошибки доступа (исключения, коды биржи) — прежняя тревога с причиной. /STATUS: строка «Окружение: Python …, ccxt …» теперь в status_text() — в v119 она по ошибке была добавлена только в суточный дайджест (тест проверял исходник, а не вывод /status). /NET_PROBE: временные экземпляры ccxt закрываются дважды с паузой (access_probe.close_ccxt; гипотеза причины «requires to release all resources» — недозавершённые параллельные запросы load_markets заново открывают сессию после первого close; в среде без сети НЕ воспроизведена), то же для загрузки с собственными клиентами. НЕ ПРОВЕРЕНО (сети нет): поля markets BingX/OKX как признак не-крипто, исчезновение предупреждения о ресурсах на проде. Тесты: tests/test_v120_noncrypto_idle.py'),
     ('2026-11-20-v119', 'ЭКВИТИ «ПУСТОЙ ОТВЕТ», OKX БЕЗ CCXT, МАРКЕРЫ ПРЕ-РЕГИСТРАЦИЙ, ПОДСКАЗКИ КОМАНД (BOT_SPEC §2.51; прод-факты, маркеры и поправка §2.47 внесены ОТДЕЛЬНЫМ коммитом ДО кода и ДО загрузки данных). bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет. Шаг 0 на проде: Bybit — гео-блок (HTTP 403 CloudFront), OKX — aiohttp доступен, ccxt load_markets падает TypeError. Маркеры в BOT_SPEC: X1-MAIN-PAIR: BingX/Binance, H2REPL-VENUES: bingx,okx; §2.47: вселенная H2-репликации — перпетуалы BingX и OKX вне архива Binance (монета на обеих — биржа с большим оборотом за 30 суток), фандинг OKX = 0 там, где истории для окна позиции нет, счётчик в отчёте. ЭКВИТИ: _extract_equity_ex → (значение, статус ok/zero/unrecognized/empty), разбор dict/list/balances; при нулевом балансе фьючерсов — «баланс фьючерсов USDT-M: 0; проверьте кошелёк», при неизвестной структуре — «структура ответа баланса не распознана (ключи)» вместо «пустой ответ»; /net_probe шлёт третье сообщение со структурой ответа ccxt fetch_balance и прямого /openApi/swap/v2/user/balance (ключи и числа, без id/ключей/подписей, balance_shape); версии Python/ccxt — строкой в /status. OKX: research_okx.OkxPublic — прямой REST aiohttp (instruments SWAP, listTime, history-candles назад с кэшем, funding-rate-history назад, ставка realizedRate), интерфейс ccxt-подмножества для Fetcher/fetch_bars/fetch_funding; глубина истории фандинга OKX измеряется загрузкой (строка в отчёте). load_index дополняет индекс прошлых версий ключом okx. Команды: /help — порядок «load → без аргумента → confirm»; неизвестная команда, похожая на известную (Левенштейн ≤ 2), → «возможно, вы имели в виду /…» (к штатному ответу v96; /cmd@other_bot игнорируется); /xdata → подсказка про /xfund_test load и /h2_replicate load. НЕ ПРОВЕРЕНО (сети нет): реальная структура ответа баланса BingX и причина нулевого эквити, форматы полей OKX v5 (взяты из документации по памяти), глубина фандинга OKX, причина TypeError ccxt.okx. Тесты: tests/test_v119_okx_equity.py'),
     ('2026-11-20-v118', 'ДОСТУП К BYBIT/OKX, ПРИЧИНА СБОЯ ЭКВИТИ, УСТОЙЧИВАЯ ЗАГРУЗКА (BOT_SPEC §2.50; прод-факты и шаг 0 записаны ОТДЕЛЬНЫМ коммитом ДО кода). bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; ордеров нет. ШАГ 0: /net_probe дополнен пробой Bybit (v5 рынки/тикер) и OKX (тикер): aiohttp — HTTP-код, заголовки Server/X-Cache/Via/Retry-After, первые 300 байт тела; ccxt load_markets — имя класса исключения; вердикт «гео-блок» / «лимит частоты» / «доступно» (access_probe.py; ответ отдельным сообщением). Вердикт получает владелец на проде; из среды разработки (сети нет) он недостижим, поэтому условные поправки пре-регистраций (X1-MAIN-PAIR, H2REPL-VENUES) в BOT_SPEC НЕ внесены — код ведёт себя по исходным §2.47/§2.48, пока маркеров нет. ПРАВКА 1: строка эквити в /status, /dd_status и алерты «3 сбоя»/«эквити не получено» показывают причину последнего сбоя — класс исключения + код биржи (safe_exc_reason: «AuthenticationError 100413 Incorrect apiKey»; ключ/секрет/signature/длинные токены/query вырезаются); при успехе причина сбрасывается. ПРАВКА 2: /xdata load — недоступная биржа помечается «недоступна (вердикт пробы)» и загрузка остальных продолжается (в индексе unavailable); все недоступны — явный отказ; параметр venues исключает площадку по пре-регистрации. Binance — из архива data.binance.vision: новый вид h1 (1h-свечи месяцами, только high/low/close float32, продолжение с места остановки, батарею /battery_load не меняет), X1 с основной парой BingX/Binance (включается маркером X1-MAIN-PAIR: BingX/Binance в BOT_SPEC): ставки Binance — fundingRate архива с фактическими отметками времени, свечи — архив (1h для базиса и хода против ноги, 1D иначе), комиссия Binance — FEE_DEFAULT 0.05% (правило «FEE_TAKER биржи, иначе 0.05%»). H2-репликация: маркер H2REPL-VENUES: bingx ограничивает вселенную BingX. НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/OKX с прода, фактическая комиссия Binance, объём и время загрузки 1h-архива. Тесты: tests/test_v118_access.py'),
@@ -7804,7 +7845,7 @@ async def battery_job(cmd, task, extra=None, need_universe=True):
     """[v108] Команды серии «батарея» (BOT_SPEC §2.43): расчёты и сеть — в дочернем процессе research_runner; комиссии (FEE_TAKER/FEE_MAKER) передаются параметрами."""
     import research_bdata
     import research_xdata
-    await factory_job(cmd, task, dict(extra or {}, bdir=research_bdata.battery_dir(), xdir=research_xdata.xdata_dir(), fee_taker=FEE_TAKER, fee_maker=FEE_MAKER), need_universe)
+    await factory_job(cmd, task, dict(extra or {}, bdir=research_bdata.battery_dir(), xdir=research_xdata.xdata_dir(), fee_taker=FEE_TAKER, fee_maker=FEE_MAKER, htf_db=TRADES_DB), need_universe)
 
 
 async def battery_final_gate(args):
