@@ -1,6 +1,7 @@
 """research_xfund.py — X1: межбиржевой арбитраж фандинга (BingX/Bybit), BOT_SPEC §2.48. Нейтральная к направлению пара ног (шорт на бирже с более высокой ставкой, лонг на другой); суточная
 симуляция по дневным барам и событиям фандинга обеих бирж; ни одного реального ордера. Справочно — пары с Binance (архив v108)."""
 import math
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -411,8 +412,9 @@ def common_pairs(ven, a='bingx', b='bybit'):
     return out
 
 
-def binance_venue(bdir, norms, fee_taker):
-    """Binance из архива: символы, чья нормализованная база среди norms; выбирается ряд с наибольшим числом суток."""
+def binance_venue(bdir, norms, fee_taker, with_h1=False):
+    """Binance из архива: символы, чья нормализованная база среди norms; выбирается ряд с наибольшим числом суток.
+    with_h1 [v118, §2.50]: добавляются часовые свечи архива (`hbars`, для базиса X1 по 1h); ставки — fundingRate архива с ФАКТИЧЕСКИМИ отметками времени (calc_time)."""
     idx = B.load_index(bdir)
     best = {}
     for s in idx.get('symbols', []):
@@ -424,13 +426,53 @@ def binance_venue(bdir, norms, fee_taker):
             continue
         if nb not in best or len(z['ts']) > len(best[nb][1]['ts']):
             best[nb] = (s, z)
-    bars, fund = {}, {}
+    bars, fund, hbars = {}, {}, {}
     for nb, (s, z) in best.items():
         bars[nb] = {'ts': z['ts'], 'o': z['o'], 'h': z['h'], 'l': z['l'], 'c': z['c'], 'qv': z['qv']}
         f = B.load_fund(bdir, s)
         if f is not None:
             fund[nb] = (f['ts'], f['rate'])
-    return {'bars': bars, 'fund': fund, 'fee': fee_taker, 'markets': {}}
+        if with_h1:
+            h = B.load_h1(bdir, s)
+            if h is not None and len(h['ts']):
+                hbars[nb] = {'ts': h['ts'], 'h': h['h'], 'l': h['l'], 'c': h['c']}
+    return {'bars': bars, 'fund': fund, 'hbars': hbars, 'fee': fee_taker, 'markets': {}, 'symbols': {nb: s for nb, (s, _z) in best.items()}}
+
+
+def main_pairs_binance(ven_bingx, bn):
+    """[v118] Пары (метка, символ BingX, база Binance): база есть в обеих площадках; несколько рынков одной базы на BingX — с большим оборотом."""
+    nm = {}
+    for sym in ven_bingx['bars']:
+        nm.setdefault(ven_bingx['markets'].get(sym, {}).get('norm') or X.norm_base(sym.split('/')[0]), []).append(sym)
+    return [(norm, max(nm[norm], key=lambda s: float(np.mean(ven_bingx['bars'][s]['qv']))), norm) for norm in sorted(set(nm) & set(bn['bars']))]
+
+
+async def sync_binance_h1(params, progress=None, fetch=None):
+    """[v118] 1h-свечи архива Binance для баз, загруженных с BingX (X1, §2.50); продолжение с места остановки. → строка отчёта."""
+    xdir = params.get('xdir') or X.xdata_dir()
+    bdir = params.get('bdir') or B.battery_dir()
+    idx_b = B.load_index(bdir)
+    if not idx_b.get('symbols'):
+        return '⛔ архив Binance пуст (/battery_load) — 1h-свечи Binance не загружены'
+    idx = X.load_index(xdir)
+    norms = {idx['markets'].get('bingx', {}).get(s, {}).get('norm') for s in idx['fund'].get('bingx', {})}
+    norms.discard(None)
+    syms = []
+    for s in sorted(idx_b['symbols']):
+        nb = X.norm_base(s[:-4] if s.endswith('USDT') else s)
+        if nb in norms and B.load_d1(bdir, s) is not None:
+            syms.append(s)
+    deadline = time.time() + float(params.get('max_minutes', 150)) * 60
+    own = fetch is None
+    if own:
+        import aiohttp
+        import research_vision
+        async with aiohttp.ClientSession() as ses:
+            r = await B.sync_h1(research_vision.make_fetcher(ses), bdir, syms, deadline, progress)
+    else:
+        r = await B.sync_h1(fetch, bdir, syms, deadline, progress)
+    tail = ' — ⏱ бюджет времени исчерпан, повторите команду' if r['stopped'] else ''
+    return f'  Binance 1h-свечи (архив): символов {r["processed"]}/{len(syms)}, месяцев загружено {r["loaded"]}, не получено {r["failed"]}{tail}'
 
 
 async def run_xfund(params, progress=None):
@@ -439,25 +481,40 @@ async def run_xfund(params, progress=None):
     bdir = params.get('bdir') or B.battery_dir()
     fdir = params.get('fdir') or RF.FD.factory_dir()
     fee = float(params.get('fee_taker', FEE_DEFAULT))
+    main_binance = params.get('x1_pair', X.x1_pair_from_spec()) == 'binance'     # [v118] маркер X1-MAIN-PAIR в BOT_SPEC (§2.50)
     if params.get('mode') == 'load':
-        return await X.run_xload(params, progress)
+        txt = await X.run_xload(dict(params, x1_main=main_binance, venues=params.get('venues') or (('bingx',) if main_binance else None)), progress)
+        if main_binance:
+            txt += '\n' + await sync_binance_h1(params, progress, params.get('b_fetch'))
+        return txt
     ven = load_venues(xdir, bdir, fee)
-    if not ven['bingx']['bars'] or not ven['bybit']['bars']:
-        return '⛔ /xfund_test отказ: нет данных Bybit/BingX — выполните /xfund_test load до сообщения «загрузка завершена»'
-    pairs = common_pairs(ven)
-    inp, rej = build_inputs(ven['bingx'], ven['bybit'], pairs)
-    R = [f'🔗 <b>/xfund_test — межбиржевой арбитраж фандинга X1 (BOT_SPEC §2.48)</b> | код {params.get("version", "")}; ордеров нет',
-         f'комиссии: BingX FEE_TAKER {fee * 100:.4f}%, Bybit {FEE_DEFAULT * 100:.2f}% (по умолчанию), проскальзывание {SLIP * 100:.2f}% на исполнение; плечо {LEV:g}x, позиций ≤ {MAX_POS}',
-         f'Общих баз BingX∩Bybit: {len(pairs)}; принято пар (корреляция ≥ {CORR_MIN}): {0 if inp is None else len(inp["labels"])}; отклонено: {len(rej)}']
+    nameB = 'Binance' if main_binance else 'Bybit'
+    if main_binance:
+        if not ven['bingx']['bars']:
+            return '⛔ /xfund_test отказ: нет данных BingX — выполните /xfund_test load до сообщения «загрузка завершена»'
+        bn = binance_venue(bdir, {X.norm_base(sym.split('/')[0]) for sym in ven['bingx']['bars']} | {v.get('norm') for v in ven['bingx']['markets'].values() if v.get('norm')}, FEE_DEFAULT, with_h1=True)
+        if not bn['bars']:
+            return '⛔ /xfund_test отказ: нет данных Binance (архив /battery_load) для баз BingX'
+        ven['binance'] = bn
+        pairs = main_pairs_binance(ven['bingx'], bn)
+    else:
+        if not ven['bingx']['bars'] or not ven['bybit']['bars']:
+            return '⛔ /xfund_test отказ: нет данных Bybit/BingX — выполните /xfund_test load до сообщения «загрузка завершена»'
+        pairs = common_pairs(ven)
+    venB = ven['binance'] if main_binance else ven['bybit']
+    inp, rej = build_inputs(ven['bingx'], venB, pairs)
+    R = [f'🔗 <b>/xfund_test — межбиржевой арбитраж фандинга X1 (BOT_SPEC §2.48{", основная пара BingX/Binance — §2.50" if main_binance else ""})</b> | код {params.get("version", "")}; ордеров нет',
+         f'комиссии: BingX FEE_TAKER {fee * 100:.4f}%, {nameB} {FEE_DEFAULT * 100:.2f}% (по умолчанию), проскальзывание {SLIP * 100:.2f}% на исполнение; плечо {LEV:g}x, позиций ≤ {MAX_POS}',
+         f'Общих баз BingX∩{nameB}: {len(pairs)}; принято пар (корреляция ≥ {CORR_MIN}): {0 if inp is None else len(inp["labels"])}; отклонено: {len(rej)}']
     if inp is None:
         return '\n'.join(R + ['Нет пар для симуляции.'])
     ints = {}
-    for tag, vv, ix in (('BingX', ven['bingx'], 0), ('Bybit', ven['bybit'], 1)):
+    for tag, ix in (('BingX', 0), (nameB, 1)):
         vals = [interval_hours(inp['fund'][j][ix][0]) for j in range(len(inp['labels'])) if inp['fund'][j][ix] is not None]
         ints[tag] = float(np.median([v for v in vals if v])) if vals else None
-    nh = sum(1 for vv in (ven['bingx'], ven['bybit']) for _ in vv['hbars'])
-    R.append(f'1h-свечи: символов с часовыми рядами BingX {len(ven["bingx"]["hbars"])}, Bybit {len(ven["bybit"]["hbars"])}' + (' — НЕТ часовых данных: весь базис по дневному close (запасной вариант)' if not nh else ''))
-    R.append(f'Интервалы начисления (медиана по парам, ч): BingX {fm(ints["BingX"], 1)}, Bybit {fm(ints["Bybit"], 1)}; ставки приводятся к 8 ч (сумма за 72 ч ÷ 9)')
+    nh = len(ven['bingx']['hbars']) + len(venB['hbars'])
+    R.append(f'1h-свечи: символов с часовыми рядами BingX {len(ven["bingx"]["hbars"])}, {nameB} {len(venB["hbars"])}' + (' — НЕТ часовых данных: весь базис по дневному close (запасной вариант)' if not nh else ''))
+    R.append(f'Интервалы начисления (медиана по парам, ч): BingX {fm(ints["BingX"], 1)}, {nameB} {fm(ints[nameB], 1)}; ставки приводятся к 8 ч (сумма за 72 ч ÷ 9)' + ('; ставки Binance — из архива fundingRate по фактическим отметкам времени' if main_binance else ''))
     first = int(np.argmax(inp['elig'].any(axis=1))) if inp['elig'].any() else 0
     R.append(f'Допущенных суток-пар (ликвидность ≥ 20 млн на обеих биржах и ≥ 2 события): {int(inp["elig"].sum())}; период {datetime.fromtimestamp((inp["day0"] + first) * DAY / 1000, timezone.utc):%Y-%m-%d} … {datetime.fromtimestamp((inp["day0"] + inp["nd"] - 1) * DAY / 1000, timezone.utc):%Y-%m-%d}')
     best, passed = None, False
@@ -465,7 +522,7 @@ async def run_xfund(params, progress=None):
         res = simulate_x1(inp, T)
         m = metrics(res, inp)
         c, ok = criteria(m)
-        R += [''] + fmt_metrics('BingX/Bybit', T, m, c, ok)
+        R += [''] + fmt_metrics(f'BingX/{nameB}', T, m, c, ok)
         top = top_symbols(res, inp)
         if top:
             R.append('  топ-10 символов по числу сделок (ёмкость K_max = 5% × мин. медианный дневной оборот двух бирж): ' + '; '.join(f'{s} n={n}, K_max {cap / 1e3:.0f}k$' if cap and math.isfinite(cap) else f'{s} n={n}' for s, n, cap in top))
@@ -476,7 +533,9 @@ async def run_xfund(params, progress=None):
     RF.kv_set(KV_PASSED, bool(passed), fdir)
     # справочно: пары с Binance
     norms = {p[0] for p in pairs}
-    bn = binance_venue(bdir, norms, fee)
+    bn = {'bars': {}} if main_binance else binance_venue(bdir, norms, fee)      # [v118] при основной паре с Binance справочный блок не нужен
+    if main_binance:
+        R += ['', 'Пара с Bybit — справочно, если Bybit станет доступен (§2.50); живое исполнение пары с Binance требует сервера вне США (Binance 451) — решается только при прохождении теста.']
     if bn['bars']:
         R += ['', '<b>Справочно (не критерий): пары с Binance (архив v108)</b>']
         for other, ven_o in (('Bybit', ven['bybit']), ('BingX', ven['bingx'])):
