@@ -6784,8 +6784,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-14-v115'
+CODE_VERSION = '2026-11-19-v116'
 CHANGELOG = [
+    ('2026-11-19-v116', 'H2: ПРОВЕРКА ФАНДИНГА И РЕПЛИКАЦИЯ НА НЕЗАВИСИМЫХ МОНЕТАХ (BOT_SPEC §2.47) И МЕЖБИРЖЕВОЙ АРБИТРАЖ ФАНДИНГА X1 (§2.48); пре-регистрации записаны ОТДЕЛЬНЫМИ коммитами ДО загрузки данных и ДО кода; bybit_worker.py, режим ожидания, breaker-ы, каналы v96 не менялись; НИ ОДНОГО реального ордера (методов создания ордеров нет — тест на исходниках); расчёты — через research_runner. Часть 0 документации (отдельный коммит): итог /final_h2 retry confirm (§2.43.20: НЕ ПРОЙДЕНО только по значимости, t_adj 1.25 < 2.0; Шарп 1.18, просадка 10.1%, стресс +3.05, месяцы роста +3.51 / падения +2.71, LOCKBOX +3.13 б.п./день; LOCKBOX батареи исчерпан), итог /vrp_measure (§2.46.5), строки H2/VRP в RESEARCH_SUMMARY. /h2_funding_check: ответ по коду — фандинг в исходном H2 УЧИТЫВАЛСЯ (sim_h2 начисляет +w·F шорту, fund_on=True по умолчанию), поэтому LOCKBOX не пересчитывается и не читается; команда считает H2-D3 на TRAIN и VALID «без фандинга / с фандингом» (mean, t, Шарп, просадка), средний фандинг за 30 суток после листинга и решение владельца (mean VALID+LOCKBOX с фандингом ≤ 0 → H2 закрыт). /h2_replicate [load|confirm|report]: вселенная — USDT-перпетуалы Bybit/BingX, базы которых НИКОГДА не было в архиве Binance (нормализация 1000X → X), монета на обеих биржах — биржа с большим оборотом за первые 30 суток; та же run_cell(H2-D3) на панели того же формата (тест побитово), фандинг учитывается; шаг 0 мощность (D < 365 → непроверяема), k по синтетике панели записывается в BOT_SPEC ДО расчёта (строки H2REPL-UNIVERSE и H2REPL-K), критерии на всём периоде панели, один расчёт (флаг h2_repl_*). /xfund_test [load]: X1 BingX/Bybit — приведение ставок к 8 ч (сумма за [t−72 ч, t) ÷ 9), T ∈ {0.02%, 0.05%}, выход при d < 0.005% или 14 сут., ≤ 5 позиций, плечо 2x, 4 исполнения комиссии + проскальзывание, фандинг по начислениям ног, разница цен бирж в P&L, ликвидация ноги при ходе ≥ 40%, отчёт APR/Шарп/просадка/худший месяц/доли/издержки/по годам/ёмкость, справочно пары с Binance. /exec_check h2|x1 [start|stop|report]: почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (стакан, спред, проскальзывание по размерам, фандинг), старт только после пройденной проверки. Данные: research_xdata.py (ccxt, только публичные методы, кэш XDATA_DIR, повторы, пауза HTF_FETCH_PAUSE_SEC, продолжение с места остановки). НЕ ПРОВЕРЕНО (сети нет): ответы Bybit/BingX (глубина истории, пагинация фандинга назад: Bybit until / BingX endTime, закрытые инструменты), реальные время и память. Тесты: tests/test_v116_h2x1.py'),
     ('2026-11-14-v115', 'ПОПРАВКА /final_h2 audit: ЛОЖНОЕ СРАБАТЫВАНИЕ МАРКЕРОВ (BOT_SPEC §2.43.18; запись — ОТДЕЛЬНЫМ коммитом ДО исправления; bybit_worker.py, режим ожидания, breaker-ы, кандидат H2-D3, k = 1.122, критерии §2.43.11, состояния флага не менялись). Первый audit на проде (2026-10-29 20:30 UTC, v114) нашёл маркеры «РЕЗУЛЬТАТ: НЕ ПРОЙДЕНО» и «mean при издержках ×2 =» в отчёте /final_crypto4h от 2026-10-25 20:46 (htf_reports и htf_backtest_2026-10-25_2046.txt): эти строки общие с форматом отчёта crypto4h, который H2 копирует; H2-специфичные маркеры (листингов в LOCKBOX, месяцы BTC (UTC → доходность), заголовок финала H2-D3) не найдены. Исправлено: общие маркеры считаются находкой только при «H2-D3» в том же тексте (ячейка БД или файл), специфичные — всегда; audit выводит состав оставшихся каталогов задач final_h2_* (имена, размеры). Критерии «утечки» не ослаблены. Вердикт «утечки нет» выносится по повторному /final_h2 audit v115 и ручной проверке логов Render за окно сбоя (≈ 19:40–19:55 UTC). Тесты: tests/test_v114_finalstate.py (+3)'),
     ('2026-11-13-v114', 'ИСПРАВЛЕНИЕ ПАМЯТИ ФИНАЛЬНОГО ПУТИ /final_h2 (BOT_SPEC §2.43.13–14; инцидент и порядок восстановления записаны ОТДЕЛЬНЫМ коммитом ДО исправления; bybit_worker.py, режим ожидания, breaker-ы, research_bsim.py, research_battery.run_cell, кандидат, критерии, k = 1.122 и seed НЕ менялись). Инцидент 2026-10-29 19:45 UTC: после взятия флага final_h2_started и открытия LOCKBOX дочерний процесс упал с MemoryError (RESEARCH_MEM_MB=300) до расчёта; результата нет. Причина (воспроизведена на синтетике ≈ 650 символов): полная панель с листингами 2025+ в ≈ 1.6 раза больше пре-панели, make_ctx (pit_adv, atr_panel) держит десятки матриц float64, load_panel копировал все матрицы при живых исходных. Исправлено: load_panel обрезает матрицы по одной с освобождением исходной (числа те же); контекст финала make_ctx_h2 без неиспользуемого в H2 (atr, adv; после расчёта освобождаются QV, L, G, GC), маски ликвидности и топ-30 блоками (побитово те же, тест сравнивает с make_ctx и результаты H2-D3 базовый/стресс); перед взятием флага — оценка пика памяти по индексу архива (отказ без взятия флага, если выше 85% лимита; калибровка 120 МБ + 43 МБ на млн ячеек); сбой после взятия флага пишется в БД (final_h2_crash). На фикстуре 700 символов под RLIMIT_AS = 300 МБ полный путь проходит (пик ≈ 190–215 МБ). Флаг final_h2_started НЕ снят (снять может только владелец прямой правкой БД, порядок и условия — §2.43.13). СОСТОЯНИЯ ФЛАГА ФИНАЛА (§2.43.17, research_finalstate.py): free → running → done | tech_fail_no_output, ровно одна повторная попытка командой /final_h2 retry confirm (после чистого /final_h2 audit), далее done или tech_fail_final; done только после записи итогового отчёта в БД (/final_h2 report); сбой до вывода пишется в final_h2_crash, а не «взятым флагом»; ключ v113 final_h2_started без результата трактуется как зависший running (legacy). /final_h2 audit (§2.43.15, только чтение): маркеры итогового отчёта H2 в SQLite-базах, текстовых файлах, каталогах задач. Условное исключение §2.43.16 (одна повторная попытка при «утечки нет»). Не проверено: пик памяти на реальных данных, содержимое прод-хранилищ. Тесты: tests/test_v113_h2_vrp.py, tests/test_v114_finalstate.py'),
     ('2026-11-12-v113', 'ОДИНОЧНЫЙ ФИНАЛ H2-D3 (BOT_SPEC §2.43.11) И ПРЕМИЯ ЗА ВОЛАТИЛЬНОСТЬ (§2.46); оба раздела записаны ОТДЕЛЬНЫМИ коммитами ДО кода; bybit_worker.py, режим ожидания, breaker-ы, правила /audit не менялись; расчёты — через research_runner (добавлены только записи задач); торговых модулей опционов нет. 1) /final_h2 (research_h2final.py): кандидат H2-D3 — research_battery.run_cell без изменений; k на синтетике нулевой гипотезы (synth_daily_panel как шаг 1 /battery, 200 повторов, seed 20261025, t = меньший из NW лаг 5/20, участок — последние D_lock суток ДО LOCKBOX, LOCKBOX не читается), k = max(1, m0/0.674) записывается в BOT_SPEC строкой FINALH2-K ДО открытия; без аргумента — k и сверка; confirm отказывает (флаг НЕ берётся), пока строка не совпадёт с расчётом до 3 знаков; отдельный флаг final_h2_started берётся ДО открытия LOCKBOX, повтор запрещён; критерии: t_adj ≥ 2.0, Шарп ≥ 0.5, просадка ≤ 15%, стресс ×2 mean больше 0, mean ≥ 0 в месяцы роста и падения BTC; справочно по годам, листинги, доля стопов +50%, пропуски по лимиту; не прошёл → «LOCKBOX battery исчерпан» (флаг lockbox_battery_exhausted). 2) /vrp_probe (код ответа Deribit, при 451/403 — стоп; глубина и шаг DVOL BTC/ETH — только измеренные значения), /vrp_measure (VRP_t = DVOL_t − RV(t, t+30) по кэшу Binance D1; по годам, доля больше 0, худшие 10, перед крупнейшими падениями BTC, автокорреляция, t по неперекрывающимся 30-дневным точкам), /vrp_sim (приближённый недельный железный кондор по Блэку–Шоулзу с IV = DVOL, издержки 3% премии + 0.03% на ногу, риск 2%; только при гейте: среднее VRP больше 0, t ≥ 2.0, доля больше 0 ≥ 60%; пометка про приближение). Не проверено: формат ответа Deribit (в среде разработки недоступен, формат — по памяти документации), реальные k и время его расчёта на проде, реальные данные DVOL. Тесты: tests/test_v113_h2_vrp.py'),
@@ -7558,13 +7559,65 @@ async def final_crypto4h_gate(args):
 async def battery_job(cmd, task, extra=None, need_universe=True):
     """[v108] Команды серии «батарея» (BOT_SPEC §2.43): расчёты и сеть — в дочернем процессе research_runner; комиссии (FEE_TAKER/FEE_MAKER) передаются параметрами."""
     import research_bdata
-    await factory_job(cmd, task, dict(extra or {}, bdir=research_bdata.battery_dir(), fee_taker=FEE_TAKER, fee_maker=FEE_MAKER), need_universe)
+    import research_xdata
+    await factory_job(cmd, task, dict(extra or {}, bdir=research_bdata.battery_dir(), xdir=research_xdata.xdata_dir(), fee_taker=FEE_TAKER, fee_maker=FEE_MAKER), need_universe)
 
 
 async def battery_final_gate(args):
     """[v108] /battery_final: без аргументов — показ кандидатов и флага; с confirm — единственный прогон на LOCKBOX (флаг серии, повтор запрещён)."""
     confirm = bool(args) and args[0].lower() == 'confirm'
     await battery_job('/battery_final', 'battery_final', {'confirm': confirm})
+
+
+_exec_state = {'task': None, 'sampler': None}
+
+
+async def exec_check_cmd(args):
+    """[v116] /exec_check h2|x1 [start|stop|report] — почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (BOT_SPEC §2.47.4, §2.48.3). Старт — только после пройденной репликации H2 / критериев X1.
+    Только публичные запросы чтения (стаканы, ставки фандинга, рынки)."""
+    import research_exec
+    import research_factory
+    import research_xfund
+    import research_xdata
+    kind = (args[0].lower() if args else '')
+    act = (args[1].lower() if len(args) > 1 else 'report')
+    if kind not in ('h2', 'x1'):
+        await tg('Использование: <code>/exec_check h2|x1 [start|stop|report]</code> (старт — только после пройденной проверки: h2 — репликация §2.47, x1 — критерии §2.48)')
+        return
+    if act == 'report':
+        await tg(research_exec.report(kind, fee_bingx=FEE_TAKER))
+        return
+    if act == 'stop':
+        s = _exec_state['sampler']
+        if s is not None:
+            s.stop = True
+        await tg('⏹ /exec_check: остановка запрошена (текущий цикл доработает)')
+        return
+    if act != 'start':
+        await tg('Действие: start | stop | report')
+        return
+    passed = research_factory.kv_get('h2_repl_passed' if kind == 'h2' else 'x1_passed')
+    if not passed:
+        await tg(f'⛔ /exec_check {kind} отказ: ' + ('репликация H2 (/h2_replicate confirm) не пройдена или не выполнена' if kind == 'h2' else 'критерии X1 (/xfund_test) не выполнены или расчёт не запускался') + ' — шаг проверки исполнения не нужен')
+        return
+    if _exec_state['task'] is not None and not _exec_state['task'].done():
+        await tg('⏳ /exec_check уже выполняется')
+        return
+    bybit = None
+    try:
+        if kind == 'x1':
+            bybit = ccxt_async.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+        sampler = research_exec.ExecSampler(kind, exchange, bybit, fee_bingx=FEE_TAKER)
+        scan = research_xfund.scan_list(research_xdata.xdata_dir()) if kind == 'x1' else None
+        if kind == 'x1' and not scan:
+            await tg('⛔ /exec_check x1: нет кэша фандинга (/xfund_test load)')
+            return
+        _exec_state['sampler'] = sampler
+        _exec_state['task'] = asyncio.create_task(sampler.run(scan))
+        _bg_tasks.add(_exec_state['task']); _exec_state['task'].add_done_callback(_bg_tasks.discard)
+        await tg(f'🧪 /exec_check {kind} запущен: раз в час, не более {research_exec.MAX_DAYS} суток, ТОЛЬКО публичные запросы (ордеров нет). Промежуточный итог — /exec_check {kind} report')
+    except Exception as e:
+        await tg(f'❌ /exec_check {kind}: {esc(type(e).__name__)}')
 
 
 async def audit_job():
@@ -9782,6 +9835,7 @@ async def check_tg_commands():
                     '/audit_backfill — [v110] вся история каналов аудита (только чтение, до AUDIT_BACKFILL_MAX на канал, FloodWait, продолжение с места остановки; источник catchup); /audit_stop — остановить чтение и отключить Telethon (напоминание удалить TG_SESSION_STRING); /audit_start — возобновить\n'
                     '/final_h2 [confirm | retry confirm | audit | report] — [v113/v114] одиночный финал H2-D3 (§2.43.11): без аргумента k, сверка с BOT_SPEC и состояние флага; confirm — один прогон на LOCKBOX; retry confirm — ровно одна техническая повторная попытка после сбоя без вывода (§2.43.16–17); audit — проверка утечки (только чтение); report — сохранённый отчёт; /vrp_probe, /vrp_measure, /vrp_sim — премия за волатильность по DVOL Deribit (§2.46): доступность, VRP, приближённый кондор (только при пройденном гейте); торговых модулей опционов нет\n'
                     '/signal_study — [v111] поиск по данным канала (§2.45), только DISCOVERY: «его вход + наш стоп» (12 вариантов), портрет метода, признаки полных стопов; /signal_final [confirm] — кандидаты / единственный прогон на HOLDOUT\n'
+                    '/h2_funding_check — [v116] фандинг в исходном H2-D3: по коду и «без / с фандингом» на TRAIN и VALID (LOCKBOX не читается, §2.47.1); /h2_replicate [load|confirm|report] — репликация H2-D3 на независимых монетах Bybit/BingX (§2.47); /xfund_test [load] — межбиржевой арбитраж фандинга X1 BingX/Bybit (§2.48); /exec_check h2|x1 [start|stop|report] — почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (только после пройденной проверки)\n'
                     '/audit — [v109] аудит внешнего источника сигналов (§2.44): симуляция A/B, критерии по форварду; /audit_import — файл result.json документом (ретроспектива, справочно); /audit_unparsed — нераспознанные; /audit_status — состояние; /tg_login [код] — вход для чтения каналов (только чтение)\n'
                     '/battery_load — [v108] загрузка D1+фандинг всех перпетуалов Binance (§2.43), с места остановки; /battery — шаги 0–3 серии (мощность, смещение, калибровка, TRAIN/VALID, LOCKBOX не читается); /battery_final confirm — шаг 4 на LOCKBOX (один раз, флаг серии)\n'
                     '/final_crypto4h — [v106] одиночный финал CRYPTO 4h T-MA-10-50 (§2.42): без аргументов — показ и k, confirm — один прогон на LOCKBOX (общий флаг финала)\n'
@@ -9918,6 +9972,29 @@ async def check_tg_commands():
             elif cmd == '/final_h2' or cmd.startswith('/final_h2 '):
                 # [v113] одиночный финал H2-D3 (§2.43.11) — только вручную, с confirm, один раз (флаг final_h2_started)
                 _t = asyncio.create_task(final_h2_gate(text.split('@')[0].split()[1:]))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/h2_funding_check':
+                # [v116] фандинг в исходном H2-D3: проверка по коду и «без / с фандингом» (TRAIN, VALID), LOCKBOX не читается (§2.47.1), фоном
+                _t = asyncio.create_task(battery_job('/h2_funding_check', 'h2_funding_check', None, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/h2_replicate' or cmd.startswith('/h2_replicate '):
+                # [v116] репликация H2-D3 на независимых монетах Bybit/BingX (§2.47): load | (без аргумента: вселенная, мощность, k) | confirm | report
+                _a = (text.split('@')[0].split()[1:] or [''])[0].lower()
+                _mode = _a if _a in ('load', 'confirm', 'report') else 'show'
+                _t = asyncio.create_task(battery_job('/h2_replicate', 'h2_replicate', {'mode': _mode}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/xfund_test' or cmd.startswith('/xfund_test '):
+                # [v116] X1: межбиржевой арбитраж фандинга BingX/Bybit (§2.48): load | расчёт
+                _a = (text.split('@')[0].split()[1:] or [''])[0].lower()
+                _t = asyncio.create_task(battery_job('/xfund_test', 'xfund_test', {'mode': 'load' if _a == 'load' else 'run'}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/exec_check' or cmd.startswith('/exec_check '):
+                # [v116] проверка исполнения БЕЗ ордеров (шаги 1.3/2.5): h2|x1 start|stop|report, только после пройденной проверки
+                _t = asyncio.create_task(exec_check_cmd(text.split('@')[0].split()[1:]))
                 _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/vrp_probe':
