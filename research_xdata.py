@@ -147,6 +147,39 @@ def round_sec(ts):
 
 
 # ── рынки ───────────────────────────────────────────────────────────────────────────────────────────
+NC_PREFIX = 'NC'                                     # §2.52: базы NCSK/NCSI/NCFX/NCCO и любые NC* — перпетуалы на акции, индексы, валюты, сырьё
+CAT_KEYS = ('instCategory', 'category', 'assetType', 'productType')      # кандидаты поля «класс актива» в market['info'] (проверяются при загрузке, §2.52)
+NONCRYPTO_WORDS = ('stock', 'equit', 'index', 'indic', 'forex', 'fx', 'commodit', 'metal', 'bond', 'etf')
+
+
+def noncrypto_reason(base, info=None):
+    """Признак не-крипто (BOT_SPEC §2.52): 'NC-префикс' | 'поле <ключ>=<значение>' | None. OKX instCategory: «1» (или пусто) — крипто, иное — не-крипто (по документации OKX по памяти, НЕ проверено —
+    распределение значений печатается в отчёте загрузки); остальные поля — по словам (stock, index, forex, commodity …)."""
+    b = str(base or '').upper().strip()
+    if b.startswith(NC_PREFIX):
+        return 'NC-префикс'
+    for k in CAT_KEYS:
+        v = (info or {}).get(k) if isinstance(info, dict) else None
+        if v in (None, ''):
+            continue
+        sv = str(v).strip().lower()
+        if k == 'instCategory':
+            if sv not in ('1', ''):
+                return f'поле {k}={v}'
+        elif any(w in sv for w in NONCRYPTO_WORDS):
+            return f'поле {k}={v}'
+    return None
+
+
+def cat_of(info):
+    """Первое найденное поле «класс актива» как 'ключ=значение' (для распределения в отчёте) либо ''."""
+    for k in CAT_KEYS:
+        v = (info or {}).get(k) if isinstance(info, dict) else None
+        if v not in (None, ''):
+            return f'{k}={v}'
+    return ''
+
+
 def usdt_swaps(markets):
     """Линейные USDT-перпетуалы из ccxt-markets (неактивные включаются, если биржа их отдала). → {symbol: {base, norm, active, created}}."""
     out = {}
@@ -154,7 +187,8 @@ def usdt_swaps(markets):
         if not (m.get('swap') and m.get('linear') and str(m.get('quote')) == 'USDT' and str(m.get('settle') or 'USDT') == 'USDT'):
             continue
         base = str(m.get('base') or '')
-        out[sym] = {'base': base, 'norm': norm_base(base), 'active': m.get('active') is not False, 'created': m.get('created')}
+        out[sym] = {'base': base, 'norm': norm_base(base), 'active': m.get('active') is not False, 'created': m.get('created'),
+                    'excl': noncrypto_reason(base, m.get('info')), 'cat': cat_of(m.get('info'))}
     return out
 
 
@@ -231,6 +265,21 @@ async def fetch_funding(f, ex_id, sym, stop_ms, limit=None):
     return round_sec(np.array(ts, np.int64)) if ts else np.zeros(0, np.int64), np.array([ev[t] for t in ts], float)
 
 
+def noncrypto_lines(ex, swaps):
+    """Строки отчёта загрузки (§2.52): сколько исключено и по какому признаку; NC-базы списком; распределение значений найденных полей «класс актива» по бирже."""
+    from collections import Counter
+    out = []
+    ex_by = Counter((v['excl'].split('=')[0] if v.get('excl') else None) for v in swaps.values())
+    ex_by.pop(None, None)
+    if ex_by:
+        ncs = sorted(v['base'] for v in swaps.values() if v.get('excl') == 'NC-префикс')
+        out.append(f'    исключено не-крипто (§2.52): {sum(ex_by.values())} — ' + ', '.join(f'{k}: {n}' for k, n in sorted(ex_by.items()))
+                   + (f'; NC-базы ({len(ncs)}): ' + ', '.join(ncs[:40]) + (' …' if len(ncs) > 40 else '') if ncs else ''))
+    cats = Counter(v.get('cat') for v in swaps.values() if v.get('cat'))
+    out.append(f'    поля «класс актива» в markets ({ex}): ' + (', '.join(f'{k}: {n}' for k, n in sorted(cats.items())[:12]) if cats else 'не найдено (проверялись ' + ', '.join(CAT_KEYS) + ') — признак только по NC-префиксу'))
+    return out
+
+
 def coarse_liquid(qv, window=30):
     """Максимум 30-дневного среднего оборота за всю историю ≥ LIQ_COARSE (грубый фильтр загрузки фандинга)."""
     if len(qv) < 1:
@@ -251,14 +300,18 @@ def h2_universe(markets, bars, binance_norm):
     биржа с большим оборотом за первые 30 баров (при равенстве — Bybit). Исключаются стейблкоин-подобные (σ < 0.5%) и существовавшие до начала истории биржи (первый бар в самый ранний день
     среди загруженных символов биржи). → (список dict(ex, sym, norm, first_day), справка dict счётчиков и исключений)."""
     earliest = {ex: min((int(b['ts'][0]) for b in bars.get(ex, {}).values() if len(b['ts'])), default=None) for ex in EXCHANGES}
-    cand = {}
+    cand, nonc = {}, {}
     for ex in EXCHANGES:
         for sym, m in markets.get(ex, {}).items():
             b = bars.get(ex, {}).get(sym)
             if b is None or not len(b['ts']) or m['norm'] in binance_norm:
                 continue
+            why = m.get('excl') or noncrypto_reason(m.get('base') or m['norm'])      # [v120, §2.52] не-крипто — до расчёта вселенной (кэш прошлых версий — по базе)
+            if why:
+                nonc.setdefault(why.split('=')[0], []).append(f'{ex}:{m.get("base") or m["norm"]}')
+                continue
             cand.setdefault(m['norm'], []).append((ex, sym, b))
-    out, ref = [], {'stable': [], 'pre_existing': [], 'both': 0, 'not_in_binance_bases': len(cand)}
+    out, ref = [], {'stable': [], 'pre_existing': [], 'both': 0, 'not_in_binance_bases': len(cand), 'noncrypto': nonc}
     for norm in sorted(cand):
         opts = cand[norm]
         if len(opts) > 1:
@@ -354,8 +407,10 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                          f'загрузка остальных продолжается')
                 continue
             mk[ex] = usdt_swaps(m)
-            idx['markets'][ex] = {s: {'base': v['base'], 'norm': v['norm'], 'active': v['active'], 'created': v['created']} for s, v in mk[ex].items()}
+            idx['markets'][ex] = {s: {'base': v['base'], 'norm': v['norm'], 'active': v['active'], 'created': v['created'], 'excl': v.get('excl'), 'cat': v.get('cat', '')} for s, v in mk[ex].items()}
             L.append(f'  {ex}: линейных USDT-перпетуалов {len(mk[ex])} (неактивных {sum(1 for v in mk[ex].values() if not v["active"])})')
+            L += noncrypto_lines(ex, mk[ex])
+            mk[ex] = {s: v for s, v in mk[ex].items() if not v.get('excl')}          # [v120, §2.52] данные по исключённым символам не запрашиваются
         if exchanges and not any(mk.get(ex) for ex in exchanges) and (unavailable or len(venues) < len(exchanges)):
             save_index(d, idx)
             return '\n'.join(L + ['⛔ все биржи недоступны — загружать нечего (Binance — из архива /battery_load, не отсюда)'])
@@ -481,11 +536,9 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         save_index(d, idx)
     finally:
         if own:
-            for c in exchanges.values():
-                try:
-                    await c.close()
-                except Exception:
-                    pass
+            import access_probe
+            for c in exchanges.values():                            # [v120] двойное закрытие с паузой (см. access_probe.close_ccxt)
+                await access_probe.close_ccxt(c)
     L += coverage_lines(d, idx, now_ms)
     if stopped:
         L.append(stopped)

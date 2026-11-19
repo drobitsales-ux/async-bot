@@ -72,7 +72,23 @@ def classify_exchange(http_results: list, ccxt_res: dict = None) -> str:
     return 'не определено'
 
 
-async def ccxt_probe(ex_id: str, timeout: float = 60.0) -> dict:
+CLOSE_DELAY = 1.0
+
+
+async def close_ccxt(ex, delay: float = None, sleep=asyncio.sleep):
+    """[v120] Закрывает временный экземпляр ccxt ДВАЖДЫ: после исключения из load_markets (ccxt запускает несколько запросов параллельно) недозавершённые запросы могут
+    заново открыть сессию уже после первого close() — тогда в логе «<биржа> requires to release all resources». Пауза между вызовами даёт им закончиться.
+    Гипотеза причины: в среде разработки без сети НЕ воспроизведена. Не бросает исключений."""
+    for k in range(2):
+        try:
+            await ex.close()
+        except Exception:
+            pass
+        if k == 0:
+            await sleep(CLOSE_DELAY if delay is None else delay)
+
+
+async def ccxt_probe(ex_id: str, timeout: float = 60.0, sleep=asyncio.sleep) -> dict:
     """load_markets через ccxt (публичный, без ключей) → {'dt','ok','exc','n'}; exc — имя класса исключения."""
     t0 = time.time()
     ex = None
@@ -84,11 +100,8 @@ async def ccxt_probe(ex_id: str, timeout: float = 60.0) -> dict:
     except Exception as e:
         return {'dt': time.time() - t0, 'ok': False, 'exc': f'{type(e).__name__}: {str(e)[:120]}', 'n': 0}
     finally:
-        try:
-            if ex is not None:
-                await ex.close()
-        except Exception:
-            pass
+        if ex is not None:
+            await close_ccxt(ex, sleep=sleep)
 
 
 async def probe_all(ex_ids=('bybit', 'okx'), session=None, ccxt_fn=ccxt_probe) -> dict:

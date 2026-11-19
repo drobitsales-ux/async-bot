@@ -269,8 +269,8 @@ class Hints(unittest.TestCase):
         src = open(os.path.join(_common.ROOT, 'async_bot.py'), encoding='utf-8').read()
         self.assertIn('Порядок: /h2_replicate load → /h2_replicate (без аргумента', src)
         self.assertIn('Порядок: /xfund_test load → /xfund_test (без аргумента', src)
-        self.assertTrue(a.CODE_VERSION.endswith('v119'))
-        self.assertIsNotNone(re.search(r"'2026-\d\d-\d\d-v119'", src))
+        self.assertIsNotNone(re.fullmatch(r'2026-\d\d-\d\d-v\d+', a.CODE_VERSION))
+        self.assertIn("'2026-11-20-v119'", src)                                          # запись v119 в CHANGELOG сохранена
 
     def test_no_order_methods_in_okx_module(self):
         src = open(os.path.join(_common.ROOT, 'research_okx.py'), encoding='utf-8').read().lower()

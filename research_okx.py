@@ -61,7 +61,7 @@ class OkxPublic:
             sym = f'{base}/USDT:USDT'
             lt = d.get('listTime')
             out[sym] = {'swap': True, 'linear': True, 'quote': 'USDT', 'settle': 'USDT', 'base': base, 'active': str(d.get('state')) == 'live',
-                        'created': int(lt) if str(lt or '').isdigit() else None, 'id': inst}
+                        'created': int(lt) if str(lt or '').isdigit() else None, 'id': inst, 'info': d}
             self._ids[sym] = inst
         return out
 
