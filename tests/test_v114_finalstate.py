@@ -300,7 +300,7 @@ class Memory(unittest.TestCase):
             self.assertEqual(RR.THREAD_ENV[k], '1')
         self.assertEqual(RR.THREAD_ENV['MALLOC_ARENA_MAX'], '2')
         src = open(os.path.join(ROOT, 'research_runner.py'), encoding='utf-8').read()
-        self.assertIn('env = dict(os.environ, **THREAD_ENV', src)           # дочерний процесс запускается с этим окружением
+        self.assertIn('env = child_env(mem_mb)', src)           # дочерний процесс запускается с этим окружением
 
 
 class Gate(unittest.TestCase):

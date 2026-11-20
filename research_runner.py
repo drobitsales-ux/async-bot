@@ -23,7 +23,22 @@ import time
 import traceback
 
 DEFAULT_MEM_MB = 300
-THREAD_ENV = {'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'NUMEXPR_NUM_THREADS': '1', 'MALLOC_ARENA_MAX': '2'}
+THREAD_ENV = {'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'NUMEXPR_NUM_THREADS': '1', 'VECLIB_MAXIMUM_THREADS': '1', 'MALLOC_ARENA_MAX': '2'}
+BLAS_VARS = ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS')
+
+
+def child_env(mem_mb: float = None) -> dict:
+    """Окружение дочернего процесса: потоки BLAS = 1 ПЕРЕД запуском интерпретатора (значения сервиса перекрываются; после import numpy менять поздно), лимит RESEARCH_MEM_MB."""
+    return dict(os.environ, **THREAD_ENV, RESEARCH_MEM_MB=str(mem_mb if mem_mb is not None else mem_limit_mb()), BOT_RESEARCH_CHILD='1', PYTHONUNBUFFERED='1')
+
+
+def blas_threads_text() -> str:
+    """Для /status: «потоки BLAS в дочерних процессах: 1» (если все пять переменных равны) либо перечень."""
+    e = child_env()
+    vals = {k: e.get(k) for k in BLAS_VARS}
+    if len(set(vals.values())) == 1:
+        return f'потоки BLAS в дочерних процессах: {next(iter(vals.values()))}'
+    return 'потоки BLAS в дочерних процессах: ' + ', '.join(f'{k.split("_")[0]} {v}' for k, v in vals.items())
 EXIT_MEMORY = 3
 EXIT_ERROR = 1
 STATE = {'task': None, 'pid': None, 'started': 0.0, 'rss_mb': 0.0, 'last': ''}      # для /status
@@ -114,6 +129,18 @@ async def _task_selftest_ok(ctx: Ctx):
     await ctx.progress('selftest: шаг 1')
     await ctx.progress('selftest: шаг 2')
     return {'text': 'selftest ok ' + str(ctx.params.get('x', ''))}
+
+
+async def _task_selftest_env(ctx: Ctx):
+    """Тестовая задача: значения переменных потоков BLAS, как их видит дочерний процесс (до import numpy они уже в окружении)."""
+    return {'text': json.dumps({k: os.environ.get(k) for k in BLAS_VARS + ('MALLOC_ARENA_MAX',)})}
+
+
+async def _task_selftest_blas(ctx: Ctx):
+    """Тестовая задача: имитирует падение OpenBLAS (текст как в прод-логе) с кодом возврата 1."""
+    sys.stderr.write('OpenBLAS error: Memory allocation still failed after 10 retries, giving up.\n')
+    sys.stderr.flush()
+    os._exit(1)
 
 
 async def _task_selftest_kill(ctx: Ctx):
@@ -316,7 +343,7 @@ async def _task_xfund_test(ctx: Ctx):
 
 
 TASKS = {
-    '_selftest_mem': _task_selftest_mem, '_selftest_ok': _task_selftest_ok, '_selftest_kill': _task_selftest_kill,
+    '_selftest_mem': _task_selftest_mem, '_selftest_ok': _task_selftest_ok, '_selftest_kill': _task_selftest_kill, '_selftest_env': _task_selftest_env, '_selftest_blas': _task_selftest_blas,
     'edge_audit': _task_edge_audit, 'of_backtest': _task_of_backtest, 'htf_backtest': _task_htf_backtest, 'htf_wide': _task_htf_wide,
     'htf_xsmom': _task_htf_xsmom, 'wide_stop': _task_wide_stop, 'data_probe': _task_data_probe, 'carry_test': _task_carry_test, 'data_probe_ma': _task_data_probe_ma,
     'factory_load': _task_factory_load, 'factory_pairs': _task_factory_pairs, 'factory': _task_factory, 'factory_final': _task_factory_final,
@@ -403,6 +430,10 @@ def describe_exit(code, result, mem_mb, stderr_tail: str = '') -> str:
         return f'убит сигналом {name}{extra}'
     if code == EXIT_MEMORY:
         return f'MemoryError: превышен лимит памяти RESEARCH_MEM_MB={mem_mb:g}'
+    low = (stderr_tail or '').lower()
+    if 'openblas' in low or 'memory allocation' in low:
+        thr = child_env().get('OPENBLAS_NUM_THREADS', '?')
+        return f'нехватка адресного пространства для BLAS; потоки BLAS: {thr}; лимит RESEARCH_MEM_MB={mem_mb:g} (код возврата {code})'
     tail = (stderr_tail or '').strip().splitlines()[-3:]
     return f'код возврата {code}' + (f'; stderr: {" | ".join(tail)[:400]}' if tail else '')
 
@@ -425,7 +456,7 @@ async def run_job(task: str, params: dict = None, payload=None, progress=None, m
         if payload is not None:
             with open(os.path.join(d, 'payload.pkl'), 'wb') as f:
                 pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-        env = dict(os.environ, **THREAD_ENV, RESEARCH_MEM_MB=str(mem_mb), BOT_RESEARCH_CHILD='1', PYTHONUNBUFFERED='1')
+        env = child_env(mem_mb)
         script = script or os.path.abspath(__file__)
         err_f = open(os.path.join(d, 'stderr.log'), 'wb')
         try:
