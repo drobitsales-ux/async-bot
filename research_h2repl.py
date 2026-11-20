@@ -5,6 +5,8 @@ import math
 import time
 from datetime import datetime, timezone
 
+import os
+
 import numpy as np
 
 import research_battery as RB
@@ -133,20 +135,14 @@ def build_repl_panel(xdir, bdir=None, venues=None):
     idx = X.load_index(xdir)
     vn = tuple(venues) if venues else X.venues_from_spec()                                          # [v118] H2REPL-VENUES (BOT_SPEC §2.50): без маркера — обе площадки
     mk = {ex: ({s: dict(v) for s, v in idx['markets'].get(ex, {}).items()} if ex in vn else {}) for ex in X.EXCHANGES}
-    bars = {ex: {} for ex in X.EXCHANGES}
-    for ex in vn:
-        for s in idx['bars'].get(ex, {}):
-            b = X.load_bars(xdir, ex, s)
-            if b is not None and len(b['ts']):
-                bars[ex][s] = b
+    def keys_of(ex):                                                   # v123 (§2.55): ключи из индекса (запись есть, ряд непуст, файл существует) — ряды читаются лениво по одному
+        return [s_ for s_, r in idx['bars'].get(ex, {}).items() if int(r.get('n', 1) or 0) > 0 and os.path.exists(X.bars_path(xdir, ex, s_))]
+    bars = {ex: X.LazyStore(keys_of(ex) if ex in vn else [], lambda s_, ex=ex: X.load_bars(xdir, ex, s_)) for ex in X.EXCHANGES}
     uni, ref = X.h2_universe(mk, bars, X.binance_norm_set(bdir))
-    series, fund = {}, {}
-    for u in uni:
-        name = f'{u["ex"]}:{u["sym"]}'
-        series[name] = bars[u['ex']][u['sym']]
-        f = X.load_fund(xdir, u['ex'], u['sym'])
-        if f is not None:
-            fund[name] = f
+    where = {f'{u["ex"]}:{u["sym"]}': (u['ex'], u['sym']) for u in uni}
+    series = X.LazyStore(list(where), lambda name: bars[where[name][0]][where[name][1]])
+    fk = [nm for nm, (ex_, s_) in where.items() if os.path.exists(X.fund_path(xdir, ex_, s_))]
+    fund = X.LazyStore(fk, lambda name: X.load_fund(xdir, where[name][0], where[name][1]))
     P = X.panel_from_series(series, fund)
     if P is not None:                                                  # [v119, §2.51] первый день с фандингом по символу (−1 — истории нет): счётчик «фандинг = 0»
         P['fund_first'] = np.array([(int(fund[nm][0][0]) // DAY - P['day0']) if (nm in fund and len(fund[nm][0])) else -1 for nm in P['syms']], np.int64)
