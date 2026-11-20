@@ -325,7 +325,7 @@ class HourlyForTraded(unittest.TestCase):
         self.assertTrue(all(k[3].get('endTime') is None or k[3]['endTime'] > 0 for k in spy.spy))
         cov = X.coverage_report(xdir, 'x1', bdir, hourly_syms=[('bingx', sym)])
         self.assertTrue(cov['ok'], cov['lines'])
-        self.assertIn('1h по символам сделок (загружены или подтверждённо пусты; ошибка/не обработано — гейт): 1 из 1', '; '.join(cov['lines']))
+        self.assertRegex('; '.join(cov['lines']), r'1h по символам сделок \([^)]*\): 1 из 1')                  # формулировка скобок менялась (v121 → v124 → v125) — проверяем долю
         # повторный запуск — запросов нет
         spy2 = FakeEx({sym: mkt('NEWA')}, {sym + '#h': dict(hb, o=hb['c'], v=np.ones(len(hb['ts'])))}, {})
         run(XF.load_traded_hourly({'xdir': xdir, 'bdir': bdir, 'fee_taker': 0.0005}, None, {'bingx': spy2}, now_ms=(day0 + nd + 1) * DAY, sleep=nosleep))

@@ -337,6 +337,11 @@ async def _task_h2_replicate(ctx: Ctx):
     return {'text': await research_h2repl.run_h2repl(ctx.params, progress=ctx.progress)}
 
 
+async def _task_xfund_1h_errors(ctx: Ctx):
+    import research_h1err                       # [v125] диагностика и классификация ошибок 1h BingX (BOT_SPEC §2.57)
+    return {'text': await research_h1err.run_h1_errors(ctx.params, progress=ctx.progress)}
+
+
 async def _task_xfund_test(ctx: Ctx):
     import research_xfund                        # [v116] X1: межбиржевой арбитраж фандинга BingX/Bybit (BOT_SPEC §2.48)
     return {'text': await research_xfund.run_xfund(ctx.params, progress=ctx.progress)}
@@ -351,7 +356,7 @@ TASKS = {
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
     'final_h2': _task_final_h2, 'vrp_probe': _task_vrp_probe, 'vrp_measure': _task_vrp_measure, 'vrp_sim': _task_vrp_sim,
-    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test,
+    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors,
     'audit': _task_audit, 'audit_import': _task_audit_import, 'signal_study': _task_signal_study, 'signal_final': _task_signal_final,
 }
 
