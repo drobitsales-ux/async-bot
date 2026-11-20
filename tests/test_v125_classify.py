@@ -64,6 +64,7 @@ def make_idx(syms):
     for s in syms:
         idx['bars']['bingx'][s] = {'first': NOW - 400 * DAY, 'last': NOW - DAY, 'n': 399, 't': 3, 'complete': True}
         idx['neg'][f'bingx|{s}|h1'] = {'t': 3, 'why': 'ExchangeError', 'msg': 'старое', 'pages': 0, 'rows': 0}
+    idx['migr']['bingx|v127_reset'] = {'t': 1, 'n': 0}                                     # разовый сброс v127 уже выполнен (иначе записи-ошибки были бы сброшены в «не обработано»)
     X.save_index(d, idx)
     return d
 
@@ -177,7 +178,7 @@ class Classes(unittest.TestCase):
         self.assertTrue(c['ok'], c['lines'])
         line = X.hourly_line(c['hourly'])
         self.assertIn('подтверждённо недоступны (§2.57 а2, дневной запасной базис): 5', line)
-        self.assertIn('частичной глубины (§2.57 а1, остальной период — дневной базис): 1', line)
+        self.assertIn('частичной глубины (§2.57 а1 / §2.58 п. 4, остальной период — дневной базис): 1', line)
         self.assertIn('через соответствие переименованию (§2.57 б): 1', line)
         # два символа класса г (ошибка в гейте) → 8/10 < 90% — расчёт блокируется
         for _e, s in syms[5:7]:

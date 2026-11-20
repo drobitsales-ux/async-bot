@@ -20,6 +20,7 @@ def build(n_syms, pages=30):
     for s in syms:
         idx['bars']['bingx'][s] = {'first': NOW - 2500 * DAY, 'last': NOW - DAY, 'n': 2400, 't': 3, 'complete': True}
         idx['neg'][f'bingx|{s}|h1'] = {'t': 3, 'why': 'ExchangeError', 'msg': 'старое', 'pages': 0, 'rows': 0}
+    idx['migr']['bingx|v127_reset'] = {'t': 1, 'n': 0}
     X.save_index(d, idx)
 
     def script(k, since, limit, params):                      # 30 страниц по 1000 баров, затем ошибка границы; за 7 суток данные есть → класс а1 (загружается доступная часть)

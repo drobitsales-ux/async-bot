@@ -13,7 +13,7 @@ DAY = X.DAY
 HOUR = X.HOUR
 RETRY_V = (3, 8, 20, 45)                        # §2.57 в): паузы повторов
 NODATA_RE = re.compile(r'no data|not exist|does not exist|invalid symbol|symbol .{0,20}(closed|offline|delist)|out of (range|history)|time range|startTime|endTime|too early|beyond', re.I)
-TRANSIENT_RE = re.compile(r'rate.?limit|too many|timeout|timed out|busy|temporar|try again|unavailable|internal (server )?error|5\d\d', re.I)
+TRANSIENT_RE = re.compile(r'rate.?limit|too many|timeout|timed out|busy|temporar|try again|unavailable|internal (server )?error|5\d\d|请稍后重试|稍后', re.I)       # v127 (§2.58): + китайское «повторите позже»
 CODE_RE = re.compile(r'"code"\s*:\s*"?(-?\d+)')
 MSG_RE = re.compile(r'"msg"\s*:\s*"([^"]*)"')
 
@@ -82,12 +82,14 @@ def classify(p, p7, market, daily, candidates):
     code, text = code_text(exc) if exc is not None else ('', '')
     if exc is None:
         return 'в', 'ошибка не воспроизвелась при повторном проходе (временная)'
-    transient = X.is_transient(exc) or bool(TRANSIENT_RE.search(text))
+    transient = X.is_transient(exc) or code in X.TRANSIENT_CODES or bool(TRANSIENT_RE.search(text))
     nodata_text = bool(NODATA_RE.search(text))
+    if transient:                                                  # [v127, §2.58 п. 2] временная ошибка проверяется ПЕРЕД а1/а2: лимит запросов никогда не становится «недоступно»/«глубина»
+        return 'в', f'временная ошибка (лимит запросов/сеть): код {code or "—"}'
     # а) недоступны: интервал неудавшегося запроса попадает в диапазон дневных свечей
     in_daily = daily is not None and (p['end_fail'] is None or daily[0] <= p['end_fail'] <= daily[1] + DAY)
     if not transient and in_daily:
-        if n7 and p['pages_ok'] >= 1:
+        if n7 and p['pages_ok'] >= 1 and nodata_text:                # [v127, §2.58 п. 6] а1 — только при явном ответе биржи «нет данных / вне диапазона», не по ошибке без такого текста
             return 'а1', f'1h за 7 суток есть ({n7}), ошибка на странице {p["pages_ok"] + 1} (endTime {iso(p["end_fail"])}) — ограничение глубины истории'
         if market != 'активен' and not candidates and not n7 and (nodata_text or e7 is None):
             return 'а2', f'символ {market}, 1h за 7 суток нет, ответ биржи — «нет данных/символа»'
@@ -116,6 +118,7 @@ async def run_h1_errors(params, progress=None, exchanges=None, now_ms=None, slee
         import ccxt.async_support as ccxt
         exchanges = {'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
     idx = X.compact_index(d)
+    X.migrate_v127(d, idx)                                        # [v127, §2.58 п. 8] разовый сброс записей-ошибок и классификации в «не обработано»
     errs = sorted((k.split('|')[0], k.split('|')[1]) for k, r in idx['neg'].items() if k.endswith('|h1') and r.get('why') not in ('empty', 'unavailable'))
     errs = [(ex, s_) for ex, s_ in errs if ex == 'bingx']
     if not errs:
