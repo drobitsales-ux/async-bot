@@ -2,6 +2,7 @@
 симуляция по дневным барам и событиям фандинга обеих бирж; ни одного реального ордера. Справочно — пары с Binance (архив v108)."""
 import asyncio
 import math
+import os
 import time
 from datetime import datetime, timezone
 
@@ -99,10 +100,99 @@ def _hget(hs, k, hour):
     return float(hs[k][i]) if 0 <= i < hs['n'] else float('nan')
 
 
+class _Lru(dict):
+    """Маленький кэш с вытеснением самого старого (для открытых позиций: ≤ MAX_POS пар одновременно)."""
+
+    def __init__(self, cap):
+        super().__init__()
+        self.cap = cap
+
+    def put(self, k, v):
+        if len(self) >= self.cap:
+            del self[next(iter(self))]
+        self[k] = v
+        return v
+
+
+class _Src:
+    """Дневной ряд пары j площадки (один файл на пару): общий кэш нескольких недавних пар для всех полей O/H/L/C/Q — одно чтение файла обслуживает пять полей."""
+
+    def __init__(self, ven, syms):
+        self.ven, self.syms = ven, syms
+        self.cache = _Lru(12)
+
+    def get(self, j):
+        x = self.cache.get(j)
+        if x is None:
+            x = self.cache.put(j, self.ven['bars'][self.syms[j]])
+        return x
+
+
+class PairMat:
+    """Поле дневной матрицы «сутки × пара» (O/H/L/C/Q для площадки A или B), НЕ хранимое целиком: `m[d, j]` — значение, `m[:, j]` — столбец пары j; столбец строится из ряда пары
+    тем же присваиванием, что и прежняя плотная матрица (значения побитово те же), и кэшируется для немногих недавних пар (v123, BOT_SPEC §2.55)."""
+
+    def __init__(self, src, key, day0, nd):
+        self.src, self.key, self.day0, self.nd = src, key, day0, nd
+        self.cache = _Lru(24)
+
+    def col(self, j):
+        c = self.cache.get(j)
+        if c is None:
+            x = self.src.get(j)
+            di = (x['ts'] // DAY - self.day0).astype(np.int64)
+            c = np.full(self.nd, np.nan)
+            c[di] = x[self.key]
+            self.cache.put(j, c)
+        return c
+
+    def __getitem__(self, k):
+        d, j = k
+        return self.col(int(j))[d]
+
+
+class LazyFund:
+    """inp['fund'][j] → (события A, события B) пары j; ряды читаются из площадок при обращении (кэш — несколько недавних пар)."""
+
+    def __init__(self, venA, venB, syms):
+        self.venA, self.venB, self.syms = venA, venB, syms
+        self.cache = _Lru(24)
+
+    def __len__(self):
+        return len(self.syms)
+
+    def __getitem__(self, j):
+        v = self.cache.get(j)
+        if v is None:
+            sa, sb = self.syms[j]
+            v = self.cache.put(j, (self.venA['fund'].get(sa), self.venB['fund'].get(sb)))
+        return v
+
+
+class LazyHs:
+    """hs[tag][j] → часовые массивы пары j (или None, если часовых данных нет — файл не читается); строятся при обращении."""
+
+    def __init__(self, ven, syms, day0):
+        self.ven, self.syms, self.day0 = ven, syms, day0
+        self.cache = _Lru(16)
+
+    def __len__(self):
+        return len(self.syms)
+
+    def __getitem__(self, j):
+        if j in self.cache:
+            return self.cache[j]
+        hb = self.ven.get('hbars') or {}
+        sym = self.syms[j]
+        return self.cache.put(j, _hseries(hb.get(sym) if sym in hb else None, self.day0))
+
+
 def build_inputs(venA, venB, pairs):
-    """venX = {'bars': {sym: дневные}, 'hbars': {sym: часовые h/l/c} (необязательно), 'fund': {sym: (ts, rate)}, 'fee': доля}; pairs = [(метка, symA, symB)]. → inputs для simulate_x1: общая дневная сетка,
-    массивы по парам, допуск (оба бара + ликвидность PIT ≥ 20 млн на КАЖДОЙ площадке + ≥ 2 события в окне на каждой), avg8 по площадкам, часовые ряды (если есть)."""
-    keep, rejected = [], []
+    """venX = {'bars': {sym: дневные}, 'hbars': {sym: часовые h/l/c} (необязательно), 'fund': {sym: (ts, rate)}, 'fee': доля}; pairs = [(метка, symA, symB)]. → inputs для simulate_x1.
+    v123 (BOT_SPEC §2.55): ПОТОКОВО — пара за парой: сигнал d (avg8), допуск ликвидности PIT и «присутствие» считаются по одной паре (плотные массивы только avg/elig/present «сутки × пары»),
+    дневные поля O/H/L/C/Q, ряды фандинга и часовые ряды — ленивые (PairMat, LazyFund, LazyHs) и читаются лишь для открытых позиций; значения побитово те же, что у плотной версии v122.
+    Допуск: оба бара + ликвидность PIT ≥ 20 млн на КАЖДОЙ площадке + ≥ 2 события в окне на каждой."""
+    keep, rejected, ext = [], [], []
     for lab, sa, sb in pairs:
         a, b = venA['bars'].get(sa), venB['bars'].get(sb)
         if a is None or b is None:
@@ -112,31 +202,47 @@ def build_inputs(venA, venB, pairs):
             rejected.append((lab, 'стейблкоин-подобный'))
             continue
         ok, corr, n = pair_ok(a, b)
-        (keep if ok else rejected).append((lab, sa, sb) if ok else (lab, f'корреляция {corr:.2f} на {n} сутках'))
+        if ok:
+            keep.append((lab, sa, sb))
+            ext.append((int(min(a['ts'][0], b['ts'][0])) // DAY, int(max(a['ts'][-1], b['ts'][-1])) // DAY))
+        else:
+            rejected.append((lab, f'корреляция {corr:.2f} на {n} сутках'))
+        del a, b
     if not keep:
         return None, rejected
-    day0 = min(int(min(venA['bars'][sa]['ts'][0], venB['bars'][sb]['ts'][0])) // DAY for _l, sa, sb in keep)
-    day1 = max(int(max(venA['bars'][sa]['ts'][-1], venB['bars'][sb]['ts'][-1])) // DAY for _l, sa, sb in keep)
+    day0 = min(e[0] for e in ext)
+    day1 = max(e[1] for e in ext)
     nd, n = day1 - day0 + 1, len(keep)
-    M = {k: np.full((nd, n), np.nan) for k in ('OA', 'HA', 'LA', 'CA', 'QA', 'OB', 'HB', 'LB', 'CB', 'QB')}
     avg = {'A': np.full((nd, n), np.nan), 'B': np.full((nd, n), np.nan)}
-    hs = {'A': [], 'B': []}
+    present = np.zeros((nd, n), dtype=bool)
+    elig = np.zeros((nd, n), dtype=bool)
     for j, (lab, sa, sb) in enumerate(keep):
+        cols, liq = {}, {}
         for tag, ven, sym in (('A', venA, sa), ('B', venB, sb)):
             x = ven['bars'][sym]
             di = (x['ts'] // DAY - day0).astype(np.int64)
-            for k, kk in zip('OHLCQ', ('o', 'h', 'l', 'c', 'qv')):
-                M[k + tag][di, j] = x[kk]
+            for k, kk in (('O', 'o'), ('C', 'c'), ('Q', 'qv')):
+                col = np.full(nd, np.nan)
+                col[di] = x[kk]
+                cols[k + tag] = col
             avg[tag][:, j] = avg8_matrix(day0, nd, ven['fund'].get(sym))
-            hs[tag].append(_hseries((ven.get('hbars') or {}).get(sym), day0))
-    liq = {}
-    for tag in 'AB':
-        adv, _c = B.pit_adv(M['Q' + tag].astype(np.float32))
-        liq[tag] = B.liquid_mask(adv)
-    present = np.isfinite(M['OA']) & np.isfinite(M['CA']) & np.isfinite(M['OB']) & np.isfinite(M['CB'])
-    elig = present & liq['A'] & liq['B'] & np.isfinite(avg['A']) & np.isfinite(avg['B'])
-    return {'day0': day0, 'nd': nd, 'M': M, 'avg': avg, 'elig': elig, 'present': present, 'labels': [k[0] for k in keep], 'syms': [(k[1], k[2]) for k in keep], 'hs': hs,
-            'fund': [(venA['fund'].get(sa), venB['fund'].get(sb)) for _l, sa, sb in keep], 'fees': (venA['fee'], venB['fee'])}, rejected
+            adv, _c = B.pit_adv(cols['Q' + tag].astype(np.float32).reshape(-1, 1))
+            liq[tag] = B.liquid_mask(adv)[:, 0]
+            del x, di
+        pj = np.isfinite(cols['OA']) & np.isfinite(cols['CA']) & np.isfinite(cols['OB']) & np.isfinite(cols['CB'])
+        present[:, j] = pj
+        elig[:, j] = pj & liq['A'] & liq['B'] & np.isfinite(avg['A'][:, j]) & np.isfinite(avg['B'][:, j])
+        del cols, liq
+    syms = [(k[1], k[2]) for k in keep]
+    M = {}
+    srcA, srcB = _Src(venA, [s_[0] for s_ in syms]), _Src(venB, [s_[1] for s_ in syms])
+    for k in 'OHLCQ':
+        kk = {'O': 'o', 'H': 'h', 'L': 'l', 'C': 'c', 'Q': 'qv'}[k]
+        M[k + 'A'] = PairMat(srcA, kk, day0, nd)
+        M[k + 'B'] = PairMat(srcB, kk, day0, nd)
+    return {'day0': day0, 'nd': nd, 'M': M, 'avg': avg, 'elig': elig, 'present': present, 'labels': [k[0] for k in keep], 'syms': syms,
+            'hs': {'A': LazyHs(venA, [s_[0] for s_ in syms], day0), 'B': LazyHs(venB, [s_[1] for s_ in syms], day0)},
+            'fund': LazyFund(venA, venB, syms), 'fees': (venA['fee'], venB['fee'])}, rejected
 
 
 # ── симуляция ───────────────────────────────────────────────────────────────────────────────────────
@@ -381,23 +487,19 @@ def fmt_metrics(label, T, m, c, ok):
 
 
 # ── данные и команда ────────────────────────────────────────────────────────────────────────────────
+LazyStore = X.LazyStore                                          # v123: определение — в research_xdata (общее для X1 и H2)
+
+
 def load_venues(xdir, bdir, fee_taker):
-    """Площадки: BingX, Bybit (кэш XDATA_DIR) и Binance (архив v108) — только для норм-баз, загруженных для X1."""
+    """Площадки: BingX, Bybit, OKX (кэш XDATA_DIR) и Binance (архив v108). v123: ряды НЕ загружаются — ключи из индекса (запись есть и файл существует), ряд читается по одному при обращении."""
     idx = X.load_index(xdir)
     ven = {}
     for ex in X.EXCHANGES:
-        bars, fund, hbars = {}, {}, {}
-        for sym in idx['bars'].get(ex, {}):
-            b = X.load_bars(xdir, ex, sym)
-            if b is not None and len(b['ts']):
-                bars[sym] = b
-                f = X.load_fund(xdir, ex, sym)
-                if f is not None:
-                    fund[sym] = f
-                hb = X.load_hbars(xdir, ex, sym)
-                if hb is not None:
-                    hbars[sym] = hb
-        ven[ex] = {'bars': bars, 'fund': fund, 'hbars': hbars, 'fee': (fee_taker if ex == 'bingx' else FEE_DEFAULT), 'markets': idx['markets'].get(ex, {})}
+        ks = [s_ for s_, r in idx['bars'].get(ex, {}).items() if int(r.get('n', 1) or 0) > 0 and os.path.exists(X.bars_path(xdir, ex, s_))]
+        fk = [s_ for s_ in ks if os.path.exists(X.fund_path(xdir, ex, s_))]
+        hk = [s_ for s_ in ks if os.path.exists(X.hbars_path(xdir, ex, s_))]
+        ven[ex] = {'bars': LazyStore(ks, lambda s_, ex=ex: X.load_bars(xdir, ex, s_)), 'fund': LazyStore(fk, lambda s_, ex=ex: X.load_fund(xdir, ex, s_)),
+                   'hbars': LazyStore(hk, lambda s_, ex=ex: X.load_hbars(xdir, ex, s_)), 'fee': (fee_taker if ex == 'bingx' else FEE_DEFAULT), 'markets': idx['markets'].get(ex, {})}
     return ven
 
 
@@ -425,31 +527,46 @@ def common_pairs(ven, a='bingx', b='bybit'):
     return out
 
 
+def _npz_len(path):
+    """Число строк ряда (длина `ts`) без загрузки остальных массивов; None — файла нет/не читается."""
+    try:
+        with np.load(path) as z:
+            return int(len(z['ts']))
+    except Exception:
+        return None
+
+
 def binance_venue(bdir, norms, fee_taker, with_h1=False):
     """Binance из архива: символы, чья нормализованная база среди norms; выбирается ряд с наибольшим числом суток.
-    with_h1 [v118, §2.50]: добавляются часовые свечи архива (`hbars`, для базиса X1 по 1h); ставки — fundingRate архива с ФАКТИЧЕСКИМИ отметками времени (calc_time)."""
+    with_h1 [v118, §2.50]: добавляются часовые свечи архива (`hbars`, для базиса X1 по 1h); ставки — fundingRate архива с ФАКТИЧЕСКИМИ отметками времени (calc_time).
+    v123 (§2.55): выбор символа — по длине `ts` (остальные массивы не читаются), ряды читаются лениво по одному."""
     idx = B.load_index(bdir)
     best = {}
     for s in idx.get('symbols', []):
         nb = X.norm_base(s[:-4] if s.endswith('USDT') else s)
         if nb not in norms:
             continue
-        z = B.load_d1(bdir, s)
-        if z is None or not len(z['ts']):
+        n_ = _npz_len(B.d1_path(bdir, s))
+        if not n_:
             continue
-        if nb not in best or len(z['ts']) > len(best[nb][1]['ts']):
-            best[nb] = (s, z)
-    bars, fund, hbars = {}, {}, {}
-    for nb, (s, z) in best.items():
-        bars[nb] = {'ts': z['ts'], 'o': z['o'], 'h': z['h'], 'l': z['l'], 'c': z['c'], 'qv': z['qv']}
-        f = B.load_fund(bdir, s)
-        if f is not None:
-            fund[nb] = (f['ts'], f['rate'])
-        if with_h1:
-            h = B.load_h1(bdir, s)
-            if h is not None and len(h['ts']):
-                hbars[nb] = {'ts': h['ts'], 'h': h['h'], 'l': h['l'], 'c': h['c']}
-    return {'bars': bars, 'fund': fund, 'hbars': hbars, 'fee': fee_taker, 'markets': {}, 'symbols': {nb: s for nb, (s, _z) in best.items()}}
+        if nb not in best or n_ > best[nb][1]:
+            best[nb] = (s, n_)
+    sym_of = {nb: s for nb, (s, _n) in best.items()}
+
+    def d1(nb):
+        z = B.load_d1(bdir, sym_of[nb])
+        return {'ts': z['ts'], 'o': z['o'], 'h': z['h'], 'l': z['l'], 'c': z['c'], 'qv': z['qv']}
+
+    def fu(nb):
+        f = B.load_fund(bdir, sym_of[nb])
+        return (f['ts'], f['rate'])
+
+    def h1(nb):
+        h = B.load_h1(bdir, sym_of[nb])
+        return {'ts': h['ts'], 'h': h['h'], 'l': h['l'], 'c': h['c']}
+    fk = [nb for nb in sym_of if os.path.exists(B.fr_path(bdir, sym_of[nb]))]
+    hk = [nb for nb in sym_of if with_h1 and (_npz_len(B.h1_path(bdir, sym_of[nb])) or 0) > 0]
+    return {'bars': LazyStore(list(sym_of), d1), 'fund': LazyStore(fk, fu), 'hbars': LazyStore(hk, h1), 'fee': fee_taker, 'markets': {}, 'symbols': dict(sym_of)}
 
 
 def main_pairs_binance(ven_bingx, bn):

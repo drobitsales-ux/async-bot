@@ -2,6 +2,7 @@
 свечи и история фандинга с кэшем и повторами, правило вселенной (монеты, которых НИКОГДА не было в архиве Binance), панель в формате `research_bdata.load_panel`. Сеть — только в дочернем
 процессе (research_runner); ни одного вызова создания ордеров."""
 import asyncio
+import collections.abc
 import json
 import os
 import re
@@ -255,6 +256,28 @@ def usdt_swaps(markets):
         out[sym] = {'base': base, 'norm': norm_base(base), 'active': m.get('active') is not False, 'created': m.get('created'),
                     'excl': noncrypto_reason(base, m.get('info')), 'cat': cat_of(m.get('info'))}
     return out
+
+
+class LazyStore(collections.abc.Mapping):
+    """Отображение «символ → ряд» БЕЗ подъёма рядов в память: ключи известны из индекса, ряд читается из файла при обращении и не кэшируется (v123, BOT_SPEC §2.55)."""
+
+    def __init__(self, keys, loader):
+        self._keys, self._loader = list(keys), loader
+        self._set = set(self._keys)
+
+    def __getitem__(self, k):
+        if k not in self._set:
+            raise KeyError(k)
+        return self._loader(k)
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __contains__(self, k):
+        return k in self._set
 
 
 # ── загрузка (ccxt, публичные методы) ───────────────────────────────────────────────────────────────
@@ -522,7 +545,7 @@ async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sle
         if neg_active(idx, ex, sym, 'h1', now_ms):
             empty += 1
             continue
-        cur = load_hbars(d, ex, sym)
+        cur = load_hbars(d, ex, sym) if rec else None
         since = (int(cur['ts'][-1]) + HOUR) if cur is not None and len(cur['ts']) else SINCE_MS
         try:
             hts, _o, hh, hl, hc, _v, comp = await fetch_bars_back(fx[ex], ex, sym, since, now_ms, tf='1h')
@@ -622,7 +645,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                 continue
             if neg_active(idx, ex, sym, 'bars', now_ms):
                 continue
-            cur = load_bars(d, ex, sym)
+            cur = load_bars(d, ex, sym) if rec else None                  # без записи в индексе файл не открываем (индекс — единственный источник «что готово»)
             since = (int(cur['ts'][-1]) + DAY) if cur is not None and len(cur['ts']) else SINCE_MS
             try:
                 ts, o, h, l_, c, v, comp = await fetch_bars_back(fx[ex], ex, sym, since, now_ms)
@@ -670,7 +693,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     else:
                         put(d, idx, 'neg', ex, f'{sym}|fund', {'t': now_ms, 'why': type(e).__name__})
                     continue
-                cur = load_fund(d, ex, sym)
+                cur = load_fund(d, ex, sym) if rec else None
                 parts_t, parts_r = [ts], [r]
                 if cur is not None and len(cur[0]):
                     parts_t.append(cur[0]); parts_r.append(cur[1])
