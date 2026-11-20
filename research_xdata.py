@@ -99,6 +99,8 @@ def _apply(idx, kind, ex, sym, rec):
         idx[kind].setdefault(ex, {})[sym] = rec
     elif kind in ('neg', 'fail'):
         idx[kind][f'{ex}|{sym}'] = rec
+    elif kind == 'negdel':                                           # [v125] сброс отрицательной записи (повторный запрос символа)
+        idx['neg'].pop(f'{ex}|{sym}', None)
 
 
 def load_index(d):
@@ -155,6 +157,45 @@ def compact_index(d):
     except OSError:
         pass
     return idx
+
+
+def neg_rec(now_ms, e):
+    """[v125] Отрицательная запись об ошибке символа: класс исключения, сообщение биржи (≤ 200 симв., публичный API — секретов нет), число успешных страниц и строк ДО ошибки
+    (ошибка после успешных страниц — подозрение на «граница истории», сразу — «символ/запрос не принимается»)."""
+    return {'t': now_ms, 'why': type(e).__name__, 'msg': ' '.join(str(e).split())[:200], 'pages': getattr(e, 'pages_ok', None), 'rows': getattr(e, 'rows_got', None)}
+
+
+def error_lines(idx, what='h1', syms=None, limit=6):
+    """[v125] Сводка отрицательных записей-ошибок по виду данных (h1/bars/fund): группы по классу и началу сообщения, число, пример символа, страниц до ошибки.
+    syms — ограничение [(биржа, символ)]. → список строк (пусто — ошибок нет)."""
+    allow = None if syms is None else {f'{ex}|{s_}|{what}' for ex, s_ in syms}
+    groups = {}
+    for k, r in idx['neg'].items():
+        if not k.endswith('|' + what) or r.get('why') == 'empty' or (allow is not None and k not in allow):
+            continue
+        g = groups.setdefault((r.get('why'), (r.get('msg') or '')[:90]), {'n': 0, 'sample': k.split('|')[1], 'p0': 0, 'pn': 0, 'rows': 0})
+        g['n'] += 1
+        if (r.get('pages') or 0) > 0:
+            g['pn'] += 1
+        else:
+            g['p0'] += 1
+        g['rows'] += int(r.get('rows') or 0)
+    out = []
+    for (why, msg), g in sorted(groups.items(), key=lambda kv: -kv[1]['n'])[:limit]:
+        out.append(f'  ошибки {what}: {why} ×{g["n"]}: «{msg}» (пример: {g["sample"]}; ошибка на первой странице: {g["p0"]}, после успешных страниц: {g["pn"]}'
+                   + (f', собрано строк до ошибки: {g["rows"]}' if g['pn'] else '') + ')')
+    return out
+
+
+def clear_neg_errors(d, idx, whats=('h1', 'bars', 'fund')):
+    """[v125] Сбрасывает отрицательные записи-ОШИБКИ (не «подтверждённо пусто») — символы будут запрошены снова (иначе постоянные ошибки не перезапрашиваются 7 суток). → число сброшенных."""
+    n = 0
+    for k, r in list(idx['neg'].items()):
+        ex, sym, what = k.split('|')[0], '|'.join(k.split('|')[1:-1]), k.split('|')[-1]
+        if what in whats and r.get('why') != 'empty':
+            put(d, idx, 'negdel', ex, f'{sym}|{what}', None)
+            n += 1
+    return n
 
 
 def neg_active(idx, ex, sym, what, now_ms):
@@ -339,9 +380,18 @@ async def fetch_bars_back(f, ex_id, sym, since_ms, now_ms, tf='1d', limit=1000, 
     step = DAY if tf == '1d' else HOUR
     rows, end, complete = {}, None, False
     key = 'until' if ex_id == 'bybit' else 'endTime'
+    pages_ok = 0
     for _ in range(max_pages or (400 if tf == '1h' else 200)):
         params = {} if end is None else {key: end}
-        got = await f.call('fetch_ohlcv', sym, tf, None, limit, params)
+        try:
+            got = await f.call('fetch_ohlcv', sym, tf, None, limit, params)
+        except Exception as e:                                  # [v125] сколько страниц и строк успели получить до ошибки — в отрицательную запись
+            try:
+                e.pages_ok, e.rows_got = pages_ok, len(rows)
+            except Exception:
+                pass
+            raise
+        pages_ok += 1
         if not got:
             complete = True
             break
@@ -556,7 +606,7 @@ async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sle
             if is_transient(e):
                 put(d, idx, 'fail', ex, f'{sym}|h1', type(e).__name__)
             else:
-                put(d, idx, 'neg', ex, f'{sym}|h1', {'t': now_ms, 'why': type(e).__name__})
+                put(d, idx, 'neg', ex, f'{sym}|h1', neg_rec(now_ms, e))
                 err += 1
             continue
         if cur is not None and len(cur['ts']):
@@ -656,7 +706,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                 if is_transient(e):
                     put(d, idx, 'fail', ex, f'{sym}|bars', type(e).__name__)
                 else:
-                    put(d, idx, 'neg', ex, f'{sym}|bars', {'t': now_ms, 'why': type(e).__name__})
+                    put(d, idx, 'neg', ex, f'{sym}|bars', neg_rec(now_ms, e))
                 continue
             if cur is not None and len(cur['ts']):
                 ts = np.concatenate([cur['ts'], ts]); o = np.concatenate([cur['o'], o]); h = np.concatenate([cur['h'], h]); l_ = np.concatenate([cur['l'], l_]); c = np.concatenate([cur['c'], c]); v = np.concatenate([cur['v'], v])
@@ -673,6 +723,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         save_index(d, idx)
         x_, y_, n_, z_ = _stats_line('bars', syms_all, idx, 'bars')
         L.append(f'  свечи: загружено {x_} из {y_}, осталось {z_}; подтверждённо пусто/постоянная ошибка: {n_}')
+        L += error_lines(idx, 'bars', syms_all, 4)
         left_total += z_
         # 2. фандинг — все символы со свечами (без предфильтра ликвидности: ликвидность — point-in-time при расчёте)
         if not stopped:
@@ -694,7 +745,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     if is_transient(e):
                         put(d, idx, 'fail', ex, f'{sym}|fund', type(e).__name__)
                     else:
-                        put(d, idx, 'neg', ex, f'{sym}|fund', {'t': now_ms, 'why': type(e).__name__})
+                        put(d, idx, 'neg', ex, f'{sym}|fund', neg_rec(now_ms, e))
                     continue
                 cur = load_fund(d, ex, sym) if rec else None
                 parts_t, parts_r = [ts], [r]
@@ -719,6 +770,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             save_index(d, idx)
             x_, y_, n_, z_ = _stats_line('fund', todo, idx, 'fund')
             L.append(f'  фандинг: загружено {x_} из {y_}, осталось {z_}; подтверждённо пусто/постоянная ошибка: {n_} (без предфильтра ликвидности)')
+            L += error_lines(idx, 'fund', todo, 4)
             left_total += z_
             # 3. часовые свечи общих баз Bybit∩BingX (X1 с архивом Binance — по символам сделок, отдельным шагом /xfund_test load)
             if params.get('hourly', True) and not stopped and common:
@@ -816,6 +868,8 @@ def coverage_report(d, kind, bdir=None, venues=None, hourly_syms=None, minimum=N
         lines.append(f'{name}: {a_} из {b_} ({share * 100:.0f}%)' + (f' < {minimum * 100:.0f}%' if bad else ''))
     if hst is not None:
         lines.append(hourly_line(hst))
+        if hst['error']:                                            # [v125] какие именно ошибки биржи (класс, сообщение, страниц до ошибки)
+            lines += [x.strip() for x in error_lines(idx, 'h1', [(ex, s_) for ex, s_ in hourly_syms if s_ in hst['error']])]
     return {'ok': ok, 'parts': parts, 'lines': lines, 'expected': n, 'hourly': hst}
 
 

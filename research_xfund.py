@@ -691,8 +691,12 @@ async def load_traded_hourly(params, progress=None, exchanges=None, now_ms=None,
             import access_probe
             for c in exchanges.values():
                 await access_probe.close_ccxt(c)
-    return (f'  1h BingX по символам сделок предварительного прогона: загружено {dn} из {len(traded)}, осталось {lf}; подтверждённо пусто (дневной запасной базис): {em}; ошибка биржи: {er}'
-            + (' — ⏱ бюджет времени исчерпан, повторите команду' if stp else ''))
+    msg = (f'  1h BingX по символам сделок предварительного прогона: загружено {dn} из {len(traded)}, осталось {lf}; подтверждённо пусто (дневной запасной базис): {em}; ошибка биржи: {er}'
+           + (' — ⏱ бюджет времени исчерпан, повторите команду' if stp else ''))
+    errs = X.error_lines(X.load_index(xdir), 'h1', [('bingx', s_) for _l, s_ in traded])               # [v125] что именно ответила биржа
+    if errs:
+        msg += '\n' + '\n'.join(errs) + '\n  (постоянные ошибки не перезапрашиваются 7 суток; повторить сейчас: /xfund_test load retry)'
+    return msg
 
 
 async def run_xfund(params, progress=None):
@@ -703,12 +707,16 @@ async def run_xfund(params, progress=None):
     fee = float(params.get('fee_taker', FEE_DEFAULT))
     main_binance = params.get('x1_pair', X.x1_pair_from_spec()) == 'binance'     # [v118] маркер X1-MAIN-PAIR в BOT_SPEC (§2.50)
     if params.get('mode') == 'load':
+        pre = ''
+        if params.get('retry'):                                     # [v125] `/xfund_test load retry`: сброс отрицательных записей-ОШИБОК (не «пусто») — символы запрашиваются снова
+            n_clr = X.clear_neg_errors(xdir, X.compact_index(xdir))
+            pre = f'↺ сброшено отрицательных записей-ошибок: {n_clr} (запрашиваются снова; «подтверждённо пусто» не сбрасывается)\n'
         txt = await X.run_xload(dict(params, x1_main=main_binance, venues=params.get('venues') or (('bingx',) if main_binance else None)), progress)
         if main_binance:
             traded, _np = prelim_traded(xdir, bdir, fee)                      # 1h — только по символам сделок (Binance из архива, BingX через ccxt)
             txt += '\n' + await sync_binance_h1(dict(params, only_norms=[lab for lab, _s in traded]), progress, params.get('b_fetch'))
             txt += '\n' + await load_traded_hourly(params, progress, params.get('ccxt_exchanges'))
-        return txt
+        return pre + txt
     ven = load_venues(xdir, bdir, fee)
     nameB = 'Binance' if main_binance else 'Bybit'
     if main_binance:
