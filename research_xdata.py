@@ -99,6 +99,10 @@ def _apply(idx, kind, ex, sym, rec):
         idx[kind].setdefault(ex, {})[sym] = rec
     elif kind in ('neg', 'fail'):
         idx[kind][f'{ex}|{sym}'] = rec
+    elif kind == 'h1classdel':
+        idx['h1class'].pop(f'{ex}|{sym}', None)
+    elif kind == 'migr':                                             # [v127] отметки разовых миграций индекса
+        idx['migr'][f'{ex}|{sym}'] = rec
     elif kind in ('alias', 'h1class'):                               # [v125, §2.57] переименованные символы и результат классификации ошибок 1h
         idx[kind][f'{ex}|{sym}'] = rec
     elif kind == 'negdel':                                           # [v125] сброс отрицательной записи (повторный запрос символа)
@@ -112,9 +116,9 @@ def load_index(d):
             idx = json.load(f)
     except (OSError, ValueError):
         idx = {}
-    for k in ('markets', 'bars', 'fund', 'hbars', 'fail', 'neg', 'alias', 'h1class'):
-        idx.setdefault(k, {ex: {} for ex in EXCHANGES} if k not in ('fail', 'neg', 'alias', 'h1class') else {})
-        if k not in ('fail', 'neg', 'alias', 'h1class'):
+    for k in ('markets', 'bars', 'fund', 'hbars', 'fail', 'neg', 'alias', 'h1class', 'migr'):
+        idx.setdefault(k, {ex: {} for ex in EXCHANGES} if k not in ('fail', 'neg', 'alias', 'h1class', 'migr') else {})
+        if k not in ('fail', 'neg', 'alias', 'h1class', 'migr'):
             for ex in EXCHANGES:                                   # [v119] индекс прошлых версий без ключа новой площадки (okx)
                 idx[k].setdefault(ex, {})
     idx.setdefault('t', 0)
@@ -161,6 +165,26 @@ def compact_index(d):
     return idx
 
 
+def migrate_v127(d, idx):
+    """[v127, §2.58 п. 8] РАЗОВЫЙ сброс: отрицательные записи-ОШИБКИ (кроме «подтверждённо пусто/недоступны») по свечам, фандингу и 1h и записи классификации h1class — в «не обработано»
+    (ошибки лимита запросов 100410 в v121–v126 записывались как постоянные). Отметка `migr` в журнале; повторно не выполняется. → число сброшенных записей (0 при повторе)."""
+    if 'bingx|v127_reset' in idx['migr']:
+        return 0
+    n = 0
+    for k, r in list(idx['neg'].items()):
+        ex, sym, what = k.split('|')[0], '|'.join(k.split('|')[1:-1]), k.split('|')[-1]
+        if r.get('why') not in ('empty', 'unavailable'):
+            put(d, idx, 'negdel', ex, f'{sym}|{what}', None)
+            n += 1
+    for k in list(idx['h1class']):
+        ex, sym = k.split('|')[0], '|'.join(k.split('|')[1:])
+        idx['h1class'].pop(k, None)
+        put(d, idx, 'h1classdel', ex, sym, None)
+        n += 1
+    put(d, idx, 'migr', 'bingx', 'v127_reset', {'t': int(time.time() * 1000), 'n': n})
+    return n
+
+
 def neg_rec(now_ms, e):
     """[v125] Отрицательная запись об ошибке символа: класс исключения, сообщение биржи (≤ 200 симв., публичный API — секретов нет), число успешных страниц и строк ДО ошибки
     (ошибка после успешных страниц — подозрение на «граница истории», сразу — «символ/запрос не принимается»)."""
@@ -205,16 +229,49 @@ def neg_active(idx, ex, sym, what, now_ms):
     return bool(r and now_ms - int(r.get('t', 0)) < NEG_TTL)
 
 
+TRANSIENT_CODES = ('100410',)                                  # BingX: «请稍后重试» — лимит запросов (по отчёту /xfund_1h_errors 2026-11-20, BOT_SPEC §2.58)
+TRANSIENT_TEXT = re.compile(r'请稍后重试|稍后|rate.?limit|too many requests|try again later|\btimeout\b|\btimed out\b|\btime out\b', re.I)           # границы слов: «endTime out of range» — не таймаут
+RATE_LIMIT_TEXT = re.compile(r'请稍后重试|稍后|rate.?limit|too many requests|try again later', re.I)
+RATE_LIMIT_DELAYS = (3, 8, 20, 45)                              # §2.58 п. 7: повторы той же страницы на лимит запросов (100410)
+_CODE_IN_TEXT = re.compile(r'"code"\s*:\s*"?(-?\d+)')
+
+
+def is_rate_limit(e):
+    """Лимит запросов: код 100410 / текст «请稍后重试» / RateLimitExceeded."""
+    if 'RateLimitExceeded' in {c.__name__ for c in type(e).__mro__}:
+        return True
+    t = str(e)
+    m = _CODE_IN_TEXT.search(t)
+    return bool((m and m.group(1) in TRANSIENT_CODES) or RATE_LIMIT_TEXT.search(t))
+
+
 def is_transient(e):
-    """Сеть/лимиты — повторять; постоянная ошибка символа (BadSymbol, ExchangeError …) — нет (v121: раньше каждый такой символ стоил 2+6+15 с на КАЖДОМ прогоне)."""
+    """Сеть/лимиты — повторять; постоянная ошибка символа (BadSymbol, ExchangeError …) — нет (v121: раньше каждый такой символ стоил 2+6+15 с на КАЖДОМ прогоне).
+    v127 (§2.58): делегирует research_htf.is_retryable (повторы на ExchangeError 100410 — с v87; в v121 я их потерял) и распознаёт код/текст лимита («请稍后重试» — «повторите позже»)."""
+    try:
+        import research_htf
+        if research_htf.is_retryable(e):
+            return True
+    except Exception:
+        pass
     names = {c.__name__ for c in type(e).__mro__}
     if names & {'NetworkError', 'RequestTimeout', 'DDoSProtection', 'RateLimitExceeded', 'ExchangeNotAvailable', 'OnMaintenance', 'TimeoutError',
                 'ClientError', 'ConnectionError', 'OSError'}:
         return True
+    t = str(e)
     if 'OkxError' in names:
-        t = str(e)
         return 'HTTP' in t or '50011' in t or '50013' in t
-    return False
+    return is_rate_limit(e) or bool(TRANSIENT_TEXT.search(t))
+
+
+def page_pause(ex_id):
+    """Пауза после каждой успешной страницы свечей/фандинга BingX (ENV BINGX_PAGE_PAUSE_SEC, по умолчанию 1.0 с; §2.58 п. 7) — ДОПОЛНИТЕЛЬНО к HTF_FETCH_PAUSE_SEC."""
+    if ex_id != 'bingx':
+        return 0.0
+    try:
+        return max(0.0, float(os.getenv('BINGX_PAGE_PAUSE_SEC', '1.0')))
+    except ValueError:
+        return 1.0
 
 
 def save_bars(d, ex, sym, ts, o, h, l, c, v):
@@ -337,21 +394,25 @@ class Fetcher:
         self.pause = pause
 
     async def call(self, name, *a, **kw):
-        last = None
-        for delay in (0,) + self.delays:
-            if delay:
-                await self.sleep(delay)
+        """Вызов с повторами: сетевые/временные ошибки — по расписанию self.delays (2/6/15 с); лимит запросов (100410) — повтор ТОЙ ЖЕ страницы по RATE_LIMIT_DELAYS 3/8/20/45 с (v127, §2.58;
+        в режиме без повторов delays=() — не повторяется ничего); постоянная ошибка — сразу наверх."""
+        i = 0
+        while True:
             try:
                 r = await getattr(self.ex, name)(*a, **kw)
                 self.calls += 1
                 await self.sleep(self.pause)
                 return r
-            except Exception as e:                      # сеть/лимиты — повтор; постоянная ошибка символа — сразу наверх (v121: без 23 с на каждый такой символ)
-                last = e
+            except Exception as e:                      # сеть/лимиты — повтор; последняя ошибка поднимается
                 self.errors += 1
                 if not self.retry_all and not is_transient(e):
                     raise
-        raise last
+                sched = RATE_LIMIT_DELAYS if (self.delays and is_rate_limit(e)) else self.delays
+                if i >= len(sched):
+                    raise
+                if sched[i]:
+                    await self.sleep(sched[i])
+                i += 1
 
 
 async def fetch_bars(f, sym, since_ms, now_ms, limit=1000, tf='1d'):
@@ -396,6 +457,8 @@ async def fetch_bars_back(f, ex_id, sym, since_ms, now_ms, tf='1d', limit=1000, 
                 pass
             raise
         pages_ok += 1
+        if page_pause(ex_id):
+            await f.sleep(page_pause(ex_id))                    # [v127] пауза между страницами (BINGX_PAGE_PAUSE_SEC)
         if not got:
             complete = True
             break
@@ -437,6 +500,8 @@ async def fetch_funding_ex(f, ex_id, sym, stop_ms, limit=None):
             complete = True                                   # API исчерпан — глубже истории нет
             break
         mn = min(t for t, _r in batch)
+        if page_pause(ex_id):
+            await f.sleep(page_pause(ex_id))                    # [v127] пауза между страницами (BINGX_PAGE_PAUSE_SEC)
         for t, r in batch:
             ev[t] = r
         if earliest is not None and mn >= earliest:
@@ -641,8 +706,11 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         import research_okx
         exchanges = {'okx': research_okx.OkxPublic(), 'bybit': ccxt.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}), 'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
     idx = compact_index(d)
+    n_mig = migrate_v127(d, idx)                                    # [v127, §2.58 п. 8] разовый сброс записей-ошибок (лимит запросов 100410 записывался как постоянная ошибка)
     idx['fail'] = {}                                                # ошибки текущего прогона (транзиентные); постоянные — в idx['neg']
     L = [f'📥 <b>загрузка данных бирж</b> — Bybit/BingX (публичные методы ccxt), OKX (прямой REST без ccxt) → {d}']
+    if n_mig:
+        L.append(f'↺ v127 (§2.58): сброшено {n_mig} записей-ошибок загрузки и классификации в «не обработано» (код 100410 «请稍后重试» — лимит запросов — ранее записывался как постоянная ошибка)')
     stopped = ''
     left_total = 0
     try:
@@ -817,8 +885,9 @@ def hourly_status(idx, syms):
     for ex, s_ in syms:
         if s_ in idx['hbars'].get(ex, {}):
             out['loaded'].append(s_)
-            if idx['hbars'][ex][s_].get('limit') == 'depth':
-                out['partial'].append(s_)                           # [v125, §2.57 а1] загружена доступная часть, остальной период — дневной запасной базис
+            hb_, br_ = idx['hbars'][ex][s_], (idx['bars'].get(ex, {}).get(s_) or {})
+            if hb_.get('limit') == 'depth' or (hb_.get('first') and br_.get('first') and int(hb_['first']) > int(br_['first']) + 3 * DAY):
+                out['partial'].append(s_)                           # [v125 §2.57 а1, v127 §2.58 п. 4] 1h-история короче дневной (глубина BingX ≈ 22 500 баров) — остальной период по дневному запасному базису
             if f'{ex}|{s_}' in idx['alias']:
                 out['alias'].append(s_)
             continue
@@ -839,7 +908,7 @@ def hourly_line(st):
     return (f'1h доступны для {len(st["loaded"])} из {st["total"]} символов сделок; символы с подтверждённо пустой 1h-историей ({len(st["empty"])}) используют дневной запасной базис (§2.48 п. 3.2 = §2.48.6 п. 2); '
             f'ошибка загрузки 1h: {len(st["error"])}, не обработано: {len(st["pending"])}'
             + (f'; подтверждённо недоступны (§2.57 а2, дневной запасной базис): {len(st["unavailable"])}' if st.get('unavailable') else '')
-            + (f'; частичной глубины (§2.57 а1, остальной период — дневной базис): {len(st["partial"])}' if st.get('partial') else '')
+            + (f'; частичной глубины (§2.57 а1 / §2.58 п. 4, остальной период — дневной базис): {len(st["partial"])}' if st.get('partial') else '')
             + (f'; через соответствие переименованию (§2.57 б): {len(st["alias"])}' if st.get('alias') else ''))
 
 

@@ -7,6 +7,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+os.environ.setdefault('BINGX_PAGE_PAUSE_SEC', '0')      # v127: пауза между страницами BingX в тестах не нужна (тест паузы задаёт значение явно)
+
 import async_bot as a  # noqa: E402
 
 
