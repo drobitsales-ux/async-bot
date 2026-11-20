@@ -11,7 +11,7 @@ import research_h2repl as H2R
 import research_xdata as X
 import research_xfund as XF
 from _common import a, fresh_state
-from test_v116_h2x1 import D0, END, DAY, mk_bars, mk_fund, nosleep, run, write_xdata, x1_inputs
+from test_v116_h2x1 import ohlcv_window, D0, END, DAY, mk_bars, mk_fund, nosleep, run, write_xdata, x1_inputs
 from test_v119_okx_equity import SWAP_OK, SWAP_ZERO
 
 
@@ -48,12 +48,11 @@ class Load(unittest.TestCase):
             async def load_markets(self_):
                 return markets
 
-            async def fetch_ohlcv(self_, sym, tf, since, limit):
+            async def fetch_ohlcv(self_, sym, tf, since=None, limit=None, params=None):
                 spy.append(('ohlcv', sym))
                 if tf == '1h':
                     return []
-                b = bars[sym]
-                return [[int(t), o, h, l, c, v] for t, o, h, l, c, v in zip(b['ts'], b['o'], b['h'], b['l'], b['c'], b['v']) if t >= since][:limit]
+                return ohlcv_window(bars[sym], since, limit, params)
 
             async def fetch_funding_rate_history(self_, sym, since=None, limit=None, params=None):
                 spy.append(('fund', sym))

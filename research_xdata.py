@@ -85,27 +85,92 @@ def index_path(d):
     return os.path.join(d, 'xindex.json')
 
 
+JOURNAL = 'index.journal'
+NEG_TTL = 7 * DAY                                         # подтверждённый «пусто / постоянная ошибка» не перезапрашивается 7 суток
+
+
+def journal_path(d):
+    return os.path.join(d, JOURNAL)
+
+
+def _apply(idx, kind, ex, sym, rec):
+    if kind in ('bars', 'fund', 'hbars'):
+        idx[kind].setdefault(ex, {})[sym] = rec
+    elif kind in ('neg', 'fail'):
+        idx[kind][f'{ex}|{sym}'] = rec
+
+
 def load_index(d):
+    """Индекс = index.json (снимок) + журнал index.journal (по строке на каждый завершённый символ; v121, BOT_SPEC §2.53): завершённые символы переживают обрыв процесса."""
     try:
         with open(index_path(d), encoding='utf-8') as f:
             idx = json.load(f)
     except (OSError, ValueError):
         idx = {}
-    for k in ('markets', 'bars', 'fund', 'hbars', 'fail'):
-        idx.setdefault(k, {ex: {} for ex in EXCHANGES} if k != 'fail' else {})
-        if k != 'fail':
+    for k in ('markets', 'bars', 'fund', 'hbars', 'fail', 'neg'):
+        idx.setdefault(k, {ex: {} for ex in EXCHANGES} if k not in ('fail', 'neg') else {})
+        if k not in ('fail', 'neg'):
             for ex in EXCHANGES:                                   # [v119] индекс прошлых версий без ключа новой площадки (okx)
                 idx[k].setdefault(ex, {})
     idx.setdefault('t', 0)
+    try:
+        with open(journal_path(d), encoding='utf-8') as f:
+            for ln in f:
+                try:
+                    kind, ex, sym, rec = json.loads(ln)
+                except (ValueError, TypeError):
+                    continue                                       # оборванная последняя строка — пропускается
+                _apply(idx, kind, ex, sym, rec)
+    except OSError:
+        pass
     return idx
 
 
-def save_index(d, idx):
+def put(d, idx, kind, ex, sym, rec):
+    """Записывает результат по символу в память и СРАЗУ в журнал (одна строка, дозапись): обрыв процесса не теряет завершённые символы."""
+    _apply(idx, kind, ex, sym, rec)
     os.makedirs(d, exist_ok=True)
-    tmp = index_path(d) + '.tmp'
+    with open(journal_path(d), 'a', encoding='utf-8') as f:
+        f.write(json.dumps([kind, ex, sym, rec], ensure_ascii=False) + '\n')
+        f.flush()
+
+
+def save_index(d, idx):
+    """Снимок index.json (атомарно; имя временного файла уникально для процесса). Журнал не усекается (его компактирует compact_index в начале прогона)."""
+    os.makedirs(d, exist_ok=True)
+    path = index_path(d)
+    tmp = f'{path}.{os.getpid()}.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(idx, f, ensure_ascii=False)
-    os.replace(tmp, index_path(d))
+    os.replace(tmp, path)
+
+
+def compact_index(d):
+    """Сливает журнал в снимок и очищает журнал (вызывается в начале прогона, когда других загрузок нет — задачи исследований идут по одной)."""
+    idx = load_index(d)
+    save_index(d, idx)
+    try:
+        open(journal_path(d), 'w').close()
+    except OSError:
+        pass
+    return idx
+
+
+def neg_active(idx, ex, sym, what, now_ms):
+    r = idx['neg'].get(f'{ex}|{sym}|{what}')
+    return bool(r and now_ms - int(r.get('t', 0)) < NEG_TTL)
+
+
+def is_transient(e):
+    """Сеть/лимиты — повторять; постоянная ошибка символа (BadSymbol, ExchangeError …) — нет (v121: раньше каждый такой символ стоил 2+6+15 с на КАЖДОМ прогоне)."""
+    names = {c.__name__ for c in type(e).__mro__}
+    if names & {'NetworkError', 'RequestTimeout', 'DDoSProtection', 'RateLimitExceeded', 'ExchangeNotAvailable', 'OnMaintenance', 'TimeoutError',
+                'ClientError', 'ConnectionError', 'OSError'}:
+        return True
+    if 'OkxError' in names:
+        t = str(e)
+        return 'HTTP' in t or '50011' in t or '50013' in t
+    return False
 
 
 def save_bars(d, ex, sym, ts, o, h, l, c, v):
@@ -213,9 +278,11 @@ class Fetcher:
                 self.calls += 1
                 await self.sleep(self.pause)
                 return r
-            except Exception as e:                      # сеть/лимиты — повтор; последняя ошибка поднимается
+            except Exception as e:                      # сеть/лимиты — повтор; постоянная ошибка символа — сразу наверх (v121: без 23 с на каждый такой символ)
                 last = e
                 self.errors += 1
+                if not is_transient(e):
+                    raise
         raise last
 
 
@@ -241,28 +308,70 @@ async def fetch_bars(f, sym, since_ms, now_ms, limit=1000, tf='1d'):
     return np.array(ts, np.int64), a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4]
 
 
+async def fetch_bars_back(f, ex_id, sym, since_ms, now_ms, tf='1d', limit=1000, max_pages=None):
+    """Свечи ПОСТРАНИЧНО НАЗАД от «сейчас» (параметр конца интервала endTime/until), только ЗАКРЫТЫЕ и не раньше since_ms. → (ts, o, h, l, c, v, complete).
+    complete = история дошла до начала (пустая страница либо нет прогресса) либо до since_ms; False — упёрлись в лимит страниц.
+    v121 (BOT_SPEC §2.53): прямой проход от since=2019-01-01 с limit=1000 даёт пустое окно для символов, листингованных позже окна, а пустой ответ принимался за «данных нет»;
+    проход назад от настоящего от даты листинга не зависит. ПРИЧИНА НА ПРОДЕ — гипотеза (BingX отдаёт [] на окно [startTime, startTime+limit·шаг] без данных), не проверена."""
+    step = DAY if tf == '1d' else HOUR
+    rows, end, complete = {}, None, False
+    key = 'until' if ex_id == 'bybit' else 'endTime'
+    for _ in range(max_pages or (400 if tf == '1h' else 200)):
+        params = {} if end is None else {key: end}
+        got = await f.call('fetch_ohlcv', sym, tf, None, limit, params)
+        if not got:
+            complete = True
+            break
+        new, mn = 0, None
+        for r in got:
+            t = int(r[0])
+            mn = t if mn is None else min(mn, t)
+            if t not in rows:
+                rows[t] = r
+                new += 1
+        if new == 0:
+            complete = True
+            break
+        if mn <= since_ms:
+            complete = True
+            break
+        end = mn - 1
+    ts = sorted(t for t in rows if t + step <= now_ms and t >= since_ms)
+    a = np.array([rows[t][1:6] for t in ts], float) if ts else np.zeros((0, 5))
+    return np.array(ts, np.int64), a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4], complete
+
+
 async def fetch_funding(f, ex_id, sym, stop_ms, limit=None):
+    """Совместимая обёртка: (ts, rate) без признака полноты (см. fetch_funding_ex)."""
+    ts, r, _c = await fetch_funding_ex(f, ex_id, sym, stop_ms, limit)
+    return ts, r
+
+
+async def fetch_funding_ex(f, ex_id, sym, stop_ms, limit=None):
     """История фандинга постранично НАЗАД (параметры конца интервала `until`/`endTime`), до stop_ms (первый бар символа) либо пока страница не даёт более ранних записей.
     → (ts, rate) по возрастанию, время округлено до секунды."""
     lim = limit or {'bybit': 200, 'okx': 100}.get(ex_id, 1000)
-    ev, end, earliest = {}, None, None
+    ev, end, earliest, complete = {}, None, None, False
     for _ in range(MAX_FUND_PAGES):
         params = {} if end is None else ({'until': end} if ex_id == 'bybit' else {'endTime': end})   # BingX в ccxt 4.2.14: 'until' кладётся в startTime — конец передаём сырым endTime (как research_htf)
         got = await f.call('fetch_funding_rate_history', sym, None, lim, params)
         batch = [(int(x['timestamp']), float(x['fundingRate'])) for x in (got or []) if x.get('timestamp') is not None and x.get('fundingRate') is not None]
         if not batch:
+            complete = True                                   # API исчерпан — глубже истории нет
             break
         mn = min(t for t, _r in batch)
         for t, r in batch:
             ev[t] = r
         if earliest is not None and mn >= earliest:
+            complete = True
             break
         earliest = mn
         if mn <= stop_ms:
+            complete = True                                   # дошли до первого бара символа
             break
         end = mn - 1
     ts = sorted(ev)
-    return round_sec(np.array(ts, np.int64)) if ts else np.zeros(0, np.int64), np.array([ev[t] for t in ts], float)
+    return (round_sec(np.array(ts, np.int64)) if ts else np.zeros(0, np.int64)), np.array([ev[t] for t in ts], float), complete
 
 
 def noncrypto_lines(ex, swaps):
@@ -374,9 +483,74 @@ def panel_from_series(series, funding=None, exclude_stable=False):
 
 
 # ── задача загрузки ─────────────────────────────────────────────────────────────────────────────────
+def htf_funding_rows(db_path, sym):
+    """Кэш фандинга v86–v88 (таблица htf_funding в БД бота): [(ts мс, ставка)] по символу BingX либо [] (нет БД/таблицы/символа)."""
+    if not db_path:
+        return []
+    try:
+        import sqlite3
+        con = sqlite3.connect(db_path)
+        try:
+            return [(int(t), float(r)) for t, r in con.execute('SELECT ts, rate FROM htf_funding WHERE symbol=? ORDER BY ts', (sym,))]
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+
+def _stats_line(what, ex_syms, idx, kind, extra=''):
+    """«загружено X из Y, осталось Z» (X — символы с данными в индексе, N — подтверждённо пустые/постоянные ошибки, Z — ещё не обработаны)."""
+    y = len(ex_syms)
+    x = sum(1 for ex, s_ in ex_syms if s_ in idx[kind].get(ex, {}))
+    n = sum(1 for ex, s_ in ex_syms if s_ not in idx[kind].get(ex, {}) and f'{ex}|{s_}|{what}' in idx['neg'])
+    return x, y, n, y - x - n
+
+
+async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sleep=None):
+    """1h-свечи заданных символов (ПО ОДНОМУ СИМВОЛУ — сразу в журнал); проход назад от настоящего. → (загружено, пустых, осталось, остановлено_бюджетом)."""
+    done = empty = left = 0
+    stopped = False
+    for sym in sorted(syms):
+        if time.time() > deadline:
+            stopped = True
+            left = sum(1 for s_ in syms if s_ not in idx['hbars'].get(ex, {}) and not neg_active(idx, ex, s_, 'h1', now_ms))
+            break
+        rec = idx['hbars'].get(ex, {}).get(sym)
+        if rec and 'complete' in rec and rec.get('last', 0) + 3 * HOUR >= now_ms - DAY:
+            done += 1
+            continue
+        if neg_active(idx, ex, sym, 'h1', now_ms):
+            empty += 1
+            continue
+        cur = load_hbars(d, ex, sym)
+        since = (int(cur['ts'][-1]) + HOUR) if cur is not None and len(cur['ts']) else SINCE_MS
+        try:
+            hts, _o, hh, hl, hc, _v, comp = await fetch_bars_back(fx[ex], ex, sym, since, now_ms, tf='1h')
+        except Exception as e:
+            if is_transient(e):
+                put(d, idx, 'fail', ex, f'{sym}|h1', type(e).__name__)
+            else:
+                put(d, idx, 'neg', ex, f'{sym}|h1', {'t': now_ms, 'why': type(e).__name__})
+                empty += 1
+            continue
+        if cur is not None and len(cur['ts']):
+            hts = np.concatenate([cur['ts'], hts]); hh = np.concatenate([cur['h'], hh]); hl = np.concatenate([cur['l'], hl]); hc = np.concatenate([cur['c'], hc])
+        if len(hts):
+            save_hbars(d, ex, sym, hts, hh, hl, hc)
+            put(d, idx, 'hbars', ex, sym, {'first': int(hts[0]), 'last': int(hts[-1]), 'n': int(len(hts)), 't': now_ms, 'complete': bool(comp)})
+            done += 1
+        else:
+            put(d, idx, 'neg', ex, f'{sym}|h1', {'t': now_ms, 'why': 'empty'})
+            empty += 1
+        if progress and (done + empty) % 5 == 0:
+            await progress(f'1h-свечи: обработано {done + empty}/{len(syms)} ({ex}:{sym})')
+    return done, empty, left, stopped
+
+
 async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=asyncio.sleep):
-    """`/h2_replicate load` и `/xfund_test load`: рынки → дневные свечи (вселенная H2 + общие символы X1) → фандинг для грубо ликвидных; продолжение с места остановки, бюджет времени max_minutes.
-    exchanges — {id: ccxt-клиент} (в тестах фейки). → текст отчёта."""
+    """`/h2_replicate load` и `/xfund_test load`: рынки → дневные свечи → история фандинга (все символы вселенной; X1 с архивом Binance — все общие базы, без предфильтра ликвидности) →
+    1h-свечи общих баз Bybit∩BingX. v121 (BOT_SPEC §2.53): каждый символ сразу пишется в журнал индекса, повторный запуск продолжает с оставшихся (порядок — сортировка),
+    постоянные ошибки/пустые ответы кэшируются (не перезапрашиваются 7 суток), свечи — проходом назад от настоящего. exchanges — {id: ccxt-клиент} (в тестах фейки). → текст отчёта."""
     d = params.get('xdir') or xdata_dir()
     now_ms = int(now_ms or time.time() * 1000)
     deadline = time.time() + float(params.get('max_minutes', 150)) * 60
@@ -385,9 +559,11 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         import ccxt.async_support as ccxt
         import research_okx
         exchanges = {'okx': research_okx.OkxPublic(), 'bybit': ccxt.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}), 'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
-    idx = load_index(d)
+    idx = compact_index(d)
+    idx['fail'] = {}                                                # ошибки текущего прогона (транзиентные); постоянные — в idx['neg']
     L = [f'📥 <b>загрузка данных бирж</b> — Bybit/BingX (публичные методы ccxt), OKX (прямой REST без ccxt) → {d}']
     stopped = ''
+    left_total = 0
     try:
         fx = {ex: Fetcher(c, sleep=sleep) for ex, c in exchanges.items()}
         mk = {}
@@ -415,6 +591,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             save_index(d, idx)
             return '\n'.join(L + ['⛔ все биржи недоступны — загружать нечего (Binance — из архива /battery_load, не отсюда)'])
         idx['unavailable'] = dict(unavailable)
+        save_index(d, idx)
         bnorm = binance_norm_set(params.get('bdir'))
         norms = {ex: {} for ex in EXCHANGES}
         for ex in EXCHANGES:
@@ -426,112 +603,108 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             for s, v in mk.get(ex, {}).items():
                 if v['norm'] not in bnorm or v['norm'] in common:
                     want[ex].append(s)
-        x1_main = bool(params.get('x1_main'))                        # [v118] X1 (BingX, Binance): BingX-символы с базой из архива Binance (§2.50)
+        x1_main = bool(params.get('x1_main'))                        # [v118] X1 (BingX, Binance): ВСЕ BingX-символы с базой из архива Binance (§2.50, §2.53)
         if x1_main:
             for s_, v in mk.get('bingx', {}).items():
                 if v['norm'] in bnorm and s_ not in want['bingx']:
                     want['bingx'].append(s_)
-        L.append(f'  вселенная H2 (базы вне архива Binance): {sum(1 for n in set().union(*[set(v) for v in norms.values()]) if n not in bnorm)} баз; общих баз Bybit∩BingX: {len(common)}; символов к загрузке свечей: ' + ', '.join(f'{ex} {len(want[ex])}' for ex in EXCHANGES))
-        # 1. свечи
-        n_new = 0
-        for ex in EXCHANGES:
-            for sym in want[ex]:
-                if time.time() > deadline:
-                    stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
-                    break
-                rec = idx['bars'][ex].get(sym)
-                if rec and rec.get('last', 0) + 2 * DAY >= now_ms - DAY:
-                    continue
-                cur = load_bars(d, ex, sym)
-                since = (int(cur['ts'][-1]) + DAY) if cur is not None and len(cur['ts']) else SINCE_MS
-                try:
-                    ts, o, h, l_, c, v = await fetch_bars(fx[ex], sym, since, now_ms)
-                except Exception as e:
-                    idx['fail'][f'{ex}:{sym}:bars'] = type(e).__name__
-                    continue
-                if cur is not None and len(cur['ts']):
-                    ts = np.concatenate([cur['ts'], ts]); o = np.concatenate([cur['o'], o]); h = np.concatenate([cur['h'], h]); l_ = np.concatenate([cur['l'], l_]); c = np.concatenate([cur['c'], c]); v = np.concatenate([cur['v'], v])
-                if len(ts):
-                    save_bars(d, ex, sym, ts, o, h, l_, c, v)
-                    idx['bars'][ex][sym] = {'first': int(ts[0]), 'last': int(ts[-1]), 'n': int(len(ts)), 't': now_ms}
-                n_new += 1
-                if progress and n_new % 25 == 0:
-                    await progress(f'свечи: загружено символов {n_new} ({ex}:{sym})')
-                    save_index(d, idx)
-            if stopped:
+        syms_all = [(ex, s_) for ex in EXCHANGES for s_ in sorted(set(want[ex]))]
+        L.append(f'  вселенная H2 (базы вне архива Binance): {sum(1 for n in set().union(*[set(v) for v in norms.values()]) if n not in bnorm)} баз; общих баз Bybit∩BingX: {len(common)}; '
+                 f'символов к загрузке свечей: ' + ', '.join(f'{ex} {len(set(want[ex]))}' for ex in EXCHANGES))
+        # 1. свечи — по одному символу, сразу в журнал; порядок детерминирован (сортировка)
+        n_try = 0
+        for ex, sym in syms_all:
+            if time.time() > deadline:
+                stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
                 break
+            rec = idx['bars'][ex].get(sym)
+            if rec and 'complete' in rec and rec.get('last', 0) + 2 * DAY >= now_ms - DAY:      # записи прошлых версий (без признака полноты) загружаются заново
+                continue
+            if neg_active(idx, ex, sym, 'bars', now_ms):
+                continue
+            cur = load_bars(d, ex, sym)
+            since = (int(cur['ts'][-1]) + DAY) if cur is not None and len(cur['ts']) else SINCE_MS
+            try:
+                ts, o, h, l_, c, v, comp = await fetch_bars_back(fx[ex], ex, sym, since, now_ms)
+            except Exception as e:
+                if is_transient(e):
+                    put(d, idx, 'fail', ex, f'{sym}|bars', type(e).__name__)
+                else:
+                    put(d, idx, 'neg', ex, f'{sym}|bars', {'t': now_ms, 'why': type(e).__name__})
+                continue
+            if cur is not None and len(cur['ts']):
+                ts = np.concatenate([cur['ts'], ts]); o = np.concatenate([cur['o'], o]); h = np.concatenate([cur['h'], h]); l_ = np.concatenate([cur['l'], l_]); c = np.concatenate([cur['c'], c]); v = np.concatenate([cur['v'], v])
+                comp = bool(comp and (rec or {}).get('complete', True))
+            if len(ts):
+                save_bars(d, ex, sym, ts, o, h, l_, c, v)
+                put(d, idx, 'bars', ex, sym, {'first': int(ts[0]), 'last': int(ts[-1]), 'n': int(len(ts)), 't': now_ms, 'complete': bool(comp)})
+            else:
+                put(d, idx, 'neg', ex, f'{sym}|bars', {'t': now_ms, 'why': 'empty'})
+            n_try += 1
+            if progress and n_try % 25 == 0:
+                x_, y_, n_, z_ = _stats_line('bars', syms_all, idx, 'bars')
+                await progress(f'свечи: загружено {x_} из {y_}, осталось {z_} ({ex}:{sym})')
         save_index(d, idx)
-        # 2. фандинг для грубо ликвидных (X1: общие символы — на обеих биржах; H2: вселенная)
+        x_, y_, n_, z_ = _stats_line('bars', syms_all, idx, 'bars')
+        L.append(f'  свечи: загружено {x_} из {y_}, осталось {z_}; подтверждённо пусто/постоянная ошибка: {n_}')
+        left_total += z_
+        # 2. фандинг — все символы со свечами (без предфильтра ликвидности: ликвидность — point-in-time при расчёте)
         if not stopped:
-            todo = []
-            for ex in EXCHANGES:
-                for sym in want[ex]:
-                    b = load_bars(d, ex, sym)
-                    if b is None or not coarse_liquid(b['qv']):
-                        continue
-                    nrm = mk[ex][sym]['norm']
-                    if nrm in common and nrm in bnorm:
-                        other = [s for s in norms['bingx' if ex == 'bybit' else 'bybit'].get(nrm, [])]
-                        ob = [load_bars(d, 'bingx' if ex == 'bybit' else 'bybit', s) for s in other]
-                        if not any(x is not None and coarse_liquid(x['qv']) for x in ob):
-                            continue
-                    todo.append((ex, sym, b))
+            todo = [(ex, sym) for ex, sym in syms_all if sym in idx['bars'][ex]]
             n_f = 0
-            for ex, sym, b in todo:
+            for ex, sym in todo:
                 if time.time() > deadline:
                     stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
                     break
                 rec = idx['fund'][ex].get(sym)
-                if rec and rec.get('t', 0) >= now_ms - 2 * DAY:
+                if rec and 'complete' in rec and rec.get('t', 0) >= now_ms - 2 * DAY:
                     continue
+                if neg_active(idx, ex, sym, 'fund', now_ms):
+                    continue
+                b0 = int(idx['bars'][ex][sym]['first'])
                 try:
-                    ts, r = await fetch_funding(fx[ex], ex, sym, int(b['ts'][0]))
+                    ts, r, comp = await fetch_funding_ex(fx[ex], ex, sym, b0)
                 except Exception as e:
-                    idx['fail'][f'{ex}:{sym}:fund'] = type(e).__name__
+                    if is_transient(e):
+                        put(d, idx, 'fail', ex, f'{sym}|fund', type(e).__name__)
+                    else:
+                        put(d, idx, 'neg', ex, f'{sym}|fund', {'t': now_ms, 'why': type(e).__name__})
                     continue
                 cur = load_fund(d, ex, sym)
+                parts_t, parts_r = [ts], [r]
                 if cur is not None and len(cur[0]):
-                    allts = np.concatenate([cur[0], ts]); allr = np.concatenate([cur[1], r])
-                    u, ui = np.unique(allts, return_index=True)
-                    ts, r = u, allr[ui]
+                    parts_t.append(cur[0]); parts_r.append(cur[1])
+                if ex == 'bingx':                                   # кэш v86–v88 (htf_funding) глубже — объединяем по времени события
+                    hr = htf_funding_rows(params.get('htf_db'), sym)
+                    if hr:
+                        parts_t.append(round_sec(np.array([t for t, _ in hr], np.int64))); parts_r.append(np.array([x for _, x in hr], float))
+                allts, allr = np.concatenate(parts_t), np.concatenate(parts_r)
+                u, ui = np.unique(allts, return_index=True)
+                ts, r = u, allr[ui]
                 if len(ts):
                     save_fund(d, ex, sym, ts, r)
-                idx['fund'][ex][sym] = {'first': int(ts[0]) if len(ts) else None, 'last': int(ts[-1]) if len(ts) else None, 'n': int(len(ts)), 't': now_ms}
+                    put(d, idx, 'fund', ex, sym, {'first': int(ts[0]), 'last': int(ts[-1]), 'n': int(len(ts)), 't': now_ms, 'complete': bool(comp)})
+                else:
+                    put(d, idx, 'neg', ex, f'{sym}|fund', {'t': now_ms, 'why': 'empty'})
                 n_f += 1
                 if progress and n_f % 10 == 0:
-                    await progress(f'фандинг: загружено символов {n_f}/{len(todo)} ({ex}:{sym})')
-                    save_index(d, idx)
+                    x_, y_, _n, z_ = _stats_line('fund', todo, idx, 'fund')
+                    await progress(f'фандинг: загружено {x_} из {y_}, осталось {z_} ({ex}:{sym})')
             save_index(d, idx)
-            L.append(f'  фандинг запрошен для {len(todo)} грубо ликвидных символов (загружено в этом прогоне {n_f})')
-            # 3. часовые свечи для X1: общие базы Bybit∩BingX, грубо ликвидные (BOT_SPEC §2.48.6 п. 2)
-            if params.get('hourly', True) and not stopped:
-                htodo = [(ex, sym, b) for ex, sym, b in todo if mk[ex][sym]['norm'] in common or (x1_main and ex == 'bingx' and mk[ex][sym]['norm'] in bnorm)]
-                n_h = 0
-                for ex, sym, b in htodo:
-                    if time.time() > deadline:
+            x_, y_, n_, z_ = _stats_line('fund', todo, idx, 'fund')
+            L.append(f'  фандинг: загружено {x_} из {y_}, осталось {z_}; подтверждённо пусто/постоянная ошибка: {n_} (без предфильтра ликвидности)')
+            left_total += z_
+            # 3. часовые свечи общих баз Bybit∩BingX (X1 с архивом Binance — по символам сделок, отдельным шагом /xfund_test load)
+            if params.get('hourly', True) and not stopped and common:
+                for ex in EXCHANGES:
+                    hs = [s_ for s_ in want[ex] if mk[ex][s_]['norm'] in common and s_ in idx['bars'][ex]]
+                    if not hs or stopped:
+                        continue
+                    dn, em, lf, stp = await load_hourly(d, idx, fx, ex, hs, now_ms, deadline, progress)
+                    if stp:
                         stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
-                        break
-                    rec = idx['hbars'][ex].get(sym)
-                    if rec and rec.get('last', 0) + 3 * HOUR >= now_ms - DAY:
-                        continue
-                    cur = load_hbars(d, ex, sym)
-                    since = (int(cur['ts'][-1]) + HOUR) if cur is not None and len(cur['ts']) else int(b['ts'][0])
-                    try:
-                        hts, _o, hh, hl, hc, _v = await fetch_bars(fx[ex], sym, since, now_ms, tf='1h')
-                    except Exception as e:
-                        idx['fail'][f'{ex}:{sym}:h1'] = type(e).__name__
-                        continue
-                    if cur is not None and len(cur['ts']):
-                        hts = np.concatenate([cur['ts'], hts]); hh = np.concatenate([cur['h'], hh]); hl = np.concatenate([cur['l'], hl]); hc = np.concatenate([cur['c'], hc])
-                    if len(hts):
-                        save_hbars(d, ex, sym, hts, hh, hl, hc)
-                        idx['hbars'][ex][sym] = {'first': int(hts[0]), 'last': int(hts[-1]), 'n': int(len(hts)), 't': now_ms}
-                    n_h += 1
-                    if progress and n_h % 5 == 0:
-                        await progress(f'1h-свечи: загружено символов {n_h}/{len(htodo)} ({ex}:{sym})')
-                        save_index(d, idx)
-                save_index(d, idx)
-                L.append(f'  1h-свечи X1 запрошены для {len(htodo)} символов (загружено в этом прогоне {n_h})')
+                    L.append(f'  1h-свечи ({ex}, общие базы Bybit∩BingX): загружено {dn} из {len(hs)}, осталось {lf}; подтверждённо пусто/постоянная ошибка: {em}')
+                    left_total += lf
         idx['t'] = now_ms
         save_index(d, idx)
     finally:
@@ -540,13 +713,57 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             for c in exchanges.values():                            # [v120] двойное закрытие с паузой (см. access_probe.close_ccxt)
                 await access_probe.close_ccxt(c)
     L += coverage_lines(d, idx, now_ms)
+    if idx['fail']:
+        L.append(f'⚠ транзиентные ошибки сети в этом прогоне: {len(idx["fail"])} (первые: ' + ', '.join(f'{k}={v}' for k, v in list(idx["fail"].items())[:5]) + ') — повторите команду, они будут запрошены снова')
     if stopped:
         L.append(stopped)
-    elif idx['fail']:
-        L.append(f'⚠ ошибки загрузки: {len(idx["fail"])} (первые: ' + ', '.join(f'{k}={v}' for k, v in list(idx['fail'].items())[:5]) + ') — повторите команду')
-    else:
+    elif left_total == 0 and not idx['fail']:
         L.append('✅ загрузка завершена')
+    else:
+        L.append(f'⏳ загрузка не завершена: осталось {left_total + len(idx["fail"])} — повторите команду')
     return '\n'.join(L)
+
+
+COVERAGE_MIN = 0.9
+
+
+def coverage_report(d, kind, bdir=None, venues=None, hourly_syms=None, minimum=None):
+    """Контроль полноты данных ПЕРЕД расчётом (BOT_SPEC §2.53 п. 3). kind: 'x1' (BingX-символы, общие с архивом Binance) | 'h2' (вселенная H2 площадок venues, базы вне архива Binance).
+    Ожидаемое — активные не-исключённые рынки из markets; считаются доли: свечи, фандинг, глубина (свечи и фандинг доведены до начала истории — признак complete; для OKX глубина
+    фандинга ограничена API, §2.51 — не требуется) и (X1) 1h по символам сделок. Любая доля < minimum (0.9) → ok=False. → dict(ok, lines, parts)."""
+    minimum = COVERAGE_MIN if minimum is None else minimum
+    idx = load_index(d)
+    bnorm = binance_norm_set(bdir)
+    exs = ('bingx',) if kind == 'x1' else tuple(venues or ('bingx', 'okx'))
+    exp = []
+    for ex in exs:
+        for sym, m in idx['markets'].get(ex, {}).items():
+            if m.get('excl') or noncrypto_reason(m.get('base') or m.get('norm')) or not m.get('active', True):
+                continue
+            if (m['norm'] in bnorm) == (kind == 'x1'):
+                exp.append((ex, sym))
+    parts, lines = {}, []
+    n = len(exp)
+    if n == 0:
+        return {'ok': False, 'parts': {}, 'lines': ['ожидаемая вселенная пуста — выполните load']}
+    nb = sum(1 for ex, s_ in exp if s_ in idx['bars'].get(ex, {}))
+    nf = sum(1 for ex, s_ in exp if s_ in idx['fund'].get(ex, {}))
+    deep = [(ex, s_) for ex, s_ in exp if ex != 'okx']
+    nd = sum(1 for ex, s_ in deep if idx['bars'].get(ex, {}).get(s_, {}).get('complete') and idx['fund'].get(ex, {}).get(s_, {}).get('complete'))
+    parts['свечи'] = (nb, n)
+    parts['фандинг'] = (nf, n)
+    if deep:
+        parts['глубина (свечи и фандинг до начала истории)'] = (nd, len(deep))
+    if hourly_syms is not None:
+        nh = sum(1 for ex, s_ in hourly_syms if s_ in idx['hbars'].get(ex, {}))
+        parts['1h по символам сделок'] = (nh, len(hourly_syms))
+    ok = True
+    for name, (a_, b_) in parts.items():
+        share = a_ / b_ if b_ else 0.0
+        bad = share < minimum
+        ok = ok and not bad
+        lines.append(f'{name}: {a_} из {b_} ({share * 100:.0f}%)' + (f' < {minimum * 100:.0f}%' if bad else ''))
+    return {'ok': ok, 'parts': parts, 'lines': lines, 'expected': n}
 
 
 def coverage_lines(d, idx, now_ms):

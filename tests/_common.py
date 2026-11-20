@@ -18,7 +18,7 @@ def fresh_state():
     a._init_trades_db()
     a._health_scans.clear(); a._health_errs.clear(); a._health_err_sample.clear(); a._health_last_alert.clear()
     a._dd.update({'start_equity': 0.0, 'start_date': '', 'equity': 0.0, 'ok_ts': 0.0, 'fails': 0,
-                  'min_dd': 0.0, 'fail_since': 0.0})
+                  'min_dd': 0.0, 'fail_since': 0.0, 'last_err': '', 'last_status': '', 'empty_account': False})
     sent = []
 
     async def fake_tg(text):

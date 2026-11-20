@@ -16,7 +16,7 @@ import research_vision as V
 import research_xdata as X
 import research_xfund as XF
 from _common import a, fresh_state
-from test_v116_h2x1 import mk_bars, mk_fund, x1_inputs, D0, END, DAY, nosleep, run
+from test_v116_h2x1 import ohlcv_window, mk_bars, mk_fund, x1_inputs, D0, END, DAY, nosleep, run
 
 SECRET_KEY = 'AbCdEf0123456789AbCdEf0123456789XyZ'
 
@@ -166,11 +166,10 @@ class Load(unittest.TestCase):
                     raise fail
                 return markets
 
-            async def fetch_ohlcv(self_, sym, tf, since, limit):
-                b = bars[sym]
+            async def fetch_ohlcv(self_, sym, tf, since=None, limit=None, params=None):
                 if tf == '1h':
                     return []
-                return [[int(t), o, h, l, c, v] for t, o, h, l, c, v in zip(b['ts'], b['o'], b['h'], b['l'], b['c'], b['v']) if t >= since][:limit]
+                return ohlcv_window(bars[sym], since, limit, params)
 
             async def fetch_funding_rate_history(self_, sym, since=None, limit=None, params=None):
                 ts, r = funding[sym]
