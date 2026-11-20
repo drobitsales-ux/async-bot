@@ -79,6 +79,8 @@ class Bitwise(unittest.TestCase):
         for T in XF.THRESHOLDS:
             for mult in (1.0, 2.0):
                 a_, b_ = XF.simulate_x1(ni, T, mult), REF.simulate_x1(ri, T, mult)
+                for k_ in ('em_h', 'em_d', 'groups'):                                           # новые поля v124 (разбивка отчёта) — в эталоне их нет; суммарные массивы сравниваются как есть
+                    a_.pop(k_)
                 same(a_, b_, f'sim[T={T},x{mult}]')
                 n_trades += len(a_['trades'])
                 same(XF.metrics(a_, ni), REF.metrics(b_, ri), f'metrics[T={T},x{mult}]')

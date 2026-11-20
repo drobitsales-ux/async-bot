@@ -269,8 +269,15 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
     c = 1.0 / max_pos
     fills = (feeA * mult + SLIP * mult, feeB * mult + SLIP * mult)
     pos, trades = [], []
-    cnt = {'liq': 0, 'emerg': 0, 'n_h': 0, 'n_fb': 0}
+    cnt = {'liq': 0, 'emerg': 0, 'n_h': 0, 'n_fb': 0, 'em_h': 0, 'em_d': 0}
     TAGS = (('A', 0), ('B', 1))
+    hists = []                                                                   # [v124, §2.53.2] история P&L каждой сделки (параллельно trades) — только для разбивки отчёта 1h/дневной; суммарные массивы считаются теми же операциями, что и раньше
+
+    def cr(p, name, arr, k, amt):
+        """arr[k] += amt (та же операция, что и прежде) + запись вклада в историю позиции p."""
+        arr[k] += amt
+        h = p['h'][name]
+        h[k] = h.get(k, 0.0) + amt
 
     def accrue(p, t0, t1):
         for vi in (0, 1):
@@ -278,8 +285,8 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
             for d_idx, amt in leg_funding(inp['fund'][p['j']][vi], t0, t1, short, c):
                 k = d_idx - day0
                 if 0 <= k < nd:
-                    fund[k] += amt
-                    pnl[k] += amt
+                    cr(p, 'fund', fund, k, amt)
+                    cr(p, 'pnl', pnl, k, amt)
 
     def hour_abs(d, h=0):
         return (day0 + d) * 24 + h
@@ -316,6 +323,7 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
     def emergency(p, d, hit):
         """Закрытие по аварийному правилу в баре hit=(бар, kinds). Дневные P&L ног, издержки, фандинг до конца бара, учёт."""
         b, kinds = hit
+        cnt['em_d' if b is None else 'em_h'] += 1                                # источник срабатывания: дневные high/low (b is None) либо 1h
         t_end = None
         for tag, vi in TAGS:
             d_dir = -1.0 if p['short'] == vi else 1.0
@@ -326,19 +334,20 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
             elif kinds[vi] == 'emerg':
                 level = p['p0'][vi] * (1.0 + EMERG_MOVE) if p['short'] == vi else p['p0'][vi] * (1.0 - EMERG_MOVE)
                 day_pnl = d_dir * c * (level - p['ref'][vi]) / p['p0'][vi]
-                cost[d] += c * fills[vi]
-                pnl[d] -= c * fills[vi]
+                cr(p, 'cost', cost, d, c * fills[vi])
+                cr(p, 'pnl', pnl, d, -(c * fills[vi]))
                 cnt['emerg'] += 1
             else:                                                             # вторая нога — по close бара своей биржи
                 px, _t = bar_close(p, tag, d, b)
                 day_pnl = d_dir * c * (px - p['ref'][vi]) / p['p0'][vi]
-                cost[d] += c * fills[vi]
-                pnl[d] -= c * fills[vi]
+                cr(p, 'cost', cost, d, c * fills[vi])
+                cr(p, 'pnl', pnl, d, -(c * fills[vi]))
             _px, t_end = bar_close(p, tag, d, b)
-            pnl[d] += day_pnl
-            price[d] += day_pnl
+            cr(p, 'pnl', pnl, d, day_pnl)
+            cr(p, 'price', price, d, day_pnl)
         accrue(p, p['te'], t_end)
         trades.append({'sym': inp['labels'][p['j']], 'e': p['e'], 'x': d, 'reason': 'ликвидация (гэп)' if 'gap' in kinds else 'аварийное 30%', 'fb': p['fb']})
+        hists.append(p['h'])
         pos.remove(p)
 
     for d in range(nd):
@@ -371,12 +380,13 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
                 d_dir = -1.0 if p['short'] == vi else 1.0
                 pdl = 0.0 if gone else d_dir * c * (pxs[vi] - p['ref'][vi]) / p['p0'][vi]
                 p['legpnl'][vi] += pdl
-                pnl[d] += pdl
-                price[d] += pdl
-                cost[d] += c * fills[vi]
-                pnl[d] -= c * fills[vi]
+                cr(p, 'pnl', pnl, d, pdl)
+                cr(p, 'price', price, d, pdl)
+                cr(p, 'cost', cost, d, c * fills[vi])
+                cr(p, 'pnl', pnl, d, -(c * fills[vi]))
             accrue(p, p['te'], t_exit)
             trades.append({'sym': inp['labels'][j], 'e': p['e'], 'x': d, 'reason': reason, 'fb': p['fb']})
+            hists.append(p['h'])
             pos.remove(p)
             exited_today.add(j)
         # 2. входы
@@ -399,10 +409,11 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
                 else:
                     mode, p0, te, fb = 'd', (M['CA'][d, j], M['CB'][d, j]), (day0 + d + 1) * DAY, True
                     cnt['n_fb'] += 1
-                pos.append({'j': j, 'short': sv, 'e': d, 'mode': mode, 'fb': fb, 'p0': p0, 'ref': [p0[0], p0[1]], 'legpnl': [0.0, 0.0], 'te': te})
+                npos = {'j': j, 'short': sv, 'e': d, 'mode': mode, 'fb': fb, 'p0': p0, 'ref': [p0[0], p0[1]], 'legpnl': [0.0, 0.0], 'te': te, 'h': {'pnl': {}, 'fund': {}, 'price': {}, 'cost': {}}}
+                pos.append(npos)
                 for vi in (0, 1):
-                    cost[d] += c * fills[vi]
-                    pnl[d] -= c * fills[vi]
+                    cr(npos, 'cost', cost, d, c * fills[vi])
+                    cr(npos, 'pnl', pnl, d, -(c * fills[vi]))
         # 3. контроль аварийного закрытия внутри суток и разметка дня
         for p in list(pos):
             j = p['j']
@@ -427,11 +438,25 @@ def simulate_x1(inp, T, mult=1.0, max_pos=MAX_POS):
                 day_pnl = d_dir * c * (M['C' + tag][d, j] - p['ref'][vi]) / p['p0'][vi]
                 p['legpnl'][vi] += day_pnl
                 p['ref'][vi] = M['C' + tag][d, j]
-                pnl[d] += day_pnl
-                price[d] += day_pnl
+                cr(p, 'pnl', pnl, d, day_pnl)
+                cr(p, 'price', price, d, day_pnl)
     for p in pos:                                                                # открытые на конец данных: фандинг до конца, издержки выхода не платятся
         accrue(p, p['te'], (day0 + nd) * DAY)
-    return {'pnl': pnl, 'fund': fund, 'price': price, 'cost': cost, 'trades': trades, 'liq': cnt['liq'], 'emerg': cnt['emerg'], 'n_h': cnt['n_h'], 'n_fb': cnt['n_fb'], 'open_end': len(pos), 'open_syms': [inp['labels'][p_['j']] for p_ in pos]}
+    grp = {g: {'pnl': np.zeros(nd), 'fund': np.zeros(nd), 'price': np.zeros(nd), 'cost': np.zeros(nd), 'trades': [], 'liq': 0, 'emerg': 0, 'open_end': 0, 'open_syms': []} for g in ('h', 'd')}
+    for tr, h in zip(trades, hists):                                              # группа сделки: «d» — запасной дневной базис использован (вход, выход или контроль хода), иначе «h» — 1h
+        g = grp['d' if tr['fb'] else 'h']
+        g['trades'].append(tr)
+        for name, hh in h.items():
+            for k, amt in hh.items():
+                g[name][k] += amt
+    for p in pos:
+        g = grp['d' if p['fb'] else 'h']
+        g['open_end'] += 1
+        g['open_syms'].append(inp['labels'][p['j']])
+        for name, hh in p['h'].items():
+            for k, amt in hh.items():
+                g[name][k] += amt
+    return {'pnl': pnl, 'fund': fund, 'price': price, 'cost': cost, 'trades': trades, 'liq': cnt['liq'], 'emerg': cnt['emerg'], 'n_h': cnt['n_h'], 'n_fb': cnt['n_fb'], 'open_end': len(pos), 'open_syms': [inp['labels'][p_['j']] for p_ in pos], 'em_h': cnt['em_h'], 'em_d': cnt['em_d'], 'groups': grp}
 
 
 # ── метрики и отчёт ─────────────────────────────────────────────────────────────────────────────────
@@ -484,6 +509,19 @@ def fmt_metrics(label, T, m, c, ok):
             f'аварийных закрытий (ход ≥ 30%): {m["emerg"]}, ликвидаций ног (гэп ≥ 45%): {m["liq"]}, открыто на конец {m["open_end"]}; доход: фандинг {m["fund"] * 100:+.2f}%, разница цен {m["price"] * 100:+.2f}%, '
             f'издержки {m["cost"] * 100:.2f}% (издержки / валовый фандинг {fm(m["cost_to_fund"], 2)}); доля фандинга в P&L {fm(m["fund_share"], 2) if m["fund_share"] is not None else "н/д"}',
             f'  по годам: {yrs}; 2025 [{mark(c["y2025"])}], 2026 [{mark(c["y2026"])}]; ' + ('<b>критерии выполнены</b>' if ok else 'критерии НЕ выполнены')]
+
+
+def fmt_split(res, inp):
+    """[v124, §2.53.2] Разбивка отчёта (СПРАВОЧНО, не критерии): метрики по каждому T отдельно для сделок с 1h-базисом и с дневным запасным (группа — по признаку fb сделки: запасной дневной close
+    использован при входе, выходе или контроле хода), число аварийных закрытий (позиций) по 1h и по дневным high/low."""
+    out = []
+    for key, name in (('h', '1h-базис'), ('d', 'дневной запасной базис')):
+        g = res['groups'][key]
+        m = metrics(g, inp)
+        out.append(f'{name}: сделок {m["n_trades"]} (открыто на конец {m["open_end"]}), APR {m["apr"] * 100:+.2f}%, Шарп {fm(m["sharpe"])}, просадка {m["dd"] * 100:.1f}%, '
+                   f'фандинг {m["fund"] * 100:+.2f}%, цена {m["price"] * 100:+.2f}%, издержки {m["cost"] * 100:.2f}%')
+    return ['  разбивка по базису (справочно, не критерии): ' + '; '.join(out),
+            f'  аварийных закрытий (позиций): определено по 1h {res["em_h"]}, по дневным high/low {res["em_d"]}']
 
 
 # ── данные и команда ────────────────────────────────────────────────────────────────────────────────
@@ -646,14 +684,14 @@ async def load_traded_hourly(params, progress=None, exchanges=None, now_ms=None,
     try:
         idx = X.load_index(xdir)
         fx = {'bingx': X.Fetcher(exchanges['bingx'], sleep=sleep)}
-        dn, em, lf, stp = await X.load_hourly(xdir, idx, fx, 'bingx', [s_ for _l, s_ in traded], now_ms, time.time() + float(params.get('max_minutes', 150)) * 60, progress)
+        dn, em, er, lf, stp = await X.load_hourly(xdir, idx, fx, 'bingx', [s_ for _l, s_ in traded], now_ms, time.time() + float(params.get('max_minutes', 150)) * 60, progress)
         X.save_index(xdir, idx)
     finally:
         if own:
             import access_probe
             for c in exchanges.values():
                 await access_probe.close_ccxt(c)
-    return (f'  1h BingX по символам сделок предварительного прогона: загружено {dn} из {len(traded)}, осталось {lf}; подтверждённо пусто/постоянная ошибка: {em}'
+    return (f'  1h BingX по символам сделок предварительного прогона: загружено {dn} из {len(traded)}, осталось {lf}; подтверждённо пусто (дневной запасной базис): {em}; ошибка биржи: {er}'
             + (' — ⏱ бюджет времени исчерпан, повторите команду' if stp else ''))
 
 
@@ -685,6 +723,7 @@ async def run_xfund(params, progress=None):
         if not ven['bingx']['bars'] or not ven['bybit']['bars']:
             return '⛔ /xfund_test отказ: нет данных Bybit/BingX — выполните /xfund_test load до сообщения «загрузка завершена»'
         pairs = common_pairs(ven)
+    cov = None
     if main_binance and float(params.get('coverage_min', X.COVERAGE_MIN)) > 0:
         traded, _np = prelim_traded(xdir, bdir, fee)
         cov = X.coverage_report(xdir, 'x1', bdir, hourly_syms=[('bingx', s_) for _l, s_ in traded], minimum=float(params.get('coverage_min', X.COVERAGE_MIN)))
@@ -703,6 +742,8 @@ async def run_xfund(params, progress=None):
         ints[tag] = float(np.median([v for v in vals if v])) if vals else None
     nh = len(ven['bingx']['hbars']) + len(venB['hbars'])
     R.append(f'1h-свечи: символов с часовыми рядами BingX {len(ven["bingx"]["hbars"])}, {nameB} {len(venB["hbars"])}' + (' — НЕТ часовых данных: весь базис по дневному close (запасной вариант)' if not nh else ''))
+    if cov is not None and cov.get('hourly') is not None:                                        # [v124, §2.53.2] 1h по символам сделок — показатель, не гейт (ошибка загрузки — гейт)
+        R.append(X.hourly_line(cov['hourly']))
     R.append(f'Интервалы начисления (медиана по парам, ч): BingX {fm(ints["BingX"], 1)}, {nameB} {fm(ints[nameB], 1)}; ставки приводятся к 8 ч (сумма за 72 ч ÷ 9)' + ('; ставки Binance — из архива fundingRate по фактическим отметкам времени' if main_binance else ''))
     first = int(np.argmax(inp['elig'].any(axis=1))) if inp['elig'].any() else 0
     R.append(f'Допущенных суток-пар (ликвидность ≥ 20 млн на обеих биржах и ≥ 2 события): {int(inp["elig"].sum())}; период {datetime.fromtimestamp((inp["day0"] + first) * DAY / 1000, timezone.utc):%Y-%m-%d} … {datetime.fromtimestamp((inp["day0"] + inp["nd"] - 1) * DAY / 1000, timezone.utc):%Y-%m-%d}')
@@ -711,7 +752,7 @@ async def run_xfund(params, progress=None):
         res = simulate_x1(inp, T)
         m = metrics(res, inp)
         c, ok = criteria(m)
-        R += [''] + fmt_metrics(f'BingX/{nameB}', T, m, c, ok)
+        R += [''] + fmt_metrics(f'BingX/{nameB}', T, m, c, ok) + fmt_split(res, inp)
         top = top_symbols(res, inp)
         if top:
             R.append('  топ-10 символов по числу сделок (ёмкость K_max = 5% × мин. медианный дневной оборот двух бирж): ' + '; '.join(f'{s} n={n}, K_max {cap / 1e3:.0f}k$' if cap and math.isfinite(cap) else f'{s} n={n}' for s, n, cap in top))

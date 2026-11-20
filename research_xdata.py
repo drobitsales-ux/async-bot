@@ -530,8 +530,8 @@ def _stats_line(what, ex_syms, idx, kind, extra=''):
 
 
 async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sleep=None):
-    """1h-свечи заданных символов (ПО ОДНОМУ СИМВОЛУ — сразу в журнал); проход назад от настоящего. → (загружено, пустых, осталось, остановлено_бюджетом)."""
-    done = empty = left = 0
+    """1h-свечи заданных символов (ПО ОДНОМУ СИМВОЛУ — сразу в журнал); проход назад от настоящего. → (загружено, подтверждённо пусто, ошибка биржи, осталось, остановлено_бюджетом) — v124: пусто и ошибка раздельно (§2.53.2)."""
+    done = empty = err = left = 0
     stopped = False
     for sym in sorted(syms):
         if time.time() > deadline:
@@ -543,7 +543,10 @@ async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sle
             done += 1
             continue
         if neg_active(idx, ex, sym, 'h1', now_ms):
-            empty += 1
+            if idx['neg'][f'{ex}|{sym}|h1'].get('why') == 'empty':
+                empty += 1
+            else:
+                err += 1
             continue
         cur = load_hbars(d, ex, sym) if rec else None
         since = (int(cur['ts'][-1]) + HOUR) if cur is not None and len(cur['ts']) else SINCE_MS
@@ -554,7 +557,7 @@ async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sle
                 put(d, idx, 'fail', ex, f'{sym}|h1', type(e).__name__)
             else:
                 put(d, idx, 'neg', ex, f'{sym}|h1', {'t': now_ms, 'why': type(e).__name__})
-                empty += 1
+                err += 1
             continue
         if cur is not None and len(cur['ts']):
             hts = np.concatenate([cur['ts'], hts]); hh = np.concatenate([cur['h'], hh]); hl = np.concatenate([cur['l'], hl]); hc = np.concatenate([cur['c'], hc])
@@ -565,9 +568,9 @@ async def load_hourly(d, idx, fx, ex, syms, now_ms, deadline, progress=None, sle
         else:
             put(d, idx, 'neg', ex, f'{sym}|h1', {'t': now_ms, 'why': 'empty'})
             empty += 1
-        if progress and (done + empty) % 5 == 0:
-            await progress(f'1h-свечи: обработано {done + empty}/{len(syms)} ({ex}:{sym})')
-    return done, empty, left, stopped
+        if progress and (done + empty + err) % 5 == 0:
+            await progress(f'1h-свечи: обработано {done + empty + err}/{len(syms)} ({ex}:{sym})')
+    return done, empty, err, left, stopped
 
 
 async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=asyncio.sleep):
@@ -723,10 +726,10 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     hs = [s_ for s_ in want[ex] if mk[ex][s_]['norm'] in common and s_ in idx['bars'][ex]]
                     if not hs or stopped:
                         continue
-                    dn, em, lf, stp = await load_hourly(d, idx, fx, ex, hs, now_ms, deadline, progress)
+                    dn, em, er, lf, stp = await load_hourly(d, idx, fx, ex, hs, now_ms, deadline, progress)
                     if stp:
                         stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
-                    L.append(f'  1h-свечи ({ex}, общие базы Bybit∩BingX): загружено {dn} из {len(hs)}, осталось {lf}; подтверждённо пусто/постоянная ошибка: {em}')
+                    L.append(f'  1h-свечи ({ex}, общие базы Bybit∩BingX): загружено {dn} из {len(hs)}, осталось {lf}; подтверждённо пусто: {em}; ошибка биржи: {er}')
                     left_total += lf
         idx['t'] = now_ms
         save_index(d, idx)
@@ -748,6 +751,30 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
 
 
 COVERAGE_MIN = 0.9
+
+
+def hourly_status(idx, syms):
+    """[v124, §2.53.2] Состояние 1h-истории по символам сделок [(биржа, символ)]: загружена / подтверждённо пуста (ответ биржи без ошибки: отрицательная запись с причиной `empty` —
+    дневной запасной базис §2.48.6 п. 2) / ошибка загрузки (постоянная ошибка биржи) / не обработана (сеть, продолжение). → dict(loaded, empty, error, pending: списки символов, total)."""
+    out = {'loaded': [], 'empty': [], 'error': [], 'pending': [], 'total': len(syms)}
+    for ex, s_ in syms:
+        if s_ in idx['hbars'].get(ex, {}):
+            out['loaded'].append(s_)
+            continue
+        r = idx['neg'].get(f'{ex}|{s_}|h1')
+        if r is None:
+            out['pending'].append(s_)
+        elif r.get('why') == 'empty':
+            out['empty'].append(s_)
+        else:
+            out['error'].append(s_)
+    return out
+
+
+def hourly_line(st):
+    """Строка отчёта: «1h доступны для X из Y символов сделок; …» (BOT_SPEC §2.53.2)."""
+    return (f'1h доступны для {len(st["loaded"])} из {st["total"]} символов сделок; символы с подтверждённо пустой 1h-историей ({len(st["empty"])}) используют дневной запасной базис (§2.48 п. 3.2 = §2.48.6 п. 2); '
+            f'ошибка загрузки 1h: {len(st["error"])}, не обработано: {len(st["pending"])}')
 
 
 def coverage_report(d, kind, bdir=None, venues=None, hourly_syms=None, minimum=None):
@@ -777,16 +804,19 @@ def coverage_report(d, kind, bdir=None, venues=None, hourly_syms=None, minimum=N
     parts['фандинг'] = (nf, n)
     if deep:
         parts['глубина (свечи и фандинг до начала истории)'] = (nd, len(deep))
-    if hourly_syms is not None:
-        nh = sum(1 for ex, s_ in hourly_syms if s_ in idx['hbars'].get(ex, {}))
-        parts['1h по символам сделок'] = (nh, len(hourly_syms))
+    hst = None
+    if hourly_syms is not None:                                     # [v124, §2.53.2] 1h: гейт только по ОШИБКАМ загрузки — «загружена» и «подтверждённо пуста» (дневной запасной базис) проходят
+        hst = hourly_status(idx, hourly_syms)
+        parts['1h по символам сделок (загружены или подтверждённо пусты; ошибка/не обработано — гейт)'] = (len(hst['loaded']) + len(hst['empty']), len(hourly_syms))
     ok = True
     for name, (a_, b_) in parts.items():
         share = a_ / b_ if b_ else 0.0
         bad = share < minimum
         ok = ok and not bad
         lines.append(f'{name}: {a_} из {b_} ({share * 100:.0f}%)' + (f' < {minimum * 100:.0f}%' if bad else ''))
-    return {'ok': ok, 'parts': parts, 'lines': lines, 'expected': n}
+    if hst is not None:
+        lines.append(hourly_line(hst))
+    return {'ok': ok, 'parts': parts, 'lines': lines, 'expected': n, 'hourly': hst}
 
 
 def coverage_lines(d, idx, now_ms):
