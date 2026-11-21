@@ -12,7 +12,15 @@ PROBES = {
     'bybit': [('рынки v5', 'https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1'),
               ('тикер v5', 'https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT')],
     'okx': [('тикер', 'https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP')],
+    # [v129, §2.59.1] новые биржи H2EXT: прямой REST (ccxt не используется); вердикт — только по факту пробы на проде
+    'gateio': [('контракт BTC_USDT', 'https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT'),
+               ('тикер', 'https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT')],
+    'mexc': [('тикер', 'https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT'),
+             ('контракты', 'https://contract.mexc.com/api/v1/contract/detail?symbol=BTC_USDT')],
+    'bitget': [('тикер', 'https://api.bitget.com/api/v2/mix/market/ticker?symbol=BTCUSDT&productType=USDT-FUTURES'),
+               ('контракты', 'https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol=BTCUSDT')],
 }
+CCXT_IDS = ('bybit', 'okx')                 # через ccxt пробуются только эти; новые биржи — только прямой REST
 HEADERS_KEEP = ('server', 'x-cache', 'via', 'retry-after', 'x-amz-cf-id')
 GEO_WORDS = re.compile(r'(?i)block access from your country|country|region|restricted location|not available in your|unavailable for legal|'
                        r'access denied|forbidden|eligibility|your location')
@@ -35,9 +43,12 @@ def _ok_body(body: str) -> bool:
     """Тело — успешный ответ API: Bybit retCode 0 / OKX code '0' (по первым 300 байтам JSON может быть обрезан — ищем маркеры)."""
     try:
         j = json.loads(body)
-        return j.get('retCode') == 0 or str(j.get('code')) == '0'
+        if isinstance(j, list):
+            return bool(j)
+        return (j.get('retCode') == 0 or str(j.get('code')) in ('0', '00000') or j.get('success') is True or j.get('name') == 'BTC_USDT')
     except Exception:
-        return bool(re.search(r'"retCode"\s*:\s*0\b', body) or re.search(r'"code"\s*:\s*"0"', body))
+        return bool(re.search(r'"retCode"\s*:\s*0\b', body) or re.search(r'"code"\s*:\s*"(0|00000)"', body) or re.search(r'"code"\s*:\s*0\b', body)
+                    or re.search(r'"success"\s*:\s*true', body) or re.search(r'"name"\s*:\s*"BTC_USDT"', body) or re.search(r'^\s*\[\s*\{', body))
 
 
 def classify_http(r: dict) -> str:
@@ -104,7 +115,7 @@ async def ccxt_probe(ex_id: str, timeout: float = 60.0, sleep=asyncio.sleep) -> 
             await close_ccxt(ex, sleep=sleep)
 
 
-async def probe_all(ex_ids=('bybit', 'okx'), session=None, ccxt_fn=ccxt_probe) -> dict:
+async def probe_all(ex_ids=('bybit', 'okx', 'gateio', 'mexc', 'bitget'), session=None, ccxt_fn=ccxt_probe) -> dict:
     """→ {ex: {'http': [{'name','url',…результат…}], 'ccxt': {...}, 'verdict': str}}. Не бросает исключений."""
     out = {}
     own = session is None
@@ -118,10 +129,13 @@ async def probe_all(ex_ids=('bybit', 'okx'), session=None, ccxt_fn=ccxt_probe) -
                 r = await http_get(sess, url)
                 r['name'], r['url'] = name, url
                 hs.append(r)
-            try:
-                c = await ccxt_fn(ex_id)
-            except Exception as e:
-                c = {'dt': 0.0, 'ok': False, 'exc': f'{type(e).__name__}: {e}', 'n': 0}
+            if ex_id not in CCXT_IDS:
+                c = {'dt': 0.0, 'ok': None, 'exc': None, 'n': 0}
+            else:
+                try:
+                    c = await ccxt_fn(ex_id)
+                except Exception as e:
+                    c = {'dt': 0.0, 'ok': False, 'exc': f'{type(e).__name__}: {e}', 'n': 0}
             out[ex_id] = {'http': hs, 'ccxt': c, 'verdict': classify_exchange(hs, c)}
     except Exception as e:
         out['_error'] = f'{type(e).__name__}: {e}'
@@ -149,5 +163,8 @@ def format_probe(res: dict, esc=lambda x: str(x)) -> list:
             h = ', '.join(f'{k}={v}' for k, v in sorted(r['headers'].items())) or 'заголовков нет'
             lines.append(f"  aiohttp {esc(r['name'])}: HTTP {r['status']} ({r['dt']:.1f}с) [{esc(h)}] тело: <code>{esc(r['body'][:300])}</code>")
         c = d['ccxt']
+        if c['ok'] is None:
+            lines.append('  ccxt: не проверялся (прямой REST без ccxt, §2.59.1)')
+            continue
         lines.append('  ccxt load_markets: ' + (f"ok, {c['n']} рынков ({c['dt']:.1f}с)" if c['ok'] else f"ИСКЛЮЧЕНИЕ {esc(c['exc'])} ({c['dt']:.1f}с)"))
     return lines

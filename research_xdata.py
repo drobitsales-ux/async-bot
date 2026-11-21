@@ -15,7 +15,10 @@ import research_vision as V
 
 DAY = 86_400_000
 HOUR = 3_600_000
-EXCHANGES = ('bybit', 'bingx', 'okx')
+EXCHANGES = ('bybit', 'bingx', 'okx', 'gateio', 'mexc', 'bitget')
+OLD_VENUES = ('bybit', 'bingx', 'okx')          # v129 (§2.59): gateio/mexc/bitget — новые биржи H2EXT (прямой REST, research_venues)
+EXT_ALL = ('bingx', 'okx', 'gateio', 'mexc', 'bitget')
+NEW_VENUES = ('gateio', 'mexc', 'bitget')
 RETRY_DELAYS = (2, 6, 15)
 LIQ_COARSE = 20_000_000.0               # грубый фильтр загрузки фандинга: максимум 30-дневного среднего оборота ≥ 20 млн USDT
 FIRST30 = 30
@@ -46,6 +49,15 @@ def venues_from_spec(path=None):
     v = (spec_line('H2REPL-VENUES:', path) or '').lower().replace(' ', '')
     got = tuple(x for x in v.split(',') if x in EXCHANGES)
     return got if got else ('bybit', 'bingx')
+
+
+def ext_venues_from_spec(path=None):
+    """H2EXT (BOT_SPEC §2.59.1): площадки по маркеру `H2EXT-VENUES: bingx,okx,<доступные новые>` → tuple | None (маркера нет — расчёт и загрузка отказывают)."""
+    v = spec_line('H2EXT-VENUES:', path)
+    if v is None:
+        return None
+    got = tuple(x for x in v.lower().replace(' ', '').split(',') if x in EXT_ALL)
+    return got or None
 
 
 def x1_pair_from_spec(path=None):
@@ -255,6 +267,8 @@ def is_transient(e):
     except Exception:
         pass
     names = {c.__name__ for c in type(e).__mro__}
+    if 'VenueError' in names:                                       # v129: Gate/MEXC/Bitget (research_venues) — лимит и 5xx временные
+        return bool(re.search(r'HTTP (5\d\d|429)|too many requests|rate.?limit', str(e), re.I))
     if names & {'NetworkError', 'RequestTimeout', 'DDoSProtection', 'RateLimitExceeded', 'ExchangeNotAvailable', 'OnMaintenance', 'TimeoutError',
                 'ClientError', 'ConnectionError', 'OSError'}:
         return True
@@ -705,6 +719,12 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         import ccxt.async_support as ccxt
         import research_okx
         exchanges = {'okx': research_okx.OkxPublic(), 'bybit': ccxt.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}), 'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
+        if params.get('ext'):                                       # [v129, §2.59.2] H2EXT: BingX + OKX + новые биржи (прямой REST без ccxt); Bybit не используется
+            import research_venues
+            exchanges = {ex: c for ex, c in exchanges.items() if ex != 'bybit'}
+            for ex_, cls in research_venues.CLASSES.items():
+                if ex_ in (params.get('venues') or ()):
+                    exchanges[ex_] = cls()
     idx = compact_index(d)
     n_mig = migrate_v127(d, idx)                                    # [v127, §2.58 п. 8] разовый сброс записей-ошибок (лимит запросов 100410 записывался как постоянная ошибка)
     idx['fail'] = {}                                                # ошибки текущего прогона (транзиентные); постоянные — в idx['neg']
@@ -750,7 +770,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         want = {ex: [] for ex in EXCHANGES}
         for ex in EXCHANGES:
             for s, v in mk.get(ex, {}).items():
-                if v['norm'] not in bnorm or v['norm'] in common:
+                if v['norm'] not in bnorm or (ex in OLD_VENUES and v['norm'] in common):
                     want[ex].append(s)
         x1_main = bool(params.get('x1_main'))                        # [v118] X1 (BingX, Binance): ВСЕ BingX-символы с базой из архива Binance (§2.50, §2.53)
         if x1_main:
@@ -846,7 +866,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             L += error_lines(idx, 'fund', todo, 4)
             left_total += z_
             # 3. часовые свечи общих баз Bybit∩BingX (X1 с архивом Binance — по символам сделок, отдельным шагом /xfund_test load)
-            if params.get('hourly', True) and not stopped and common:
+            if params.get('hourly', True) and not stopped and common and not params.get('ext'):
                 for ex in EXCHANGES:
                     hs = [s_ for s_ in want[ex] if mk[ex][s_]['norm'] in common and s_ in idx['bars'][ex]]
                     if not hs or stopped:
@@ -932,8 +952,8 @@ def coverage_report(d, kind, bdir=None, venues=None, hourly_syms=None, minimum=N
     if n == 0:
         return {'ok': False, 'parts': {}, 'lines': ['ожидаемая вселенная пуста — выполните load']}
     nb = sum(1 for ex, s_ in exp if s_ in idx['bars'].get(ex, {}))
-    nf = sum(1 for ex, s_ in exp if s_ in idx['fund'].get(ex, {}))
-    deep = [(ex, s_) for ex, s_ in exp if ex != 'okx']
+    nf = sum(1 for ex, s_ in exp if s_ in idx['fund'].get(ex, {}) or (ex in NEW_VENUES and idx['neg'].get(f'{ex}|{s_}|fund', {}).get('why') == 'empty'))     # [v129, §2.59.2] новые биржи: подтверждённо пустая история фандинга = «фандинг 0 со счётчиком»
+    deep = [(ex, s_) for ex, s_ in exp if ex in ('bybit', 'bingx')]
     nd = sum(1 for ex, s_ in deep if idx['bars'].get(ex, {}).get(s_, {}).get('complete') and idx['fund'].get(ex, {}).get(s_, {}).get('complete'))
     parts['свечи'] = (nb, n)
     parts['фандинг'] = (nf, n)
@@ -969,11 +989,15 @@ def coverage_lines(d, idx, now_ms):
         if fs:
             fl = [v['first'] for v in fs.values() if v.get('first')]
             out.append(f'    фандинг по {len(fs)} символам; самое раннее событие {time.strftime("%Y-%m-%d", time.gmtime(min(fl) / 1000)) if fl else "н/д"}')
-        if ex == 'okx' and fs:                                      # [v119] измеренная глубина истории фандинга OKX (§2.51): сколько суток отдаёт API
+        if ex in ('okx',) + NEW_VENUES and fs:                      # [v119/v129] измеренная глубина истории фандинга (§2.51, §2.59.2): сколько суток отдаёт API
             dep = sorted((v['last'] - v['first']) / DAY for v in fs.values() if v.get('first') and v.get('last'))
             if dep:
-                out.append(f'    OKX: глубина истории фандинга (последняя − первая отметка) по {len(dep)} символам: мин {dep[0]:.0f}, медиана {dep[len(dep) // 2]:.0f}, макс {dep[-1]:.0f} сут. '
+                out.append(f'    {ex.upper()}: глубина истории фандинга (последняя − первая отметка) по {len(dep)} символам: мин {dep[0]:.0f}, медиана {dep[len(dep) // 2]:.0f}, макс {dep[-1]:.0f} сут. '
                            f'(окно позиции H2 вне этой глубины → фандинг = 0 со счётчиком, §2.51)')
+            cov30 = sum(1 for s_, v in fs.items() if v.get('first') and s_ in bs and int(v['first']) <= int(bs[s_]['first']) + 3 * DAY)
+            if ex in NEW_VENUES:                                    # [v129, §2.59.2] доля символов, у которых история фандинга начинается у листинга (иначе начало окна H2 без фандинга)
+                nempty = sum(1 for s_ in bs if idx['neg'].get(f'{ex}|{s_}|fund', {}).get('why') == 'empty')
+                out.append(f'    {ex.upper()}: история фандинга начинается у листинга (≤ 3 сут. от первого бара) у {cov30} из {len(bs)} символов; подтверждённо без истории фандинга: {nempty}')
         mk = idx['markets'].get(ex, {})
         inactive = [s for s, v in mk.items() if not v.get('active')]
         out.append(f'    неактивных рынков в markets: {len(inactive)}' + ('' if inactive else ' — закрытых инструментов API не отдаёт: ОШИБКА ВЫЖИВШЕГО (делистинги отсутствуют; смещение ПРОТИВ шорт-стратегии)'))
