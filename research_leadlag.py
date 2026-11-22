@@ -27,6 +27,7 @@ EXEC_PER_DAY_MIN = 20.0
 EXEC_SYMS_MIN = 10
 CONV_SHARE_MIN = 0.70
 BREAK_STEPS = 3
+DISK_CHECK_S = 600.0                      # §2.59.9 п. 5: проверка свободного места раз в 10 минут
 DT = np.dtype([('mb', '<f4'), ('mo', '<f4'), ('sb', '<u2'), ('so', '<u2')])
 SPREAD_UNIT = 1e-6                       # half-spread: доля mid в единицах 1e-6 (0.01 б.п.), uint16 → до 6.55%
 
@@ -79,6 +80,26 @@ def save_state(d, st):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(st, f, ensure_ascii=False)
     os.replace(tmp, state_path(d))
+
+
+def min_free_mb():
+    """Минимум свободного места на томе сбора (§2.59.9 п. 5): ENV LEADLAG_MIN_FREE_MB, по умолчанию 200 МБ."""
+    try:
+        return float(os.getenv('LEADLAG_MIN_FREE_MB', '200'))
+    except ValueError:
+        return 200.0
+
+
+def free_mb(d):
+    """Свободное место на томе каталога d (МБ); каталога ещё нет — берётся ближайший существующий родитель. При ошибке — inf (проверка не блокирует)."""
+    import shutil
+    p = d
+    while p and not os.path.exists(p) and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    try:
+        return shutil.disk_usage(p or '/').free / 1e6
+    except OSError:
+        return float('inf')
 
 
 def dir_mb(d):
@@ -249,6 +270,7 @@ class Collector:
         until = float(st['until'])
         warm_left = 0 if st.get('warm_done') else WARM_TICKS
         warm_rows = []
+        next_disk = self.now() + DISK_CHECK_S
         while not self.stop and self.now() < until:
             t0 = self.now()
             rb, ro = await asyncio.gather(self.get_b(), self.get_o(), return_exceptions=True)
@@ -284,6 +306,17 @@ class Collector:
                     st['warm_done'] = True
                     save_state(self.d, st)
                     await self._say(f'📈 /leadlag: после прогрева символов {len(self.syms)} (исключено по масштабу: {len(st["excluded_scale"])})')
+            if self.now() >= next_disk:                                      # §2.59.9 п. 5: свободно < 200 МБ — запись прекращается, сообщение в Telegram
+                next_disk = self.now() + DISK_CHECK_S
+                fr = free_mb(self.d)
+                if fr < min_free_mb():
+                    self.flush()
+                    st['running'] = False
+                    st['stopped'] = f'мало места на диске: свободно {fr:.0f} МБ < {min_free_mb():.0f} МБ'
+                    st['ticks'] = self.ticks
+                    save_state(self.d, st)
+                    await self._say(f'⛔ /leadlag: свободно {fr:.0f} МБ < {min_free_mb():.0f} МБ — запись прекращена (данные до этого момента сохранены; /leadlag_report)')
+                    break
             if len(self.buf_ts) >= FLUSH_TICKS and not warm_left:
                 self.flush()
                 st['ticks'] = self.ticks
@@ -334,7 +367,7 @@ def status_text(d):
     t = time.time()
     left = max(0.0, float(st.get('until', 0)) - t) / 86400
     return (f'{"▶️ идёт" if st.get("running") else "⏹ не идёт"} сбор lead-lag OKX↔BingX: символов {len(st.get("symbols") or [])}, тиков {st.get("ticks", 0)}, осталось {left:.1f} сут., '
-            f'шаг {st.get("step")} с, объём {dir_mb(d):.0f} МБ из {max_mb():.0f}' + (f', причина остановки: {st["stopped"]}' if st.get('stopped') else '')
+            f'шаг {st.get("step")} с, занято сборщиком {dir_mb(d):.0f} МБ (лимит {max_mb():.0f}), свободно на томе {free_mb(d):.0f} МБ (минимум {min_free_mb():.0f})' + (f', причина остановки: {st["stopped"]}' if st.get('stopped') else '')
             + (f', повышений шага из-за лимита: {st["step_raised"]}' if st.get('step_raised') else '') + (f', медианная длительность цикла {st["median_cycle_s"]:.2f} с' if st.get('median_cycle_s') else ''))
 
 

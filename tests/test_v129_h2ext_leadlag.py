@@ -325,23 +325,42 @@ class Ext(unittest.TestCase):
         self.assertTrue(r['meta']['opened'] > 0)
         self.assertEqual(r['meta']['events'], len(ev))
 
-    def test_bonferroni_threshold_applies(self):
-        self.assertAlmostEqual(HX.T_ADJ_MIN, 2.24)
+    def test_threshold_is_2_0_fixed_sequence_not_bonferroni(self):
+        self.assertEqual(HX.T_ADJ_MIN, 2.0)
+        self.assertEqual(HX.T_ADJ_MIN, H2R.MIN_T_ADJ)
         n = 400
-        rng = np.random.default_rng(1)
-        base = rng.normal(0.0004, 0.002, n)
-        days = np.arange(n)
-        seg = np.ones(n, bool)
-        ev = HX.evaluate(days, base, base, seg, 1.0, {})
-        t_adj = ev['t_adj']
-        self.assertTrue(np.isfinite(t_adj))
-        old = H2R.evaluate(days, base, base, seg, 1.0, {})
-        self.assertEqual(old['t_adj'], ev['t_adj'])
-        # порог 2.24 строже 2.0: t_adj между 2.0 и 2.24 → H2EXT не проходит
-        lo = H2R.MIN_T_ADJ
-        self.assertTrue(HX.T_ADJ_MIN > lo)
-        if lo <= t_adj < HX.T_ADJ_MIN:
-            self.assertFalse(ev['crit']['t_adj'])
+        base = np.random.default_rng(1).normal(0.0004, 0.002, n)
+        days, seg = np.arange(n), np.ones(n, bool)
+        ev, old = HX.evaluate(days, base, base, seg, 1.0, {}), H2R.evaluate(days, base, base, seg, 1.0, {})
+        self.assertEqual(ev['crit'], old['crit'])
+        self.assertEqual(ev['pass'], old['pass'])
+        src = open(os.path.join(ROOT, 'research_h2ext.py'), encoding='utf-8').read()
+        self.assertNotIn('2.24', src.replace('# §2.59.9: fixed-sequence, порог 2.0 (§2.47 без изменений); поправка Бонферрони 2.24 снята', ''))
+
+    def test_h2f_gate_fixed_sequence(self):
+        fd = tempfile.mkdtemp()
+        p = dict(self.params, fdir=fd, hyp='f', spec_path=self.spec([]))
+        calls = []
+        orig = HX.evaluate
+        HX.evaluate = lambda *x, **k: calls.append(1)
+        try:
+            for mode in ('show', 'confirm'):
+                t = run(HX.run_h2ext(dict(p, mode=mode)))
+                self.assertIn('сначала H2EXT', t)                                 # H2EXT не выполнялся
+            RF.kv_set('h2_ext_done', True, fd)
+            RF.kv_set('h2_ext_passed', False, fd)
+            for mode in ('show', 'confirm'):
+                t = run(HX.run_h2ext(dict(p, mode=mode)))
+                self.assertIn('H2 закрыт целиком', t)                             # H2EXT не пройден → H2F не считается
+            self.assertIsNone(RF.kv_get('h2f_done', fd))
+            self.assertIsNone(RF.kv_get('h2f_started', fd))
+            self.assertEqual(calls, [])
+            self.assertIn('нет', run(HX.run_h2ext(dict(p, mode='report'))))       # report доступен всегда
+            RF.kv_set('h2_ext_passed', True, fd)
+            t = run(HX.run_h2ext(dict(p, mode='show')))
+            self.assertIn('H2F-UNIVERSE: N=', t)                                  # H2EXT пройден → H2F разрешена
+        finally:
+            HX.evaluate = orig
 
     def test_show_k_before_returns_and_confirm_needs_both_lines_once_only(self):
         calls = []
@@ -368,7 +387,7 @@ class Ext(unittest.TestCase):
                 self.assertEqual(calls, [])
             else:
                 self.assertEqual(calls, [1])
-                for needle in ('Критерии', 'Справочно', 'по биржам', 't_adj', '2.24'):
+                for needle in ('Критерии', 'Справочно', 'по биржам', 't_adj', 'последовательная проверка'):
                     self.assertIn(needle, res)
             self.assertTrue(RF.kv_get('h2_ext_done', self.fdir))
             again = run(HX.run_h2ext(dict(self.params, mode='confirm', hyp='ext', spec_path=sp)))
@@ -378,11 +397,14 @@ class Ext(unittest.TestCase):
             HX.evaluate = orig
 
     def test_h2f_has_own_state_and_lines(self):
-        txt = run(HX.run_h2ext(dict(self.params, mode='show', hyp='f', spec_path=self.spec([]))))
+        fd = tempfile.mkdtemp()
+        RF.kv_set('h2_ext_done', True, fd)
+        RF.kv_set('h2_ext_passed', True, fd)
+        txt = run(HX.run_h2ext(dict(self.params, fdir=fd, mode='show', hyp='f', spec_path=self.spec([]))))
         self.assertIn('H2F-UNIVERSE: N=', txt)
         self.assertIn('H2F: символов новых бирж', txt)
         self.assertIn('Мощность (шаг 0)', txt)
-        self.assertIsNone(RF.kv_get('h2f_done', self.fdir))
+        self.assertIsNone(RF.kv_get('h2f_done', fd))
 
     def test_untestable_closes_without_returns(self):
         fd = tempfile.mkdtemp()
@@ -773,6 +795,114 @@ class Wiring(unittest.TestCase):
         finally:
             a._ll_launch = orig
             os.environ.pop('LEADLAG_DIR')
+
+
+class DiskAndStatus(unittest.TestCase):
+    def test_collector_stops_when_free_space_below_200mb_and_notifies(self):
+        d = tempfile.mkdtemp()
+        clk = Clock()
+        sent = []
+
+        async def notify(m):
+            sent.append(m)
+
+        async def gb():
+            return snaps({'AAA': 0.0})[0]
+
+        async def go():
+            return snaps({'AAA': 0.0})[1]
+        orig, old_f = LL.free_mb, LL.FLUSH_TICKS
+        LL.free_mb = lambda _d: 150.0
+        LL.FLUSH_TICKS = 10
+        try:
+            col = LL.Collector(d, gb, go, step=2.0, sleep=clk.sleep, now=clk.now, notify=notify)
+            st = run(col.run())
+        finally:
+            LL.free_mb, LL.FLUSH_TICKS = orig, old_f
+        self.assertFalse(st['running'])
+        self.assertIn('мало места', st['stopped'])
+        self.assertTrue(any('150' in m and '200' in m for m in sent))
+        self.assertTrue(col.ticks <= LL.DISK_CHECK_S / 2 + 5)                    # остановка на первой 10-минутной проверке
+        self.assertEqual(os.path.getsize(LL.ts_path(d)) // 16, col.ticks)         # записанное до остановки сохранено
+
+    def test_enough_space_does_not_stop_before_check_and_checks_every_10_minutes(self):
+        d = tempfile.mkdtemp()
+        clk = Clock()
+        checks = []
+
+        async def gb():
+            return snaps({'AAA': 0.0})[0]
+
+        async def go():
+            return snaps({'AAA': 0.0})[1]
+        orig = LL.free_mb
+
+        def fake(_d):
+            checks.append(clk.t)
+            return 5000.0
+        LL.free_mb = fake
+        try:
+            col = LL.Collector(d, gb, go, step=2.0, sleep=clk.sleep, now=clk.now)
+
+            async def both():
+                async def stopper():
+                    while clk.t < 1_800_000_000.0 + 3 * 600 + 30:
+                        await asyncio.sleep(0)
+                    col.stop = True
+                await asyncio.gather(col.run(), stopper())
+            run(both())
+        finally:
+            LL.free_mb = orig
+        self.assertEqual(len(checks), 3)
+        self.assertTrue(all(abs((b - a_) - 600) < 5 for a_, b in zip(checks, checks[1:])))
+
+    def test_start_refused_when_free_space_low_and_status_shows_space(self):
+        d = tempfile.mkdtemp()
+        os.environ['LEADLAG_DIR'] = d
+        _db, sent = _common.fresh_state()
+        launched = []
+        orig_l, orig_f = a._ll_launch, LL.free_mb
+
+        async def fake(resume):
+            launched.append(resume)
+            return {'symbols': [], 'ref': {}, 'step': 2.0, 'est_bytes': 1}
+        a._ll_launch = fake
+        LL.free_mb = lambda _d: 120.0
+        try:
+            run(a.leadlag_cmd('/leadlag_start', []))
+            self.assertEqual(launched, [])
+            self.assertTrue(any('120' in m and '200' in m for m in sent))
+            LL.free_mb = lambda _d: 900.0
+            run(a.leadlag_cmd('/leadlag_start', []))
+            self.assertEqual(launched, [False])
+            LL.save_state(d, {'running': True, 'until': 4_000_000_000, 'step': 2.0, 'symbols': ['AAA'], 'ticks': 5})
+            txt = LL.status_text(d)
+            self.assertIn('занято сборщиком', txt)
+            self.assertIn('свободно на томе 900', txt)
+        finally:
+            a._ll_launch, LL.free_mb = orig_l, orig_f
+            os.environ.pop('LEADLAG_DIR')
+
+    def test_free_mb_missing_dir_uses_parent(self):
+        self.assertTrue(LL.free_mb(os.path.join(tempfile.mkdtemp(), 'a', 'b')) > 0)
+
+    def test_status_line_with_scanner_flags(self):
+        _common.fresh_state()
+        txt = a.status_text()
+        self.assertIn('Сканеры (ENV): все выключены', txt)
+        saved = (a.SMC2_ENABLED, a.RB_ENABLED)
+        a.SMC2_ENABLED, a.RB_ENABLED = True, True
+        try:
+            txt = a.status_text()
+            self.assertIn('⚠️ Сканеры включены (ENV): SMC2, RB', txt)
+            self.assertNotIn('все выключены', txt)
+        finally:
+            a.SMC2_ENABLED, a.RB_ENABLED = saved
+        a._ll_state['task'] = type('T', (), {'done': lambda self: False})()
+        try:
+            self.assertIn('сбор /leadlag идёт', a.status_text())
+        finally:
+            a._ll_state['task'] = None
 
 
 if __name__ == '__main__':

@@ -1,7 +1,8 @@
 """research_h2ext.py — H2-D3 на НОВЫХ биржах (Gate.io, MEXC, Bitget) — гипотеза H2EXT — и гипотеза H2F (BOT_SPEC §2.59).
 Правила H2-D3 БЕЗ изменений: те же `research_bsim.h2_events` / `sim_h2`, что в `research_battery.run_cell(('H2','D3'))`; панель и вселенная — `research_h2repl.build_repl_panel`
 (правило `research_xdata.h2_universe`, §2.47.2) с площадками из маркера `H2EXT-VENUES:`. H2F отличается ТОЛЬКО списком событий (фильтр по фандингу, только символы новых бирж).
-Порядок (§2.59.5): мощность ДО доходностей → k по синтетике → строки `…-UNIVERSE:`/`…-K:` в BOT_SPEC → `confirm` (один прогон). Порог t_adj = 2.24 (Бонферрони на 2, §2.59.6).
+Порядок (§2.59.5): мощность ДО доходностей → k по синтетике → строки `…-UNIVERSE:`/`…-K:` в BOT_SPEC → `confirm` (один прогон). Порог t_adj ≥ 2.0 у обеих гипотез; последовательная проверка (§2.59.9):
+H2F проверяется ТОЛЬКО если H2EXT пройден; иначе H2F не считается и H2 закрыт целиком.
 LOCKBOX батареи (исчерпан, §2.43.20) не читается. Ордеров нет."""
 import hashlib
 import math
@@ -19,11 +20,20 @@ import research_xdata as X
 SEED = 20261121
 K_TAG = {'ext': 4701, 'f': 4702}
 K_REPS = 200
-T_ADJ_MIN = 2.24                          # §2.59.6: Бонферрони на 2 (двусторонний 5% / 2)
+T_ADJ_MIN = H.MIN_T_ADJ                  # §2.59.9: fixed-sequence, порог 2.0 (§2.47 без изменений); поправка Бонферрони 2.24 снята
 CFG = {
     'ext': {'ns': 'h2_ext', 'title': 'H2EXT — H2-D3 на новых биржах', 'spec_u': 'H2EXT-UNIVERSE:', 'spec_k': 'H2EXT-K:', 'cmd': '/h2_ext'},
     'f': {'ns': 'h2f', 'title': 'H2F — H2-D3 + шорт только при среднем фандинге > 0 за сутки до входа (символы новых бирж)', 'spec_u': 'H2F-UNIVERSE:', 'spec_k': 'H2F-K:', 'cmd': '/h2f'},
 }
+
+
+def sequence_gate(fdir):
+    """[§2.59.9] None — H2F разрешена (H2EXT выполнен и пройден); иначе текст отказа."""
+    if not RF.kv_get('h2_ext_done', fdir):
+        return '⛔ /h2f отказ: последовательная проверка (§2.59.9) — сначала H2EXT (/h2_ext confirm); H2F считается только если H2EXT пройден'
+    if not RF.kv_get('h2_ext_passed', fdir):
+        return '⛔ /h2f отказ: H2EXT не пройден (или «непроверяема») — по §2.59.9 H2F не считается, H2 закрыт целиком'
+    return None
 
 
 def keys(hyp):
@@ -115,12 +125,8 @@ def compute_k(env, fees, ev, hyp, reps=K_REPS, progress=None):
 
 
 def evaluate(days, base, stress, seg, k, months_ret):
-    """Критерии §2.47.3 п. 2 с порогом t_adj ≥ 2.24 (§2.59.6): расчёт — `research_h2repl.evaluate`, критерий t_adj пересчитан с новым порогом."""
-    ev = H.evaluate(days, base, stress, seg, k, months_ret)
-    c = ev['crit']
-    c['t_adj'] = bool(math.isfinite(ev['t_adj']) and ev['t_adj'] >= T_ADJ_MIN and ev['mean'] > 0)
-    ev['pass'] = bool(all(v for v in c.values() if v is not None) and ev['n'] > 0)
-    return ev
+    """Критерии §2.47.3 п. 2 без изменений (порог t_adj ≥ 2.0; §2.59.9) — расчёт `research_h2repl.evaluate`."""
+    return H.evaluate(days, base, stress, seg, k, months_ret)
 
 
 def lines_of(uni_sub):
@@ -158,7 +164,7 @@ def final_lines(ev, ref_):
     c = ev['crit']
     mark = lambda v: 'н/п' if v is None else ('да' if v else 'НЕТ')
     g = ev['groups']
-    R = ['', f'<b>Критерии (весь период панели, ряд суток {ev["n"]}); порог t_adj ≥ {T_ADJ_MIN} (Бонферрони на 2, §2.59.6)</b>',
+    R = ['', f'<b>Критерии (весь период панели, ряд суток {ev["n"]}); порог t_adj ≥ {T_ADJ_MIN} (§2.47 без изменений; последовательная проверка H2EXT → H2F, §2.59.9)</b>',
          f'  t_adj = {H.fm(ev["t_adj"])} (t = {H.fm(ev["t"])}, k = {H.fm(ev["k"], 3)}) и mean {H.bp(ev["mean"])} б.п./день > 0 [{mark(c["t_adj"])}]',
          f'  годовой Шарп {H.fm(ev["sharpe"])} ≥ {H.MIN_SHARPE} [{mark(c["sharpe"])}]; просадка {ev["dd"] * 100:.1f}% ≤ {H.MAX_DD * 100:.0f}% [{mark(c["dd"])}]; стресс ×2 mean {H.bp(ev["stress_mean"])} [{mark(c["stress"])}]',
          f'  месяцы роста BTC: {g["up"]["n_months"]} мес., mean {H.bp(g["up"]["mean"]) if g["up"]["mean"] is not None else "н/п"} [{mark(c["up"])}]; падения: {g["down"]["n_months"]} мес., mean '
@@ -198,6 +204,10 @@ async def run_h2ext(params, progress=None):
         if hyp != 'ext':
             return '⛔ /h2f load отсутствует: данные общие — /h2_ext load'
         return await X.run_xload(dict(params, venues=venues, ext=True, hourly=False), progress)
+    if hyp == 'f':                                                      # §2.59.9: fixed-sequence — H2F только после H2EXT «пройдено»
+        gate = sequence_gate(fdir)
+        if gate:
+            return gate
     if RF.kv_get(K['done'], fdir):
         return f'⛔ {cfg["cmd"]}: расчёт уже выполнен (повтор запрещён, §2.59.5)\n' + (RF.kv_get(K['report'], fdir) or '')
     cmin = float(params.get('coverage_min', X.COVERAGE_MIN))
