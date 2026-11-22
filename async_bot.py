@@ -7022,8 +7022,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-20-v128'
+CODE_VERSION = '2026-11-21-v129'
 CHANGELOG = [
+    ('2026-11-21-v129', 'H2 НА НОВЫХ БИРЖАХ (Gate.io, MEXC, Bitget; BOT_SPEC §2.59) И ЗАМЕР РАСХОЖДЕНИЙ ЦЕН OKX↔BingX (§2.60); пре-регистрации записаны ОТДЕЛЬНЫМИ коммитами ДО кода, данных и сбора. Расчёты прежних гипотез, breaker-ы, режим ожидания, bybit_worker.py не менялись; ордеров нет. (1) /net_probe: проба Gate.io/MEXC/Bitget (прямой REST). (2) research_venues.py: публичные клиенты трёх бирж без ccxt (формат ответов по памяти, не проверен). (3) /h2_ext [load|confirm|report] — H2-D3 те же функции на BingX+OKX+новых биржах (площадки — маркер H2EXT-VENUES в BOT_SPEC), /h2f [confirm|report] — H2F (только символы новых бирж, фильтр по фандингу), последовательная проверка (§2.59.9): H2F считается только если H2EXT пройден, порог t_adj 2.0. (4) /leadlag_start|stop|status|report — сбор тикеров OKX и BingX раз в 2 с, 7 суток, только публичные запросы; отчёт и критерий B3; свободное место на диске < 200 МБ — запись прекращается (проверка перед стартом и раз в 10 минут). (5) /status: строка с флагами сканеров (ENV).'),
     ('2026-11-20-v128', 'ТОЛЬКО ДОКУМЕНТАЦИЯ: итог X1 (BOT_SPEC §2.48.8, направление закрыто), итоговая формулировка H2 (§2.47.7), RESEARCH_SUMMARY, START_HERE.md, PROJECT_HANDOFF.md, README.md. Расчёты, пре-регистрации, breaker-ы, bybit_worker.py не менялись; ордеров нет.'),
     ('2026-11-20-v127', 'ЛИМИТ ЗАПРОСОВ BingX (КОД 100410) БЫЛ ПРИНЯТ ЗА ПОСТОЯННУЮ ОШИБКУ (BOT_SPEC §2.58; поправка записана ОТДЕЛЬНЫМ коммитом ДО кода; расчёты, пороги, критерии, гейт, пре-регистрации §2.47/§2.48/§2.53, bybit_worker.py, режим ожидания, breaker-ы не менялись; ордеров нет). ОТЧЁТ /xfund_1h_errors (v126): все 48 ошибок — код 100410 «请稍后重试» («повторите позже»): 16 с ошибкой на разных страницах (0…18 успешных до ошибки) и 32, не воспроизведшихся (полный проход, 24 страницы, ≈ 22 499 баров); классы а1 ×15 (ОШИБОЧНО: лимит запросов принят за «ограничение глубины»), в ×32, г ×1 (ONT); apply НЕ применялся, данные не менялись. ПРИЧИНА (моя регрессия v121, признаю): повторы на ExchangeError 100410 есть в research_htf.is_retryable с v87, а в v121 я заменил повтор «любой ошибки» в Fetcher загрузчика на is_transient по классам исключений и не переиспользовал is_retryable — 100410 стал «постоянной ошибкой» с кэшем на 7 суток, поэтому повторный /xfund_test load эти символы не запрашивал. ИСПРАВЛЕНО: is_transient делегирует research_htf.is_retryable и распознаёт код/текст лимита; лимит запросов — повтор ТОЙ ЖЕ страницы с паузами 3/8/20/45 с (Fetcher; остальные временные 2/6/15 с; в режиме диагностики без повторов — ничего), после — символ «не обработано» (не ошибка, не «пусто»), догрузка следующим прогоном; пауза между страницами свечей и фандинга BingX — ENV BINGX_PAGE_PAUSE_SEC (1.0 с по умолчанию) ДОПОЛНИТЕЛЬНО к HTF_FETCH_PAUSE_SEC=2.0 (итого 3.0 с; ровно 1.0 с — при HTF_FETCH_PAUSE_SEC=0); классификация: временная ошибка (код 100410 / «请稍后重试» / сетевые признаки) — ВСЕГДА класс в и проверяется ПЕРЕД а1/а2; а1 — только при явном ответе «нет данных / вне диапазона» на странице с дневными свечами; разовый сброс (migrate_v127, при первой загрузке/диагностике на v127): все записи-ошибки загрузки (neg: 1h, свечи, фандинг; кроме «подтверждённо пусто/недоступны») и h1class → «не обработано» — охватывает и 25 символов без свечей/фандинга в «439 из 464» (вероятно тот же 100410; гипотеза). ПОБОЧНОЕ НАБЛЮДЕНИЕ по числам отчёта (прод не проверялся): 1h-история BingX ограничена ≈ 22 500 барами (≈ 937 суток) — у листингованных раньше ≈ 2024-04 проход назад кончается пустой страницей; более ранний период X1 идёт по дневному запасному базису (§2.48.6 п. 2); отчёт /xfund_test показывает символы с 1h короче дневной истории (первый 1h-бар позже первого дневного более чем на 3 суток) как «частичной глубины». НЕ ПРОВЕРЕНО: что 100410 всегда лимит запросов (текст и случайные страницы это подтверждают; официальной таблицы кодов BingX нет), что предел ≈ 22 500 баров постоянен; рекомендация владельцу: при повторяющемся 100410 поднять HTF_FETCH_PAUSE_SEC/BINGX_PAGE_PAUSE_SEC. Тесты: tests/test_v127_ratelimit.py'),
     ('2026-11-20-v126', 'MemoryError В /xfund_1h_errors (BOT_SPEC §2.57.2; расчёты, пороги, правило классификации §2.57, пре-регистрации, bybit_worker.py, режим ожидания, breaker-ы не менялись; ордеров нет). ПРОД (v125): «диагностика 1h: 8/48 → MemoryError: превышен лимит памяти RESEARCH_MEM_MB=300 (RSS 204 МБ)». ПРИЧИНА (моя ошибка v125, воспроизведена): пробный проход держал свечи в виде списков Python (≈ 250 байт на бар: список из 6 float + объекты) и словарь результатов хранил ряды ВСЕХ символов до конца прогона (нужны были только для apply) — до 60 страниц × 1000 баров на символ ≈ 15–20 МБ, к 8-му символу ≈ 160 МБ + базовые 100 МБ импортов. ИСПРАВЛЕНИЕ: probe_pages хранит ряд компактными массивами (ts int64, high/low/close float32 ≈ 20 байт на бар; новые бары — строго старше предыдущей страницы), символы обрабатываются по одному — классификация и (при apply) применение исхода сразу, ряд освобождается до следующего символа, в отчёт идут только лёгкие поля. Тест (tracemalloc): пик при 12 символах × 30 000 баров не растёт относительно 3 символов (< 8 МБ разницы, < 40 МБ всего); на коде v125 тот же тест даёт 21 → 67 МБ и падает. Данные сохраняются полностью (30 000 баров, по возрастанию, без дублей). НЕ ПРОВЕРЕНО: прод (реальные размеры ответов BingX). Тесты: tests/test_v126_h1err_memory.py'),
@@ -7632,7 +7633,7 @@ def net_probe_access_text(res: dict) -> str:
     a = res.get('access') or {}
     if not a:
         return ''
-    return '🌐 <b>Доступ к Bybit/OKX с сервера бота</b> (шаг 0, §2.50)\n' + '\n'.join(_ap.format_probe(a, esc))
+    return '🌐 <b>Доступ к Bybit/OKX и новым биржам (Gate.io, MEXC, Bitget) с сервера бота</b> (шаг 0, §2.50, §2.59.1)\n' + '\n'.join(_ap.format_probe(a, esc))
 
 
 def net_probe_balance_text(res: dict) -> str:
@@ -7863,6 +7864,90 @@ async def battery_final_gate(args):
 
 
 _exec_state = {'task': None, 'sampler': None}
+_ll_state = {'task': None, 'collector': None}
+
+
+def _ll_running():
+    t = _ll_state['task']
+    return t is not None and not t.done()
+
+
+async def _ll_launch(resume):
+    """[v129] Запуск сборщика (§2.60.1): только публичные GET — OKX (прямой REST) и BingX (`exchange_pub.fetch_tickers`, публичный экземпляр без ключей); методы создания ордеров не вызываются."""
+    import research_leadlag as LL
+    d = LL.leadlag_dir()
+    col = LL.Collector(d, lambda: LL.bingx_tickers(exchange_pub), lambda: LL.okx_tickers(http), notify=tg)
+    st = await col.start(resume=resume)
+    _ll_state['collector'] = col
+    _ll_state['task'] = asyncio.create_task(col.run(resume=True))
+    _bg_tasks.add(_ll_state['task']); _ll_state['task'].add_done_callback(_bg_tasks.discard)
+    return st
+
+
+async def leadlag_autoresume():
+    """[v129] После рестарта сервиса сбор продолжается (пропуск виден в данных, §2.60.1). Не запускает ничего, если сбор не был начат командой."""
+    import research_leadlag as LL
+    st = LL.load_state(LL.leadlag_dir())
+    if st.get('running') and float(st.get('until', 0)) > time.time() and not _ll_running():
+        await _ll_launch(True)
+        await tg(f'▶️ /leadlag: сбор продолжен после перезапуска ({esc(CODE_VERSION)}); до конца {max(0.0, float(st["until"]) - time.time()) / 86400:.1f} сут.')
+
+
+async def leadlag_cmd(cmd, args):
+    """[v129] /leadlag_start [new] | /leadlag_stop | /leadlag_status | /leadlag_report (BOT_SPEC §2.60). Сборщик — фоновая задача основного процесса; отчёт — в дочернем процессе."""
+    import research_leadlag as LL
+    d = LL.leadlag_dir()
+    a = [x.lower() for x in (args or [])]
+    if cmd == '/leadlag_status':
+        await tg(esc(LL.status_text(d)))
+        return
+    if cmd == '/leadlag_stop':
+        c = _ll_state['collector']
+        if c is not None and _ll_running():
+            c.stop = True
+            await tg('⏹ /leadlag: остановка запрошена (текущий цикл доработает; данные сохранены)')
+        else:
+            await tg('/leadlag: сбор не идёт')
+        return
+    if cmd == '/leadlag_report':
+        await battery_job('/leadlag_report', 'leadlag_report', {'ll_dir': d}, need_universe=False)
+        return
+    if _ll_running():
+        await tg('⏳ /leadlag: сбор уже идёт (/leadlag_status)')
+        return
+    st0 = LL.load_state(d)
+    if st0.get('ticks') or os.path.exists(LL.ts_path(d)):
+        if a[:1] not in (['new'], ['resume']):
+            await tg(f'⛔ /leadlag_start: в {esc(d)} уже есть данные прошлого сбора ({esc(LL.status_text(d))}). Продолжение после остановки — командой /leadlag_start resume; '
+                     f'начать заново (данные прошлого сбора БУДУТ УДАЛЕНЫ) — /leadlag_start new')
+            return
+        for fn in (os.listdir(d) if a[:1] == ['new'] else []):
+            if fn == 'state.json' or fn == 'ts.bin' or (fn.startswith('sym_') and fn.endswith('.bin')):
+                os.remove(os.path.join(d, fn))
+    free = LL.free_mb(d)
+    if free < LL.min_free_mb():                                                  # [v129, §2.59.9 п. 5] перед стартом
+        await tg(f'⛔ /leadlag_start: свободно {free:.0f} МБ на томе {esc(d)} < {LL.min_free_mb():.0f} МБ — сбор не запущен')
+        return
+    resume = a[:1] == ['resume']
+    if resume and not st0:
+        await tg('⛔ /leadlag_start resume: состояния нет — начните командой /leadlag_start')
+        return
+    if resume:
+        if float(st0.get('until', 0)) <= time.time():
+            await tg('⛔ /leadlag_start resume: срок 7 суток истёк — отчёт: /leadlag_report; новый сбор (данные будут удалены): /leadlag_start new')
+            return
+        st0['running'] = True
+        st0.pop('stopped', None)
+        LL.save_state(d, st0)
+    try:
+        st = await _ll_launch(resume)
+    except Exception as e:
+        await tg(f'❌ /leadlag_start: {esc(safe_exc_reason(e))}')
+        return
+    ref = st.get('ref') or {}
+    await tg(f'▶️ /leadlag запущен на {LL.DAYS} суток (§2.60, ТОЛЬКО публичные запросы, ордеров нет): символов {len(st.get("symbols") or [])} (общих баз {ref.get("common")}, не-крипто {ref.get("noncrypto")}, '
+             f'оборот < 5 млн $ {ref.get("low_turnover")}, урезано по объёму {ref.get("trimmed")}), шаг {st.get("step")} с; оценка объёма {st.get("est_bytes", 0) / 1e6:.0f} МБ без сжатия при лимите '
+             f'{LL.max_mb():.0f} МБ (ENV LEADLAG_MAX_MB). Статус: /leadlag_status, отчёт: /leadlag_report')
 
 
 async def exec_check_cmd(args):
@@ -9916,6 +10001,17 @@ def _unknown_command_text(text: str) -> str:
     return (esc(hint.lstrip('❓ ')) + f'. Версия бота: {esc(CODE_VERSION)}. /help — список команд') if hint else base
 
 
+def scanner_flags_text() -> str:
+    """[v129] Строка /status: какие сканеры/стратегии включены флагами ENV (в режиме ожидания все выключены); сбор /leadlag — отдельно (фоновая задача, только публичные запросы)."""
+    flags = (('SA', SA_ENABLED), ('SMC_LIVE', SMC_LIVE), ('SMC_SIG', SMC_SIG_ENABLED), ('SMC2', SMC2_ENABLED), ('PO3', PO3_ENABLED), ('ORB', ORB_ENABLED), ('ORB_RT', ORB_RT_ENABLED),
+             ('RB', RB_ENABLED), ('SMC_SHADOW', SMC_SHADOW_ENABLED), ('PB', PB_ENABLED), ('MOMENTUM', MOMENTUM_ENABLED), ('RSI', RSI_ENABLED))
+    on = [n for n, v in flags if v]
+    txt = ('⚠️ Сканеры включены (ENV): ' + ', '.join(on)) if on else 'Сканеры (ENV): все выключены'
+    if _ll_running():
+        txt += ' | сбор /leadlag идёт (только публичные запросы)'
+    return txt
+
+
 def status_text() -> str:
     """[v107] Текст /status (вынесен из обработчика для теста); в режиме ожидания — строка IDLE_TEXT."""
     all_pos = all_positions()
@@ -9933,6 +10029,7 @@ def status_text() -> str:
         f'{health_status_line()}\n'
         f'{esc(runtime_versions_text())}\n'                # [v120] строка «Окружение» — в /status (в v119 по ошибке попала только в суточный дайджест)
         f'{esc(_rr.status_line())}\n'
+        f'{esc(scanner_flags_text())}\n'                   # [v129, §2.59.9 п. 6] какие сканеры включены через ENV
         f'Баланс: проверьте на бирже\n'
         f'БД сделок: /stats | CSV: /csv'
     )
@@ -10134,6 +10231,9 @@ async def check_tg_commands():
                     '/h2_funding_check — [v116] фандинг в исходном H2-D3: по коду и «без / с фандингом» на TRAIN и VALID (LOCKBOX не читается, §2.47.1)\n'
                     '/h2_replicate [load|confirm|report] — [v116/v119] репликация H2-D3 на независимых монетах BingX и OKX (§2.47, §2.51). Порядок: /h2_replicate load → /h2_replicate (без аргумента: вселенная, мощность, k) → /h2_replicate confirm\n'
                     '/xfund_test [load [retry]] — [v116/v119] межбиржевой арбитраж фандинга X1, основная пара BingX/Binance (§2.48, §2.51). Порядок: /xfund_test load → /xfund_test (без аргумента: расчёт); load retry — запросить снова символы с постоянной ошибкой\n'
+                    '/h2_ext [load|confirm|report] — [v129] H2-D3 на BingX+OKX+новых биржах Gate.io/MEXC/Bitget (§2.59); площадки — маркер H2EXT-VENUES в BOT_SPEC после /net_probe. Порядок: load → без аргумента → confirm\n'
+                    '/h2f [confirm|report] — [v129] H2F: H2-D3 + шорт только при среднем фандинге > 0 за сутки до входа, только символы новых бирж (§2.59.6); только если H2EXT пройден (§2.59.9), порог t_adj 2.0\n'
+                    '/leadlag_start [new|resume] | /leadlag_stop | /leadlag_status | /leadlag_report — [v129] замер расхождений цен OKX↔BingX 7 суток, ТОЛЬКО публичные запросы (§2.60)\n'
                     '/xfund_1h_errors [apply] — [v125] диагностика и классификация ошибок загрузки 1h BingX (§2.57): код, текст, интервал, листинг, статус в markets, проба 7 суток; apply — применить исходы по классам\n'
                     '/exec_check h2|x1 [start|stop|report] — почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (только после пройденной проверки)\n'
                     '/audit — [v109] аудит внешнего источника сигналов (§2.44): симуляция A/B, критерии по форварду; /audit_import — файл result.json документом (ретроспектива, справочно); /audit_unparsed — нераспознанные; /audit_status — состояние; /tg_login [код] — вход для чтения каналов (только чтение)\n'
@@ -10298,6 +10398,25 @@ async def check_tg_commands():
                 # [v125, §2.57] диагностика и классификация ошибок 1h BingX; `apply` — применить исходы по классам а1/а2/б/в/г
                 _args = [x.lower() for x in text.split('@')[0].split()[1:]]
                 _t = asyncio.create_task(battery_job('/xfund_1h_errors', 'xfund_1h_errors', {'apply': 'apply' in _args}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/h2_ext' or cmd.startswith('/h2_ext '):
+                # [v129] H2-D3 на новых биржах (§2.59): load | (без аргумента: вселенная, мощность, k) | confirm | report
+                _a = (text.split('@')[0].split()[1:] or [''])[0].lower()
+                _mode = _a if _a in ('load', 'confirm', 'report') else 'show'
+                _t = asyncio.create_task(battery_job('/h2_ext', 'h2_ext', {'mode': _mode, 'hyp': 'ext'}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/h2f' or cmd.startswith('/h2f '):
+                # [v129] H2F (§2.59.6): без аргумента — вселенная, мощность, k; confirm — один прогон; report
+                _a = (text.split('@')[0].split()[1:] or [''])[0].lower()
+                _mode = _a if _a in ('confirm', 'report') else 'show'
+                _t = asyncio.create_task(battery_job('/h2f', 'h2_ext', {'mode': _mode, 'hyp': 'f'}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd in ('/leadlag_start', '/leadlag_stop', '/leadlag_status', '/leadlag_report') or cmd.startswith(('/leadlag_start ', '/leadlag_stop ', '/leadlag_status ', '/leadlag_report ')):
+                # [v129] замер расхождений цен OKX↔BingX (§2.60): только публичные запросы, ордеров нет
+                _t = asyncio.create_task(leadlag_cmd(cmd.split()[0], text.split('@')[0].split()[1:]))
                 _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/exec_check' or cmd.startswith('/exec_check '):
@@ -10630,6 +10749,11 @@ async def main():
     if audit_bot.configured():          # [v109] чтение каналов аудита (только чтение; без настройки ENV ничего не запускается)
         _t_audit = asyncio.create_task(audit_bot.start(tg))
         _bg_tasks.add(_t_audit); _t_audit.add_done_callback(_bg_tasks.discard)
+
+    try:
+        await leadlag_autoresume()      # [v129] продолжить сбор расхождений цен после перезапуска (если был начат командой)
+    except Exception as _e:
+        logging.warning(f'[LEADLAG] автопродолжение: {type(_e).__name__}')
 
     cycle = 0
     try:

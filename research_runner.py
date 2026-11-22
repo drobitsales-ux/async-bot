@@ -337,6 +337,17 @@ async def _task_h2_replicate(ctx: Ctx):
     return {'text': await research_h2repl.run_h2repl(ctx.params, progress=ctx.progress)}
 
 
+async def _task_h2_ext(ctx: Ctx):
+    import research_h2ext                        # [v129] H2-D3 на новых биржах (H2EXT) и H2F (BOT_SPEC §2.59)
+    return {'text': await research_h2ext.run_h2ext(ctx.params, progress=ctx.progress)}
+
+
+async def _task_leadlag_report(ctx: Ctx):
+    import research_leadlag                      # [v129] отчёт по замеру расхождений цен OKX↔BingX (BOT_SPEC §2.60)
+    d = ctx.params.get('ll_dir') or research_leadlag.leadlag_dir()
+    return {'text': research_leadlag.report(d, float(ctx.params.get('fee_taker') or 0.0005))}
+
+
 async def _task_xfund_1h_errors(ctx: Ctx):
     import research_h1err                       # [v125] диагностика и классификация ошибок 1h BingX (BOT_SPEC §2.57)
     return {'text': await research_h1err.run_h1_errors(ctx.params, progress=ctx.progress)}
@@ -356,7 +367,7 @@ TASKS = {
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
     'final_h2': _task_final_h2, 'vrp_probe': _task_vrp_probe, 'vrp_measure': _task_vrp_measure, 'vrp_sim': _task_vrp_sim,
-    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors,
+    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors, 'h2_ext': _task_h2_ext, 'leadlag_report': _task_leadlag_report,
     'audit': _task_audit, 'audit_import': _task_audit_import, 'signal_study': _task_signal_study, 'signal_final': _task_signal_final,
 }
 
