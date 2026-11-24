@@ -57,7 +57,9 @@ def ext_venues_from_spec(path=None):
     if v is None:
         return None
     got = tuple(x for x in v.lower().replace(' ', '').split(',') if x in EXT_ALL)
-    return got or None
+    if not got:
+        return None
+    return tuple(dict.fromkeys(('bingx', 'okx') + got))              # [v130, §2.59.10] BingX и OKX входят во вселенную всегда (из кэша §2.47); маркер перечисляет загружаемые новые биржи
 
 
 def x1_pair_from_spec(path=None):
@@ -721,7 +723,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         exchanges = {'okx': research_okx.OkxPublic(), 'bybit': ccxt.bybit({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}), 'bingx': ccxt.bingx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})}
         if params.get('ext'):                                       # [v129, §2.59.2] H2EXT: BingX + OKX + новые биржи (прямой REST без ccxt); Bybit не используется
             import research_venues
-            exchanges = {ex: c for ex, c in exchanges.items() if ex != 'bybit'}
+            exchanges = {ex: c for ex, c in exchanges.items() if ex in (params.get('venues') or ())}
             for ex_, cls in research_venues.CLASSES.items():
                 if ex_ in (params.get('venues') or ()):
                     exchanges[ex_] = cls()
@@ -780,6 +782,12 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         syms_all = [(ex, s_) for ex in EXCHANGES for s_ in sorted(set(want[ex]))]
         L.append(f'  вселенная H2 (базы вне архива Binance): {sum(1 for n in set().union(*[set(v) for v in norms.values()]) if n not in bnorm)} баз; общих баз Bybit∩BingX: {len(common)}; '
                  f'символов к загрузке свечей: ' + ', '.join(f'{ex} {len(set(want[ex]))}' for ex in EXCHANGES))
+        guard = params.get('space_guard')                            # [v130, §2.59.11 п. 3] отказ до скачивания, если не хватит места при идущем замере
+        if guard is not None:
+            refuse = guard(syms_all, idx)
+            if refuse:
+                save_index(d, idx)
+                return '\n'.join(L + [refuse])
         # 1. свечи — по одному символу, сразу в журнал; порядок детерминирован (сортировка)
         n_try = 0
         for ex, sym in syms_all:

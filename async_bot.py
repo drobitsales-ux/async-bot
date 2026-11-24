@@ -7022,8 +7022,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-21-v129'
+CODE_VERSION = '2026-11-24-v130'
 CHANGELOG = [
+    ('2026-11-24-v130', 'МАРКЕР H2EXT-VENUES, ДИСК ДО /h2_ext load, ПЕРЕЗАПУСК И РАЗРЫВЫ lead-lag, ПРАВИЛО ДВУХ ТИКОВ B3 (BOT_SPEC §2.59.10–§2.59.11, §2.60.6–§2.60.7; маркер и уточнения записаны ОТДЕЛЬНЫМ коммитом ДО кода и данных; пре-регистрации §2.59/§2.60, правила H2, breaker-ы, режим ожидания, bybit_worker.py не менялись; ордеров нет). (1) /h2_ext load загружает только биржи из маркера (gateio,mexc,bitget); BingX/OKX — из кэша §2.47; при идущем замере /leadlag отказывает, если после загрузки останется меньше LEADLAG_MIN_FREE_MB + 50 МБ (до скачивания, с расчётом нехватки). (2) /disk_usage — размеры папок/файлов на /data с пометкой «активно / архив закрытого исследования», итог «свободно / нужно для h2_ext / нужно до конца lead-lag» (число контрактов — публичные списки); /disk_cleanup <имя> confirm — единственный способ удаления, только архивы закрытых исследований (vision, factory_data, edge), без confirm — только показ, при выполняющейся задаче отказ; автоматически ничего не удаляется. (3) lead-lag: сбор продолжается после перезапуска (тот же прогон), разрыв записывается (resumes), сброс буфера не реже 60 с и при SIGTERM, /leadlag_status и отчёт показывают число и длительность разрывов. (4) B3: событие «≥ 4 с» = порог превышен в ≥ 2 подряд идущих тиках, события в одном тике — отдельной строкой вне критерия, фактический шаг — в отчёте.'),
     ('2026-11-21-v129', 'H2 НА НОВЫХ БИРЖАХ (Gate.io, MEXC, Bitget; BOT_SPEC §2.59) И ЗАМЕР РАСХОЖДЕНИЙ ЦЕН OKX↔BingX (§2.60); пре-регистрации записаны ОТДЕЛЬНЫМИ коммитами ДО кода, данных и сбора. Расчёты прежних гипотез, breaker-ы, режим ожидания, bybit_worker.py не менялись; ордеров нет. (1) /net_probe: проба Gate.io/MEXC/Bitget (прямой REST). (2) research_venues.py: публичные клиенты трёх бирж без ccxt (формат ответов по памяти, не проверен). (3) /h2_ext [load|confirm|report] — H2-D3 те же функции на BingX+OKX+новых биржах (площадки — маркер H2EXT-VENUES в BOT_SPEC), /h2f [confirm|report] — H2F (только символы новых бирж, фильтр по фандингу), последовательная проверка (§2.59.9): H2F считается только если H2EXT пройден, порог t_adj 2.0. (4) /leadlag_start|stop|status|report — сбор тикеров OKX и BingX раз в 2 с, 7 суток, только публичные запросы; отчёт и критерий B3; свободное место на диске < 200 МБ — запись прекращается (проверка перед стартом и раз в 10 минут). (5) /status: строка с флагами сканеров (ENV).'),
     ('2026-11-20-v128', 'ТОЛЬКО ДОКУМЕНТАЦИЯ: итог X1 (BOT_SPEC §2.48.8, направление закрыто), итоговая формулировка H2 (§2.47.7), RESEARCH_SUMMARY, START_HERE.md, PROJECT_HANDOFF.md, README.md. Расчёты, пре-регистрации, breaker-ы, bybit_worker.py не менялись; ордеров нет.'),
     ('2026-11-20-v127', 'ЛИМИТ ЗАПРОСОВ BingX (КОД 100410) БЫЛ ПРИНЯТ ЗА ПОСТОЯННУЮ ОШИБКУ (BOT_SPEC §2.58; поправка записана ОТДЕЛЬНЫМ коммитом ДО кода; расчёты, пороги, критерии, гейт, пре-регистрации §2.47/§2.48/§2.53, bybit_worker.py, режим ожидания, breaker-ы не менялись; ордеров нет). ОТЧЁТ /xfund_1h_errors (v126): все 48 ошибок — код 100410 «请稍后重试» («повторите позже»): 16 с ошибкой на разных страницах (0…18 успешных до ошибки) и 32, не воспроизведшихся (полный проход, 24 страницы, ≈ 22 499 баров); классы а1 ×15 (ОШИБОЧНО: лимит запросов принят за «ограничение глубины»), в ×32, г ×1 (ONT); apply НЕ применялся, данные не менялись. ПРИЧИНА (моя регрессия v121, признаю): повторы на ExchangeError 100410 есть в research_htf.is_retryable с v87, а в v121 я заменил повтор «любой ошибки» в Fetcher загрузчика на is_transient по классам исключений и не переиспользовал is_retryable — 100410 стал «постоянной ошибкой» с кэшем на 7 суток, поэтому повторный /xfund_test load эти символы не запрашивал. ИСПРАВЛЕНО: is_transient делегирует research_htf.is_retryable и распознаёт код/текст лимита; лимит запросов — повтор ТОЙ ЖЕ страницы с паузами 3/8/20/45 с (Fetcher; остальные временные 2/6/15 с; в режиме диагностики без повторов — ничего), после — символ «не обработано» (не ошибка, не «пусто»), догрузка следующим прогоном; пауза между страницами свечей и фандинга BingX — ENV BINGX_PAGE_PAUSE_SEC (1.0 с по умолчанию) ДОПОЛНИТЕЛЬНО к HTF_FETCH_PAUSE_SEC=2.0 (итого 3.0 с; ровно 1.0 с — при HTF_FETCH_PAUSE_SEC=0); классификация: временная ошибка (код 100410 / «请稍后重试» / сетевые признаки) — ВСЕГДА класс в и проверяется ПЕРЕД а1/а2; а1 — только при явном ответе «нет данных / вне диапазона» на странице с дневными свечами; разовый сброс (migrate_v127, при первой загрузке/диагностике на v127): все записи-ошибки загрузки (neg: 1h, свечи, фандинг; кроме «подтверждённо пусто/недоступны») и h1class → «не обработано» — охватывает и 25 символов без свечей/фандинга в «439 из 464» (вероятно тот же 100410; гипотеза). ПОБОЧНОЕ НАБЛЮДЕНИЕ по числам отчёта (прод не проверялся): 1h-история BingX ограничена ≈ 22 500 барами (≈ 937 суток) — у листингованных раньше ≈ 2024-04 проход назад кончается пустой страницей; более ранний период X1 идёт по дневному запасному базису (§2.48.6 п. 2); отчёт /xfund_test показывает символы с 1h короче дневной истории (первый 1h-бар позже первого дневного более чем на 3 суток) как «частичной глубины». НЕ ПРОВЕРЕНО: что 100410 всегда лимит запросов (текст и случайные страницы это подтверждают; официальной таблицы кодов BingX нет), что предел ≈ 22 500 баров постоянен; рекомендация владельцу: при повторяющемся 100410 поднять HTF_FETCH_PAUSE_SEC/BINGX_PAGE_PAUSE_SEC. Тесты: tests/test_v127_ratelimit.py'),
@@ -7867,6 +7868,47 @@ _exec_state = {'task': None, 'sampler': None}
 _ll_state = {'task': None, 'collector': None}
 
 
+def _disk_params():
+    """[v130] Пути данных для /disk_usage и /disk_cleanup (учитывают ENV-переопределения каталогов)."""
+    import research_bdata
+    import research_edge
+    import research_factory
+    import research_leadlag as LL
+    import research_runner
+    import research_vision
+    import research_xdata
+    return {'root': '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(TRADES_DB)), 'vision': research_vision.vision_dir(), 'factory': research_factory.FD.factory_dir(),
+            'edge': research_edge.edge_db_path(TRADES_DB), 'battery': research_bdata.battery_dir(), 'xdata': research_xdata.xdata_dir(), 'leadlag': LL.leadlag_dir(), 'jobs': research_runner.workdir_base(),
+            'll_dir': LL.leadlag_dir()}
+
+
+async def disk_cleanup_cmd(args):
+    """[v130, §2.59.11 п. 4] /disk_cleanup <имя> [confirm]: без confirm — показ; с confirm — удаление ТОЛЬКО для «архив закрытого исследования»; при выполняющейся задаче — отказ."""
+    import disk_usage as DU
+    a = [x for x in (args or [])]
+    if not a:
+        await tg('Использование: <code>/disk_cleanup &lt;имя&gt; [confirm]</code> (имена и пометки — /disk_usage). Удаляются только архивы закрытых исследований; автоматически ничего не удаляется.')
+        return
+    key, confirm = a[0], (len(a) > 1 and a[1].lower() == 'confirm')
+    if _htf_running[0]:
+        await tg('⛔ /disk_cleanup: выполняется исследовательская задача — дождитесь отчёта')
+        return
+    prm = _disk_params()
+    loop = asyncio.get_running_loop()
+    items = await loop.run_in_executor(None, DU.layout, prm['root'], {k: prm[k] for k in ('vision', 'factory', 'edge', 'battery', 'xdata', 'leadlag', 'jobs')})
+    ok, msg, paths, size = DU.cleanup_plan(prm['root'], items, key)
+    if not ok:
+        await tg(esc(msg))
+        return
+    it = next(x for x in items if x['key'] == key)
+    if not confirm:
+        await tg(f'🗑 /disk_cleanup {esc(key)}: будет удалено ≈ {size / 1e6:.1f} МБ — {esc(it["name"])} ({esc(it["cls"])}): {esc(it["note"])}. Для удаления: <code>/disk_cleanup {esc(key)} confirm</code>')
+        return
+    freed = await loop.run_in_executor(None, DU.cleanup_run, paths)
+    logging.warning(f'[DISK] /disk_cleanup {key}: удалено {freed / 1e6:.1f} МБ по команде владельца')
+    await tg(f'🗑 /disk_cleanup {esc(key)}: удалено ≈ {freed / 1e6:.1f} МБ (по команде владельца). Что осталось — /disk_usage')
+
+
 def _ll_running():
     t = _ll_state['task']
     return t is not None and not t.done()
@@ -7879,6 +7921,7 @@ async def _ll_launch(resume):
     col = LL.Collector(d, lambda: LL.bingx_tickers(exchange_pub), lambda: LL.okx_tickers(http), notify=tg)
     st = await col.start(resume=resume)
     _ll_state['collector'] = col
+    col.install_sigterm()                                         # [v130, §2.60.7] при SIGTERM (деплой) — сбросить буфер на диск
     _ll_state['task'] = asyncio.create_task(col.run(resume=True))
     _bg_tasks.add(_ll_state['task']); _ll_state['task'].add_done_callback(_bg_tasks.discard)
     return st
@@ -7889,8 +7932,10 @@ async def leadlag_autoresume():
     import research_leadlag as LL
     st = LL.load_state(LL.leadlag_dir())
     if st.get('running') and float(st.get('until', 0)) > time.time() and not _ll_running():
-        await _ll_launch(True)
-        await tg(f'▶️ /leadlag: сбор продолжен после перезапуска ({esc(CODE_VERSION)}); до конца {max(0.0, float(st["until"]) - time.time()) / 86400:.1f} сут.')
+        st2 = await _ll_launch(True)
+        rs = (st2.get('resumes') or [{}])[-1]
+        await tg(f'▶️ /leadlag: сбор продолжен после перезапуска ({esc(CODE_VERSION)}); разрыв {float(rs.get("gap_s", 0)) / 60:.1f} мин от последнего записанного тика; '
+                 f'до конца {max(0.0, float(st["until"]) - time.time()) / 86400:.1f} сут.')
 
 
 async def leadlag_cmd(cmd, args):
@@ -10233,6 +10278,7 @@ async def check_tg_commands():
                     '/xfund_test [load [retry]] — [v116/v119] межбиржевой арбитраж фандинга X1, основная пара BingX/Binance (§2.48, §2.51). Порядок: /xfund_test load → /xfund_test (без аргумента: расчёт); load retry — запросить снова символы с постоянной ошибкой\n'
                     '/h2_ext [load|confirm|report] — [v129] H2-D3 на BingX+OKX+новых биржах Gate.io/MEXC/Bitget (§2.59); площадки — маркер H2EXT-VENUES в BOT_SPEC после /net_probe. Порядок: load → без аргумента → confirm\n'
                     '/h2f [confirm|report] — [v129] H2F: H2-D3 + шорт только при среднем фандинге > 0 за сутки до входа, только символы новых бирж (§2.59.6); только если H2EXT пройден (§2.59.9), порог t_adj 2.0\n'
+                    '/disk_usage — [v130] размеры папок/файлов на /data («активно» / «архив закрытого исследования»), итог «свободно / нужно для h2_ext / нужно до конца lead-lag» (§2.59.11); /disk_cleanup <имя> [confirm] — удаление ТОЛЬКО архивов закрытых исследований, только с confirm\n'
                     '/leadlag_start [new|resume] | /leadlag_stop | /leadlag_status | /leadlag_report — [v129] замер расхождений цен OKX↔BingX 7 суток, ТОЛЬКО публичные запросы (§2.60)\n'
                     '/xfund_1h_errors [apply] — [v125] диагностика и классификация ошибок загрузки 1h BingX (§2.57): код, текст, интервал, листинг, статус в markets, проба 7 суток; apply — применить исходы по классам\n'
                     '/exec_check h2|x1 [start|stop|report] — почасовая проверка исполнения БЕЗ ордеров ≤ 7 суток (только после пройденной проверки)\n'
@@ -10404,7 +10450,18 @@ async def check_tg_commands():
                 # [v129] H2-D3 на новых биржах (§2.59): load | (без аргумента: вселенная, мощность, k) | confirm | report
                 _a = (text.split('@')[0].split()[1:] or [''])[0].lower()
                 _mode = _a if _a in ('load', 'confirm', 'report') else 'show'
-                _t = asyncio.create_task(battery_job('/h2_ext', 'h2_ext', {'mode': _mode, 'hyp': 'ext'}, need_universe=False))
+                import research_leadlag as _LL
+                _t = asyncio.create_task(battery_job('/h2_ext', 'h2_ext', {'mode': _mode, 'hyp': 'ext', 'll_dir': _LL.leadlag_dir()}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/disk_usage':
+                # [v130] структура диска, оценка H2EXT, рост lead-lag (§2.59.11); ничего не изменяет
+                _t = asyncio.create_task(battery_job('/disk_usage', 'disk_usage', _disk_params(), need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/disk_cleanup' or cmd.startswith('/disk_cleanup '):
+                # [v130] единственный способ удаления: /disk_cleanup <имя> confirm, только «архив закрытого исследования»
+                _t = asyncio.create_task(disk_cleanup_cmd(text.split('@')[0].split()[1:]))
                 _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/h2f' or cmd.startswith('/h2f '):
