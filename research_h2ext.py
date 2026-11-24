@@ -6,6 +6,7 @@ H2F проверяется ТОЛЬКО если H2EXT пройден; инач�
 LOCKBOX батареи (исчерпан, §2.43.20) не читается. Ордеров нет."""
 import hashlib
 import math
+import os
 import time
 
 import numpy as np
@@ -15,6 +16,8 @@ import research_bdata as B
 import research_bsim as S
 import research_factory as RF
 import research_h2repl as H
+import disk_usage as DU
+import research_leadlag as LL
 import research_xdata as X
 
 SEED = 20261121
@@ -27,6 +30,26 @@ CFG = {
 }
 
 
+def space_guard(xdir, ll_dir, params=None):
+    """[§2.59.11 п. 3] Функция для `run_xload`: после списка контрактов и до скачивания свечей — отказ, если идёт замер §2.60 и после загрузки свободного места останется
+    меньше LEADLAG_MIN_FREE_MB + 50 МБ. Замер не идёт — проверка не применяется. → callable(syms_all, idx, now) → str | None."""
+    def guard(syms_all, idx, now=None):
+        st = LL.load_state(ll_dir)
+        now = time.time() if now is None else now
+        if not (st.get('running') and float(st.get('until', 0)) > now):
+            return None
+        todo = [1 for ex, s_ in syms_all if not (idx['bars'].get(ex, {}).get(s_) or {}).get('complete')]
+        free = (params or {}).get('free_mb')
+        free = LL.free_mb(xdir) if free is None else float(free)
+        ok, d = DU.space_check(free, len(todo), st, now, LL.min_free_mb())
+        if ok:
+            return None
+        return (f'⛔ /h2_ext load отказ (пока идёт замер /leadlag, §2.59.11 п. 3): свободно {free:.0f} МБ; к загрузке {len(todo)} символов ≈ {d["load"]:.0f} МБ (верхняя оценка 140 КБ/символ) '
+                f'+ рост замера до конца срока ≈ {d["growth"]:.0f} МБ → после загрузки останется ≈ {d["after"]:.0f} МБ < {d["need_after"]:.0f} МБ (LEADLAG_MIN_FREE_MB + 50). '
+                f'Не хватает ≈ {d["short"]:.0f} МБ. Что можно освободить: /disk_usage (архивы закрытых исследований — /disk_cleanup <имя> confirm); либо дождаться конца замера. Ничего не загружено.')
+    return guard
+
+
 def sequence_gate(fdir):
     """[§2.59.9] None — H2F разрешена (H2EXT выполнен и пройден); иначе текст отказа."""
     if not RF.kv_get('h2_ext_done', fdir):
@@ -34,6 +57,55 @@ def sequence_gate(fdir):
     if not RF.kv_get('h2_ext_passed', fdir):
         return '⛔ /h2f отказ: H2EXT не пройден (или «непроверяема») — по §2.59.9 H2F не считается, H2 закрыт целиком'
     return None
+
+
+def last_bar_info(xdir, venues):
+    """Последний дневной бар (максимум по символам биржи) для каждой площадки вселенной; spread_days — разница между самой свежей и самой старой."""
+    idx = X.load_index(xdir)
+    by = {}
+    for ex in venues:
+        ls = [int(r['last']) for r in idx['bars'].get(ex, {}).values() if r.get('last')]
+        if ls:
+            by[ex] = max(ls)
+    if not by:
+        return None
+    return {'by_ex': {ex: time.strftime('%Y-%m-%d', time.gmtime(v / 1000)) for ex, v in by.items()}, 'spread_days': (max(by.values()) - min(by.values())) / X.DAY}
+
+
+async def count_contracts(venues, bdir=None, clients=None):
+    """[§2.59.11] Число контрактов новых бирж по спискам (публичные GET): всего и «к загрузке» (база не в архиве Binance, не не-крипто). → {биржа: dict(markets, want | err)}."""
+    import research_venues
+    bn = X.binance_norm_set(bdir)
+    out = {}
+    for ex in venues:
+        if ex not in research_venues.CLASSES:
+            continue
+        c = (clients or {}).get(ex) or research_venues.CLASSES[ex]()
+        try:
+            sw = X.usdt_swaps(await c.load_markets())
+            out[ex] = {'markets': len(sw), 'want': sum(1 for v in sw.values() if not v.get('excl') and v['norm'] not in bn)}
+        except Exception as e:
+            out[ex] = {'markets': None, 'want': None, 'err': f'{type(e).__name__}: {str(e)[:80]}'}
+        finally:
+            try:
+                await c.close()
+            except Exception:
+                pass
+    return out
+
+
+async def disk_job(params):
+    """Задача `/disk_usage` (дочерний процесс): структура диска, оценка H2EXT по спискам контрактов, рост замера. Ничего не изменяет."""
+    import shutil
+    root = params.get('root') or ('/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(params.get('xdir') or '/tmp')))
+    paths = {k: params.get(k) for k in ('vision', 'factory', 'edge', 'battery', 'xdata', 'leadlag', 'jobs') if params.get(k)}
+    items = DU.layout(root, paths)
+    du_ = shutil.disk_usage(root)
+    venues = tuple(params.get('venues') or X.ext_venues_from_spec(params.get('spec_path')) or ())
+    new = tuple(v for v in venues if v in X.NEW_VENUES)
+    contracts = await count_contracts(new, params.get('bdir'), params.get('clients')) if new else None
+    st = LL.load_state(params.get('ll_dir') or LL.leadlag_dir())
+    return DU.format_report(root, items, du_.free / 1e6, du_.total / 1e6, st, time.time(), LL.min_free_mb(), contracts, new)
 
 
 def keys(hyp):
@@ -203,7 +275,9 @@ async def run_h2ext(params, progress=None):
     if mode == 'load':
         if hyp != 'ext':
             return '⛔ /h2f load отсутствует: данные общие — /h2_ext load'
-        return await X.run_xload(dict(params, venues=venues, ext=True, hourly=False), progress)
+        load_venues = tuple(v for v in venues if v in X.NEW_VENUES)       # §2.59.10: загружаются только новые биржи; BingX/OKX — из кэша §2.47
+        guard = space_guard(xdir, params.get('ll_dir') or LL.leadlag_dir(), params)
+        return await X.run_xload(dict(params, venues=load_venues, ext=True, hourly=False, space_guard=guard), progress)
     if hyp == 'f':                                                      # §2.59.9: fixed-sequence — H2F только после H2EXT «пройдено»
         gate = sequence_gate(fdir)
         if gate:
@@ -245,6 +319,10 @@ async def run_h2ext(params, progress=None):
     if hyp == 'f':
         head.append(f'H2F: символов новых бирж (база не встречалась на BingX/OKX) {len(uni_names)}; событий-кандидатов {counters["candidates"]}, без фандинга в сутки входа {counters["no_funding"]}, '
                     f'фандинг ≤ 0 {counters["neg_or_zero"]}, допущено {counters["admitted"]} (всего событий H2 по вселенной {len(ev_all)}).')
+    ends = last_bar_info(xdir, venues)
+    if ends:
+        head.append('Последний дневной бар по биржам: ' + ', '.join(f'{ex} {d_}' for ex, d_ in ends['by_ex'].items())
+                    + (f'. ⚠️ расхождение {ends["spread_days"]:.0f} сут. > 2: у BingX/OKX кэш старше (§2.59.10) — для листингов последних суток выход «делистинг» наступает раньше; правила не менялись' if ends['spread_days'] > 2 else '.'))
     head.append(f'Мощность (шаг 0): D = {pw["D"]} суток с позициями, S_min = {H.fm(pw["s_min"])} → ' + ('проверяема' if pw['testable'] else '<b>НЕПРОВЕРЯЕМА</b> (D < 365)'))
     kres = None
     if pw['testable']:

@@ -690,9 +690,9 @@ class Analysis(unittest.TestCase):
 
     def test_short_event_and_costs_not_executable(self):
         d = tempfile.mkdtemp()
-        arr, ts = make_series(d, lambda i: (0.003, 0.0, 0.0) if 100 <= i < 102 else (0.0, 0.0, 0.0), n=300)       # 2 тика = 2 с < 4 с
+        arr, ts = make_series(d, lambda i: (0.003, 0.0, 0.0) if i == 100 else (0.0, 0.0, 0.0), n=300)       # один тик — не событие критерия (§2.60.6)
         r = LL.analyse_symbol(arr, ts, 2.0, 0.0025, 0.0005)
-        self.assertEqual((r['events'], r['exec']), (1, 0))
+        self.assertEqual((r['events'], r['single'], r['exec']), (1, 1, 0))
         d2 = tempfile.mkdtemp()
         arr, ts = make_series(d2, lambda i: (0.003, 0.0, 0.0) if 100 <= i < 110 else (0.0, 0.0, 0.0), n=300)      # 0.3% − 0.04% − 0.10% = 0.16% > 0.10% → исполнимо
         self.assertEqual(LL.analyse_symbol(arr, ts, 2.0, 0.0025, 0.0005)['exec'], 1)
@@ -745,8 +745,9 @@ class Wiring(unittest.TestCase):
         import research_runner as R
         self.assertIn('h2_ext', R.TASKS)
         self.assertIn('leadlag_report', R.TASKS)
-        self.assertTrue(a.CODE_VERSION.endswith('v129'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-21-v129')
+        self.assertTrue(a.CODE_VERSION.endswith('v130'))
+        self.assertEqual(a.CHANGELOG[0][0], '2026-11-24-v130')
+        self.assertIn('2026-11-21-v129', [x[0] for x in a.CHANGELOG])
 
     def test_leadlag_commands_do_not_start_in_idle_without_command(self):
         """Автопродолжение ничего не запускает, если сбор не начинали (состояния нет)."""
@@ -757,6 +758,7 @@ class Wiring(unittest.TestCase):
 
         async def fake(resume):
             started.append(resume)
+            return {}
         a._ll_launch = fake
         try:
             run(a.leadlag_autoresume())

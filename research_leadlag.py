@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import os
+import signal
 import time
 
 import numpy as np
@@ -17,11 +18,13 @@ STEP_MAX_S = 10.0
 DAYS = 7
 MIN_TURNOVER = 5_000_000.0
 FLUSH_TICKS = 150
+FLUSH_MAX_S = 60.0                        # §2.60.7: буфер сбрасывается на диск не реже раза в минуту (потеря при аварийном завершении ≤ 60 с)
 WARM_TICKS = 5
 MAX_ABS_GAP_WARM = 0.05                  # медианный |gap| в первых тиках > 5% → масштаб/контракт не совпадает, символ исключается
 BYTES_PER_SYM = 12
 C_SET = (0.0015, 0.0025, 0.0040)
-MIN_DUR_S = 4.0
+MIN_DUR_S = 4.0                          # справочно (§2.60.2); с 2026-11-24 (§2.60.6) условие «≥ 4 с» = порог превышен в ≥ 2 подряд идущих тиках
+MIN_TICKS = 2
 EXEC_GAP_MIN = 0.0010
 EXEC_PER_DAY_MIN = 20.0
 EXEC_SYMS_MIN = 10
@@ -206,6 +209,8 @@ class Collector:
         self.ticks = 0
         self.durs = []
         self.errors = {'rate': 0, 'other': 0}
+        self.warming = False
+        self.last_flush = None
 
     async def _say(self, m):
         if self.notify:
@@ -235,6 +240,38 @@ class Collector:
         self.ticks = n
         return n
 
+    def last_tick_time(self):
+        """Время последнего записанного тика (с, среднее двух ответов) | None."""
+        p = ts_path(self.d)
+        if not os.path.exists(p) or os.path.getsize(p) < 16:
+            return None
+        with open(p, 'rb') as f:
+            f.seek(-16, os.SEEK_END)
+            a = np.frombuffer(f.read(16), dtype='<i8')
+        return float(a[0] + a[1]) / 2000.0
+
+    def install_sigterm(self, loop=None):
+        """[§2.60.7] При SIGTERM (деплой Render) — сбросить буфер на диск и передать сигнал дальше: завершение процесса прежнее (обработчик по умолчанию), но накопленные тики не теряются.
+        До конца прогрева (первые тики с неотфильтрованными символами) буфер не сбрасывается."""
+        try:
+            loop = loop or asyncio.get_running_loop()
+
+            def handler():
+                try:
+                    if not self.warming:
+                        self.flush()
+                        st = load_state(self.d)
+                        if st:
+                            st['ticks'] = self.ticks
+                            save_state(self.d, st)
+                finally:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    os.kill(os.getpid(), signal.SIGTERM)
+            loop.add_signal_handler(signal.SIGTERM, handler)
+            return True
+        except (NotImplementedError, RuntimeError, ValueError):
+            return False
+
     def flush(self):
         if not self.buf_ts:
             return
@@ -255,6 +292,12 @@ class Collector:
             self.syms = list(st.get('symbols') or [])
             self.step = float(st.get('step', self.step))
             self.repair()
+            last = self.last_tick_time()
+            now = self.now()
+            if last is not None:                                             # §2.60.7: разрыв от последнего записанного тика до возобновления — в состояние (виден в /leadlag_status и отчёте)
+                st.setdefault('resumes', []).append({'at': now, 'last_tick': last, 'gap_s': max(0.0, now - last), 'ticks': self.ticks})
+                st['running'] = True
+                save_state(self.d, st)
             return st
         sb, so = await asyncio.gather(self.get_b(), self.get_o())
         syms, ref = select_symbols(sb, so, self.step)
@@ -269,8 +312,18 @@ class Collector:
         st = await self.start(resume)
         until = float(st['until'])
         warm_left = 0 if st.get('warm_done') else WARM_TICKS
+        self.warming = bool(warm_left)
         warm_rows = []
         next_disk = self.now() + DISK_CHECK_S
+        self.last_flush = self.now()
+        try:
+            return await self._loop(st, until, warm_left, warm_rows, next_disk)
+        except asyncio.CancelledError:
+            if not self.warming:
+                self.flush()
+            raise
+
+    async def _loop(self, st, until, warm_left, warm_rows, next_disk):
         while not self.stop and self.now() < until:
             t0 = self.now()
             rb, ro = await asyncio.gather(self.get_b(), self.get_o(), return_exceptions=True)
@@ -304,6 +357,7 @@ class Collector:
                     self._drop_cols(keep)
                     st['symbols'] = list(self.syms)
                     st['warm_done'] = True
+                    self.warming = False
                     save_state(self.d, st)
                     await self._say(f'📈 /leadlag: после прогрева символов {len(self.syms)} (исключено по масштабу: {len(st["excluded_scale"])})')
             if self.now() >= next_disk:                                      # §2.59.9 п. 5: свободно < 200 МБ — запись прекращается, сообщение в Telegram
@@ -317,8 +371,9 @@ class Collector:
                     save_state(self.d, st)
                     await self._say(f'⛔ /leadlag: свободно {fr:.0f} МБ < {min_free_mb():.0f} МБ — запись прекращена (данные до этого момента сохранены; /leadlag_report)')
                     break
-            if len(self.buf_ts) >= FLUSH_TICKS and not warm_left:
+            if self.buf_ts and not warm_left and (len(self.buf_ts) >= FLUSH_TICKS or self.now() - self.last_flush >= FLUSH_MAX_S):
                 self.flush()
+                self.last_flush = self.now()
                 st['ticks'] = self.ticks
                 st['last_ts'] = tb
                 if dir_mb(self.d) > max_mb():
@@ -360,15 +415,43 @@ class Collector:
         self.buf = [[r[j] for j in idx] for r in self.buf]
 
 
+def gaps_info(ts, step):
+    """Разрывы данных: интервалы между соседними тиками > 3·шаг. → список (начало_с, пропущено_с); пропущено = интервал − шаг."""
+    if len(ts) < 2:
+        return []
+    t = (ts[:, 0] + ts[:, 1]) / 2000.0
+    dt = np.diff(t)
+    return [(float(t[k]), float(dt[k] - step)) for k in np.flatnonzero(dt > BREAK_STEPS * step)]
+
+
+def gaps_text(ts, step, st):
+    g = gaps_info(ts, step)
+    rs = (st or {}).get('resumes') or []
+    tot = sum(x[1] for x in g) / 60.0
+    mx = max((x[1] for x in g), default=0.0) / 60.0
+    txt = f'разрывов {len(g)} (суммарно пропущено {tot:.1f} мин, наибольший {mx:.1f} мин)'
+    if rs:
+        txt += f'; возобновлений после перезапуска {len(rs)} (суммарно {sum(float(r.get("gap_s", 0)) for r in rs) / 60.0:.1f} мин от последнего записанного тика до возобновления)'
+    return txt
+
+
 def status_text(d):
     st = load_state(d)
     if not st:
         return 'Сбор не запускался (/leadlag_start).'
     t = time.time()
     left = max(0.0, float(st.get('until', 0)) - t) / 86400
-    return (f'{"▶️ идёт" if st.get("running") else "⏹ не идёт"} сбор lead-lag OKX↔BingX: символов {len(st.get("symbols") or [])}, тиков {st.get("ticks", 0)}, осталось {left:.1f} сут., '
-            f'шаг {st.get("step")} с, занято сборщиком {dir_mb(d):.0f} МБ (лимит {max_mb():.0f}), свободно на томе {free_mb(d):.0f} МБ (минимум {min_free_mb():.0f})' + (f', причина остановки: {st["stopped"]}' if st.get('stopped') else '')
-            + (f', повышений шага из-за лимита: {st["step_raised"]}' if st.get('step_raised') else '') + (f', медианная длительность цикла {st["median_cycle_s"]:.2f} с' if st.get('median_cycle_s') else ''))
+    ts = load_ts(d)
+    step = float(st.get('step') or STEP_S)
+    out = (f'{"▶️ идёт" if st.get("running") else "⏹ не идёт"} сбор lead-lag OKX↔BingX: символов {len(st.get("symbols") or [])}, тиков {len(ts)}, осталось {left:.1f} сут., '
+           f'шаг {step} с, занято сборщиком {dir_mb(d):.0f} МБ (лимит {max_mb():.0f}), свободно на томе {free_mb(d):.0f} МБ (минимум {min_free_mb():.0f}); ' + gaps_text(ts, step, st))
+    if st.get('stopped'):
+        out += f'; причина остановки: {st["stopped"]}'
+    if st.get('step_raised'):
+        out += f'; повышений шага из-за лимита: {st["step_raised"]}'
+    if st.get('median_cycle_s'):
+        out += f'; медианная длительность цикла {st["median_cycle_s"]:.2f} с'
+    return out
 
 
 # ── отчёт ──────────────────────────────────────────────────────────────────────────────────────────
@@ -418,28 +501,28 @@ def find_events(gap, t, c, step):
     return out
 
 
-def analyse_symbol(arr, ts, step, c, fee, min_dur=MIN_DUR_S):
-    """Одна пара (символ, C) → dict: события, исполнимые события, доля «BingX сходится», длительности, реализованный ход одной ноги (справочно)."""
+def analyse_symbol(arr, ts, step, c, fee, min_ticks=MIN_TICKS):
+    """Одна пара (символ, C) → dict. Правило §2.60.6 (2026-11-24): длительность измеряется с разрешением шага; событие «≥ 4 с» — порог превышен в ≥ 2 подряд идущих тиках;
+    события в одном тике (`single`) считаются отдельно и в критерий не входят. Вход — второй тик события; `exec_gap` по §2.60.2 (выход — последний тик над порогом)."""
     t = (ts[:, 0] + ts[:, 1]) / 2000.0
     mb, mo = arr['mb'].astype(np.float64), arr['mo'].astype(np.float64)
     gap = mb / mo - 1.0
     hsb = arr['sb'].astype(np.float64) * SPREAD_UNIT
     ev = find_events(gap, t, c, step)
-    res = {'events': len(ev), 'exec': 0, 'b_conv': 0, 'dur_exec': [], 'dur_all': [], 'real': []}
+    res = {'events': len(ev), 'single': 0, 'multi': 0, 'exec': 0, 'b_conv': 0, 'dur_exec': [], 'dur_all': [], 'real': []}
     for f, l, e in ev:
-        dur = float(t[l] - t[f])
-        res['dur_all'].append(dur)
-        if dur < min_dur:
+        if l - f + 1 < min_ticks:
+            res['single'] += 1
             continue
-        j = f + int(np.searchsorted(t[f:l + 1] - t[f], min_dur, side='left'))      # первый тик с возрастом события ≥ 4 с
-        if j > l:
-            continue
+        res['multi'] += 1
+        res['dur_all'].append(float(t[l] - t[f]))
+        j = f + 1                                                            # второй тик события
         sig = 1.0 if gap[f] > 0 else -1.0
-        eg = abs(gap[j]) - hsb[j] - hsb[l] - 2.0 * fee                           # §2.60.2: вход j, выход — последний тик над порогом l
+        eg = abs(gap[j]) - hsb[j] - hsb[l] - 2.0 * fee                       # §2.60.2: вход j, выход — последний тик над порогом l
         if not (eg > EXEC_GAP_MIN):
             continue
         res['exec'] += 1
-        res['dur_exec'].append(dur)
+        res['dur_exec'].append(float(t[l] - t[f]))
         db, do = mb[e] / mb[f] - 1.0, mo[e] / mo[f] - 1.0
         if (-sig * db) > (sig * do):
             res['b_conv'] += 1
@@ -468,6 +551,11 @@ def report(d, fee, params=None):
          f'медианный интервал между тиками {float(np.median(dtt)) if len(dtt) else float("nan"):.2f} с, разрывов (> {BREAK_STEPS}·шаг) {int((dtt > BREAK_STEPS * step).sum()) if len(dtt) else 0}.',
          f'Отбор при старте: общих баз {st.get("ref", {}).get("common")}, не-крипто {st.get("ref", {}).get("noncrypto")}, оборот < 5 млн $ {st.get("ref", {}).get("low_turnover")}, урезано по объёму '
          f'{st.get("ref", {}).get("trimmed")}; исключено по масштабу (|gap| > 5% в прогреве) {len(st.get("excluded_scale") or [])}. Комиссия taker BingX {fee * 100:.3f}% (×2: вход и выход).']
+    ok_dt = dtt[dtt <= BREAK_STEPS * step] if len(dtt) else dtt
+    if len(ok_dt):                                                           # §2.60.6: фактический шаг по времени — в отчёт
+        L.append(f'Фактический шаг по времени (интервалы без разрывов): медиана {np.median(ok_dt):.2f} с, p95 {np.percentile(ok_dt, 95):.2f} с; доли интервалов: ≤ 3 с {np.mean(ok_dt <= 3) * 100:.0f}%, '
+                 f'3–7.5 с {np.mean((ok_dt > 3) & (ok_dt <= 7.5)) * 100:.0f}%, > 7.5 с {np.mean(ok_dt > 7.5) * 100:.0f}%. Длительность события измеряется с разрешением шага; «≥ 4 с» = порог превышен в ≥ {MIN_TICKS} подряд идущих тиках (§2.60.6).')
+    L.append('Разрывы данных: ' + gaps_text(ts, step, st))
     if covered_days <= 0:
         return '\n'.join(L + ['Данных для расчёта недостаточно.'])
     stats, per = {}, {}
@@ -490,7 +578,8 @@ def report(d, fee, params=None):
     for c in C_SET:
         ex_day = {b: per[b][c]['exec'] / covered_days for b in per}
         good = [b for b in per if ex_day[b] >= EXEC_PER_DAY_MIN]
-        n_ev = sum(per[b][c]['events'] for b in per)
+        n_ev = sum(per[b][c]['multi'] for b in per)
+        n_single = sum(per[b][c]['single'] for b in per)
         n_ex = sum(per[b][c]['exec'] for b in per)
         pooled = sum(per[b][c]['b_conv'] for b in good)
         pooled_n = sum(per[b][c]['exec'] for b in good)
@@ -502,10 +591,11 @@ def report(d, fee, params=None):
         ok = len(good) >= EXEC_SYMS_MIN and pooled_n > 0 and share >= CONV_SHARE_MIN
         verdicts.append(ok)
         L.append('')
-        L.append(f'<b>C = {c * 100:.2f}%</b>: событий {n_ev} ({n_ev / covered_days:.1f} в сутки по всем символам), медианная длительность {np.median(dur_all) if dur_all else float("nan"):.1f} с; '
-                 f'исполнимых (exec_gap > {EXEC_GAP_MIN * 100:.2f}%, ≥ {MIN_DUR_S:.0f} с) {n_ex} ({n_ex / covered_days:.2f} в сутки всего), медианная длительность {np.median(dur_ex) if dur_ex else float("nan"):.1f} с, '
+        L.append(f'<b>C = {c * 100:.2f}%</b>: событий в ≥ 2 тиках подряд {n_ev} ({n_ev / covered_days:.1f} в сутки по всем символам), медианная длительность {np.median(dur_all) if dur_all else float("nan"):.1f} с; '
+                 f'исполнимых (exec_gap > {EXEC_GAP_MIN * 100:.2f}%, ≥ {MIN_TICKS} тиков подряд) {n_ex} ({n_ex / covered_days:.2f} в сутки всего), медианная длительность {np.median(dur_ex) if dur_ex else float("nan"):.1f} с, '
                  f'BingX сходится к OKX: {conv_all}/{n_ex}' + (f' ({conv_all / n_ex * 100:.0f}%)' if n_ex else '') + (f'; справочно реализованный ход одной ноги BingX (вход — тик возраста ≥ 4 с, выход — первый тик под порогом, '
                  f'за вычетом издержек): медиана {np.median(real) * 1e4:+.1f} б.п., доля > 0 {np.mean(np.array(real) > 0) * 100:.0f}%' if real else ''))
+        L.append(f'  события в одном тике (отдельно, в критерий не входят): {n_single}')
         top = sorted(per, key=lambda b: -ex_day[b])[:8]
         L.append('  символы по исполнимым событиям/сутки: ' + '; '.join(f'{b} {ex_day[b]:.1f}' for b in top))
         L.append(f'  B3: символов с ≥ {EXEC_PER_DAY_MIN:.0f} исполнимых событий в сутки: {len(good)} (нужно ≥ {EXEC_SYMS_MIN}); доля «BingX сходится» по ним {share * 100 if math.isfinite(share) else float("nan"):.0f}% (нужно ≥ {CONV_SHARE_MIN * 100:.0f}%) → '

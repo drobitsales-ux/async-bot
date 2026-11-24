@@ -1,6 +1,6 @@
 # PROJECT_HANDOFF — полное досье проекта async-bot
 
-> Состояние на **2026-11-21**, код **async_bot v129 / bybit_worker v68** (воркер не тронут с v69). Версия v128 — только документация.
+> Состояние на **2026-11-24**, код **async_bot v130 / bybit_worker v68** (воркер не тронут с v69). Версия v128 — только документация.
 > Как читать: каждое число снабжено ссылкой на раздел `BOT_SPEC.md` (далее «§») или на запись CHANGELOG (список `CHANGELOG` в `async_bot.py`, ключ `дата-vNNN`). Если числа в репозитории нет — написано **«нет данных в репозитории»**; я ничего не додумывал.
 > **Важно:** прод-БД (`/data/trades.db` и др.), логи и файловая система Render из среды разработки **недоступны**. Все прод-цифры — «со слов владельца», как записано в BOT_SPEC; я их не проверял (см. §2.43.13, §2.36).
 > Точка входа для человека и новой ИИ-сессии — `START_HERE.md`. Краткая сводка гипотез — `RESEARCH_SUMMARY.md`.
@@ -72,6 +72,7 @@
 | v127 | 11-20 | лимит 100410 принят за постоянную ошибку — исправлено | §2.58 |
 | **X1 итог** | 2026-11-20 | `/xfund_test` 22:59 UTC, первый действительный прогон | **X1 закрыт** (§2.48.8) |
 | **v128** | 2026-11-20 | документация: START_HERE.md, PROJECT_HANDOFF.md, README.md, итоги X1/H2 | код не менялся, кроме `CODE_VERSION`/CHANGELOG |
+| **v130** | 2026-11-24 | маркер `H2EXT-VENUES: gateio,mexc,bitget` (§2.59.10); `/disk_usage`, `/disk_cleanup`, защита места при `/h2_ext load` (§2.59.11); возобновление lead-lag после перезапуска и разрывы, правило двух тиков B3 (§2.60.6–§2.60.7) | загрузка H2EXT и отчёт lead-lag ещё не запускались |
 | **v129** | 2026-11-21 | **H2 на новых биржах (Gate.io, MEXC, Bitget) и H2F — пре-регистрация §2.59; замер расхождений цен OKX↔BingX — §2.60**; код: `research_venues.py`, `research_h2ext.py`, `research_leadlag.py`, команды `/h2_ext`, `/h2f`, `/leadlag_*` | проверок на проде ещё нет (§2.59.8, §2.60.5) |
 
 ---
@@ -219,7 +220,7 @@
 | Binance fapi | HTTP 451 (гео-блок); работает архив data.binance.vision |
 | Bybit | 403 гео-блок |
 | OKX REST | работает; **ccxt 4.2.14 падает** (поэтому OKX без ccxt, v119) |
-| Gate.io, MEXC, Bitget (публичные API) | **нет данных** — проба `/net_probe` (v129) на проде ещё не выполнена (§2.59.1) |
+| Gate.io, MEXC, Bitget (публичные API) | доступно — `/net_probe` 2026-11-24, со слов владельца (§2.59.10); формат ответов на живом API не проверялся |
 | Deribit публичный (DVOL) | работает |
 | Dukascopy | работает с повторами (HTTP 503 при частоте, §2.41, v101) |
 
@@ -267,6 +268,7 @@
 | `/audit`, `/audit_import`, `/audit_unparsed`, `/audit_status`, `/audit_backfill`, `/audit_stop`, `/audit_start`, `/tg_login`, `/signal_study`, `/signal`, `/signal_final` | аудит чужого канала | закрыты; код — инструмент |
 | `/vrp_probe`, `/vrp_measure`, `/vrp_sim` | VRP | закрыты |
 | `/h2_funding_check`, `/h2_replicate`, `/xdata`, `/xfund_test`, `/xfund_1h_errors`, `/exec_check` | H2-репликация, X1, диагностика | закрыты; пригодны как шаблон |
+| `/disk_usage`, `/disk_cleanup <имя> [confirm]` | размеры на `/data` («активно» / «архив закрытого исследования»), оценка H2EXT; удаление только архивов и только с `confirm` (§2.59.11) | перед `/h2_ext load` |
 | `/h2_ext [load\|confirm\|report]`, `/h2f [confirm\|report]` | H2-D3 на новых биржах и H2F (§2.59); маркер `H2EXT-VENUES` в BOT_SPEC обязателен | после `/net_probe`; порядок load → без аргумента → confirm |
 | `/leadlag_start [new\|resume]`, `/leadlag_stop`, `/leadlag_status`, `/leadlag_report` | сбор и отчёт расхождений цен OKX↔BingX (§2.60), только публичные запросы | 7 суток сбора, затем отчёт |
 | `/help`, `/commands`, `/sync`, `/smc_entry_audit`, `/smc_regime_check` | справка и аудиты SMC | по необходимости |
