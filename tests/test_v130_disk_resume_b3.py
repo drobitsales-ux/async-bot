@@ -195,7 +195,7 @@ class Disk(unittest.TestCase):
         items = DU.layout(root)
         st = dict(SpaceGuard.ST)
         txt = DU.format_report(root, items, 259.0, 1000.0, st, SpaceGuard.NOW, 200.0, {'gateio': {'markets': 600, 'want': 300}, 'mexc': {'markets': None, 'want': None, 'err': 'HTTP 403'}}, ('gateio', 'mexc'))
-        for needle in ('/disk_usage', 'активно', 'архив закрытого исследования', 'свободно 259', 'нужно для /h2_ext load', 'нужно до конца lead-lag', 'gateio: всего 600, к загрузке 300', 'mexc: нет данных', 'не хватает'):
+        for needle in ('/disk_usage', 'активно', 'архив закрытого исследования', 'свободно 259', 'нужно для /h2_ext load', 'нужно до конца lead-lag', 'gateio: всего 600, к загрузке по правилу 300', 'mexc: нет данных', 'не хватает'):
             self.assertIn(needle, txt)
         txt2 = DU.format_report(root, items, 259.0, 1000.0, {}, SpaceGuard.NOW, 200.0, None, ())
         self.assertIn('нет данных (число контрактов не получено)', txt2)
@@ -228,7 +228,8 @@ class Disk(unittest.TestCase):
         root = mk_root()
         _db, sent = _common.fresh_state()
         prm = {'root': root, 'vision': os.path.join(root, 'vision'), 'factory': os.path.join(root, 'factory'), 'edge': os.path.join(root, 'edge.db'), 'battery': os.path.join(root, 'battery'),
-               'xdata': os.path.join(root, 'xdata'), 'leadlag': os.path.join(root, 'leadlag'), 'jobs': os.path.join(root, 'research_jobs'), 'll_dir': os.path.join(root, 'leadlag')}
+               'xdata': os.path.join(root, 'xdata'), 'leadlag': os.path.join(root, 'leadlag'), 'jobs': os.path.join(root, 'research_jobs'), 'll_dir': os.path.join(root, 'leadlag'),
+               'audit_cache': os.path.join(root, 'audit_cache'), 'vrp': os.path.join(root, 'vrp')}
         orig = a._disk_params
         a._disk_params = lambda: prm
         try:
@@ -268,7 +269,7 @@ class Disk(unittest.TestCase):
         import research_runner as R
         self.assertIn('disk_usage', R.TASKS)
         p = a._disk_params()
-        for k in ('root', 'vision', 'factory', 'edge', 'battery', 'xdata', 'leadlag', 'jobs', 'll_dir'):
+        for k in ('root', 'vision', 'factory', 'edge', 'audit_cache', 'vrp', 'battery', 'xdata', 'leadlag', 'jobs', 'll_dir'):
             self.assertTrue(p[k])
 
 

@@ -348,9 +348,8 @@ class Docs(unittest.TestCase):
         src = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         for needle in ('### 2.61.', '#### 2.61.1', '#### 2.61.2', '#### 2.61.3', '#### 2.61.4', 'H2EXT-EXCLUDE:', '| v131 |'):
             self.assertIn(needle, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v131'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-25-v131')
-        self.assertIn('v131', src.split('\n', 3)[1])
+        self.assertIn('2026-11-25-v131', [x[0] for x in a.CHANGELOG])
+        self.assertIn('| v131 |', src)
         self.assertEqual([l for l in src.split('\n') if l.startswith('H2EXT-EXCLUDE:')], [])        # маркер исключения пока не записан
 
 

@@ -130,8 +130,8 @@ def funding_check(params, progress=None):
 
 
 # ── ШАГ 1.1–1.2: вселенная, панель, k, критерии ──────────────────────────────────────────────────────
-def build_repl_panel(xdir, bdir=None, venues=None):
-    """Загруженный кэш → (панель, вселенная, справка). Имена символов в панели — `биржа:символ`."""
+def repl_inputs(xdir, bdir=None, venues=None):
+    """Вселенная и ленивые ряды: → (series, fund, uni, ref, where, mk). Общая часть `build_repl_panel` и лёгкой панели `research_h2ext.build_lean` (v132, §2.62): правило вселенной то же."""
     idx = X.load_index(xdir)
     vn = tuple(venues) if venues else X.venues_from_spec()                                          # [v118] H2REPL-VENUES (BOT_SPEC §2.50): без маркера — обе площадки
     mk = {ex: ({s: dict(v) for s, v in idx['markets'].get(ex, {}).items()} if ex in vn else {}) for ex in X.EXCHANGES}
@@ -143,9 +143,20 @@ def build_repl_panel(xdir, bdir=None, venues=None):
     series = X.LazyStore(list(where), lambda name: bars[where[name][0]][where[name][1]])
     fk = [nm for nm, (ex_, s_) in where.items() if os.path.exists(X.fund_path(xdir, ex_, s_))]
     fund = X.LazyStore(fk, lambda name: X.load_fund(xdir, where[name][0], where[name][1]))
+    return series, fund, uni, ref, where, mk
+
+
+def end_data_flags(names, where, mk):
+    """[v131, §2.61.3] BingX/OKX: конец кэша — «конец данных», делистинг — только неактивные в markets."""
+    return np.array([where[nm][0] in ('bingx', 'okx') and (mk[where[nm][0]].get(where[nm][1]) or {}).get('active', True) is not False for nm in names], bool)
+
+
+def build_repl_panel(xdir, bdir=None, venues=None):
+    """Загруженный кэш → (панель, вселенная, справка). Имена символов в панели — `биржа:символ`."""
+    series, fund, uni, ref, where, mk = repl_inputs(xdir, bdir, venues)
     P = X.panel_from_series(series, fund)
-    if P is not None:                                                  # [v131, §2.61.3] BingX/OKX: конец кэша — «конец данных», делистинг — только неактивные в markets
-        P['end_data'] = np.array([where[nm][0] in ('bingx', 'okx') and (mk[where[nm][0]].get(where[nm][1]) or {}).get('active', True) is not False for nm in P['syms']], bool)
+    if P is not None:
+        P['end_data'] = end_data_flags(P['syms'], where, mk)
     if P is not None:                                                  # [v119, §2.51] первый день с фандингом по символу (−1 — истории нет): счётчик «фандинг = 0»
         P['fund_first'] = np.array([(int(fund[nm][0][0]) // DAY - P['day0']) if (nm in fund and len(fund[nm][0])) else -1 for nm in P['syms']], np.int64)
     return P, uni, ref

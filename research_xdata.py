@@ -634,20 +634,20 @@ def h2_universe(markets, bars, binance_norm):
             if why:
                 nonc.setdefault(why.split('=')[0], []).append(f'{ex}:{m.get("base") or m["norm"]}')
                 continue
-            cand.setdefault(m['norm'], []).append((ex, sym, b))
+            cand.setdefault(m['norm'], []).append((ex, sym, first30_turnover(b), int(b['ts'][0])))      # [v132, §2.62.1] в памяти — только оборот и первый бар (ряды целиком не удерживаются; кандидатов ≈ 1800)
     out, ref = [], {'stable': [], 'pre_existing': [], 'both': 0, 'not_in_binance_bases': len(cand), 'noncrypto': nonc}
     for norm in sorted(cand):
         opts = cand[norm]
         if len(opts) > 1:
             ref['both'] += 1
-        ex, sym, b = max(opts, key=lambda o: (first30_turnover(o[2]), o[0] == 'bybit'))
-        if B.stable_like(b['c']):
+        ex, sym, _turn, first_ts = max(opts, key=lambda o: (o[2], o[0] == 'bybit'))
+        if B.stable_like(bars[ex][sym]['c']):                          # ряд выбранного символа перечитывается (результат тот же, что при хранении ряда)
             ref['stable'].append(f'{ex}:{sym}')
             continue
-        if earliest[ex] is not None and int(b['ts'][0]) <= earliest[ex]:
+        if earliest[ex] is not None and first_ts <= earliest[ex]:
             ref['pre_existing'].append(f'{ex}:{sym}')
             continue
-        out.append({'ex': ex, 'sym': sym, 'norm': norm, 'first_day': int(b['ts'][0]) // DAY})
+        out.append({'ex': ex, 'sym': sym, 'norm': norm, 'first_day': first_ts // DAY})
     return out, ref
 
 
@@ -966,6 +966,10 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                         stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
                     L.append(f'  1h-свечи ({ex}, общие базы Bybit∩BingX): загружено {dn} из {len(hs)}, осталось {lf}; подтверждённо пусто: {em}; ошибка биржи: {er}')
                     left_total += lf
+        for c_ in exchanges.values():                                   # [v132] принятая форма запроса биржи прямого REST (Bitget) — в отчёт загрузки
+            fi_ = getattr(c_, 'form_info', None)
+            if callable(fi_) and fi_():
+                L.append('  ' + fi_())
         idx['t'] = now_ms
         save_index(d, idx)
     finally:
@@ -1082,6 +1086,9 @@ def coverage_lines(d, idx, now_ms):
                            f'(не делистинг, §2.61.3); прекративших торги раньше конца кэша > 3 суток: {len(early)}')
             else:
                 stale = [s for s, v in bs.items() if v['last'] + 3 * DAY < now_ms]
+                n990 = sum(1 for v in bs.values() if int(v.get('n') or 0) >= 990)
+                if ex in NEW_VENUES:                                    # [v132] признак усечения глубины лимитом «последние 1000 баров»: сколько символов с ≥ 990 барами
+                    out.append(f'    {ex}: символов с ≥ 990 барами истории: {n990} из {len(bs)} (много таких — подозрение на усечение глубины лимитом 1000 баров; для листингов H2 глубина не нужна)')
                 out.append(f'  {ex}: свечей по {len(bs)} символам, самый ранний бар {first_s}; не обновлявшихся > 3 суток (закрытые/делистингованные): {len(stale)}')
         if fs:
             fl = [v['first'] for v in fs.values() if v.get('first')]

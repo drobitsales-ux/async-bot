@@ -42,6 +42,9 @@ def layout(root, paths=None):
         'battery': (paths.get('battery') or os.path.join(root, 'battery'), 'активно', 'D1+фандинг Binance: список баз архива и BTC для H2EXT/H2F (§2.47, §2.59); не удалять', False),
         'xdata': (paths.get('xdata') or os.path.join(root, 'xdata'), 'активно', 'кэш BingX/OKX/новых бирж для H2EXT/H2F (§2.59); внутри `*.h1.npz` — 1h-свечи X1 (§2.48.8, закрыто)', False),
         'leadlag': (paths.get('leadlag') or os.path.join(root, 'leadlag'), 'активно', 'замер расхождений цен OKX↔BingX (§2.60)', False),
+        'audit_cache': (paths.get('audit_cache') or os.path.join(root, 'audit_cache'), 'архив закрытого исследования',
+                        'кэш цен (1m/1h BingX и Binance) аудита канала сигналов: итог §2.44.7, §2.45.9 (канал закрыт; кэш — публичные данные, перезагружается); сами сигналы и HOLDOUT — в audit.db, не затрагиваются', True),
+        'vrp': (paths.get('vrp') or os.path.join(root, 'vrp'), 'архив закрытого исследования', 'кэш DVOL (Deribit) премии за волатильность: итог §2.46.4–§2.46.5 (закрыта)', True),
         'logs': (os.path.join(root, 'logs'), 'активно', 'дайджесты и отчёты (§2.25, §11)', False),
         'research_jobs': (paths.get('jobs') or os.path.join(root, 'research_jobs'), 'активно', 'рабочая папка заданий исследований (§2.39); не удалять при выполняющейся задаче', False),
         'trades.db': (os.path.join(root, 'trades.db'), 'активно', 'сделки, shadow, состояние breaker-ов (§2.36)', False),
@@ -132,12 +135,12 @@ def format_report(root, items, free_mb, total_mb, ll_state, now, min_free, contr
     growth = leadlag_remaining_mb(ll_state, now)
     L.append('')
     if contracts:
-        tot_s = sum(c['want'] for c in contracts.values() if c.get('want') is not None)
+        tot_s = sum(c.get('todo', c['want']) for c in contracts.values() if c.get('want') is not None)
         tot_m = sum(c['markets'] for c in contracts.values() if c.get('markets') is not None)
         lo, hi = need_h2ext_mb(tot_s, tot_m)
         L.append('Контракты новых бирж (по спискам, публичные запросы): ' + '; '.join(
-            f'{ex}: всего {c["markets"]}, к загрузке {c["want"]}' if c.get('markets') is not None else f'{ex}: нет данных ({c.get("err", "?")})' for ex, c in contracts.items()))
-        need_txt = f'{lo:.0f}–{hi:.0f} МБ ({tot_s} символов × 30–140 КБ; оценка Claude §2.59.11)'
+            f'{ex}: всего {c["markets"]}, к загрузке по правилу {c["want"]}' + (f', ещё не загружено {c["todo"]}' if c.get('todo') is not None else '') if c.get('markets') is not None else f'{ex}: нет данных ({c.get("err", "?")})' for ex, c in contracts.items()))
+        need_txt = (f'{lo:.0f}–{hi:.0f} МБ ({tot_s} ещё не загруженных символов × 30–140 КБ; оценка Claude §2.59.11)' if tot_s else '0 МБ (все символы уже загружены; загруженное уже занимает место в «свободно»)')
         hi_v = hi
     else:
         need_txt, hi_v = 'нет данных (число контрактов не получено)', None
