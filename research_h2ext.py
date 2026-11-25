@@ -117,7 +117,7 @@ def sim(env, fees, ev, mult=1.0, fund_on=True, costs_on=True, synth_P=None):
     """Тот же вызов, что `run_cell(('H2','D3'), …)`, но с явным списком событий."""
     ctx = env['ctx']
     c2 = S.with_prices(ctx, synth_P) if synth_P is not None else ctx
-    return S.sim_h2(c2, ev, fees, mult, fund_on, costs_on)
+    return S.sim_h2(c2, ev, fees, mult, fund_on, costs_on, data_end=c2['P'].get('end_data'))
 
 
 def all_events(env):
@@ -228,7 +228,7 @@ def reference(env, base, fees, ev, seg):
         if ff is not None:
             by_ex[ex]['fund_none'] = sum(1 for e, s_ in sub if ff[s_] < 0 or ff[s_] > e + S.H2_HOLD)
             by_ex[ex]['fund_part'] = sum(1 for e, s_ in sub if 0 <= ff[s_] and e + 1 < ff[s_] <= e + S.H2_HOLD)
-    return {'years': years, 'by_ex': by_ex, 'events': len(ev), 'opened': meta['opened'], 'stops': meta['stops'], 'skipped_cap': meta['skipped_cap'], 'delist': meta['delist'],
+    return {'years': years, 'by_ex': by_ex, 'events': len(ev), 'opened': meta['opened'], 'stops': meta['stops'], 'skipped_cap': meta['skipped_cap'], 'delist': meta['delist'], 'data_end': meta.get('data_end', 0),
             'stop_share': (meta['stops'] / meta['opened'] if meta['opened'] else None)}
 
 
@@ -248,7 +248,7 @@ def final_lines(ev, ref_):
     if nf:
         R.append('  фандинг = 0 там, где истории нет (консервативно для H2, §2.51): ' + '; '.join(nf))
     R.append(f'  событий {ref_["events"]}, позиций {ref_["opened"]}, стопов +50% {ref_["stops"]}' + (f' ({ref_["stop_share"] * 100:.0f}%)' if ref_['stop_share'] is not None else '')
-             + f', пропусков по лимиту риска {ref_["skipped_cap"]}, делистингов {ref_["delist"]}')
+             + f', пропусков по лимиту риска {ref_["skipped_cap"]}, делистингов {ref_["delist"]}, конец данных (кэш BingX/OKX, §2.61.3) {ref_["data_end"]}')
     return R
 
 
