@@ -342,6 +342,11 @@ async def _task_h2_ext(ctx: Ctx):
     return {'text': await research_h2ext.run_h2ext(ctx.params, progress=ctx.progress)}
 
 
+async def _task_venue_probe(ctx: Ctx):
+    import research_venues                       # [v131] /venue_probe: формы запросов бирж прямого REST на одном символе (BOT_SPEC §2.61.1); публичные GET
+    return {'text': await research_venues.probe_venue(ctx.params.get('venue'), ctx.params.get('base') or 'BTC')}
+
+
 async def _task_disk_usage(ctx: Ctx):
     import research_h2ext                        # [v130] /disk_usage: структура диска и оценка H2EXT (BOT_SPEC §2.59.11); ничего не изменяет
     return {'text': await research_h2ext.disk_job(ctx.params)}
@@ -372,7 +377,7 @@ TASKS = {
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
     'final_h2': _task_final_h2, 'vrp_probe': _task_vrp_probe, 'vrp_measure': _task_vrp_measure, 'vrp_sim': _task_vrp_sim,
-    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors, 'h2_ext': _task_h2_ext, 'disk_usage': _task_disk_usage, 'leadlag_report': _task_leadlag_report,
+    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors, 'h2_ext': _task_h2_ext, 'disk_usage': _task_disk_usage, 'venue_probe': _task_venue_probe, 'leadlag_report': _task_leadlag_report,
     'audit': _task_audit, 'audit_import': _task_audit_import, 'signal_study': _task_signal_study, 'signal_final': _task_signal_final,
 }
 

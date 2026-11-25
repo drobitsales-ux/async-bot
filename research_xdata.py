@@ -51,6 +51,21 @@ def venues_from_spec(path=None):
     return got if got else ('bybit', 'bingx')
 
 
+def excluded_venues_from_spec(path=None):
+    """[v131, §2.61.4] Маркер `H2EXT-EXCLUDE: bitget <причина>` — биржи, исключённые из вселенной H2EXT/H2F правилом (ДО расчёта доходностей). → tuple (пусто, если маркера нет)."""
+    out = []
+    try:
+        with open(path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'BOT_SPEC.md'), encoding='utf-8') as f:
+            for ln in f:
+                if ln.startswith('H2EXT-EXCLUDE:'):
+                    w = ln[len('H2EXT-EXCLUDE:'):].strip().split()
+                    if w and w[0].lower().strip(',') in EXT_ALL:
+                        out.append(w[0].lower().strip(','))
+    except OSError:
+        pass
+    return tuple(dict.fromkeys(out))
+
+
 def ext_venues_from_spec(path=None):
     """H2EXT (BOT_SPEC §2.59.1): площадки по маркеру `H2EXT-VENUES: bingx,okx,<доступные новые>` → tuple | None (маркера нет — расчёт и загрузка отказывают)."""
     v = spec_line('H2EXT-VENUES:', path)
@@ -59,6 +74,8 @@ def ext_venues_from_spec(path=None):
     got = tuple(x for x in v.lower().replace(' ', '').split(',') if x in EXT_ALL)
     if not got:
         return None
+    ex = excluded_venues_from_spec(path)
+    got = tuple(x for x in got if x not in ex)
     return tuple(dict.fromkeys(('bingx', 'okx') + got))              # [v130, §2.59.10] BingX и OKX входят во вселенную всегда (из кэша §2.47); маркер перечисляет загружаемые новые биржи
 
 
@@ -199,10 +216,41 @@ def migrate_v127(d, idx):
     return n
 
 
+def migrate_v131(d, idx):
+    """[v131, §2.61.2] РАЗОВЫЙ сброс отрицательных записей-ОШИБОК Bitget по свечам и фандингу (дефект запроса v130 записан как «постоянная ошибка») в «не обработано»; «подтверждённо пусто» не трогаются."""
+    if 'bitget|v131_reset' in idx['migr']:
+        return 0
+    n = 0
+    for k, r in list(idx['neg'].items()):
+        ex, sym, what = k.split('|')[0], '|'.join(k.split('|')[1:-1]), k.split('|')[-1]
+        if ex == 'bitget' and r.get('why') not in ('empty', 'unavailable'):
+            put(d, idx, 'negdel', ex, f'{sym}|{what}', None)
+            n += 1
+    put(d, idx, 'migr', 'bitget', 'v131_reset', {'t': int(time.time() * 1000), 'n': n})
+    return n
+
+
 def neg_rec(now_ms, e):
     """[v125] Отрицательная запись об ошибке символа: класс исключения, сообщение биржи (≤ 200 симв., публичный API — секретов нет), число успешных страниц и строк ДО ошибки
     (ошибка после успешных страниц — подозрение на «граница истории», сразу — «символ/запрос не принимается»)."""
     return {'t': now_ms, 'why': type(e).__name__, 'msg': ' '.join(str(e).split())[:200], 'pages': getattr(e, 'pages_ok', None), 'rows': getattr(e, 'rows_got', None)}
+
+
+DEFECT_STOP = 10                                            # §2.61.2: у биржи в прогоне нет ни одного успеха и подряд 10 дефектов запроса — остальные символы биржи не запрашиваются
+
+
+def defect_lines(idx, what, tripped=None):
+    """[v131, §2.61.2] Строки отчёта: «дефект запроса: N (текст ответа)» по виду данных и биржам; остановленные биржи — отдельно."""
+    groups = {}
+    for k, v in idx['fail'].items():
+        if k.endswith('|' + what) and str(v).startswith('ДЕФЕКТ ЗАПРОСА'):
+            ex = k.split('|')[0]
+            g = groups.setdefault((ex, str(v)[len('ДЕФЕКТ ЗАПРОСА: '):][:110]), {'n': 0, 'sample': k.split('|')[1]})
+            g['n'] += 1
+    out = [f'  дефект запроса ({what}) {ex}: {g["n"]} символов остаются «не обработано» (пример {g["sample"]}): «{msg}»' for (ex, msg), g in sorted(groups.items(), key=lambda kv: -kv[1]['n'])[:4]]
+    for ex in (tripped or {}):
+        out.append(f'  ⛔ {ex}: нет ни одного успеха и {DEFECT_STOP} дефектов запроса подряд — остальные символы биржи в этом прогоне не запрашивались (§2.61.2)')
+    return out
 
 
 def error_lines(idx, what='h1', syms=None, limit=6):
@@ -257,6 +305,15 @@ def is_rate_limit(e):
     t = str(e)
     m = _CODE_IN_TEXT.search(t)
     return bool((m and m.group(1) in TRANSIENT_CODES) or RATE_LIMIT_TEXT.search(t))
+
+
+def is_request_defect(e):
+    """[v131, §2.61.2] Отказ по ПАРАМЕТРАМ запроса (HTTP 400/422, коды валидации) у бирж прямого REST: не «пусто» и не постоянная ошибка символа — символ остаётся «не обработан»."""
+    try:
+        import research_venues
+        return research_venues.is_request_defect(e)
+    except Exception:
+        return False
 
 
 def is_transient(e):
@@ -728,9 +785,13 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                 if ex_ in (params.get('venues') or ()):
                     exchanges[ex_] = cls()
     idx = compact_index(d)
-    n_mig = migrate_v127(d, idx)                                    # [v127, §2.58 п. 8] разовый сброс записей-ошибок (лимит запросов 100410 записывался как постоянная ошибка)
+    n_mig = migrate_v127(d, idx)
+    n_mig131 = migrate_v131(d, idx)                                    # [v131, §2.61.2] разовый сброс ошибок Bitget (дефект запроса v130)
+    #                                                                  # [v127, §2.58 п. 8] разовый сброс записей-ошибок (лимит запросов 100410 записывался как постоянная ошибка)
     idx['fail'] = {}                                                # ошибки текущего прогона (транзиентные); постоянные — в idx['neg']
     L = [f'📥 <b>загрузка данных бирж</b> — Bybit/BingX (публичные методы ccxt), OKX (прямой REST без ccxt) → {d}']
+    if n_mig131:
+        L.append(f'↺ v131 (§2.61.2): сброшено {n_mig131} записей-ошибок Bitget (дефект запроса v130, HTTP 400 / 40017) в «не обработано»')
     if n_mig:
         L.append(f'↺ v127 (§2.58): сброшено {n_mig} записей-ошибок загрузки и классификации в «не обработано» (код 100410 «请稍后重试» — лимит запросов — ранее записывался как постоянная ошибка)')
     stopped = ''
@@ -790,6 +851,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                 return '\n'.join(L + [refuse])
         # 1. свечи — по одному символу, сразу в журнал; порядок детерминирован (сортировка)
         n_try = 0
+        ok_n, dstreak, tripped = {}, {}, {}                         # [v131, §2.61.2] успехи, подряд дефектов запроса и «остановленные» биржи (на прогон)
         for ex, sym in syms_all:
             if time.time() > deadline:
                 stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
@@ -799,6 +861,8 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                 continue
             if neg_active(idx, ex, sym, 'bars', now_ms):
                 continue
+            if ex in tripped:
+                continue
             cur = load_bars(d, ex, sym) if rec else None                  # без записи в индексе файл не открываем (индекс — единственный источник «что готово»)
             since = (int(cur['ts'][-1]) + DAY) if cur is not None and len(cur['ts']) else SINCE_MS
             try:
@@ -806,9 +870,16 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             except Exception as e:
                 if is_transient(e):
                     put(d, idx, 'fail', ex, f'{sym}|bars', type(e).__name__)
+                elif is_request_defect(e):                                  # [v131, §2.61.2] отказ по параметрам запроса ≠ «пусто»: символ остаётся «не обработан» (в отрицательный кэш не пишется)
+                    put(d, idx, 'fail', ex, f'{sym}|bars', 'ДЕФЕКТ ЗАПРОСА: ' + ' '.join(str(e).split())[:140])
+                    dstreak[ex] = dstreak.get(ex, 0) + 1
+                    if not ok_n.get(ex) and dstreak[ex] >= DEFECT_STOP:
+                        tripped[ex] = str(e)
                 else:
                     put(d, idx, 'neg', ex, f'{sym}|bars', neg_rec(now_ms, e))
                 continue
+            ok_n[ex] = ok_n.get(ex, 0) + 1
+            dstreak[ex] = 0
             if cur is not None and len(cur['ts']):
                 ts = np.concatenate([cur['ts'], ts]); o = np.concatenate([cur['o'], o]); h = np.concatenate([cur['h'], h]); l_ = np.concatenate([cur['l'], l_]); c = np.concatenate([cur['c'], c]); v = np.concatenate([cur['v'], v])
                 comp = bool(comp and (rec or {}).get('complete', True))
@@ -825,6 +896,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
         x_, y_, n_, z_ = _stats_line('bars', syms_all, idx, 'bars')
         L.append(f'  свечи: загружено {x_} из {y_}, осталось {z_}; подтверждённо пусто/постоянная ошибка: {n_}')
         L += error_lines(idx, 'bars', syms_all, 4)
+        L += defect_lines(idx, 'bars', tripped)
         left_total += z_
         # 2. фандинг — все символы со свечами (без предфильтра ликвидности: ликвидность — point-in-time при расчёте)
         if not stopped:
@@ -839,15 +911,24 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     continue
                 if neg_active(idx, ex, sym, 'fund', now_ms):
                     continue
+                if ex in tripped:
+                    continue
                 b0 = int(idx['bars'][ex][sym]['first'])
                 try:
                     ts, r, comp = await fetch_funding_ex(fx[ex], ex, sym, b0)
                 except Exception as e:
                     if is_transient(e):
                         put(d, idx, 'fail', ex, f'{sym}|fund', type(e).__name__)
+                    elif is_request_defect(e):                              # [v131, §2.61.2]
+                        put(d, idx, 'fail', ex, f'{sym}|fund', 'ДЕФЕКТ ЗАПРОСА: ' + ' '.join(str(e).split())[:140])
+                        dstreak[ex] = dstreak.get(ex, 0) + 1
+                        if not ok_n.get(ex) and dstreak[ex] >= DEFECT_STOP:
+                            tripped[ex] = str(e)
                     else:
                         put(d, idx, 'neg', ex, f'{sym}|fund', neg_rec(now_ms, e))
                     continue
+                ok_n[ex] = ok_n.get(ex, 0) + 1
+                dstreak[ex] = 0
                 cur = load_fund(d, ex, sym) if rec else None
                 parts_t, parts_r = [ts], [r]
                 if cur is not None and len(cur[0]):
@@ -872,6 +953,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
             x_, y_, n_, z_ = _stats_line('fund', todo, idx, 'fund')
             L.append(f'  фандинг: загружено {x_} из {y_}, осталось {z_}; подтверждённо пусто/постоянная ошибка: {n_} (без предфильтра ликвидности)')
             L += error_lines(idx, 'fund', todo, 4)
+            L += defect_lines(idx, 'fund', tripped)
             left_total += z_
             # 3. часовые свечи общих баз Bybit∩BingX (X1 с архивом Binance — по символам сделок, отдельным шагом /xfund_test load)
             if params.get('hourly', True) and not stopped and common and not params.get('ext'):
@@ -992,8 +1074,15 @@ def coverage_lines(d, idx, now_ms):
         fs = idx['fund'].get(ex, {})
         if bs:
             firsts = [v['first'] for v in bs.values()]
-            stale = [s for s, v in bs.items() if v['last'] + 3 * DAY < now_ms]
-            out.append(f'  {ex}: свечей по {len(bs)} символам, самый ранний бар {time.strftime("%Y-%m-%d", time.gmtime(min(firsts) / 1000))}; не обновлявшихся > 3 суток (закрытые/делистингованные): {len(stale)}')
+            first_s = time.strftime("%Y-%m-%d", time.gmtime(min(firsts) / 1000))
+            if ex in ('bingx', 'okx', 'bybit'):                       # [v131, §2.61.3] кэш §2.47 — конец данных по бирже, а не делистинг
+                end_ms = max(v['last'] for v in bs.values())
+                early = [s for s, v in bs.items() if v['last'] + 3 * DAY < end_ms]
+                out.append(f'  {ex}: свечей по {len(bs)} символам, самый ранний бар {first_s}; <b>конец кэша {time.strftime("%Y-%m-%d", time.gmtime(end_ms / 1000))}</b> '
+                           f'(не делистинг, §2.61.3); прекративших торги раньше конца кэша > 3 суток: {len(early)}')
+            else:
+                stale = [s for s, v in bs.items() if v['last'] + 3 * DAY < now_ms]
+                out.append(f'  {ex}: свечей по {len(bs)} символам, самый ранний бар {first_s}; не обновлявшихся > 3 суток (закрытые/делистингованные): {len(stale)}')
         if fs:
             fl = [v['first'] for v in fs.values() if v.get('first')]
             out.append(f'    фандинг по {len(fs)} символам; самое раннее событие {time.strftime("%Y-%m-%d", time.gmtime(min(fl) / 1000)) if fl else "н/д"}')

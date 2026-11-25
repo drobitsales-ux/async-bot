@@ -3,3 +3,4 @@
 - v117: `test_v117_decouple.py` — развязка публичных данных BingX и ключа (§2.49): keyless `exchange_pub`, алерт 100413, дайджест воркера, версии.
 - v129: `test_v129_h2ext_leadlag.py` — клиенты Gate.io/MEXC/Bitget, проба доступа, H2EXT/H2F (§2.59), сбор и отчёт расхождений цен OKX↔BingX (§2.60).
 - v130: `test_v130_disk_resume_b3.py` — маркер H2EXT-VENUES, диск до /h2_ext load, /disk_usage и /disk_cleanup, возобновление lead-lag и разрывы, правило двух тиков B3.
+- v131: `test_v131_bitget_classify_dataend.py` — Bitget: дефект запроса ≠ «пусто», формы запроса, /venue_probe; конец кэша BingX/OKX; маркер исключения.

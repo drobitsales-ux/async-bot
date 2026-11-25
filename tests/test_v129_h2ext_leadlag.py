@@ -273,7 +273,8 @@ class Ext(unittest.TestCase):
             r1 = RB.run_cell(('H2', 'D3'), env, fees, mult, fo, co)
             r2 = HX.sim(env, fees, ev, mult, fo, co)
             self.assertTrue(np.array_equal(r1['r'], r2['r']))
-            self.assertEqual(r1['meta'], r2['meta'])
+            self.assertEqual(r1['meta'], {k: v for k, v in r2['meta'].items() if k != 'data_end'})      # v131: добавлен счётчик «конец данных» (§2.61.3); числа и остальные счётчики те же
+            self.assertEqual(r2['meta']['delist'] + r2['meta']['data_end'], r1['meta']['delist'])
         syn = {'P': S.synth_daily_panel(P, np.random.default_rng(5))}
         r1 = RB.run_cell(('H2', 'D3'), env, fees, 1.0, False, False, synth=syn)
         r2 = HX.sim(env, fees, ev, 1.0, False, False, synth_P=syn['P'])
@@ -745,8 +746,7 @@ class Wiring(unittest.TestCase):
         import research_runner as R
         self.assertIn('h2_ext', R.TASKS)
         self.assertIn('leadlag_report', R.TASKS)
-        self.assertTrue(a.CODE_VERSION.endswith('v130'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-24-v130')
+        self.assertIn('2026-11-24-v130', [x[0] for x in a.CHANGELOG])
         self.assertIn('2026-11-21-v129', [x[0] for x in a.CHANGELOG])
 
     def test_leadlag_commands_do_not_start_in_idle_without_command(self):

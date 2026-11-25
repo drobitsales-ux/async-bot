@@ -4,6 +4,7 @@
 НЕ ПРОВЕРЕНО на живом API (сети в среде разработки нет): адреса и поля взяты из документации бирж ПО ПАМЯТИ; ошибки разбора поднимаются с текстом ответа,
 первая загрузка на проде это проверит. Свечи — страницами НАЗАД от endTime (как fetch_bars_back): окно времени [endTime − N·шаг, endTime]."""
 import asyncio
+import re
 import time
 
 DAY = 86_400_000
@@ -15,6 +16,14 @@ MAX_FUND_PAGES = 400
 
 class VenueError(Exception):
     pass
+
+
+DEFECT_RE = re.compile(r'HTTP (400|422)\b|\b400\d\d\b|Parameter verification failed|INVALID_PARAM|invalid param|param(eter)? (error|invalid)', re.I)
+
+
+def is_request_defect(e):
+    """[v131, BOT_SPEC §2.61.2] Ответ биржи отклонил ПАРАМЕТРЫ запроса (HTTP 400/422, коды валидации: Bitget 40017/400xx, Gate INVALID_PARAM*): это дефект запроса, а не «нет данных»."""
+    return isinstance(e, VenueError) and bool(DEFECT_RE.search(str(e)))
 
 
 def _f(x):
@@ -225,16 +234,26 @@ class MexcPublic(_Rest):
 
 
 class BitgetPublic(_Rest):
-    """Bitget USDT-M: /api/v2/mix/market/*. Символ `BTCUSDT`, productType=USDT-FUTURES; свечи `history-candles` (granularity 1D/1H, startTime/endTime мс, limit ≤ 200;
-    строка [ts, o, h, l, c, baseVol, quoteVol]); фандинг `history-fund-rate` (pageNo/pageSize, fundingRate, fundingTime мс)."""
+    """Bitget USDT-M: /api/v2/mix/market/*. Символ `BTCUSDT`, productType=USDT-FUTURES; строка свечи [ts, o, h, l, c, baseVol, quoteVol]; фандинг — `history-fund-rate`.
+    v131 (BOT_SPEC §2.61.1): запрос свечей v130 (`history-candles`, окно 200 суток, startTime+endTime) на проде отклонён кодом 40017 «Parameter verification failed startTime || endTime» для всех символов.
+    Документация и API Bitget из среды разработки недоступны — допустимое окно НЕ проверено, поэтому клиент перебирает ФИКСИРОВАННЫЙ список форм (CANDLE_FORMS), берёт первую успешную и запоминает её;
+    если отклонены все — ошибка с текстом ответа (без перебора по символам). Постоянная форма фиксируется по выводу `/venue_probe` на проде."""
     name = 'bitget'
     BASE = 'https://api.bitget.com'
     GRAN = {'1d': '1D', '1h': '1H'}
     PT = 'USDT-FUTURES'
+    # (endpoint, баров в окне/limit, режим): window — startTime+endTime; endonly — только endTime; latest — без времени
+    CANDLE_FORMS = (('history-candles', 200, 'window'), ('history-candles', 90, 'window'), ('history-candles', 30, 'window'), ('history-candles', 200, 'endonly'),
+                    ('candles', 90, 'window'), ('candles', 1000, 'latest'))
+    FUND_FORMS = ((100, True), (20, True), (None, False))                  # (pageSize, пагинация pageNo)
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._ids = {}
+        self._cform = None                                                  # индекс успешной формы свечей
+        self._cfail = None                                                  # все формы отклонены (VenueError)
+        self._fform = None
+        self._ffail = None
 
     @staticmethod
     def _data(j, what):
@@ -259,41 +278,161 @@ class BitgetPublic(_Rest):
     def _inst(self, sym):
         return self._ids.get(sym) or sym.split('/')[0] + 'USDT'
 
+    def candle_params(self, form, sym, tf, end):
+        ep, bars, mode = form
+        p = {'symbol': self._inst(sym), 'productType': self.PT, 'granularity': self.GRAN[tf], 'limit': bars}
+        if mode == 'window':
+            p['startTime'], p['endTime'] = int(end - bars * STEP[tf]), int(end)
+        elif mode == 'endonly':
+            p['endTime'] = int(end)
+        return ep, p
+
     async def fetch_ohlcv(self, sym, tf, since=None, limit=1000, params=None):
-        step = STEP[tf]
+        if self._cfail is not None:
+            raise self._cfail
         end = (params or {}).get('endTime')
         end = int(end) if end is not None else self.now()
-        lo = max(int(since or 0), end - PAGE_BARS * step)
-        data = self._data(await self._get('/api/v2/mix/market/history-candles', {'symbol': self._inst(sym), 'productType': self.PT, 'granularity': self.GRAN[tf],
-                                                                              'startTime': int(lo), 'endTime': int(end), 'limit': PAGE_BARS}), 'history-candles')
-        rows = []
-        for r in data or []:
-            ts = _i(r[0])
-            if ts is None:
-                continue
-            rows.append([ts, _f(r[1]), _f(r[2]), _f(r[3]), _f(r[4]), (_f(r[6]) if len(r) > 6 else None)])
-        rows.sort(key=lambda x: x[0])
-        return rows[-int(limit):]
+        order = [self._cform] if self._cform is not None else list(range(len(self.CANDLE_FORMS)))
+        last = None
+        for fi in order:
+            ep, p = self.candle_params(self.CANDLE_FORMS[fi], sym, tf, end)
+            if since and 'startTime' in p:
+                p['startTime'] = max(int(since), p['startTime'])
+            try:
+                data = self._data(await self._get(f'/api/v2/mix/market/{ep}', p), ep)
+            except VenueError as e:
+                if is_request_defect(e):
+                    last = e
+                    continue
+                raise
+            self._cform = fi
+            rows = []
+            for r in data or []:
+                ts = _i(r[0])
+                if ts is not None:
+                    rows.append([ts, _f(r[1]), _f(r[2]), _f(r[3]), _f(r[4]), (_f(r[6]) if len(r) > 6 else None)])
+            rows.sort(key=lambda x: x[0])
+            rows = [r for r in rows if r[0] <= end]
+            return rows[-int(limit):]
+        err = VenueError(f'bitget: запрос свечей отклонён ({len(order)} форм): {last}')
+        if self._cform is None:
+            self._cfail = err
+        raise err
+
+    async def _fund_pages(self, sym, form):
+        size, paged = form
+        rows, page = {}, 1
+        for _ in range(MAX_FUND_PAGES):
+            p = {'symbol': self._inst(sym), 'productType': self.PT}
+            if size:
+                p['pageSize'] = size
+            if paged:
+                p['pageNo'] = page
+            data = self._data(await self._get('/api/v2/mix/market/history-fund-rate', p), 'history-fund-rate')
+            if not data:
+                break
+            new = 0
+            for x in data:
+                t, r = _i(x.get('fundingTime')), _f(x.get('fundingRate'))
+                if t is not None and r is not None and t not in rows:
+                    rows[t] = r
+                    new += 1
+            if not paged or new == 0 or len(data) < (size or 100):
+                break
+            page += 1
+            await self.sleep(self.pause)
+        return rows
 
     async def fetch_funding_rate_history(self, sym, since=None, limit=None, params=None):
         if sym not in self._fund:
-            rows, page = {}, 1
-            for _ in range(MAX_FUND_PAGES):
-                data = self._data(await self._get('/api/v2/mix/market/history-fund-rate', {'symbol': self._inst(sym), 'productType': self.PT, 'pageSize': 100, 'pageNo': page}), 'history-fund-rate')
-                if not data:
-                    break
-                new = 0
-                for x in data:
-                    t, r = _i(x.get('fundingTime')), _f(x.get('fundingRate'))
-                    if t is not None and r is not None and t not in rows:
-                        rows[t] = r
-                        new += 1
-                if new == 0 or len(data) < 100:
-                    break
-                page += 1
-                await self.sleep(self.pause)
+            if self._ffail is not None:
+                raise self._ffail
+            order = [self._fform] if self._fform is not None else list(range(len(self.FUND_FORMS)))
+            last, rows = None, None
+            for fi in order:
+                try:
+                    rows = await self._fund_pages(sym, self.FUND_FORMS[fi])
+                except VenueError as e:
+                    if is_request_defect(e):
+                        last = e
+                        continue
+                    raise
+                self._fform = fi
+                break
+            if rows is None:
+                err = VenueError(f'bitget: запрос истории фандинга отклонён ({len(order)} форм): {last}')
+                if self._fform is None:
+                    self._ffail = err
+                raise err
             self._fund[sym] = sorted(rows.items(), key=lambda x: -x[0])
         return self._fund_slice(sym, int(limit or 1000), (params or {}).get('endTime'))
+
+    async def probe_forms(self, sym, tf='1d'):
+        """Диагностика для `/venue_probe` (§2.61.1): каждая форма свечей и фандинга на одном символе → строки текста (запрос — публичный, без секретов; HTTP-код, код/сообщение биржи, число строк, первая и последняя дата)."""
+        out = []
+        end = self.now()
+        for fi, form in enumerate(self.CANDLE_FORMS):
+            ep, p = self.candle_params(form, sym, tf, end)
+            out.append(probe_line(f'свечи[{fi}] {ep} ({form[2]}, {form[1]} баров)', f'{self.BASE}/api/v2/mix/market/{ep}', p, await self._probe(f'/api/v2/mix/market/{ep}', p, lambda d: [_i(r[0]) for r in d or []])))
+        for fi, (size, paged) in enumerate(self.FUND_FORMS):
+            p = {'symbol': self._inst(sym), 'productType': self.PT}
+            if size:
+                p['pageSize'] = size
+            if paged:
+                p['pageNo'] = 1
+            out.append(probe_line(f'фандинг[{fi}] history-fund-rate (pageSize={size}, пагинация={paged})', f'{self.BASE}/api/v2/mix/market/history-fund-rate', p,
+                                  await self._probe('/api/v2/mix/market/history-fund-rate', p, lambda d: [_i(x.get('fundingTime')) for x in d or []])))
+        return out
+
+    async def _probe(self, path, params, tsf):
+        try:
+            data = self._data(await self._get(path, params), path.rsplit('/', 1)[-1])
+            ts = [t for t in tsf(data) if t is not None]
+            return {'http': 'HTTP 200', 'msg': 'успех (code 00000)', 'n': len(ts), 'first': min(ts) if ts else None, 'last': max(ts) if ts else None}
+        except VenueError as e:
+            m = re.search(r'HTTP (\d+)', str(e))
+            return {'http': f'HTTP {m.group(1)}' if m else 'HTTP 200', 'msg': str(e)[:200], 'n': 0, 'first': None, 'last': None}
+
+
+def probe_line(title, url, params, r):
+    d = lambda t: time.strftime('%Y-%m-%d', time.gmtime(t / 1000)) if t else 'нет'
+    q = '&'.join(f'{k}={v}' for k, v in params.items())
+    return f'{title}: GET {url}?{q} → {r["http"]}; {r["msg"]}; строк {r["n"]}; первая {d(r["first"])}, последняя {d(r["last"])}'
+
+
+async def probe_venue(name, base='BTC', clients=None, now=None):
+    """`/venue_probe [биржа] [БАЗА]` (§2.61.1): проверка запросов биржи прямого REST на одном символе; только публичные GET. → текст."""
+    name = (name or 'bitget').lower()
+    if name not in CLASSES:
+        return f'⛔ /venue_probe: биржа «{name}» не из списка {", ".join(CLASSES)}'
+    c = (clients or {}).get(name) or CLASSES[name](**({'now': now} if now else {}))
+    L = [f'🔎 <b>/venue_probe {name} {base}</b> (BOT_SPEC §2.61.1; публичные запросы без ключей)']
+    try:
+        mk = await c.load_markets()
+        sym = f'{base.upper()}/USDT:USDT'
+        L.append(f'контрактов USDT-перпетуалов: {len(mk)}; {sym}: ' + ('есть' if sym in mk else 'НЕТ в списке'))
+        if hasattr(c, 'probe_forms'):
+            L += await c.probe_forms(sym)
+        else:
+            d = lambda t: time.strftime('%Y-%m-%d', time.gmtime(t / 1000)) if t else 'нет'
+            try:
+                rows = await c.fetch_ohlcv(sym, '1d', None, 1000, {'endTime': c.now()})
+                L.append(f'свечи 1d: HTTP 200; строк {len(rows)}; первая {d(rows[0][0] if rows else None)}, последняя {d(rows[-1][0] if rows else None)}')
+            except Exception as e:
+                L.append(f'свечи 1d: ОШИБКА {str(e)[:200]}')
+            try:
+                fr = await c.fetch_funding_rate_history(sym, None, 1000, {})
+                L.append((f'фандинг: строк {len(fr)}; глубина ≈ {(fr[0]["timestamp"] - fr[-1]["timestamp"]) / DAY:.1f} сут.; первая {d(fr[-1]["timestamp"])}, последняя {d(fr[0]["timestamp"])}') if fr else 'фандинг: пустой ответ')
+            except Exception as e:
+                L.append(f'фандинг: ОШИБКА {str(e)[:200]}')
+    except Exception as e:
+        L.append(f'ОШИБКА: {type(e).__name__}: {str(e)[:200]}')
+    finally:
+        try:
+            await c.close()
+        except Exception:
+            pass
+    return '\n'.join(L)
 
 
 CLASSES = {'gateio': GatePublic, 'mexc': MexcPublic, 'bitget': BitgetPublic}

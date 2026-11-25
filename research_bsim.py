@@ -211,7 +211,7 @@ def h2_random_events(ctx, n, rng, lo=0, hi=None):
     return ev
 
 
-def sim_h2(ctx, events, fees, mult=1.0, fund_on=True, costs_on=True):
+def sim_h2(ctx, events, fees, mult=1.0, fund_on=True, costs_on=True, data_end=None):
     """H2: шорт по close входа, стоп +50% (гэп — по open), выход close через 30 суток либо по close последнего бара (делистинг); w = RISK/0.5; не более 20 открытых позиций
     (риск ≤ 10% капитала; лишние пропускаются). Дневная разметка по close, фандинг: шорт при положительной ставке получает (дни входа+1…выход, на день стопа не начисляется)."""
     P = ctx['P']
@@ -224,6 +224,8 @@ def sim_h2(ctx, events, fees, mult=1.0, fund_on=True, costs_on=True):
     cap = int(round(H2_RISK_CAP / RISK))
     open_exits = []
     meta = {'events': len(events), 'opened': 0, 'skipped_cap': 0, 'incomplete': 0, 'stops': 0, 'delist': 0, 'days_open': 0}
+    if data_end is not None:                                                 # [v131, §2.61.3] счётчик «конец данных» (кэш BingX/OKX); без параметра поведение и meta прежние
+        meta['data_end'] = 0
     covered = np.zeros(nd, bool)
     for e, s in events:
         open_exits = [x for x in open_exits if x > e]
@@ -245,7 +247,10 @@ def sim_h2(ctx, events, fees, mult=1.0, fund_on=True, costs_on=True):
             if k > last or not math.isfinite(float(C[k, s])):
                 exit_k = min(k, nd - 1)
                 ret[exit_k] -= side_cost
-                meta['delist'] += 1
+                if data_end is not None and k > last and bool(data_end[s]):         # [v131] выход по последнему close из-за конца кэша биржи, не делистинг; числа те же
+                    meta['data_end'] += 1
+                else:
+                    meta['delist'] += 1
                 break
             o, h, c = float(O[k, s]), float(H[k, s]), float(C[k, s])
             if (math.isfinite(o) and o >= stop) or h >= stop:
