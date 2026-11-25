@@ -72,7 +72,7 @@ def last_bar_info(xdir, venues):
     return {'by_ex': {ex: time.strftime('%Y-%m-%d', time.gmtime(v / 1000)) for ex, v in by.items()}, 'spread_days': (max(by.values()) - min(by.values())) / X.DAY}
 
 
-async def count_contracts(venues, bdir=None, clients=None):
+async def count_contracts(venues, bdir=None, clients=None, xdir=None):
     """[§2.59.11] Число контрактов новых бирж по спискам (публичные GET): всего и «к загрузке» (база не в архиве Binance, не не-крипто). → {биржа: dict(markets, want | err)}."""
     import research_venues
     bn = X.binance_norm_set(bdir)
@@ -83,7 +83,11 @@ async def count_contracts(venues, bdir=None, clients=None):
         c = (clients or {}).get(ex) or research_venues.CLASSES[ex]()
         try:
             sw = X.usdt_swaps(await c.load_markets())
-            out[ex] = {'markets': len(sw), 'want': sum(1 for v in sw.values() if not v.get('excl') and v['norm'] not in bn)}
+            want = [s_ for s_, v in sw.items() if not v.get('excl') and v['norm'] not in bn]
+            out[ex] = {'markets': len(sw), 'want': len(want)}
+            if xdir is not None:                                       # [v132, §2.62.2] ещё не загружено: нет записи свечей и нет подтверждённо-пустой записи
+                idx = X.load_index(xdir)
+                out[ex]['todo'] = sum(1 for s_ in want if s_ not in idx['bars'].get(ex, {}) and idx['neg'].get(f'{ex}|{s_}|bars', {}).get('why') != 'empty')
         except Exception as e:
             out[ex] = {'markets': None, 'want': None, 'err': f'{type(e).__name__}: {str(e)[:80]}'}
         finally:
@@ -98,12 +102,12 @@ async def disk_job(params):
     """Задача `/disk_usage` (дочерний процесс): структура диска, оценка H2EXT по спискам контрактов, рост замера. Ничего не изменяет."""
     import shutil
     root = params.get('root') or ('/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(params.get('xdir') or '/tmp')))
-    paths = {k: params.get(k) for k in ('vision', 'factory', 'edge', 'battery', 'xdata', 'leadlag', 'jobs') if params.get(k)}
+    paths = {k: params.get(k) for k in ('vision', 'factory', 'edge', 'audit_cache', 'vrp', 'battery', 'xdata', 'leadlag', 'jobs') if params.get(k)}
     items = DU.layout(root, paths)
     du_ = shutil.disk_usage(root)
     venues = tuple(params.get('venues') or X.ext_venues_from_spec(params.get('spec_path')) or ())
     new = tuple(v for v in venues if v in X.NEW_VENUES)
-    contracts = await count_contracts(new, params.get('bdir'), params.get('clients')) if new else None
+    contracts = await count_contracts(new, params.get('bdir'), params.get('clients'), params.get('xdir')) if new else None
     st = LL.load_state(params.get('ll_dir') or LL.leadlag_dir())
     return DU.format_report(root, items, du_.free / 1e6, du_.total / 1e6, st, time.time(), LL.min_free_mb(), contracts, new)
 
@@ -114,10 +118,112 @@ def keys(hyp):
 
 
 def sim(env, fees, ev, mult=1.0, fund_on=True, costs_on=True, synth_P=None):
-    """Тот же вызов, что `run_cell(('H2','D3'), …)`, но с явным списком событий."""
+    """Тот же вызов, что `run_cell(('H2','D3'), …)`, но с явным списком событий. `sim_h2` читает из контекста только P (O, H, C, F, first, last) и маски liq/top — ATR и оборот не нужны (v132, §2.62.1)."""
     ctx = env['ctx']
-    c2 = S.with_prices(ctx, synth_P) if synth_P is not None else ctx
+    c2 = {'P': synth_P, 'liq': ctx['liq'], 'top': ctx['top']} if synth_P is not None else ctx
     return S.sim_h2(c2, ev, fees, mult, fund_on, costs_on, data_end=c2['P'].get('end_data'))
+
+
+class EventCells:
+    """`P['G']` / `P['GC']` лёгкой панели: значения фандинга только в ячейках события (e = first + D) — единственных, которые читает H2F (§2.59.6)."""
+
+    def __init__(self, first, vals, D=3):
+        self.first, self.vals, self.D = first, vals, D
+
+    def __getitem__(self, key):
+        e, s = key
+        if int(e) != int(self.first[s]) + self.D:
+            raise KeyError(key)
+        return self.vals[s]
+
+
+def build_lean(xdir, bdir=None, venues=None, D=3):
+    """[v132, §2.62.1] ЛЁГКАЯ панель H2: те же данные и правила, что `build_repl_panel` + `make_ctx`, но в памяти только то, что читают `h2_events`/`sim_h2`/H2F: O, H, C, F (float32), маски liq/top,
+    first/last, оценки σ и выходов high/low для синтетики и фандинг в ячейках события. Не хранятся QV, L, ATR, adv (float64), полные G/GC. ADV считается по одному символу (`pit_adv` по столбцам
+    независим), top-30 — по строкам (`top_n_mask` по строкам независим) → результат тот же, что у полной панели (проверено тестом). → (P, uni, ref, liq, top); P None, если рядов нет."""
+    series, fund, uni, ref, where, mk = H.repl_inputs(xdir, bdir, venues)
+    meta = []
+    for nm in sorted(series):                                          # как panel_from_series: имена по возрастанию, пустые ряды пропускаются; ряды читаются по одному
+        x = series[nm]
+        if len(x['ts']):
+            meta.append((nm, int(x['ts'][0]), int(x['ts'][-1])))
+    if not meta:
+        return None, uni, ref, None, None
+    names = [m[0] for m in meta]
+    day0 = min(m[1] for m in meta) // X.DAY
+    day1 = max(m[2] for m in meta) // X.DAY
+    nd, ns = day1 - day0 + 1, len(names)
+    O, Hh, C = (np.full((nd, ns), np.nan, np.float32) for _ in range(3))
+    F = np.zeros((nd, ns), np.float32)
+    adv = np.full((nd, ns), np.nan, np.float64)
+    first, last, hf, ffirst, stats = [], [], [], [], []
+    g_e, gc_e = np.zeros(ns, np.float32), np.zeros(ns, np.float32)
+    for j, nm in enumerate(names):
+        x = series[nm]
+        di = (np.asarray(x['ts']) // X.DAY - day0).astype(np.int64)
+        col = {}
+        for k, kk in (('O', 'o'), ('H', 'h'), ('L', 'l'), ('C', 'c'), ('QV', 'qv')):
+            col[k] = np.full(nd, np.nan, np.float32)
+            col[k][di] = np.asarray(x[kk])
+        O[:, j], Hh[:, j], C[:, j] = col['O'], col['H'], col['C']
+        f0, l0 = int(di[0]), int(di[-1])
+        first.append(f0)
+        last.append(l0)
+        adv[:, j] = B.pit_adv(col['QV'].reshape(-1, 1))[0][:, 0]
+        stats.append(S.real_stats(col['O'][f0:l0 + 1], col['H'][f0:l0 + 1], col['L'][f0:l0 + 1], col['C'][f0:l0 + 1]))
+        f = fund.get(nm)
+        if f is not None and len(f[0]):
+            Fc, Gc, GCc = B.daily_funding(day0, nd, np.asarray(f[0], np.int64), np.asarray(f[1], float))
+            F[:, j] = Fc
+            e = f0 + D
+            if 0 <= e < nd:
+                g_e[j], gc_e[j] = Gc[e], GCc[e]
+            hf.append(True)
+            ffirst.append(int(f[0][0]) // X.DAY - day0)
+            del Fc, Gc, GCc
+        else:
+            hf.append(False)
+            ffirst.append(-1)
+        del col
+    liq = B.liquid_mask(adv)
+    top = np.zeros((nd, ns), bool)
+    for r0 in range(0, nd, 128):
+        top[r0:r0 + 128] = B.top_n_mask(adv[r0:r0 + 128])
+    del adv
+    first, last = np.array(first, np.int64), np.array(last, np.int64)
+    P = {'O': O, 'H': Hh, 'C': C, 'F': F, 'syms': names, 'day0': day0, 'nd': nd, 'first': first, 'last': last, 'has_fund': np.array(hf), 'fund_first': np.array(ffirst, np.int64),
+         'end_data': H.end_data_flags(names, where, mk), 'G': EventCells(first, g_e, D), 'GC': EventCells(first, gc_e, D), 'stats': stats}
+    return P, uni, ref, liq, top
+
+
+def make_lean_env(P, liq, top):
+    return {'P': P, 'ctx': {'P': P, 'liq': liq, 'top': top}, 'days': np.arange(P['day0'], P['day0'] + P['nd'], dtype=np.int64), 'hc': None}
+
+
+def synth_panel(P, rng):
+    """Синтетика §2.47.3 п. 1. Полная панель — `research_bsim.synth_daily_panel`; лёгкая (есть `stats`) — те же числа (те же обращения к генератору в том же порядке; σ и выходы high/low посчитаны один раз
+    при построении), но без массива L, который `sim_h2` не читает (v132, §2.62.1): память одной итерации −1/3."""
+    if 'stats' not in P:
+        return S.synth_daily_panel(P, rng)
+    P2 = dict(P)
+    nd, ns = P['nd'], len(P['syms'])
+    for k in ('O', 'H', 'C'):
+        P2[k] = np.full(P[k].shape, np.nan, np.float32)
+    for j in range(ns):
+        f, l = int(P['first'][j]), int(P['last'][j])
+        n = l - f + 1
+        sg, eh, el = P['stats'][j]
+        c0 = float(P['C'][f, j]) if math.isfinite(float(P['C'][f, j])) else 1.0
+        r = rng.normal(-0.5 * sg * sg, sg, n)
+        c = c0 * np.exp(np.cumsum(r))
+        o = np.r_[c0, c[:-1]]
+        hi, lo = S._wicks(o, c, eh, el, rng, n)                         # lo — только ради расхода генератора (как в полной версии)
+        for k, arr in (('O', o), ('H', hi), ('C', c)):
+            col = np.full(nd, np.nan, np.float32)
+            col[f:l + 1] = arr
+            col[np.isnan(P[k][:, j])] = np.nan
+            P2[k][:, j] = col
+    return P2
 
 
 def all_events(env):
@@ -183,9 +289,11 @@ def compute_k(env, fees, ev, hyp, reps=K_REPS, progress=None):
         return {'k': None, 'm0': None, 'reps': 0, 'n_events': 0, 'error': 'нет допущенных событий'}
     seg = np.arange(env['P']['nd']) >= e0
     ts = []
+    P2 = res = None
     for rep in range(reps):
+        P2 = res = None                                                # [v132] предыдущая синтетика освобождается ДО создания новой (иначе пик ×2)
         rng = np.random.default_rng([SEED, K_TAG[hyp], rep])
-        P2 = S.synth_daily_panel(env['P'], rng)
+        P2 = synth_panel(env['P'], rng)
         res = sim(env, fees, ev, 1.0, False, False, synth_P=P2)
         t = S.tstat(res['r'][seg])
         if math.isfinite(t):
@@ -289,10 +397,10 @@ async def run_h2ext(params, progress=None):
         cov = X.coverage_report(xdir, 'h2', params.get('bdir'), venues=venues, minimum=cmin)
         if not cov['ok']:
             return (f'⛔ {cfg["cmd"]} отказ: данные неполны: ' + '; '.join(cov['lines']) + '. Расчёта и вердикта нет (BOT_SPEC §2.53): выполните /h2_ext load (повторяйте до «✅ загрузка завершена»).')
-    P, uni, ref = H.build_repl_panel(xdir, params.get('bdir'), venues)
+    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues)      # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
     if P is None or not uni:
         return f'⛔ {cfg["cmd"]} отказ: нет данных — выполните /h2_ext load до сообщения «загрузка завершена»'
-    env = H.make_env(P)
+    env = make_lean_env(P, liq, top)
     ev_all = all_events(env)
     counters = {}
     if hyp == 'ext':

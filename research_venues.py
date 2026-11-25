@@ -367,6 +367,15 @@ class BitgetPublic(_Rest):
             self._fund[sym] = sorted(rows.items(), key=lambda x: -x[0])
         return self._fund_slice(sym, int(limit or 1000), (params or {}).get('endTime'))
 
+    def form_info(self):
+        """[v132] Какая форма запроса принята на прогоне (для отчёта загрузки): → текст | None."""
+        if self._cform is None and self._fform is None:
+            return None
+        c = self.CANDLE_FORMS[self._cform] if self._cform is not None else None
+        f = self.FUND_FORMS[self._fform] if self._fform is not None else None
+        return (f'Bitget: принятая форма запроса — свечи: {c[0]} ({c[2]}, {c[1]} баров)' if c else 'Bitget: свечи — форма не определена') + \
+               (f'; фандинг: history-fund-rate (pageSize={f[0]}, пагинация={f[1]})' if f else '; фандинг — форма не определена')
+
     async def probe_forms(self, sym, tf='1d'):
         """Диагностика для `/venue_probe` (§2.61.1): каждая форма свечей и фандинга на одном символе → строки текста (запрос — публичный, без секретов; HTTP-код, код/сообщение биржи, число строк, первая и последняя дата)."""
         out = []
