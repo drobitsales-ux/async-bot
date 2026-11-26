@@ -130,7 +130,7 @@ def funding_check(params, progress=None):
 
 
 # ── ШАГ 1.1–1.2: вселенная, панель, k, критерии ──────────────────────────────────────────────────────
-def repl_inputs(xdir, bdir=None, venues=None):
+def repl_inputs(xdir, bdir=None, venues=None, ext=None):
     """Вселенная и ленивые ряды: → (series, fund, uni, ref, where, mk). Общая часть `build_repl_panel` и лёгкой панели `research_h2ext.build_lean` (v132, §2.62): правило вселенной то же."""
     idx = X.load_index(xdir)
     vn = tuple(venues) if venues else X.venues_from_spec()                                          # [v118] H2REPL-VENUES (BOT_SPEC §2.50): без маркера — обе площадки
@@ -138,6 +138,9 @@ def repl_inputs(xdir, bdir=None, venues=None):
     def keys_of(ex):                                                   # v123 (§2.55): ключи из индекса (запись есть, ряд непуст, файл существует) — ряды читаются лениво по одному
         return [s_ for s_, r in idx['bars'].get(ex, {}).items() if int(r.get('n', 1) or 0) > 0 and os.path.exists(X.bars_path(xdir, ex, s_))]
     bars = {ex: X.LazyStore(keys_of(ex) if ex in vn else [], lambda s_, ex=ex: X.load_bars(xdir, ex, s_)) for ex in X.EXCHANGES}
+    if ext is not None:                                                # [v134, §2.64.2] H2EXT: механическое исключение не-крипто (б, в, г); а — прежний §2.52 (excl из индекса)
+        for ex in vn:
+            X.apply_ext_filter(mk[ex], (ext.get('coins') or {}).get(ex))
     uni, ref = X.h2_universe(mk, bars, X.binance_norm_set(bdir))
     where = {f'{u["ex"]}:{u["sym"]}': (u['ex'], u['sym']) for u in uni}
     series = X.LazyStore(list(where), lambda name: bars[where[name][0]][where[name][1]])

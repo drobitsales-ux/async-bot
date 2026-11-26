@@ -17,6 +17,7 @@ import research_bsim as S
 import research_factory as RF
 import research_h2repl as H
 import disk_usage as DU
+import research_coins as RC
 import research_leadlag as LL
 import research_xdata as X
 
@@ -48,6 +49,83 @@ def space_guard(xdir, ll_dir, params=None):
                 f'+ рост замера до конца срока ≈ {d["growth"]:.0f} МБ → после загрузки останется ≈ {d["after"]:.0f} МБ < {d["need_after"]:.0f} МБ (LEADLAG_MIN_FREE_MB + 50). '
                 f'Не хватает ≈ {d["short"]:.0f} МБ. Что можно освободить: /disk_usage (архивы закрытых исследований — /disk_cleanup <имя> confirm); либо дождаться конца замера. Ничего не загружено.')
     return guard
+
+
+REVIEW_FILE = 'h2ext_universe_review.txt'
+COINS_FILE = RC.COINS_FILE
+SIGNED_NOTE = RC.SIGNED_NOTE
+
+
+def review_path(xdir):
+    return os.path.join(xdir, REVIEW_FILE)
+
+
+async def coin_sets(params, venues, xdir, refresh=False):
+    """[§2.64.2 г] Наборы спотовых монет с сетями по биржам. Обычно читаются из `h2ext_coins.json`, записанного заданием `h2_coins` (`research_coins`) ПЕРЕД расчётом (сеть в процессе расчёта не используется — лимит памяти
+    дочернего процесса); один и тот же набор — для показа, `confirm` и H2F. Нет файла — пункт г не применяется (причина в отчёте); refresh=True — запрос здесь (для тестов). → ({биржа: set | None}, {биржа: примечание}); в примечании — время набора."""
+    if params.get('coins_override') is not None:
+        co = {ex: (set(v) if v else None) for ex, v in params['coins_override'].items()}
+        return co, {ex: ('применён' if co.get(ex) else 'не применяется (тест)') for ex in venues}
+    if not refresh:
+        got = RC.read_cache(xdir)
+        if got is not None:
+            coins, notes, t = got
+            stamp = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(t)) if t else 'время неизвестно'
+            return coins, {ex: f'{notes.get(ex, "нет данных")} [набор от {stamp}]' for ex in venues}
+    if not refresh:                                                    # файла нет: сеть в процессе расчёта не используется (лимит памяти) — п. г не применяется, причина в отчёте
+        return {ex: None for ex in venues}, {ex: 'не применяется: набор монет не получен (его запрашивает задание h2_coins при запуске /h2_ext без аргумента; файла h2ext_coins.json нет)' for ex in venues}
+    coins, notes = await RC.fetch_coin_sets(venues, params.get('coin_clients'))
+    RC.write_cache(xdir, coins, notes)
+    return coins, notes
+
+
+def bucket(reason):
+    """Пункт поправки §2.64.2 по причине исключения: «поле …»/NC-префикс — это прежний §2.52 (пункт а)."""
+    r = str(reason)
+    return 'а (§2.52)' if (r.startswith('NC-') or r.startswith('поле ')) else r
+
+
+def exclusion_lines(ref, uni, venues, notes):
+    """Отчёт по пунктам и биржам (§2.64.2): сколько исключено каждым пунктом по каждой бирже (среди кандидатов), п. г — применялся ли."""
+    order = ('а (§2.52)', 'б', 'в', 'г', 'стейблкоин', 'до начала истории')
+    cnt = {}
+    for ex, _s, why in ref.get('excluded_syms', []):
+        cnt.setdefault(ex, {}).setdefault(bucket(why), 0)
+        cnt[ex][bucket(why)] += 1
+    L = ['Исключено как не-крипто и прочее (§2.64.2; среди кандидатов — символов с загруженными свечами и базой вне архива Binance), по биржам и пунктам:']
+    tot = {k: 0 for k in order}
+    for ex in venues:
+        c = cnt.get(ex, {})
+        for k in order:
+            tot[k] += c.get(k, 0)
+        L.append(f'  {ex}: ' + '; '.join(f'{k} {c.get(k, 0)}' for k in order) + f'; осталось в вселенной {sum(1 for u in uni if u["ex"] == ex)}')
+    L.append('  всего: ' + '; '.join(f'{k} {tot[k]}' for k in order) + f'; в вселенной {len(uni)}')
+    L.append('  пункт г по биржам: ' + '; '.join(f'{ex} — {notes.get(ex, "нет данных")}' for ex in venues))
+    L.append('  пункт а: действует прежний §2.52; новые поля метаданных — по выводу /contract_probe (§2.64.1), отдельной поправкой.')
+    return L
+
+
+def write_review(xdir, uni, ref, venues, version, notes, now=None):
+    """[§2.64.3] Файл-обзор вселенной (создаёт и перезаписывает `/h2_ext` без аргумента). Без доходностей. → путь | None (ошибка записи)."""
+    t = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now or time.time()))
+    day = lambda d: time.strftime('%Y-%m-%d', time.gmtime(int(d) * X.DAY / 1000))
+    L = [f'# H2EXT — обзор вселенной (BOT_SPEC §2.64.3), создан {t}, код {version}; без доходностей', f'# площадки: {", ".join(venues)}', '# пункт г: ' + '; '.join(f'{ex} — {notes.get(ex, "нет данных")}' for ex in venues), '',
+         f'## В вселенной ({len(uni)})', 'биржа\tсимвол\tдата листинга (первый дневной бар)']
+    for u in sorted(uni, key=lambda u: (u['ex'], u['sym'])):
+        L.append(f'{u["ex"]}\t{u["sym"]}\t{day(u["first_day"])}')
+    ex_ = sorted(ref.get('excluded_syms', []), key=lambda r: (r[0], bucket(r[2]), r[1]))
+    L += ['', f'## Исключены ({len(ex_)})', 'биржа\tсимвол\tпункт (а — §2.52 / б / в / г / стейблкоин / до начала истории)']
+    for ex, sym, why in ex_:
+        L.append(f'{ex}\t{sym}\t{bucket(why)}' + (f' ({why})' if bucket(why) != why else ''))
+    p = review_path(xdir)
+    try:
+        os.makedirs(xdir, exist_ok=True)
+        with open(p + '.tmp', 'w', encoding='utf-8') as f:
+            f.write('\n'.join(L) + '\n')
+        os.replace(p + '.tmp', p)
+        return p
+    except OSError:
+        return None
 
 
 def sequence_gate(fdir):
@@ -137,11 +215,11 @@ class EventCells:
         return self.vals[s]
 
 
-def build_lean(xdir, bdir=None, venues=None, D=3):
+def build_lean(xdir, bdir=None, venues=None, D=3, ext=None):
     """[v132, §2.62.1] ЛЁГКАЯ панель H2: те же данные и правила, что `build_repl_panel` + `make_ctx`, но в памяти только то, что читают `h2_events`/`sim_h2`/H2F: O, H, C, F (float32), маски liq/top,
     first/last, оценки σ и выходов high/low для синтетики и фандинг в ячейках события. Не хранятся QV, L, ATR, adv (float64), полные G/GC. ADV считается по одному символу (`pit_adv` по столбцам
     независим), top-30 — по строкам (`top_n_mask` по строкам независим) → результат тот же, что у полной панели (проверено тестом). → (P, uni, ref, liq, top); P None, если рядов нет."""
-    series, fund, uni, ref, where, mk = H.repl_inputs(xdir, bdir, venues)
+    series, fund, uni, ref, where, mk = H.repl_inputs(xdir, bdir, venues, ext)
     meta = []
     for nm in sorted(series):                                          # как panel_from_series: имена по возрастанию, пустые ряды пропускаются; ряды читаются по одному
         x = series[nm]
@@ -397,9 +475,11 @@ async def run_h2ext(params, progress=None):
         cov = X.coverage_report(xdir, 'h2', params.get('bdir'), venues=venues, minimum=cmin)
         if not cov['ok']:
             return (f'⛔ {cfg["cmd"]} отказ: данные неполны: ' + '; '.join(cov['lines']) + '. Расчёта и вердикта нет (BOT_SPEC §2.53): выполните /h2_ext load (повторяйте до «✅ загрузка завершена»).')
-    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues)      # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
+    coins, cnotes = await coin_sets(params, venues, xdir, refresh=bool(params.get('refresh_coins')))      # [v134, §2.64.2 г] набор монет — из файла задания h2_coins (сеть в этом процессе не используется)
+    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues, ext={'coins': coins})            # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
     if P is None or not uni:
         return f'⛔ {cfg["cmd"]} отказ: нет данных — выполните /h2_ext load до сообщения «загрузка завершена»'
+    review = write_review(xdir, uni, ref, venues, version, cnotes) if (mode == 'show' and hyp == 'ext') else None
     env = make_lean_env(P, liq, top)
     ev_all = all_events(env)
     counters = {}
@@ -427,6 +507,9 @@ async def run_h2ext(params, progress=None):
     if hyp == 'f':
         head.append(f'H2F: символов новых бирж (база не встречалась на BingX/OKX) {len(uni_names)}; событий-кандидатов {counters["candidates"]}, без фандинга в сутки входа {counters["no_funding"]}, '
                     f'фандинг ≤ 0 {counters["neg_or_zero"]}, допущено {counters["admitted"]} (всего событий H2 по вселенной {len(ev_all)}).')
+    head += exclusion_lines(ref, uni, venues, cnotes)
+    if mode == 'show' and hyp == 'ext':
+        head.append(f'Файл-обзор вселенной: {review} (прислать: /h2ext_review)' if review else '⚠️ файл-обзор вселенной записать не удалось (ошибка записи в каталог данных)')
     ends = last_bar_info(xdir, venues)
     if ends:
         head.append('Последний дневной бар по биржам: ' + ', '.join(f'{ex} {d_}' for ex, d_ in ends['by_ex'].items())

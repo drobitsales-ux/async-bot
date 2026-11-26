@@ -156,6 +156,17 @@ class GatePublic(_Rest):
         return self._fund_slice(sym, int(limit or 1000), (params or {}).get('endTime'))
 
 
+    async def fetch_spot_coins(self):
+        """[v134, §2.64.2 г] Коды спотовых монет Gate.io с хотя бы одной блокчейн-сетью (`GET /api/v4/spot/currencies`, поле `chains`; формат по памяти, не проверен). Пустой результат — ошибка."""
+        data = await self._get('/spot/currencies')
+        if not isinstance(data, list):
+            raise VenueError(f'gateio spot/currencies: неожиданный ответ {str(data)[:120]}')
+        out = {str(d.get('currency') or '').upper() for d in data if (d.get('chains') or d.get('chain')) and d.get('currency')}
+        if not out:
+            raise VenueError('gateio spot/currencies: список монет с сетями пуст')
+        return out
+
+
 class MexcPublic(_Rest):
     """MEXC фьючерсы: contract.mexc.com/api/v1/contract/*. Символ `BTC_USDT`; свечи `kline/{symbol}?interval=Day1&start=&end=` (секунды; колонки time/open/high/low/close/vol/amount);
     фандинг `funding_rate/history?symbol=&page_num=&page_size=` (resultList: fundingRate, settleTime мс)."""
@@ -277,6 +288,14 @@ class BitgetPublic(_Rest):
 
     def _inst(self, sym):
         return self._ids.get(sym) or sym.split('/')[0] + 'USDT'
+
+    async def fetch_spot_coins(self):
+        """[v134, §2.64.2 г] Коды спотовых монет Bitget с хотя бы одной сетью (`GET /api/v2/spot/public/coins`, поле `chains`; формат по памяти, не проверен). Пустой результат — ошибка."""
+        data = self._data(await self._get('/api/v2/spot/public/coins'), 'spot/public/coins')
+        out = {str(d.get('coin') or '').upper() for d in (data or []) if d.get('chains') and d.get('coin')}
+        if not out:
+            raise VenueError('bitget spot/public/coins: список монет с сетями пуст')
+        return out
 
     def candle_params(self, form, sym, tf, end):
         ep, bars, mode = form
