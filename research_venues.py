@@ -21,9 +21,12 @@ class VenueError(Exception):
 DEFECT_RE = re.compile(r'HTTP (400|422)\b|\b400\d\d\b|Parameter verification failed|INVALID_PARAM|invalid param|param(eter)? (error|invalid)', re.I)
 
 
+MEXC_TRADFI_ZONES = ('mc-trade-zone-Stock', 'mc-trade-zone-tradfi')
+
+
 def meta_exclusion(info):
     """[v135, BOT_SPEC §2.65.2] Пункт а — поле метаданных контракта указывает на не-крипто (по выводу /contract_probe 2026-11-26): Gate.io `contract_type` ≠ '' (stocks/indices/metals/forex/commodities);
-    Bitget `isRwa` = YES; MEXC `type` = 2 либо зона `conceptPlate` с `stock` / `mc-trade-zone-tradfi`. → 'поле <ключ>=<значение>' | None. (OKX `instCategory` и NC-префикс — §2.52, research_xdata.)"""
+    Bitget `isRwa` = YES; MEXC `type` = 2 либо зона `conceptPlate`, ТОЧНО равная `mc-trade-zone-Stock` / `mc-trade-zone-tradfi` (§2.66.1). → 'поле <ключ>=<значение>' | None. (OKX `instCategory` и NC-префикс — §2.52, research_xdata.)"""
     if not isinstance(info, dict):
         return None
     ct = info.get('contract_type')
@@ -36,8 +39,7 @@ def meta_exclusion(info):
             return 'поле type=2'
         zones = info.get('conceptPlate')
         for z in (zones if isinstance(zones, list) else []):
-            zl = str(z).lower()
-            if 'stock' in zl or zl == 'mc-trade-zone-tradfi':
+            if str(z) in MEXC_TRADFI_ZONES:                             # [v136, §2.66.1] ТОЧНОЕ совпадение зоны (mc-trade-zone-stockmeme — мем-монеты — не исключает)
                 return f'поле conceptPlate={z}'
     return None
 

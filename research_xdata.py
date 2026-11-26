@@ -457,6 +457,116 @@ def cat_of(info):
     return ''
 
 
+# ── [v136, BOT_SPEC §2.66.2] «binance-alias»: нормализованное сравнение с архивом Binance USDT-M ──────────────────────────────────────────────────────────────────────────────────────────
+ALIAS_PREFIX_RE = re.compile(r'^(1000000|100000|10000|1000|1M)(?=[A-Z])')
+ALIAS_SUFFIXES = tuple(sorted(('OFFICIAL', 'NEW', 'FUN', 'CTO', 'SOL', 'BSC', 'ETH', 'ONETH', 'COIN', 'TOKEN', 'NETWORK', 'AI'), key=lambda x: (-len(x), x)))      # по убыванию длины (§2.66.2)
+ALIAS_RENAMES = {'ZKSYNC': 'ZK', 'LUNANEW': 'LUNA2', 'TRUMPOFFICIAL': 'TRUMP', 'PUMPFUN': 'PUMP'}
+
+
+def norm_alias(base, rename=True):
+    """Нормализация базы для сравнения с архивом Binance: переименование (только база символа) → верхний регистр → снять числовой префикс → суффиксы по одному до стабилизации (остаток ≥ 2 символов)."""
+    b = str(base or '').upper().strip()
+    if rename:
+        b = ALIAS_RENAMES.get(b, b)
+    b = ALIAS_PREFIX_RE.sub('', b)
+    while True:
+        for suf in ALIAS_SUFFIXES:
+            if b.endswith(suf) and len(b) - len(suf) >= 2:
+                b = b[:-len(suf)]
+                break
+        else:
+            return b
+
+
+def binance_raw_bases(bdir=None):
+    """Базы ВСЕХ символов индекса архива Binance USDT-M (включая делистингованные), без нормализации."""
+    idx = B.load_index(bdir or B.battery_dir())
+    return sorted({(s[:-4] if s.endswith('USDT') else s).upper() for s in idx.get('symbols', [])})
+
+
+def binance_alias_map(bases):
+    """{нормализованная база: [исходные базы Binance]} (нормализация без переименований — они относятся к символам бирж)."""
+    out = {}
+    for b in bases:
+        out.setdefault(norm_alias(b, rename=False), []).append(str(b).upper())
+    return {k: sorted(set(v)) for k, v in out.items()}
+
+
+def apply_alias(mk_ex, amap):
+    """Проставляет `excl` = 'binance-alias=<база Binance>' символам одной биржи, если нормализованная база совпала с нормализованной базой архива Binance (и прежний фильтр не исключил). → число."""
+    n = 0
+    for m in mk_ex.values():
+        if m.get('excl'):
+            continue
+        hit = amap.get(norm_alias(m.get('base')))
+        if hit:
+            m['excl'] = f'binance-alias={hit[0]}'
+            n += 1
+    return n
+
+
+def dedupe_universe(uni, bars, window=30, n_common=30, min_common=10, corr_min=0.95, ratio=(0.97, 1.03), head=61):
+    """[§2.66.3] Одна монета под разными тикерами (по цене, без P&L). Пары символов с датами листинга в пределах `window` суток: корреляция дневных лог-доходностей close за первые `n_common`
+    общих суток ≥ corr_min и отношение close в первый общий день (с приведением к множителю 1000/10000) в `ratio` → одна монета; пары объединяются транзитивно; остаётся символ с наибольшим
+    оборотом за первые 30 суток (при равенстве — порядок бирж EXCHANGES, затем имя). → (группы [dict(keep, drop=[dict(name, corr, ratio)])], множество {(ex, sym)} убранных)."""
+    rec = []
+    for u in uni:
+        b = bars[u['ex']][u['sym']]
+        n = min(head, len(b['ts']))
+        c = np.array(b['c'][:n], float)                                  # копия (не вид): ряд целиком в памяти не удерживается
+        rec.append({'u': u, 'days': (np.asarray(b['ts'][:n]) // DAY).astype(np.int64), 'c': c, 'turn': first30_turnover(b), 'first': int(b['ts'][0]) // DAY})
+    order = sorted(range(len(rec)), key=lambda i: (rec[i]['first'], rec[i]['u']['ex'], rec[i]['u']['sym']))
+    parent = list(range(len(rec)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    edges = {}
+    for oi, i in enumerate(order):
+        for j in order[oi + 1:]:
+            if rec[j]['first'] - rec[i]['first'] > window:
+                break
+            ri, rj = rec[i], rec[j]
+            com = np.intersect1d(ri['days'], rj['days'])[:n_common]
+            if len(com) < min_common:
+                continue
+            ci, cj = ri['c'][np.searchsorted(ri['days'], com)], rj['c'][np.searchsorted(rj['days'], com)]
+            if not (np.all(np.isfinite(ci)) and np.all(np.isfinite(cj)) and np.all(ci > 0) and np.all(cj > 0)):
+                continue
+            li, lj = np.diff(np.log(ci)), np.diff(np.log(cj))
+            if li.std() == 0 or lj.std() == 0:
+                continue
+            di_, dj_ = li - li.mean(), lj - lj.mean()                    # корреляция Пирсона без BLAS (np.corrcoef/dot инициализирует буфер OpenBLAS ≈ 40 МБ адресного пространства — лимит RESEARCH_MEM_MB)
+            corr = float((di_ * dj_).sum() / np.sqrt((di_ * di_).sum() * (dj_ * dj_).sum()))
+            r0 = float(ci[0] / cj[0])
+            ok_ratio = any(ratio[0] <= r0 * m <= ratio[1] for m in (1.0, 1e-3, 1e3, 1e-4, 1e4))
+            if corr >= corr_min and ok_ratio:
+                edges[(i, j)] = (corr, r0)
+                parent[find(i)] = find(j)
+    comps = {}
+    for i in range(len(rec)):
+        comps.setdefault(find(i), []).append(i)
+    ex_order = {e: k for k, e in enumerate(EXCHANGES)}
+    groups, dropped = [], set()
+    for members in comps.values():
+        if len(members) < 2:
+            continue
+        keep = min(members, key=lambda i: (-rec[i]['turn'], ex_order.get(rec[i]['u']['ex'], 99), rec[i]['u']['sym']))
+        name = lambda i: f'{rec[i]["u"]["ex"]}:{rec[i]["u"]["sym"]}'
+        drops = []
+        for i in sorted(members, key=name):
+            if i == keep:
+                continue
+            e = edges.get((min(i, keep), max(i, keep))) or next((v for (a_, b_), v in edges.items() if i in (a_, b_)), (None, None))
+            drops.append({'name': name(i), 'corr': e[0], 'ratio': e[1]})
+            dropped.add((rec[i]['u']['ex'], rec[i]['u']['sym']))
+        groups.append({'keep': name(keep), 'drop': drops})
+    groups.sort(key=lambda g: g['keep'])
+    return groups, dropped
+
+
 def usdt_swaps(markets):
     """Линейные USDT-перпетуалы из ccxt-markets (неактивные включаются, если биржа их отдала). → {symbol: {base, norm, active, created}}."""
     out = {}

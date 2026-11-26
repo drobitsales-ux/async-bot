@@ -97,12 +97,16 @@ async def meta_sets(params, venues, xdir):
 def bucket(reason):
     """Пункт поправки §2.64.2 по причине исключения: «поле …» (метаданные, §2.65.2 и прежний §2.52) и NC-префикс — пункт а."""
     r = str(reason)
+    if r.startswith('binance-alias'):
+        return 'binance-alias'
+    if r.startswith('дубликат'):
+        return 'дубликат'
     return A_LABEL if (r.startswith('NC-') or r.startswith('поле ')) else r
 
 
 def exclusion_lines(ref, uni, venues, notes, mnotes=None):
     """Отчёт по пунктам и биржам (§2.64.2): сколько исключено каждым пунктом по каждой бирже (среди кандидатов), п. г — применялся ли."""
-    order = (A_LABEL, 'б', 'в', 'г', 'стейблкоин', 'до начала истории')
+    order = (A_LABEL, 'б', 'в', 'г', 'binance-alias', 'дубликат', 'стейблкоин', 'до начала истории')
     cnt = {}
     for ex, _s, why in ref.get('excluded_syms', []):
         cnt.setdefault(ex, {}).setdefault(bucket(why), 0)
@@ -120,6 +124,24 @@ def exclusion_lines(ref, uni, venues, notes, mnotes=None):
     return L
 
 
+def alias_rows(ref):
+    """[(биржа, символ, совпавшая база Binance)] — исключённые «binance-alias» (§2.66.2)."""
+    return [(ex, sym, str(why).split('=', 1)[1] if '=' in str(why) else '') for ex, sym, why in ref.get('excluded_syms', []) if str(why).startswith('binance-alias')]
+
+
+def alias_dup_lines(ref, limit=40):
+    """Строки отчёта: binance-alias (с совпавшей базой Binance) и группы дубликатов (§2.66.2–§2.66.3); полный список — в файле-обзоре."""
+    L = []
+    al = sorted(alias_rows(ref))
+    L.append(f'binance-alias (§2.66.2): исключено {len(al)}' + (': ' + ', '.join(f'{ex}:{sym.split("/")[0]}→{b}' for ex, sym, b in al[:limit]) + (f' … (ещё {len(al) - limit}, полный список — в файле-обзоре)' if len(al) > limit else '') if al else ''))
+    dups = ref.get('duplicates') or []
+    nd = sum(len(g['drop']) for g in dups)
+    f = lambda v, nd_=2: 'н/д' if v is None else f'{v:.{nd_}f}'
+    L.append(f'дубликаты одной монеты под разными тикерами (§2.66.3): групп {len(dups)}, убрано символов {nd}' + (': ' + '; '.join(f'оставлен {g["keep"]} ← ' + ', '.join(f'{d["name"]} (corr {f(d["corr"])}, цена {f(d["ratio"], 3)})' for d in g['drop']) for g in dups[:limit // 2])
+                                                                                                              + (f' … (ещё {len(dups) - limit // 2} групп, полный список — в файле-обзоре)' if len(dups) > limit // 2 else '') if dups else ''))
+    return L
+
+
 def write_review(xdir, uni, ref, venues, version, notes, now=None):
     """[§2.64.3] Файл-обзор вселенной (создаёт и перезаписывает `/h2_ext` без аргумента). Без доходностей. → путь | None (ошибка записи)."""
     t = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now or time.time()))
@@ -132,6 +154,14 @@ def write_review(xdir, uni, ref, venues, version, notes, now=None):
     L += ['', f'## Исключены ({len(ex_)})', 'биржа\tсимвол\tпункт (а — §2.52 / б / в / г / стейблкоин / до начала истории)']
     for ex, sym, why in ex_:
         L.append(f'{ex}\t{sym}\t{bucket(why)}' + (f' ({why})' if bucket(why) != why else ''))
+    al = sorted(alias_rows(ref))
+    L += ['', f'## binance-alias ({len(al)}) — нормализованная база совпала с базой архива Binance (§2.66.2)', 'биржа\tсимвол\tсовпавшая база Binance']
+    L += [f'{ex}\t{sym}\t{b}' for ex, sym, b in al]
+    dups = ref.get('duplicates') or []
+    L += ['', f'## дубликаты ({len(dups)} групп) — одна монета под разными тикерами (§2.66.3)', 'оставлен\tубран\tкорреляция\tотношение цен в первый общий день']
+    for g in dups:
+        for d in g['drop']:
+            L.append(f'{g["keep"]}\t{d["name"]}\t' + ('н/д' if d['corr'] is None else f'{d["corr"]:.3f}') + '\t' + ('н/д' if d['ratio'] is None else f'{d["ratio"]:.4f}'))
     p = review_path(xdir)
     try:
         os.makedirs(xdir, exist_ok=True)
@@ -492,7 +522,7 @@ async def run_h2ext(params, progress=None):
             return (f'⛔ {cfg["cmd"]} отказ: данные неполны: ' + '; '.join(cov['lines']) + '. Расчёта и вердикта нет (BOT_SPEC §2.53): выполните /h2_ext load (повторяйте до «✅ загрузка завершена»).')
     coins, cnotes = await coin_sets(params, venues, xdir, refresh=bool(params.get('refresh_coins')))      # [v134, §2.64.2 г] набор монет — из файла задания h2_coins (сеть в этом процессе не используется)
     meta, mnotes = await meta_sets(params, venues, xdir)                                                   # [v135, §2.65.2 а] поля метаданных — оттуда же
-    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues, ext={'coins': coins, 'meta': meta})   # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
+    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues, ext={'coins': coins, 'meta': meta, 'binance_bases': params.get('binance_bases')})   # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
     if P is None or not uni:
         return f'⛔ {cfg["cmd"]} отказ: нет данных — выполните /h2_ext load до сообщения «загрузка завершена»'
     review = write_review(xdir, uni, ref, venues, version, cnotes) if (mode == 'show' and hyp == 'ext') else None
@@ -524,6 +554,7 @@ async def run_h2ext(params, progress=None):
         head.append(f'H2F: символов новых бирж (база не встречалась на BingX/OKX) {len(uni_names)}; событий-кандидатов {counters["candidates"]}, без фандинга в сутки входа {counters["no_funding"]}, '
                     f'фандинг ≤ 0 {counters["neg_or_zero"]}, допущено {counters["admitted"]} (всего событий H2 по вселенной {len(ev_all)}).')
     head += exclusion_lines(ref, uni, venues, cnotes, mnotes)
+    head += alias_dup_lines(ref)
     if mode == 'show' and hyp == 'ext':
         head.append(f'Файл-обзор вселенной: {review} (прислать: /h2ext_review)' if review else '⚠️ файл-обзор вселенной записать не удалось (ошибка записи в каталог данных)')
     ends = last_bar_info(xdir, venues)

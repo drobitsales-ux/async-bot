@@ -145,7 +145,17 @@ def repl_inputs(xdir, bdir=None, venues=None, ext=None):
                 if m is not None and not m.get('excl'):
                     m['excl'] = why
             X.apply_ext_filter(mk[ex], (ext.get('coins') or {}).get(ex))
+        amap = X.binance_alias_map(ext['binance_bases'] if ext.get('binance_bases') is not None else X.binance_raw_bases(bdir))      # [v136, §2.66.2] binance-alias — после а → б → в → г
+        for ex in vn:
+            X.apply_alias(mk[ex], amap)
     uni, ref = X.h2_universe(mk, bars, X.binance_norm_set(bdir))
+    if ext is not None:                                                # [v136, §2.66.3] дедупликация одной монеты под разными тикерами (по цене, без P&L)
+        groups, dropped = X.dedupe_universe(uni, bars)
+        ref['duplicates'] = groups
+        keep_of = {d['name']: g['keep'] for g in groups for d in g['drop']}
+        for ex_, sym_ in sorted(dropped):
+            ref['excluded_syms'].append((ex_, sym_, f'дубликат={keep_of[f"{ex_}:{sym_}"]}'))
+        uni = [u for u in uni if (u['ex'], u['sym']) not in dropped]
     where = {f'{u["ex"]}:{u["sym"]}': (u['ex'], u['sym']) for u in uni}
     series = X.LazyStore(list(where), lambda name: bars[where[name][0]][where[name][1]])
     fk = [nm for nm, (ex_, s_) in where.items() if os.path.exists(X.fund_path(xdir, ex_, s_))]
