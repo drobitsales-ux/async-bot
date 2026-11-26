@@ -6870,7 +6870,7 @@ async def build_daily_digest(date_str: str = None):
     return fpath, verdict
 
 
-async def tg_send_document(filepath: str, caption: str = '') -> bool:
+async def tg_send_document(filepath: str, caption: str = '', timeout: float = 20) -> bool:
     """[v67] Отправляет файл в Telegram (sendDocument) — tg() умеет только
     sendMessage. Используется для суточного дайджеста."""
     if not TOKEN:
@@ -6890,7 +6890,7 @@ async def tg_send_document(filepath: str, caption: str = '') -> bool:
             data.add_field('document', f, filename=os.path.basename(filepath))
             async with http.post(
                 f"https://api.telegram.org/bot{TOKEN}/sendDocument",
-                data=data, timeout=aiohttp.ClientTimeout(total=20)
+                data=data, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -7022,8 +7022,9 @@ async def maybe_send_daily_digest():
 #  При смене версии бот сбрасывает метку 'Последнее' и пишет изменения в лог,
 #  чтобы видеть эффект каждого деплоя и не повторять прошлых ошибок.
 # ═══════════════════════════════════════════════════════
-CODE_VERSION = '2026-11-25-v132'
+CODE_VERSION = '2026-11-26-v133'
 CHANGELOG = [
+    ('2026-11-26-v133', 'КОМАНДА /h2ext_review (BOT_SPEC §2.63; запись ДО кода): присылает документом файл h2ext_universe_review.txt (создаётся владельцем вне бота). Имя файла зашито в код (путей-аргументов нет — произвольные файлы не отдаются); поиск — корень /data и подкаталоги первого уровня, а также DIGEST_DIR, XDATA_DIR, LEADLAG_DIR, RESEARCH_DIR, FACTORY_DIR; несколько файлов — самый свежий; > 50 МБ (предел Telegram) — не отправляется, сообщение с размером; нет файла — сообщение со списком проверенных каталогов. Расчёты, правила H2, пре-регистрации, breaker-ы, bybit_worker.py не менялись; ордеров нет.'),
     ('2026-11-25-v132', 'MemoryError /h2_ext, /disk_usage, ОТЧЁТ ЗАГРУЗКИ (BOT_SPEC §2.62; прод-факты записаны ОТДЕЛЬНЫМ коммитом ДО кода; пре-регистрации §2.47/§2.59, правила H2-D3 и H2F, breaker-ы, режим ожидания, bybit_worker.py не менялись; ордеров нет). (1) Лёгкая панель H2 (research_h2ext.build_lean): в памяти только O/H/C/F (float32), маски liq/top, σ и выходы high/low для синтетики и фандинг в ячейках события; ADV по одному символу, top-30 по блокам строк; синтетика k без массива L и без пересчёта ATR, предыдущая итерация освобождается до следующей; h2_universe не удерживает ряды кандидатов. Числа прежние (равенство с полной панелью и run_cell проверено тестами); пик адресного пространства на синтетике прод-размера (1807 символов × 2463 суток) ≈ 267 МБ при лимите 300 (раньше — MemoryError). (2) /disk_usage: «нужно для /h2_ext load» считается по ещё не загруженным символам; audit_cache (кэш цен аудита канала) и vrp классифицированы как архивы закрытых исследований (/disk_cleanup audit_cache|vrp confirm). (3) Отчёт загрузки: принятая форма запроса Bitget и число символов с ≥ 990 барами (признак усечения глубины).'),
     ('2026-11-25-v131', 'BITGET: ДЕФЕКТ ЗАПРОСА, КЛАССИФИКАЦИЯ ОШИБОК, КОНЕЦ КЭША BingX/OKX, ПРАВИЛО ИСКЛЮЧЕНИЯ (BOT_SPEC §2.61; записано ОТДЕЛЬНЫМ коммитом ДО кода; пре-регистрации §2.47/§2.59, правила H2-D3 и H2F, breaker-ы, режим ожидания, bybit_worker.py не менялись; ордеров нет). Прод 2026-11-25: Bitget 263/263 — HTTP 400 «40017 Parameter verification failed startTime || endTime» записано как «подтверждённо пусто» (неверно). (1) Клиент Bitget перебирает фиксированный список форм запроса свечей и фандинга и запоминает успешную (документация и API Bitget из среды разработки недоступны — не проверено); /venue_probe [биржа] [БАЗА] — на проде прогоняет каждую форму на одном символе (запрос, HTTP-код, сообщение, число строк, первая и последняя дата). (2) Классификация: HTTP 400/422 и ошибки валидации параметров (Bitget 40017/400xx, Gate INVALID_PARAM*) — «дефект запроса», НЕ «подтверждённо пусто»: символ остаётся «не обработано», в отрицательный кэш не пишется, входит в гейт §2.53 как непокрытый, в отчёте отдельная строка; «пусто» — только успешный пустой ответ; защита: нет успехов и 10 дефектов подряд — биржа в прогоне останавливается; разовый сброс записей-ошибок Bitget (миграция v131_reset). (3) BingX/OKX: дата конца данных = последний бар кэша по бирже; позиция, не закрытая к этой дате, закрывается по последнему close с причиной «конец данных» (счётчик data_end), делистинг — только по неактивности в markets; числа симуляции не менялись; пометка «не обновлявшихся > 3 суток» для них — «конец кэша <дата>». (4) Маркер H2EXT-EXCLUDE (исключение биржи правилом ДО расчёта доходностей) читается кодом.'),
     ('2026-11-24-v130', 'МАРКЕР H2EXT-VENUES, ДИСК ДО /h2_ext load, ПЕРЕЗАПУСК И РАЗРЫВЫ lead-lag, ПРАВИЛО ДВУХ ТИКОВ B3 (BOT_SPEC §2.59.10–§2.59.11, §2.60.6–§2.60.7; маркер и уточнения записаны ОТДЕЛЬНЫМ коммитом ДО кода и данных; пре-регистрации §2.59/§2.60, правила H2, breaker-ы, режим ожидания, bybit_worker.py не менялись; ордеров нет). (1) /h2_ext load загружает только биржи из маркера (gateio,mexc,bitget); BingX/OKX — из кэша §2.47; при идущем замере /leadlag отказывает, если после загрузки останется меньше LEADLAG_MIN_FREE_MB + 50 МБ (до скачивания, с расчётом нехватки). (2) /disk_usage — размеры папок/файлов на /data с пометкой «активно / архив закрытого исследования», итог «свободно / нужно для h2_ext / нужно до конца lead-lag» (число контрактов — публичные списки); /disk_cleanup <имя> confirm — единственный способ удаления, только архивы закрытых исследований (vision, factory_data, edge), без confirm — только показ, при выполняющейся задаче отказ; автоматически ничего не удаляется. (3) lead-lag: сбор продолжается после перезапуска (тот же прогон), разрыв записывается (resumes), сброс буфера не реже 60 с и при SIGTERM, /leadlag_status и отчёт показывают число и длительность разрывов. (4) B3: событие «≥ 4 с» = порог превышен в ≥ 2 подряд идущих тиках, события в одном тике — отдельной строкой вне критерия, фактический шаг — в отчёте.'),
@@ -7883,6 +7884,29 @@ def _disk_params():
     return {'root': '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(TRADES_DB)), 'vision': research_vision.vision_dir(), 'factory': research_factory.FD.factory_dir(),
             'edge': research_edge.edge_db_path(TRADES_DB), 'audit_cache': os.path.join(os.path.dirname(os.path.abspath(audit_bot.AD.db_path())), 'audit_cache'), 'vrp': research_vrp.vrp_dir(), 'battery': research_bdata.battery_dir(), 'xdata': research_xdata.xdata_dir(), 'leadlag': LL.leadlag_dir(), 'jobs': research_runner.workdir_base(),
             'll_dir': LL.leadlag_dir()}
+
+
+H2EXT_REVIEW_FILE = 'h2ext_universe_review.txt'
+
+
+async def h2ext_review_cmd():
+    """[v133, §2.63] /h2ext_review: ищет файл с зашитым именем в каталогах данных и присылает документом (≤ 50 МБ). Ничего не изменяет."""
+    import disk_usage as DU
+    prm = _disk_params()
+    dirs = [prm['root'], DIGEST_DIR, prm['xdata'], prm['leadlag'], prm['jobs'], prm['factory'], os.path.dirname(os.path.abspath(TRADES_DB))]
+    loop = asyncio.get_running_loop()
+    path, seen = await loop.run_in_executor(None, DU.find_named_file, H2EXT_REVIEW_FILE, dirs)
+    if path is None:
+        await tg(f'⛔ /h2ext_review: файл {esc(H2EXT_REVIEW_FILE)} не найден. Проверены каталоги (и подкаталоги первого уровня): ' + esc(', '.join(seen) or 'нет доступных') +
+                 '. Положите файл на диск (например, в /data) и повторите.')
+        return
+    size = os.path.getsize(path)
+    if size > DU.TG_MAX_BYTES:
+        await tg(f'⛔ /h2ext_review: файл {esc(path)} — {size / 1e6:.1f} МБ > 50 МБ (предел Telegram); отправить нельзя')
+        return
+    ok = await tg_send_document(path, caption=f'{H2EXT_REVIEW_FILE} | {size / 1e3:.0f} КБ | {esc(os.path.dirname(path))}', timeout=180)
+    if not ok:
+        await tg(f'❌ /h2ext_review: не удалось отправить {esc(path)} ({size / 1e6:.1f} МБ) — см. лог бота')
 
 
 async def disk_cleanup_cmd(args):
@@ -10281,6 +10305,7 @@ async def check_tg_commands():
                     '/xfund_test [load [retry]] — [v116/v119] межбиржевой арбитраж фандинга X1, основная пара BingX/Binance (§2.48, §2.51). Порядок: /xfund_test load → /xfund_test (без аргумента: расчёт); load retry — запросить снова символы с постоянной ошибкой\n'
                     '/h2_ext [load|confirm|report] — [v129] H2-D3 на BingX+OKX+новых биржах Gate.io/MEXC/Bitget (§2.59); площадки — маркер H2EXT-VENUES в BOT_SPEC после /net_probe. Порядок: load → без аргумента → confirm\n'
                     '/h2f [confirm|report] — [v129] H2F: H2-D3 + шорт только при среднем фандинге > 0 за сутки до входа, только символы новых бирж (§2.59.6); только если H2EXT пройден (§2.59.9), порог t_adj 2.0\n'
+                    '/h2ext_review — [v133] прислать документом файл h2ext_universe_review.txt с диска (имя зашито в код; поиск в /data и подкаталогах; ≤ 50 МБ; §2.63)\n'
                     '/venue_probe [bitget|gateio|mexc] [БАЗА] — [v131] проверка форм запросов свечей/фандинга биржи прямого REST на одном символе (запрос, HTTP-код, сообщение, число строк, первая/последняя дата; §2.61.1), публичные запросы\n'
                     '/disk_usage — [v130] размеры папок/файлов на /data («активно» / «архив закрытого исследования»), итог «свободно / нужно для h2_ext / нужно до конца lead-lag» (§2.59.11); /disk_cleanup <имя> [confirm] — удаление ТОЛЬКО архивов закрытых исследований, только с confirm\n'
                     '/leadlag_start [new|resume] | /leadlag_stop | /leadlag_status | /leadlag_report — [v129] замер расхождений цен OKX↔BingX 7 суток, ТОЛЬКО публичные запросы (§2.60)\n'
@@ -10456,6 +10481,11 @@ async def check_tg_commands():
                 _mode = _a if _a in ('load', 'confirm', 'report') else 'show'
                 import research_leadlag as _LL
                 _t = asyncio.create_task(battery_job('/h2_ext', 'h2_ext', {'mode': _mode, 'hyp': 'ext', 'll_dir': _LL.leadlag_dir()}, need_universe=False))
+                _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
+
+            elif cmd == '/h2ext_review':
+                # [v133, §2.63] прислать документом файл h2ext_universe_review.txt с диска
+                _t = asyncio.create_task(h2ext_review_cmd())
                 _bg_tasks.add(_t); _t.add_done_callback(_bg_tasks.discard)
 
             elif cmd == '/venue_probe' or cmd.startswith('/venue_probe '):
