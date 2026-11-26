@@ -210,9 +210,7 @@ class Docs(unittest.TestCase):
         src = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         for needle in ('### 2.66.', '#### 2.66.1', '#### 2.66.2', '#### 2.66.3', '#### 2.66.4', '| v136 |', 'ZKSYNC → ZK', 'LUNANEW → LUNA2', 'TRUMPOFFICIAL → TRUMP', 'PUMPFUN → PUMP'):
             self.assertIn(needle, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v136'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-27-v136')
-        self.assertIn('v136', src.split('\n', 3)[1])
+        self.assertIn('2026-11-27-v136', [c[0] for c in a.CHANGELOG])
         for ln in src.split('\n'):
             self.assertFalse(ln.startswith('H2EXT-UNIVERSE:') or ln.startswith('H2EXT-K:'))                              # строки пре-регистрации не записаны
 

@@ -61,6 +61,7 @@ def write_battery(d, n_syms=40, first_day='2019-12-01', last_day='2025-03-31', s
         idx['keys'][s] = {'d1': month_list(*_ym(ts[0], ts[-1])), 'fr': month_list(*_ym(fts[0], fts[-1]))}
         idx['done'][s] = True
     B.save_index(d, idx)
+    B.save_full(d, {'monthly': sorted(names), 'daily': [], 'symbols': sorted(names)})                      # v137: полный список баз Binance (§2.67.2) — как список батареи
     return names
 
 

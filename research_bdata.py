@@ -118,6 +118,98 @@ def parse_funding(text):
 
 
 # ── листинг ─────────────────────────────────────────────────────────────────────────────────────────
+FULL_SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')              # [v137, §2.67.2] допускает однобуквенные базы (WUSDT, SUSDT, …)
+DL_PREFIX = 'data/futures/um/daily/klines/'
+FULL_FILE = 'binance_bases.json'
+
+
+async def list_names(fetch, prefix, max_pages=50):
+    """Все общие префиксы каталога (S3 delimiter='/') без фильтра имён → список имён (без префикса). Ошибка листинга — V.VisionError."""
+    names, marker, pages = [], None, 0
+    while pages < max_pages:
+        params = {'prefix': prefix, 'delimiter': '/', 'max-keys': 1000}
+        if marker:
+            params['marker'] = marker
+        r = await fetch(V.S3, params, 'GET')
+        pages += 1
+        if r['status'] != 200:
+            raise V.VisionError('http', f'листинг {prefix}: HTTP {r["status"]} {r["error"]}')
+        t = r['body'].decode('utf-8', 'ignore')
+        pref = re.findall(r'<CommonPrefixes>\s*<Prefix>([^<]+)</Prefix>\s*</CommonPrefixes>', t)
+        names += [p[len(prefix):].strip('/') for p in pref]
+        m = re.search(r'<NextMarker>([^<]+)</NextMarker>', t)
+        if '<IsTruncated>true</IsTruncated>' in t and (m or pref):
+            marker = m.group(1) if m else pref[-1]
+        else:
+            break
+    return names
+
+
+async def list_symbols_full(fetch, max_pages=50):
+    """[v137, §2.67.2] ПОЛНЫЙ список символов USDT-M архива: объединение каталогов monthly/klines и daily/klines (включая делистингованные), имена ^[A-Z0-9]{1,20}USDT$ без '_'.
+    → dict(monthly=[…], daily=[…], symbols=[объединение]). Список батареи (list_symbols) не затрагивается."""
+    ok = lambda n: bool(FULL_SYMBOL_RE.match(n)) and '_' not in n
+    monthly = sorted({n for n in await list_names(fetch, KL_PREFIX, max_pages) if ok(n)})
+    daily = sorted({n for n in await list_names(fetch, DL_PREFIX, max_pages) if ok(n)})
+    return {'monthly': monthly, 'daily': daily, 'symbols': sorted(set(monthly) | set(daily))}
+
+
+async def run_binance_bases(params, progress=None):
+    """`/binance_bases` (§2.67.2): листинг monthly ∪ daily каталога klines архива Binance USDT-M, запись `binance_bases.json`, отчёт (сколько в каждом каталоге и в объединении, сколько не было в списке батареи,
+    проверка баз W, S, T, CORE, M, H, C, B, A, F, Q, G, O, UP). Ошибка листинга — прямое сообщение, файл не создаётся."""
+    import aiohttp
+    import research_ma as M
+    d = params.get('bdir') or battery_dir()
+    fetch = params.get('fetch')
+    own = fetch is None
+    ses = None
+    try:
+        if own:
+            ses = aiohttp.ClientSession(headers=M.UA)
+            fetch = V.make_fetcher(ses)
+        try:
+            res = await list_symbols_full(fetch)
+        except V.VisionError as e:
+            return f'⛔ /binance_bases: листинг каталога архива с сервера недоступен — {e}. Файл не создан; фильтры H2EXT остаются по списку батареи.'
+    finally:
+        if ses is not None:
+            await ses.close()
+    save_full(d, res, params.get('now'))
+    old = set(load_index(d).get('symbols', []))
+    new_only = sorted(set(res['symbols']) - old)
+    chk = ('W', 'S', 'T', 'CORE', 'M', 'H', 'C', 'B', 'A', 'F', 'Q', 'G', 'O', 'UP')
+    full = set(res['symbols'])
+    L = [f'📚 <b>/binance_bases</b> — полный список символов USDT-M архива Binance (BOT_SPEC §2.67.2) → {full_path(d)}',
+         f'monthly/klines: {len(res["monthly"])}; daily/klines: {len(res["daily"])}; объединение: {len(res["symbols"])} (имена ^[A-Z0-9]{{1,20}}USDT$, без дат поставки; включая делистингованные); в списке батареи: {len(old)}; '
+         f'в полном, но не в списке батареи: {len(new_only)}',
+         'проверка баз: ' + '; '.join(f'{b}: ' + ('полный да' if f'{b}USDT' in full else 'полный НЕТ') + ' / ' + ('батарея да' if f'{b}USDT' in old else 'батарея нет') for b in chk),
+         'не было в списке батареи (первые 80): ' + (', '.join(s[:-4] for s in new_only[:80]) + (f' … (ещё {len(new_only) - 80})' if len(new_only) > 80 else '') if new_only else 'нет')]
+    return '\n'.join(L)
+
+
+def full_path(d):
+    return os.path.join(d, FULL_FILE)
+
+
+def save_full(d, res, now=None):
+    now = now or time.time()
+    os.makedirs(d, exist_ok=True)
+    tmp = full_path(d) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump({'t': now, 'date': time.strftime('%Y-%m-%d', time.gmtime(now)), 'monthly': res['monthly'], 'daily': res['daily'], 'symbols': res['symbols']}, f, ensure_ascii=False)
+    os.replace(tmp, full_path(d))
+
+
+def load_full(d):
+    """→ dict(t, date, monthly, daily, symbols) | None (файла нет или он повреждён)."""
+    try:
+        with open(full_path(d), encoding='utf-8') as f:
+            z = json.load(f)
+        return z if z.get('symbols') else None
+    except (OSError, ValueError):
+        return None
+
+
 async def list_symbols(fetch, max_pages=50):
     """Все символы архива USDT-M (префиксы каталога klines, S3 delimiter='/'), только …USDT без даты поставки. → отсортированный список. Ошибка страницы → VisionError."""
     syms, marker, pages = [], None, 0
