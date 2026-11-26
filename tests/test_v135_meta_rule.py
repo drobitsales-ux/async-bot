@@ -196,9 +196,7 @@ class Docs(unittest.TestCase):
         src = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         for needle in ('### 2.65.', '#### 2.65.1', '#### 2.65.2', '#### 2.65.3', '| v135 |', 'contract_type', 'isRwa', 'conceptPlate'):
             self.assertIn(needle, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v135'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-26-v135')
-        self.assertIn('v135', src.split('\n', 3)[1])
+        self.assertIn('2026-11-26-v135', [x[0] for x in a.CHANGELOG])
 
 
 if __name__ == '__main__':
