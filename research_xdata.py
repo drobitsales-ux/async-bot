@@ -407,7 +407,11 @@ def noncrypto_reason(base, info=None):
                 return f'поле {k}={v}'
         elif any(w in sv for w in NONCRYPTO_WORDS):
             return f'поле {k}={v}'
-    return None
+    try:                                                              # [v135, §2.65.2] поля Gate.io / Bitget / MEXC (по выводу /contract_probe)
+        import research_venues
+        return research_venues.meta_exclusion(info)
+    except Exception:
+        return None
 
 
 # ── [v134, BOT_SPEC §2.64.2] механическое исключение не-крипто из вселенной H2EXT: порядок а → б → в → г ──────────────────────────────────────────────────────────────────────────
@@ -667,7 +671,7 @@ def h2_universe(markets, bars, binance_norm):
             why = m.get('excl') or noncrypto_reason(m.get('base') or m['norm'])      # [v120, §2.52] не-крипто — до расчёта вселенной (кэш прошлых версий — по базе)
             if why:
                 nonc.setdefault(why.split('=')[0], []).append(f'{ex}:{m.get("base") or m["norm"]}')
-                excluded_syms.append((ex, sym, why.split('=')[0]))                 # [v134, §2.64.3] для файла-обзора: биржа, символ, пункт
+                excluded_syms.append((ex, sym, why))                 # [v134, §2.64.3] для файла-обзора: биржа, символ, пункт
                 continue
             cand.setdefault(m['norm'], []).append((ex, sym, first30_turnover(b), int(b['ts'][0])))      # [v132, §2.62.1] в памяти — только оборот и первый бар (ряды целиком не удерживаются; кандидатов ≈ 1800)
     out, ref = [], {'stable': [], 'pre_existing': [], 'both': 0, 'not_in_binance_bases': len(cand), 'noncrypto': nonc, 'excluded_syms': excluded_syms}

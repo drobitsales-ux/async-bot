@@ -138,8 +138,12 @@ def repl_inputs(xdir, bdir=None, venues=None, ext=None):
     def keys_of(ex):                                                   # v123 (§2.55): ключи из индекса (запись есть, ряд непуст, файл существует) — ряды читаются лениво по одному
         return [s_ for s_, r in idx['bars'].get(ex, {}).items() if int(r.get('n', 1) or 0) > 0 and os.path.exists(X.bars_path(xdir, ex, s_))]
     bars = {ex: X.LazyStore(keys_of(ex) if ex in vn else [], lambda s_, ex=ex: X.load_bars(xdir, ex, s_)) for ex in X.EXCHANGES}
-    if ext is not None:                                                # [v134, §2.64.2] H2EXT: механическое исключение не-крипто (б, в, г); а — прежний §2.52 (excl из индекса)
+    if ext is not None:                                                # [v134, §2.64.2] H2EXT: механическое исключение не-крипто (а → б → в → г); а — §2.52 (excl из индекса) + поля метаданных (§2.65.2)
         for ex in vn:
+            for sym, why in ((ext.get('meta') or {}).get(ex) or {}).items():
+                m = mk[ex].get(sym)
+                if m is not None and not m.get('excl'):
+                    m['excl'] = why
             X.apply_ext_filter(mk[ex], (ext.get('coins') or {}).get(ex))
     uni, ref = X.h2_universe(mk, bars, X.binance_norm_set(bdir))
     where = {f'{u["ex"]}:{u["sym"]}': (u['ex'], u['sym']) for u in uni}

@@ -154,7 +154,7 @@ class Integration(unittest.TestCase):
         self.assertIn('mexc\tNVIDIA/USDT:USDT\tб', exc)
         self.assertRegex(inc, r'gateio\tCRYPA/USDT:USDT\t\d{4}-\d\d-\d\d')                # дата листинга
         self.assertNotRegex(body, r'(?i)t_adj|sharpe|mean R|б\.п\./день')                # без доходностей
-        for needle in ('по биржам и пунктам', 'gateio: а (§2.52)', 'б ', 'в ', 'г ', 'пункт г по биржам', 'Файл-обзор вселенной', 'H2EXT-UNIVERSE: N=', 'Мощность (шаг 0)'):
+        for needle in ('по биржам и пунктам', 'gateio: а (метаданные)', 'б ', 'в ', 'г ', 'пункт г по биржам', 'Файл-обзор вселенной', 'H2EXT-UNIVERSE: N=', 'Мощность (шаг 0)'):
             self.assertIn(needle, txt)
         self.assertIn('mexc — не применяется', txt)
         self.assertIn('/h2ext_review', txt)
@@ -235,7 +235,14 @@ class CoinsJob(unittest.TestCase):
         import research_coins as RC
         d = tempfile.mkdtemp()
         g = Coins.C({'BTC', 'CRYPA'})
-        txt = run(RC.refresh_job({'xdir': d, 'venues': ('gateio', 'mexc'), 'clients': {'gateio': g}}))
+        class Mk:
+            async def load_markets(self):
+                return {}
+
+            async def close(self):
+                pass
+        g.load_markets = Mk().load_markets
+        txt = run(RC.refresh_job({'xdir': d, 'venues': ('gateio', 'mexc'), 'clients': {'gateio': g, 'mexc': Mk()}}))
         self.assertIn('gateio — применён (2 монет', txt)
         self.assertIn('mexc — не применяется', txt)
         coins, notes, t = RC.read_cache(d)
@@ -366,9 +373,7 @@ class Wiring(unittest.TestCase):
         src = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         for needle in ('### 2.64.', '#### 2.64.1', '#### 2.64.2', '#### 2.64.3', '| v134 |', 'h2ext_universe_review.txt'):
             self.assertIn(needle, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v134'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-26-v134')
-        self.assertIn('v134', src.split('\n', 3)[1])
+        self.assertIn('2026-11-26-v134', [x[0] for x in a.CHANGELOG])
         for ln in src.split('\n'):
             self.assertFalse(ln.startswith('H2EXT-EXCLUDE:'))                             # маркера исключения биржи нет
 

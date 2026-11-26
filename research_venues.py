@@ -21,6 +21,27 @@ class VenueError(Exception):
 DEFECT_RE = re.compile(r'HTTP (400|422)\b|\b400\d\d\b|Parameter verification failed|INVALID_PARAM|invalid param|param(eter)? (error|invalid)', re.I)
 
 
+def meta_exclusion(info):
+    """[v135, BOT_SPEC §2.65.2] Пункт а — поле метаданных контракта указывает на не-крипто (по выводу /contract_probe 2026-11-26): Gate.io `contract_type` ≠ '' (stocks/indices/metals/forex/commodities);
+    Bitget `isRwa` = YES; MEXC `type` = 2 либо зона `conceptPlate` с `stock` / `mc-trade-zone-tradfi`. → 'поле <ключ>=<значение>' | None. (OKX `instCategory` и NC-префикс — §2.52, research_xdata.)"""
+    if not isinstance(info, dict):
+        return None
+    ct = info.get('contract_type')
+    if ct not in (None, ''):
+        return f'поле contract_type={ct}'
+    if str(info.get('isRwa') or '').strip().upper() == 'YES':
+        return 'поле isRwa=YES'
+    if 'conceptPlate' in info:
+        if str(info.get('type')).strip() == '2':
+            return 'поле type=2'
+        zones = info.get('conceptPlate')
+        for z in (zones if isinstance(zones, list) else []):
+            zl = str(z).lower()
+            if 'stock' in zl or zl == 'mc-trade-zone-tradfi':
+                return f'поле conceptPlate={z}'
+    return None
+
+
 def is_request_defect(e):
     """[v131, BOT_SPEC §2.61.2] Ответ биржи отклонил ПАРАМЕТРЫ запроса (HTTP 400/422, коды валидации: Bitget 40017/400xx, Gate INVALID_PARAM*): это дефект запроса, а не «нет данных»."""
     return isinstance(e, VenueError) and bool(DEFECT_RE.search(str(e)))
