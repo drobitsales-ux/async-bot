@@ -152,6 +152,27 @@ def format_report(root, items, free_mb, total_mb, ll_state, now, min_free, contr
     return '\n'.join(L)
 
 
+# ── поиск файла для отправки ──────────────────────────────────────────────────────────────────────
+TG_MAX_BYTES = 50 * 1024 * 1024                                     # предел sendDocument
+
+
+def find_named_file(name, dirs):
+    """[v133, §2.63] Файл с ТОЧНЫМ именем `name` (без путей) в каталогах dirs и в их подкаталогах первого уровня; несколько — самый свежий. → (путь | None, список проверенных каталогов).
+    Имя задаёт код (не пользователь): произвольные файлы не отдаются."""
+    if not name or os.path.basename(name) != name:
+        return None, []
+    seen, found = [], []
+    for d in dirs:
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.append(d)
+        cands = [os.path.join(d, name)] + [os.path.join(d, n, name) for n in _ls(d) if os.path.isdir(os.path.join(d, n))]
+        found += [p for p in cands if os.path.isfile(p)]
+    if not found:
+        return None, seen
+    return max(found, key=lambda p: os.path.getmtime(p)), seen
+
+
 # ── очистка ───────────────────────────────────────────────────────────────────────────────────────
 def cleanup_plan(root, items, key):
     """→ (ok, текст, список путей для удаления, размер байт). Допустимы только элементы с пометкой «архив закрытого исследования» и cleanable."""

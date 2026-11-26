@@ -302,9 +302,7 @@ class Docs(unittest.TestCase):
         src = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         for needle in ('### 2.62.', '#### 2.62.1', '#### 2.62.2', '#### 2.62.3', '| v132 |'):
             self.assertIn(needle, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v132'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-25-v132')
-        self.assertIn('v132', src.split('\n', 3)[1])
+        self.assertIn('2026-11-25-v132', [x[0] for x in a.CHANGELOG])
 
 
 if __name__ == '__main__':

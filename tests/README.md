@@ -5,3 +5,4 @@
 - v130: `test_v130_disk_resume_b3.py` — маркер H2EXT-VENUES, диск до /h2_ext load, /disk_usage и /disk_cleanup, возобновление lead-lag и разрывы, правило двух тиков B3.
 - v131: `test_v131_bitget_classify_dataend.py` — Bitget: дефект запроса ≠ «пусто», формы запроса, /venue_probe; конец кэша BingX/OKX; маркер исключения.
 - v132: `test_v132_lean_memory.py` — лёгкая панель H2 (равенство полной, память под RLIMIT_AS 300 МБ на синтетике прод-размера), /disk_usage по не загруженным, audit_cache/vrp, форма запроса Bitget в отчёте загрузки.
+- v133: `test_v133_h2ext_review.py` — /h2ext_review: поиск и отправка файла h2ext_universe_review.txt документом.
