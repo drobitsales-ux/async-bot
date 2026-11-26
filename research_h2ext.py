@@ -79,15 +79,30 @@ async def coin_sets(params, venues, xdir, refresh=False):
     return coins, notes
 
 
+A_LABEL = 'а (метаданные)'
+
+
+async def meta_sets(params, venues, xdir):
+    """[§2.65.2] Исключения по полям метаданных новых бирж (п. а): из файла задания h2_coins (тот же набор для показа, confirm и H2F). Нет файла/раздела — только прежний §2.52 (причина в примечании).
+    → ({биржа: {символ: причина}}, {биржа: примечание})."""
+    if params.get('meta_override') is not None:
+        return params['meta_override'], {ex: 'по переданному набору (тест)' for ex in venues}
+    got = RC.read_meta(xdir)
+    if got is None:
+        return {}, {ex: 'не применяются: поля метаданных не получены (их запрашивает задание h2_coins при /h2_ext без аргумента) — действует только §2.52' for ex in venues}
+    meta, notes = got
+    return meta, {ex: notes.get(ex, 'нет данных') for ex in venues}
+
+
 def bucket(reason):
-    """Пункт поправки §2.64.2 по причине исключения: «поле …»/NC-префикс — это прежний §2.52 (пункт а)."""
+    """Пункт поправки §2.64.2 по причине исключения: «поле …» (метаданные, §2.65.2 и прежний §2.52) и NC-префикс — пункт а."""
     r = str(reason)
-    return 'а (§2.52)' if (r.startswith('NC-') or r.startswith('поле ')) else r
+    return A_LABEL if (r.startswith('NC-') or r.startswith('поле ')) else r
 
 
-def exclusion_lines(ref, uni, venues, notes):
+def exclusion_lines(ref, uni, venues, notes, mnotes=None):
     """Отчёт по пунктам и биржам (§2.64.2): сколько исключено каждым пунктом по каждой бирже (среди кандидатов), п. г — применялся ли."""
-    order = ('а (§2.52)', 'б', 'в', 'г', 'стейблкоин', 'до начала истории')
+    order = (A_LABEL, 'б', 'в', 'г', 'стейблкоин', 'до начала истории')
     cnt = {}
     for ex, _s, why in ref.get('excluded_syms', []):
         cnt.setdefault(ex, {}).setdefault(bucket(why), 0)
@@ -101,7 +116,7 @@ def exclusion_lines(ref, uni, venues, notes):
         L.append(f'  {ex}: ' + '; '.join(f'{k} {c.get(k, 0)}' for k in order) + f'; осталось в вселенной {sum(1 for u in uni if u["ex"] == ex)}')
     L.append('  всего: ' + '; '.join(f'{k} {tot[k]}' for k in order) + f'; в вселенной {len(uni)}')
     L.append('  пункт г по биржам: ' + '; '.join(f'{ex} — {notes.get(ex, "нет данных")}' for ex in venues))
-    L.append('  пункт а: действует прежний §2.52; новые поля метаданных — по выводу /contract_probe (§2.64.1), отдельной поправкой.')
+    L.append('  пункт а (метаданные, §2.65.2 + §2.52): ' + '; '.join(f'{ex} — {mnotes.get(ex, "нет данных")}' for ex in venues))
     return L
 
 
@@ -476,7 +491,8 @@ async def run_h2ext(params, progress=None):
         if not cov['ok']:
             return (f'⛔ {cfg["cmd"]} отказ: данные неполны: ' + '; '.join(cov['lines']) + '. Расчёта и вердикта нет (BOT_SPEC §2.53): выполните /h2_ext load (повторяйте до «✅ загрузка завершена»).')
     coins, cnotes = await coin_sets(params, venues, xdir, refresh=bool(params.get('refresh_coins')))      # [v134, §2.64.2 г] набор монет — из файла задания h2_coins (сеть в этом процессе не используется)
-    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues, ext={'coins': coins})            # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
+    meta, mnotes = await meta_sets(params, venues, xdir)                                                   # [v135, §2.65.2 а] поля метаданных — оттуда же
+    P, uni, ref, liq, top = build_lean(xdir, params.get('bdir'), venues, ext={'coins': coins, 'meta': meta})   # [v132, §2.62.1] лёгкая панель (лимит памяти дочернего процесса RESEARCH_MEM_MB)
     if P is None or not uni:
         return f'⛔ {cfg["cmd"]} отказ: нет данных — выполните /h2_ext load до сообщения «загрузка завершена»'
     review = write_review(xdir, uni, ref, venues, version, cnotes) if (mode == 'show' and hyp == 'ext') else None
@@ -507,7 +523,7 @@ async def run_h2ext(params, progress=None):
     if hyp == 'f':
         head.append(f'H2F: символов новых бирж (база не встречалась на BingX/OKX) {len(uni_names)}; событий-кандидатов {counters["candidates"]}, без фандинга в сутки входа {counters["no_funding"]}, '
                     f'фандинг ≤ 0 {counters["neg_or_zero"]}, допущено {counters["admitted"]} (всего событий H2 по вселенной {len(ev_all)}).')
-    head += exclusion_lines(ref, uni, venues, cnotes)
+    head += exclusion_lines(ref, uni, venues, cnotes, mnotes)
     if mode == 'show' and hyp == 'ext':
         head.append(f'Файл-обзор вселенной: {review} (прислать: /h2ext_review)' if review else '⚠️ файл-обзор вселенной записать не удалось (ошибка записи в каталог данных)')
     ends = last_bar_info(xdir, venues)

@@ -7,3 +7,4 @@
 - v132: `test_v132_lean_memory.py` — лёгкая панель H2 (равенство полной, память под RLIMIT_AS 300 МБ на синтетике прод-размера), /disk_usage по не загруженным, audit_cache/vrp, форма запроса Bitget в отчёте загрузки.
 - v133: `test_v133_h2ext_review.py` — /h2ext_review: поиск и отправка файла h2ext_universe_review.txt документом.
 - v134: `test_v134_ext_filter.py` — механическое исключение не-крипто (б, в, г), отчёт по пунктам и биржам, файл-обзор вселенной, /contract_probe.
+- v135: `test_v135_meta_rule.py` — пункт а по выводу /contract_probe: поля Gate/Bitget/MEXC/OKX, задание h2_coins (поля + монеты), отчёт и файл-обзор.
