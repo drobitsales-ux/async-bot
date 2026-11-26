@@ -17,6 +17,7 @@ import research_bsim as S
 import research_factory as RF
 import research_h2repl as H
 import disk_usage as DU
+import research_bdata as BD
 import research_coins as RC
 import research_leadlag as LL
 import research_xdata as X
@@ -97,6 +98,8 @@ async def meta_sets(params, venues, xdir):
 def bucket(reason):
     """Пункт поправки §2.64.2 по причине исключения: «поле …» (метаданные, §2.65.2 и прежний §2.52) и NC-префикс — пункт а."""
     r = str(reason)
+    if r.startswith('binance-архив'):
+        return 'binance (полный список)'
     if r.startswith('binance-alias'):
         return 'binance-alias'
     if r.startswith('дубликат'):
@@ -106,7 +109,7 @@ def bucket(reason):
 
 def exclusion_lines(ref, uni, venues, notes, mnotes=None):
     """Отчёт по пунктам и биржам (§2.64.2): сколько исключено каждым пунктом по каждой бирже (среди кандидатов), п. г — применялся ли."""
-    order = (A_LABEL, 'б', 'в', 'г', 'binance-alias', 'дубликат', 'стейблкоин', 'до начала истории')
+    order = (A_LABEL, 'б', 'в', 'г', 'binance (полный список)', 'binance-alias', 'дубликат', 'стейблкоин', 'до начала истории')
     cnt = {}
     for ex, _s, why in ref.get('excluded_syms', []):
         cnt.setdefault(ex, {}).setdefault(bucket(why), 0)
@@ -127,6 +130,20 @@ def exclusion_lines(ref, uni, venues, notes, mnotes=None):
 def alias_rows(ref):
     """[(биржа, символ, совпавшая база Binance)] — исключённые «binance-alias» (§2.66.2)."""
     return [(ex, sym, str(why).split('=', 1)[1] if '=' in str(why) else '') for ex, sym, why in ref.get('excluded_syms', []) if str(why).startswith('binance-alias')]
+
+
+def full_list_lines(ref, bdir, limit=60):
+    """[§2.67.2] Строка отчёта: полный список баз Binance (файл, дата, размер) и символы, исключённые благодаря ему (базы нет в списке батареи)."""
+    import research_bdata as BD
+    fl = BD.load_full(bdir)
+    if fl is None:
+        return ['⚠️ полный список баз Binance не получен (/binance_bases) — фильтры §2.47 и binance-alias по списку батареи (§2.67.2); `confirm` в таком состоянии отказывает']
+    n_old = len(BD.load_index(bdir).get('symbols', []))
+    rows = sorted(ref.get('full_list_only') or [])
+    L = [f'Полный список баз Binance USDT-M (§2.67.2, файл от {fl.get("date")}): символов {len(fl["symbols"])} (monthly {len(fl["monthly"])}, daily {len(fl["daily"])}); в списке батареи {n_old}']
+    L.append(f'исключено благодаря полному списку Binance (база есть в полном списке и нет в списке батареи): {len(rows)}' + (': ' + ', '.join(f'{ex}:{sym.split("/")[0]}→{b}' for ex, sym, b, _k in rows[:limit])
+                                                                                         + (f' … (ещё {len(rows) - limit}, полный список — в файле-обзоре)' if len(rows) > limit else '') if rows else ''))
+    return L
 
 
 def alias_dup_lines(ref, limit=40):
@@ -154,6 +171,9 @@ def write_review(xdir, uni, ref, venues, version, notes, now=None):
     L += ['', f'## Исключены ({len(ex_)})', 'биржа\tсимвол\tпункт (а — §2.52 / б / в / г / стейблкоин / до начала истории)']
     for ex, sym, why in ex_:
         L.append(f'{ex}\t{sym}\t{bucket(why)}' + (f' ({why})' if bucket(why) != why else ''))
+    fo = sorted(ref.get('full_list_only') or [])
+    L += ['', f'## исключены благодаря полному списку Binance ({len(fo)}) — база есть в полном списке и нет в списке батареи (§2.67.2)', 'биржа\tсимвол\tбаза Binance\tвид совпадения (exact — точная нормализованная база, alias — §2.66.2)']
+    L += [f'{ex}\t{sym}\t{b}\t{k}' for ex, sym, b, k in fo]
     al = sorted(alias_rows(ref))
     L += ['', f'## binance-alias ({len(al)}) — нормализованная база совпала с базой архива Binance (§2.66.2)', 'биржа\tсимвол\tсовпавшая база Binance']
     L += [f'{ex}\t{sym}\t{b}' for ex, sym, b in al]
@@ -509,6 +529,8 @@ async def run_h2ext(params, progress=None):
         load_venues = tuple(v for v in venues if v in X.NEW_VENUES)       # §2.59.10: загружаются только новые биржи; BingX/OKX — из кэша §2.47
         guard = space_guard(xdir, params.get('ll_dir') or LL.leadlag_dir(), params)
         return await X.run_xload(dict(params, venues=load_venues, ext=True, hourly=False, space_guard=guard), progress)
+    if mode == 'confirm' and params.get('binance_bases') is None and not BD.load_full(params.get('bdir') or B.battery_dir()):      # [v137, §2.67.2] без полного списка Binance расчёт не запускается
+        return f'⛔ {cfg["cmd"]} confirm отказ: нет полного списка баз Binance (BOT_SPEC §2.67.2) — выполните /binance_bases и /h2_ext без аргумента; расчёт доходностей НЕ выполнялся'
     if hyp == 'f':                                                      # §2.59.9: fixed-sequence — H2F только после H2EXT «пройдено»
         gate = sequence_gate(fdir)
         if gate:
@@ -554,7 +576,7 @@ async def run_h2ext(params, progress=None):
         head.append(f'H2F: символов новых бирж (база не встречалась на BingX/OKX) {len(uni_names)}; событий-кандидатов {counters["candidates"]}, без фандинга в сутки входа {counters["no_funding"]}, '
                     f'фандинг ≤ 0 {counters["neg_or_zero"]}, допущено {counters["admitted"]} (всего событий H2 по вселенной {len(ev_all)}).')
     head += exclusion_lines(ref, uni, venues, cnotes, mnotes)
-    head += alias_dup_lines(ref)
+    head += full_list_lines(ref, params.get('bdir') or B.battery_dir()) + alias_dup_lines(ref)
     if mode == 'show' and hyp == 'ext':
         head.append(f'Файл-обзор вселенной: {review} (прислать: /h2ext_review)' if review else '⚠️ файл-обзор вселенной записать не удалось (ошибка записи в каталог данных)')
     ends = last_bar_info(xdir, venues)

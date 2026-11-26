@@ -342,6 +342,11 @@ async def _task_h2_ext(ctx: Ctx):
     return {'text': await research_h2ext.run_h2ext(ctx.params, progress=ctx.progress)}
 
 
+async def _task_binance_bases(ctx: Ctx):
+    import research_bdata                        # [v137] полный список баз архива Binance USDT-M (BOT_SPEC §2.67.2); публичный листинг data.binance.vision
+    return {'text': await research_bdata.run_binance_bases(ctx.params, progress=ctx.progress)}
+
+
 async def _task_h2_coins(ctx: Ctx):
     import research_coins                        # [v134] наборы монет с сетями для п. г §2.64.2 (сеть вне процесса расчёта); публичные GET
     return {'text': await research_coins.refresh_job(ctx.params)}
@@ -387,7 +392,7 @@ TASKS = {
     'final_crypto4h': _task_final_crypto4h,
     'battery_load': _task_battery_load, 'battery': _task_battery, 'battery_final': _task_battery_final,
     'final_h2': _task_final_h2, 'vrp_probe': _task_vrp_probe, 'vrp_measure': _task_vrp_measure, 'vrp_sim': _task_vrp_sim,
-    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors, 'h2_ext': _task_h2_ext, 'disk_usage': _task_disk_usage, 'venue_probe': _task_venue_probe, 'contract_probe': _task_contract_probe, 'h2_coins': _task_h2_coins, 'leadlag_report': _task_leadlag_report,
+    'h2_funding_check': _task_h2_funding_check, 'h2_replicate': _task_h2_replicate, 'xfund_test': _task_xfund_test, 'xfund_1h_errors': _task_xfund_1h_errors, 'h2_ext': _task_h2_ext, 'disk_usage': _task_disk_usage, 'venue_probe': _task_venue_probe, 'contract_probe': _task_contract_probe, 'h2_coins': _task_h2_coins, 'binance_bases': _task_binance_bases, 'leadlag_report': _task_leadlag_report,
     'audit': _task_audit, 'audit_import': _task_audit_import, 'signal_study': _task_signal_study, 'signal_final': _task_signal_final,
 }
 

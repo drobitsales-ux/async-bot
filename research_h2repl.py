@@ -145,10 +145,32 @@ def repl_inputs(xdir, bdir=None, venues=None, ext=None):
                 if m is not None and not m.get('excl'):
                     m['excl'] = why
             X.apply_ext_filter(mk[ex], (ext.get('coins') or {}).get(ex))
-        amap = X.binance_alias_map(ext['binance_bases'] if ext.get('binance_bases') is not None else X.binance_raw_bases(bdir))      # [v136, §2.66.2] binance-alias — после а → б → в → г
-        for ex in vn:
+        raw_full = ext['binance_bases'] if ext.get('binance_bases') is not None else X.binance_raw_bases(bdir)          # [v137, §2.67.2] полный список ∪ список батареи
+        amap = X.binance_alias_map(raw_full)
+        old_raw = X.binance_raw_bases(bdir, full=False) if ext.get('binance_bases') is None else []
+        old_amap = X.binance_alias_map(old_raw)
+        old_norm = {X.norm_base(b) for b in old_raw}
+        for ex in vn:                                                  # [v136, §2.66.2] binance-alias — после а → б → в → г
             X.apply_alias(mk[ex], amap)
     uni, ref = X.h2_universe(mk, bars, X.binance_norm_set(bdir))
+    if ext is not None:                                                # [v137, §2.67.2] исключения благодаря ПОЛНОМУ списку Binance (базы нет в списке батареи): точное совпадение (скрыто в h2_universe) и binance-alias
+        by_norm = {}
+        for b in X.binance_raw_bases(bdir):
+            by_norm.setdefault(X.norm_base(b), b)
+        full_only = []
+        for ex in vn:
+            for sym, m in mk[ex].items():
+                if sym not in bars[ex]:
+                    continue
+                why = str(m.get('excl') or '')
+                exact = m['norm'] in by_norm and m['norm'] not in old_norm
+                if why.startswith('binance-alias') and not exact and X.norm_alias(m.get('base')) not in old_amap and old_raw:
+                    full_only.append((ex, sym, why.split('=', 1)[1], 'alias'))
+                elif (not why or why.startswith('binance-alias')) and exact and old_raw:
+                    full_only.append((ex, sym, by_norm[m['norm']], 'exact'))
+                    ref['excluded_syms'] = [e for e in ref['excluded_syms'] if (e[0], e[1]) != (ex, sym)]
+                    ref['excluded_syms'].append((ex, sym, 'binance-архив=' + by_norm[m['norm']]))
+        ref['full_list_only'] = full_only
     if ext is not None:                                                # [v136, §2.66.3] дедупликация одной монеты под разными тикерами (по цене, без P&L)
         groups, dropped = X.dedupe_universe(uni, bars)
         ref['duplicates'] = groups

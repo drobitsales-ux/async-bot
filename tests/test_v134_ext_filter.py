@@ -281,14 +281,17 @@ class CoinsJob(unittest.TestCase):
 
         async def fake_battery(cmd, task, extra=None, need_universe=True):
             calls.append(('battery', task, extra['mode']))
-        orig = (a._research_job, a.battery_job)
+        import research_bdata as BD
+        import time as _t
+        orig = (a._research_job, a.battery_job, BD.load_full)
         a._research_job, a.battery_job = fake_job, fake_battery
+        BD.load_full = lambda d: {'t': _t.time(), 'symbols': ['BTCUSDT']}                       # полный список Binance свежий — отдельное задание binance_bases не нужно
         try:
             run(a.h2ext_cmd('show'))
             run(a.h2ext_cmd('confirm'))
             run(a.h2ext_cmd('load'))
         finally:
-            a._research_job, a.battery_job = orig
+            a._research_job, a.battery_job, BD.load_full = orig
         self.assertEqual([c[:2] for c in calls], [('job', 'h2_coins'), ('battery', 'h2_ext'), ('battery', 'h2_ext'), ('battery', 'h2_ext')])
         self.assertEqual(calls[0][2], ('bingx', 'okx', 'gateio', 'mexc', 'bitget'))
         self.assertTrue(any('монеты: ок' in m for m in sent))

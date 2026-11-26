@@ -91,13 +91,22 @@ def norm_base(base):
     return PREFIX_RE.sub('', b)
 
 
-def binance_norm_set(bdir=None):
-    """Нормализованные базы ВСЕХ символов индекса архива Binance (включая делистингованные и стейблкоин-подобные)."""
-    idx = B.load_index(bdir or B.battery_dir())
-    return {norm_base(s[:-4] if s.endswith('USDT') else s) for s in idx.get('symbols', [])}
+def binance_norm_set(bdir=None, full=True):
+    """[v137, §2.67.2] Нормализованные базы архива Binance: список батареи ∪ ПОЛНЫЙ список (`binance_bases.json`, monthly ∪ daily, однобуквенные базы), если он получен; full=False — только список батареи. Прежнее описание: нормализованные базы ВСЕХ символов индекса архива Binance (включая делистингованные и стейблкоин-подобные)."""
+    return {norm_base(b) for b in binance_raw_bases(bdir, full)}
 
 
 def safe(sym):
+    """Имя файла кэша. [v137, §2.67.3] Для имён с не-ASCII символами добавляется `~<8 hex SHA-1>`: прежняя замена любой не-ASCII серии на `_` давала один путь всем символам вроде <иероглифы>/USDT:USDT одной
+    биржи (идентичные ряды). Имена только из ASCII — без изменений (кэш прежних символов валиден)."""
+    s = re.sub(r'[^A-Za-z0-9]+', '_', sym)
+    if not sym.isascii():
+        import hashlib
+        s += '~' + hashlib.sha1(sym.encode('utf-8')).hexdigest()[:8]
+    return s
+
+
+def old_safe(sym):
     return re.sub(r'[^A-Za-z0-9]+', '_', sym)
 
 
@@ -136,6 +145,8 @@ def _apply(idx, kind, ex, sym, rec):
         idx['migr'][f'{ex}|{sym}'] = rec
     elif kind in ('alias', 'h1class'):                               # [v125, §2.57] переименованные символы и результат классификации ошибок 1h
         idx[kind][f'{ex}|{sym}'] = rec
+    elif kind in ('barsdel', 'funddel', 'hbarsdel'):                  # [v137, §2.67.3] сброс записи свечей/фандинга/1h (миграция v137)
+        idx[{'barsdel': 'bars', 'funddel': 'fund', 'hbarsdel': 'hbars'}[kind]].setdefault(ex, {}).pop(sym, None)
     elif kind == 'negdel':                                           # [v125] сброс отрицательной записи (повторный запрос символа)
         idx['neg'].pop(f'{ex}|{sym}', None)
 
@@ -227,6 +238,39 @@ def migrate_v131(d, idx):
             put(d, idx, 'negdel', ex, f'{sym}|{what}', None)
             n += 1
     put(d, idx, 'migr', 'bitget', 'v131_reset', {'t': int(time.time() * 1000), 'n': n})
+    return n
+
+
+def migrate_v137(d, idx):
+    """[v137, §2.67.3] РАЗОВЫЙ сброс символов, чьи файлы кэша могли разделять путь из-за прежней `safe()`: все символы с не-ASCII именем и ASCII-символы той же биржи с тем же прежним путём. Записи индекса
+    (свечи, фандинг, 1h) и файлы по прежнему пути удаляются — символы загружаются заново. → число сброшенных символов."""
+    if 'bitget|v137_reset' in idx['migr']:
+        return 0
+    n = 0
+    for ex in EXCHANGES:
+        syms = set(idx['bars'].get(ex, {})) | set(idx['fund'].get(ex, {})) | set(idx['hbars'].get(ex, {}))
+        groups = {}
+        for s_ in syms:
+            groups.setdefault(old_safe(s_), []).append(s_)
+        for old, members in groups.items():
+            if all(m.isascii() for m in members):
+                continue
+            for path in (os.path.join(d, ex, old + '.d1.npz'), os.path.join(d, ex, old + '.fr.npz'), os.path.join(d, ex, old + '.h1.npz')):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            for m in members:
+                for store, kind in (('bars', 'barsdel'), ('fund', 'funddel'), ('hbars', 'hbarsdel')):
+                    if m in idx[store].get(ex, {}):
+                        put(d, idx, kind, ex, m, None)
+                for path in (bars_path(d, ex, m), fund_path(d, ex, m), hbars_path(d, ex, m)):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                n += 1
+    put(d, idx, 'migr', 'bitget', 'v137_reset', {'t': int(time.time() * 1000), 'n': n})
     return n
 
 
@@ -478,10 +522,15 @@ def norm_alias(base, rename=True):
             return b
 
 
-def binance_raw_bases(bdir=None):
-    """Базы ВСЕХ символов индекса архива Binance USDT-M (включая делистингованные), без нормализации."""
-    idx = B.load_index(bdir or B.battery_dir())
-    return sorted({(s[:-4] if s.endswith('USDT') else s).upper() for s in idx.get('symbols', [])})
+def binance_raw_bases(bdir=None, full=True):
+    """Базы символов архива Binance USDT-M без нормализации: список батареи ∪ полный список (§2.67.2; full=False — только батарея)."""
+    d = bdir or B.battery_dir()
+    syms = set(B.load_index(d).get('symbols', []))
+    if full:
+        fl = B.load_full(d)
+        if fl:
+            syms |= set(fl['symbols'])
+    return sorted({(s[:-4] if s.endswith('USDT') else s).upper() for s in syms})
 
 
 def binance_alias_map(bases):
@@ -937,10 +986,13 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     exchanges[ex_] = cls()
     idx = compact_index(d)
     n_mig = migrate_v127(d, idx)
-    n_mig131 = migrate_v131(d, idx)                                    # [v131, §2.61.2] разовый сброс ошибок Bitget (дефект запроса v130)
+    n_mig131 = migrate_v131(d, idx)
+    n_mig137 = migrate_v137(d, idx)                                    # [v137, §2.67.3] сброс символов с возможной коллизией имён файлов                                    # [v131, §2.61.2] разовый сброс ошибок Bitget (дефект запроса v130)
     #                                                                  # [v127, §2.58 п. 8] разовый сброс записей-ошибок (лимит запросов 100410 записывался как постоянная ошибка)
     idx['fail'] = {}                                                # ошибки текущего прогона (транзиентные); постоянные — в idx['neg']
     L = [f'📥 <b>загрузка данных бирж</b> — Bybit/BingX (публичные методы ccxt), OKX (прямой REST без ccxt) → {d}']
+    if n_mig137:
+        L.append(f'↺ v137 (§2.67.3): сброшено {n_mig137} символов с не-ASCII именем (и ASCII-символов с тем же прежним путём файла) — загрузятся заново (прежняя safe() давала им общий файл кэша)')
     if n_mig131:
         L.append(f'↺ v131 (§2.61.2): сброшено {n_mig131} записей-ошибок Bitget (дефект запроса v130, HTTP 400 / 40017) в «не обработано»')
     if n_mig:
@@ -1008,7 +1060,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                 stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
                 break
             rec = idx['bars'][ex].get(sym)
-            if rec and 'complete' in rec and rec.get('last', 0) + 2 * DAY >= now_ms - DAY:      # записи прошлых версий (без признака полноты) загружаются заново
+            if rec and 'complete' in rec and rec.get('last', 0) + 2 * DAY >= now_ms - DAY and os.path.exists(bars_path(d, ex, sym)):      # записи прошлых версий (без признака полноты) и записи без файла — загружаются заново
                 continue
             if neg_active(idx, ex, sym, 'bars', now_ms):
                 continue
@@ -1058,7 +1110,7 @@ async def run_xload(params, progress=None, exchanges=None, now_ms=None, sleep=as
                     stopped = '⏱ бюджет времени исчерпан — повторите команду (продолжит с места остановки)'
                     break
                 rec = idx['fund'][ex].get(sym)
-                if rec and 'complete' in rec and rec.get('t', 0) >= now_ms - 2 * DAY:
+                if rec and 'complete' in rec and rec.get('t', 0) >= now_ms - 2 * DAY and os.path.exists(fund_path(d, ex, sym)):
                     continue
                 if neg_active(idx, ex, sym, 'fund', now_ms):
                     continue

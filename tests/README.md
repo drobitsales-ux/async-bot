@@ -9,3 +9,4 @@
 - v134: `test_v134_ext_filter.py` — механическое исключение не-крипто (б, в, г), отчёт по пунктам и биржам, файл-обзор вселенной, /contract_probe.
 - v135: `test_v135_meta_rule.py` — пункт а по выводу /contract_probe: поля Gate/Bitget/MEXC/OKX, задание h2_coins (поля + монеты), отчёт и файл-обзор.
 - v136: `test_v136_alias_dedupe.py` — MEXC conceptPlate точно, binance-alias (нормализация, переименования), дедупликация одной монеты под разными тикерами, разделы файла-обзора.
+- v137: `test_v137_full_list.py` — полный список баз Binance (monthly ∪ daily, однобуквенные базы), фильтры по нему, safe() для не-ASCII имён, миграция v137, Gate.io.
