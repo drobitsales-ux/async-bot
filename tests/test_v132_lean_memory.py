@@ -141,8 +141,8 @@ try:
         P, uni, ref = H.build_repl_panel(sys.argv[2], sys.argv[3], ("bingx", "okx", "gateio", "mexc", "bitget"))
         env = H.make_env(P)
         print(json.dumps({"ok": True, "vm": vm()}))
-except MemoryError:
-    print(json.dumps({"ok": False, "err": "MemoryError", "vm": vm()}))
+except (MemoryError, ImportError) as e:                              # исчерпание адресного пространства проявляется и как MemoryError, и как ImportError «failed to map segment» (ленивый импорт)
+    print(json.dumps({"ok": False, "err": "MemoryError", "detail": type(e).__name__, "vm": vm()}))
 '''
 
 

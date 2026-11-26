@@ -121,9 +121,8 @@ class Docs(unittest.TestCase):
         src = open(os.path.join(ROOT, 'BOT_SPEC.md'), encoding='utf-8').read()
         for needle in ('### 2.63.', '| v133 |', '/h2ext_review'):
             self.assertIn(needle, src)
-        self.assertTrue(a.CODE_VERSION.endswith('v133'))
-        self.assertEqual(a.CHANGELOG[0][0], '2026-11-26-v133')
-        self.assertIn('v133', src.split('\n', 3)[1])
+        self.assertIn('2026-11-26-v133', [x[0] for x in a.CHANGELOG])
+        self.assertIn('| v133 |', src)
 
 
 if __name__ == '__main__':

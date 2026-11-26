@@ -410,6 +410,40 @@ def noncrypto_reason(base, info=None):
     return None
 
 
+# ── [v134, BOT_SPEC §2.64.2] механическое исключение не-крипто из вселенной H2EXT: порядок а → б → в → г ──────────────────────────────────────────────────────────────────────────
+CURRENCY_CODES = frozenset('USD EUR GBP JPY CHF AUD CAD NZD CNY CNH HKD SGD KRW INR BRL MXN RUB TRY ZAR SEK NOK DKK PLN CZK HUF ILS THB IDR MYR PHP TWD AED SAR'.split())
+FACTORY_BASES = frozenset('XAU XAG XPT XPD WTI BRENT OIL GOLD SILVER PLAT DAX NIKKEI SPX NAS100 US30 USOIL UKOIL'.split())      # research_ma.BINGX_EXACT и ключи поиска §2.41 + USOIL/UKOIL (§2.64.2 в)
+INDEX_TICKERS = frozenset('SP500 SPX500 NDX100 NAS100 US30 US2000 GER40 UK100 JPN225 JP225 HK50 HSI KOSPI AUS200 DXY'.split())
+EXT_LETTERS = ('а', 'б', 'в', 'г')
+
+
+def ext_exclusion(base, norm, bases_on_ex, coins=None):
+    """Пункты б, в, г (§2.64.2) → 'б' | 'в' | 'г' | None. Пункт а — прежний §2.52 (`excl`, проверяется вызывающим) + поля шага 0 (отдельной поправкой по выводу /contract_probe).
+    bases_on_ex — множество баз (верхний регистр) ВСЕХ контрактов этой биржи; coins — множество кодов спотовых монет биржи с блокчейн-сетью (None/пусто — пункт г не применяется)."""
+    b = str(base or '').upper().strip()
+    if b.endswith('STOCK') or b.endswith('HKD') or (b + 'STOCK') in bases_on_ex:
+        return 'б'
+    if b in CURRENCY_CODES or b in FACTORY_BASES or b in INDEX_TICKERS:
+        return 'в'
+    if coins and b not in coins and str(norm or '').upper() not in coins:
+        return 'г'
+    return None
+
+
+def apply_ext_filter(mk_ex, coins=None):
+    """Проставляет `excl` ('б'/'в'/'г') символам одной биржи (словарь symbol → dict(base, norm, excl …)), если прежний фильтр §2.52 их не исключил. → число новых исключений."""
+    bases = {str(m.get('base') or '').upper() for m in mk_ex.values()}
+    n = 0
+    for m in mk_ex.values():
+        if m.get('excl'):
+            continue
+        r = ext_exclusion(m.get('base'), m.get('norm'), bases, coins)
+        if r:
+            m['excl'] = r
+            n += 1
+    return n
+
+
 def cat_of(info):
     """Первое найденное поле «класс актива» как 'ключ=значение' (для распределения в отчёте) либо ''."""
     for k in CAT_KEYS:
@@ -624,7 +658,7 @@ def h2_universe(markets, bars, binance_norm):
     биржа с большим оборотом за первые 30 баров (при равенстве — Bybit). Исключаются стейблкоин-подобные (σ < 0.5%) и существовавшие до начала истории биржи (первый бар в самый ранний день
     среди загруженных символов биржи). → (список dict(ex, sym, norm, first_day), справка dict счётчиков и исключений)."""
     earliest = {ex: min((int(b['ts'][0]) for b in bars.get(ex, {}).values() if len(b['ts'])), default=None) for ex in EXCHANGES}
-    cand, nonc = {}, {}
+    cand, nonc, excluded_syms = {}, {}, []
     for ex in EXCHANGES:
         for sym, m in markets.get(ex, {}).items():
             b = bars.get(ex, {}).get(sym)
@@ -633,9 +667,10 @@ def h2_universe(markets, bars, binance_norm):
             why = m.get('excl') or noncrypto_reason(m.get('base') or m['norm'])      # [v120, §2.52] не-крипто — до расчёта вселенной (кэш прошлых версий — по базе)
             if why:
                 nonc.setdefault(why.split('=')[0], []).append(f'{ex}:{m.get("base") or m["norm"]}')
+                excluded_syms.append((ex, sym, why.split('=')[0]))                 # [v134, §2.64.3] для файла-обзора: биржа, символ, пункт
                 continue
             cand.setdefault(m['norm'], []).append((ex, sym, first30_turnover(b), int(b['ts'][0])))      # [v132, §2.62.1] в памяти — только оборот и первый бар (ряды целиком не удерживаются; кандидатов ≈ 1800)
-    out, ref = [], {'stable': [], 'pre_existing': [], 'both': 0, 'not_in_binance_bases': len(cand), 'noncrypto': nonc}
+    out, ref = [], {'stable': [], 'pre_existing': [], 'both': 0, 'not_in_binance_bases': len(cand), 'noncrypto': nonc, 'excluded_syms': excluded_syms}
     for norm in sorted(cand):
         opts = cand[norm]
         if len(opts) > 1:
@@ -643,9 +678,11 @@ def h2_universe(markets, bars, binance_norm):
         ex, sym, _turn, first_ts = max(opts, key=lambda o: (o[2], o[0] == 'bybit'))
         if B.stable_like(bars[ex][sym]['c']):                          # ряд выбранного символа перечитывается (результат тот же, что при хранении ряда)
             ref['stable'].append(f'{ex}:{sym}')
+            excluded_syms.append((ex, sym, 'стейблкоин'))
             continue
         if earliest[ex] is not None and first_ts <= earliest[ex]:
             ref['pre_existing'].append(f'{ex}:{sym}')
+            excluded_syms.append((ex, sym, 'до начала истории'))
             continue
         out.append({'ex': ex, 'sym': sym, 'norm': norm, 'first_day': first_ts // DAY})
     return out, ref
